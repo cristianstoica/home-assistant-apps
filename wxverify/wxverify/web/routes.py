@@ -10,7 +10,6 @@ from fastapi.responses import HTMLResponse
 from wxverify.db.connection import get_db, pinned_read_snapshot
 from wxverify.forecast.data import forecast_fingerprint
 from wxverify.forecast.service import ForecastView, build_forecast
-from wxverify.scoring.rescore import schedule_score_rescore
 from wxverify.settings.depth import effective_blend_depths
 from wxverify.web.context import (
     SiteView,
@@ -21,7 +20,6 @@ from wxverify.web.context import (
     load_sites,
 )
 from wxverify.web.render import render, render_fragment
-from wxverify.web.verification import load_verification
 
 router = APIRouter(include_in_schema=False)
 
@@ -191,34 +189,13 @@ async def dashboard_page(
             lead=lead,
         )
     )
-    # Second composite enqueue site (mirrors /api/composite): the read above is
-    # closed; the enqueue is scheduled post-response via the fire-and-forget
-    # scheduler (cooldown-guarded), so it never gates the render. The resolved
-    # site comes from the context because load_dashboard defaults to the first
-    # enabled site when `site` is None.
-    resolved_site = context.get("site")
-    if context.get("composite_status") in ("stale", "rebuilding") and isinstance(
-        resolved_site, SiteView
-    ):
-        schedule_score_rescore(resolved_site.id)
     return render(request, "dashboard/show.html", **context)
-
-
-@router.get("/verification", response_class=HTMLResponse)
-async def verification_page(request: Request, site: int | None = None) -> HTMLResponse:
-    context = await get_db().read(lambda conn: load_verification(conn, site))
-    return render(request, "verification/show.html", **context)
 
 
 @router.get("/ops", response_class=HTMLResponse)
 async def ops_page(request: Request) -> HTMLResponse:
-    # Function-local so the attribute is re-read per request: a module-level
-    # import binds its own copy, and a test that lowers the cap would then
-    # leave the panel disclosing the real one.
-    from wxverify.api.routes.db_transfer import MAX_IMPORT_MIB
-
     context = await get_db().read(load_ops)
-    return render(request, "ops/show.html", **context, max_import_mib=MAX_IMPORT_MIB)
+    return render(request, "ops/show.html", **context)
 
 
 @router.get("/overlay", response_class=HTMLResponse)

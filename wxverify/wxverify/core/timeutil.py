@@ -23,8 +23,8 @@ def isoformat_utc_micro(value: datetime | None = None) -> str:
     ``isoformat_utc`` omits the fractional-seconds field when
     ``microsecond == 0``, and since ``'.' < 'Z'`` a later same-second stamp
     with microseconds compares lexically SMALLER than a whole-second one.
-    The scoring run stamp (``stamp_score_work``) relies on SQL string
-    comparison as a time ordering, so it must use this fixed-width form.
+    A stamp that SQL string comparison orders by time must use this
+    fixed-width form.
     Do not switch other call sites: ``floor_hour``-derived ``…:00Z`` values
     are stored DB-wide and would cross-format-compare against new values.
     """
@@ -125,7 +125,3 @@ def day_ahead(issued_at: str, valid_at: str, timezone: str) -> int:
 
 def window_cutoff(days: int, now: datetime | None = None) -> str:
     return isoformat_utc((now or utc_now()) - timedelta(days=days))
-
-
-def utc_day_bucket(value: datetime | None = None) -> str:
-    return (value or utc_now()).astimezone(UTC).date().isoformat()

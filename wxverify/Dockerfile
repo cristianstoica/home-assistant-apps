@@ -5,6 +5,13 @@ FROM ${BUILD_FROM}
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
+# s6-overlay stop times, in ms (defaults 3000 each, which gave the service
+# about 3 s). S6_SERVICES_GRACETIME is how long s6 waits for the service after
+# its SIGTERM: (STOP_BUDGET_S in wxverify/core/stop.py + 5 s) x 1000. Change it
+# with STOP_BUDGET_S and config.yaml's `timeout:`.
+ENV S6_SERVICES_GRACETIME=69000 \
+    S6_KILL_GRACETIME=3000
+
 COPY pyproject.toml uv.lock /tmp/
 
 RUN pip install --no-cache-dir uv==0.9.17 && \

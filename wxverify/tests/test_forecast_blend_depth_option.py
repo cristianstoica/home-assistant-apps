@@ -30,20 +30,17 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import TypeVar
 
 import pytest
 from pydantic import ValidationError
 
+from tests.helpers import seed_active_publication, seed_publication_ranking
 from wxverify.core.options import RuntimeOptions, _from_env
-from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
-from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.service import build_forecast, build_hourly
-from wxverify.scoring.cache import upsert_score_cache
-from wxverify.scoring.leaderboard import resolve_window
-from wxverify.scoring.metrics import strategy_for
+from wxverify.scoring.metrics import MetricSums, metrics_from_sums
 from wxverify.settings.keys import get_number_setting, get_setting, set_setting
 from wxverify.settings.service import apply_plain_settings
 
@@ -166,7 +163,6 @@ def _seed_two_confident_feeds(conn: sqlite3.Connection) -> None:
     set_setting(conn, "min_n", "3")
     ecmwf_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     gfs_id = _feed_id(conn, "open-meteo", "gfs_global")
-    persistence_id = _feed_id(conn, "virtual", "_persistence")
     valid_ats = [f"2026-07-20T{h:02d}:00:00Z" for h in range(4, 24)]
 
     for feed_id, value in ((ecmwf_id, 11.0), (gfs_id, 12.0)):
@@ -188,82 +184,101 @@ def _seed_two_confident_feeds(conn: sqlite3.Connection) -> None:
                 ),
             )
 
-    far_valid_ats = [
-        "2035-07-01T00:00:00Z",
-        "2035-07-01T01:00:00Z",
-        "2035-07-01T02:00:00Z",
-    ]
-    far_lead_hours = [1, 2, 3]
-    for target_feed, forecast in (
-        (persistence_id, 8.0),
-        (ecmwf_id, 10.5),
-        (gfs_id, 9.5),
-    ):
-        for valid_at, lead_hours in zip(far_valid_ats, far_lead_hours, strict=True):
-            error = forecast - 10.0
-            conn.execute(
-                """
-                INSERT INTO forecast_pairs
-                    (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                     day_ahead, forecast, observed, error, abs_error, sq_error,
-                     tz_generation_id)
-                VALUES
-                    (1, ?, 'temperature', '2035-06-30T00:00:00Z', ?, ?, 1, ?,
-                     10.0, ?, ?, ?, ?)
-                """,
-                (
-                    target_feed,
-                    valid_at,
-                    lead_hours,
-                    forecast,
-                    error,
-                    abs(error),
-                    error * error,
-                    ensure_site_generation(conn, 1),
-                ),
-            )
+    # The three feeds' far-horizon (temperature, day_ahead=1) skill numbers
+    # that used to be written here as forecast_pairs rows are now
+    # hand-derived directly in `_seed_score_cache_for_fixture`'s published
+    # ranking (no pair table is read for scoring any more, W6b, storage
+    # release 3.1).
+
+
+_TEST_PUBLICATION_WINDOW_DAYS = 30
+_TEST_PUBLICATION_WINDOW_KEY = f"w:{_TEST_PUBLICATION_WINDOW_DAYS}"
+
+
+def _ensure_test_publication(conn: sqlite3.Connection, *, min_n: int) -> int:
+    """This connection's one site-1 publication, created on first use.
+
+    ``leaderboard_with_status``'s ``rolling`` window now always reads the
+    active publication (9.2), never a live recompute. Mirrors
+    ``tests/test_forecast_service.py``'s identically-named helper.
+    """
+    row = conn.execute(
+        "SELECT id FROM publications WHERE site_id = 1 ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row is not None:
+        return int(row["id"])
+    return seed_active_publication(
+        conn,
+        site_id=1,
+        cutoff=date(2035, 6, 30),
+        published_at=datetime(2035, 6, 30, tzinfo=UTC),
+        window_days=_TEST_PUBLICATION_WINDOW_DAYS,
+        min_n=min_n,
+    )
 
 
 def _seed_score_cache_for_fixture(conn: sqlite3.Connection) -> None:
-    """Seed a fresh, complete score_cache snapshot for the (temperature,
-    day_ahead=1, w:30) cell `_seed_two_confident_feeds` populates.
+    """Seed a fresh, complete published-ranking snapshot for the
+    (temperature, day_ahead=1, w:30) cell `_seed_two_confident_feeds`
+    populates.
 
-    It seeds forecast_pairs for THREE feeds -- the two competitors plus
+    It publishes a ranking for THREE feeds -- the two competitors plus
     ``virtual/_persistence`` -- and `active_competitor_clause` counts virtual
-    feeds unconditionally, so the expected feed universe for the cache-backed
-    leaderboard lookup is all three; a snapshot missing persistence would be
-    a partial (and therefore ignored) snapshot, falling through to
-    'rebuilding'-empty rather than the confident-feed selection this test
-    exercises. `computed_at` is the REAL current UTC time, not the fixture's
-    injected `now` -- `is_cache_fresh` buckets against the actual wall-clock
-    UTC day, never an injectable test `now`.
+    feeds unconditionally, so the expected feed universe for the published
+    leaderboard lookup is all three; a cell missing persistence would fall
+    through to 'rebuilding'-empty rather than the confident-feed selection
+    this test exercises.
+
+    The pair-aggregate SQL that used to compute these sums is gone (W6b);
+    the sums below are hand-derived from `_seed_two_confident_feeds`'s 3
+    far-horizon rows per feed (forecast/observed=10.0, persistence
+    forecast=8.0), fed through the surviving pure `metrics_from_sums`:
+    ecmwf (forecast 10.5): error 0.5 x3 -> err_sum=1.5, abs_sum=1.5,
+    sq_sum=0.75; gfs (forecast 9.5): error -0.5 x3 -> err_sum=-1.5,
+    abs_sum=1.5, sq_sum=0.75 -- both skill-paired against persistence's
+    sq_error 4.0 x3 (skill_ref_sq_sum=12.0), giving skill 1-0.25/4=0.9375
+    for both, confident at n=3 >= min_n=3. persistence's own row reuses its
+    error (-2.0 x3) against itself as the reference, giving skill 0.0 --
+    only its presence (not its value) matters for the fixture's comment
+    above.
     """
     min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-    resolved = resolve_window(conn, "rolling")
-    for source, model in (
-        ("open-meteo", "ecmwf_ifs"),
-        ("open-meteo", "gfs_global"),
-        ("virtual", "_persistence"),
+    pub_id = _ensure_test_publication(conn, min_n=min_n)
+    competitor_sums: MetricSums = {
+        "n": 3,
+        "err_n": 3,
+        "err_sum": 1.5,
+        "abs_sum": 1.5,
+        "sq_sum": 0.75,
+        "skill_n": 3,
+        "skill_sq_sum": 0.75,
+        "skill_ref_sq_sum": 12.0,
+    }
+    persistence_sums: MetricSums = {
+        "n": 3,
+        "err_n": 3,
+        "err_sum": -6.0,
+        "abs_sum": 6.0,
+        "sq_sum": 12.0,
+        "skill_n": 3,
+        "skill_sq_sum": 12.0,
+        "skill_ref_sq_sum": 12.0,
+    }
+    for source, model, sums in (
+        ("open-meteo", "ecmwf_ifs", competitor_sums),
+        ("open-meteo", "gfs_global", competitor_sums),
+        ("virtual", "_persistence", persistence_sums),
     ):
         feed_id = _feed_id(conn, source, model)
-        result = strategy_for("temperature").aggregate(
+        result = metrics_from_sums(sums, variable="temperature", min_n=min_n)
+        seed_publication_ranking(
             conn,
-            site_id=1,
+            publication_id=pub_id,
             feed_id=feed_id,
             variable="temperature",
             day_ahead=1,
-            window_cutoff=resolved.cutoff,
-            min_n=min_n,
-        )
-        upsert_score_cache(
-            conn,
-            site_id=1,
-            feed_id=feed_id,
-            variable="temperature",
-            day_ahead=1,
-            window_key=resolved.window_key,
+            window_key=_TEST_PUBLICATION_WINDOW_KEY,
             result=result,
-            computed_at=isoformat_utc(),
         )
 
 

@@ -2,8 +2,8 @@
 
 One immutable snapshot per site per local day at the site's snapshot time T
 (§3): the record job rebuilds the production Forecast selection *as of T*
-(§6 parameterization only — never today's loaders, never the mutable
-``score_cache``) and appends it to the append-only ``forecast_of_record``
+(§6 parameterization only — never today's loaders; the rankings are the
+publication active at T) and appends it to the append-only ``forecast_of_record``
 table. Retries are idempotent (``ON CONFLICT ... DO NOTHING`` on the row
 identity); nothing here ever UPDATEs or DELETEs a record row.
 
@@ -28,13 +28,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from wxverify import __version__
 from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
-from wxverify.db.connection import StaleGenerationError
 from wxverify.db.runtime_state import (
     delete_runtime_state,
     get_runtime_state,
     set_runtime_state,
 )
-from wxverify.db.site_days import daily_close_on
 from wxverify.db.snapshot import read_snapshot
 from wxverify.db.switch import ensure_site_generation, site_generation_id
 from wxverify.forecast.aggregate import (
@@ -51,7 +49,6 @@ from wxverify.forecast.aggregate import (
 from wxverify.forecast.data import (
     FutureSampleRow,
     count_null_availability_samples,
-    forecast_ranking,
     load_future_samples,
     sample_day_ahead,
 )
@@ -76,10 +73,7 @@ from wxverify.forecast.wind_blend import (
     weighted_daily_high,
     weighted_hourly,
 )
-from wxverify.scoring.leaderboard import (
-    LeaderboardRow,
-    leaderboard_with_status_in_transaction,
-)
+from wxverify.scoring.leaderboard import LeaderboardRow
 from wxverify.scoring.publication import (
     Publication,
     active_publication,
@@ -533,75 +527,27 @@ def _precip_aggregate_hourly(
     return list(zip(hours, fixed_membership_series(hours, members), strict=True))
 
 
-def _leaderboard_status_cell(
-    conn: sqlite3.Connection, *, site_id: int, variable: str, day_ahead: int
-) -> dict[str, object]:
-    """Observed production leaderboard status for one effective score cell.
-
-    §7: the record stores what the production leaderboard cache looked like
-    at build time (status + window key + the cell's oldest snapshot stamp) —
-    diagnostics only, never an input to the as-of ranking.
-
-    Calls the in-transaction variant: this runs inside a caller-held
-    snapshot (the job path's ``read_snapshot``, or the synchronous path's
-    write transaction), and ``leaderboard_with_status``'s own snapshot
-    would refuse to nest.
-    """
-    result = leaderboard_with_status_in_transaction(
-        conn, site_id=site_id, variable=variable, day_ahead=day_ahead, window="rolling"
-    )
-    stamp_row = conn.execute(
-        """
-        SELECT MIN(computed_at) AS oldest FROM score_cache
-        WHERE site_id = ? AND variable = ? AND day_ahead = ? AND window_key = ?
-        """,
-        (site_id, variable, day_ahead, result.window_key),
-    ).fetchone()
-    oldest = stamp_row["oldest"] if stamp_row is not None else None
-    return {
-        "status": result.status,
-        "window_key": result.window_key,
-        "computed_at": None if oldest is None else str(oldest),
-    }
-
-
 def _record_ranking(
     conn: sqlite3.Connection,
     *,
-    site_id: int,
     variable: str,
     day_ahead: int,
-    as_of: str,
-    close_on: bool,
     publication: Publication | None,
-    declared_min_n: int | None,
-    declared_window_days: int | None,
 ) -> dict[int, LeaderboardRow]:
     """One cell's ranking for the record, keyed by feed id.
 
-    Close on (section 12): ``publication``'s rows at ``w:{window_days}``,
-    the publication active at T; with none every feed is unranked, so the
-    ladder picks by sample count. Close off: the as-of ranking under the
-    declared configuration, as before.
+    ``publication``'s rows at ``w:{window_days}``, the publication active at
+    T (section 12); with none every feed is unranked, so the ladder picks by
+    sample count.
     """
-    if close_on:
-        if publication is None:
-            return {}
-        return published_ranking(
-            conn,
-            pub=publication,
-            variable=variable,
-            day_ahead=day_ahead,
-            window_key=f"w:{publication.window_days}",
-        )
-    return forecast_ranking(
+    if publication is None:
+        return {}
+    return published_ranking(
         conn,
-        site_id=site_id,
+        pub=publication,
         variable=variable,
         day_ahead=day_ahead,
-        as_of=as_of,
-        declared_min_n=declared_min_n,
-        declared_window_days=declared_window_days,
+        window_key=f"w:{publication.window_days}",
     )
 
 
@@ -760,25 +706,14 @@ def compute_forecast_record(
     universe = _candidate_universe(conn, site_id, {s.feed_id for s in samples})
 
     # §15 lockstep: the record resolves depth through the SAME per-variable
-    # helper the live Forecast page and the run snapshot use.
+    # helper the live Forecast page uses.
     depths = effective_blend_depths(conn)
-    # The daily close (section 12), read once in the caller's snapshot: on,
-    # the record stores what was served at T -- the publication active at T,
-    # its rankings and its policy (None for both with no publication then).
-    close_on = daily_close_on(conn)
-    publication = (
-        active_publication(conn, site_id=site_id, at_utc=as_of) if close_on else None
-    )
-    declared_min_n: int | None
-    declared_window_days: int | None
-    if close_on:
-        declared_min_n = None if publication is None else publication.min_n
-        declared_window_days = None if publication is None else publication.window_days
-    else:
-        declared_min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-        declared_window_days = get_number_setting(
-            conn, "rolling_window_days", 30, minimum=1
-        )
+    # The record stores what was served at T (section 12), read in the
+    # caller's snapshot: the publication active at T, its rankings and its
+    # policy (None for both with no publication then).
+    publication = active_publication(conn, site_id=site_id, at_utc=as_of)
+    declared_min_n = None if publication is None else publication.min_n
+    declared_window_days = None if publication is None else publication.window_days
     # One set of wind weights per build, read inside the caller's snapshot
     # (§11.5).
     wind_serving = load_wind_serving(
@@ -806,8 +741,7 @@ def compute_forecast_record(
         }
     )
     latency = int((at - snapshot_utc).total_seconds())
-    # The three publication columns: NULL with the close off, and with no
-    # publication at T.
+    # The three publication columns: NULL with no publication at T.
     publication_columns: tuple[int | None, str | None, int | None] = (
         (None, None, None)
         if publication is None
@@ -819,7 +753,6 @@ def compute_forecast_record(
     )
 
     rank_cache: dict[tuple[str, int], dict[int, LeaderboardRow]] = {}
-    status_cache: dict[tuple[str, int], dict[str, object]] = {}
     rows: list[tuple[str | int | None, ...]] = []
     for day in range(RECORD_DAY_COUNT):
         target_date = local_date + timedelta(days=day)
@@ -849,18 +782,9 @@ def compute_forecast_record(
                 if key not in rank_cache:
                     rank_cache[key] = _record_ranking(
                         conn,
-                        site_id=site_id,
                         variable=variable,
                         day_ahead=rep,
-                        as_of=as_of,
-                        close_on=close_on,
                         publication=publication,
-                        declared_min_n=declared_min_n,
-                        declared_window_days=declared_window_days,
-                    )
-                if not close_on and key not in status_cache:
-                    status_cache[key] = _leaderboard_status_cell(
-                        conn, site_id=site_id, variable=variable, day_ahead=rep
                     )
                 row = rank_cache[key].get(feed_id)
                 candidates.append(
@@ -946,18 +870,18 @@ def compute_forecast_record(
                 displayed["extrema_coverage"] = selection.extrema_coverage
                 # The extrema set's own ladder verdict, raw: null when no
                 # feed qualified (no set to judge), and never the page's
-                # rebuilding precedence — this ranking is live as-of T.
+                # rebuilding precedence — this ranking is the publication's
+                # at T.
                 displayed["extrema_low_confidence"] = (
                     selection.extrema_low_confidence
                     if selection.extrema_coverage == EXTREMA_COVERAGE_COMPLETE
                     else None
                 )
             # Outcomes describe the SCORED product, so they are computed over
-            # the clearing subset (simulate.py parity, W3) — the feed set
-            # ``displayed`` uses for wind. For temperature and precipitation
-            # the two sets may differ; ``extrema_feed_ids`` records the
-            # displayed one for both so the difference is readable, not
-            # silent.
+            # the clearing subset — the feed set ``displayed`` uses for wind.
+            # For temperature and precipitation the two sets may differ;
+            # ``extrema_feed_ids`` records the displayed one for both so the
+            # difference is readable, not silent.
             outcome_hourly = _blend_hourly(agg_ids, feeds_samples)
             weights_column: dict[str, float | None] = {
                 str(fid): weight for fid in selected_ids
@@ -991,20 +915,6 @@ def compute_forecast_record(
                 str(fid): max(s.issued_at for s in feeds_samples[fid])
                 for fid in source_ids
             }
-            # NULL with the close on: the live leaderboard status is not read
-            # (section 12).
-            leaderboard_status = (
-                None
-                if close_on
-                else _dumps(
-                    {
-                        str(effective_cells[str(fid)]): status_cache[
-                            (variable, effective_cells[str(fid)])
-                        ]
-                        for fid in selected_ids
-                    }
-                )
-            )
             rows.append(
                 (
                     site_id,
@@ -1041,7 +951,9 @@ def compute_forecast_record(
                             "outcomes": [asdict(o) for o in outcomes],
                         }
                     ),
-                    leaderboard_status,
+                    # leaderboard_status: always NULL, the live leaderboard
+                    # status is not read (section 12).
+                    None,
                     *publication_columns,
                 )
             )
@@ -1329,10 +1241,10 @@ def run_record_gap_scan(
                         for identity, had_candidates in knowable.items()
                     },
                 )
-        except (JobDeferred, JobCancelled, StaleGenerationError):
-            # Worker control signals and a database swap are NOT contained:
-            # absorbing one into durable state would turn a deferral into a
-            # recorded failure and lose the processor's ordered dispatch.
+        except (JobDeferred, JobCancelled):
+            # Worker control signals are NOT contained: absorbing one into
+            # durable state would turn a deferral into a recorded failure and
+            # lose the processor's ordered dispatch.
             raise
         except Exception as exc:  # noqa: BLE001 - contained per date, by design
             conn.execute(f"ROLLBACK TO {savepoint}")

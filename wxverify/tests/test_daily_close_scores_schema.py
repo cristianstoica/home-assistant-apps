@@ -1,10 +1,11 @@
 """Schema for daily-close P4 piece 1 (plan
 2026-10-22-daily-close-pairs-and-publication.md, section 15, test IDs
-SZ2-SZ4, 18.12): the live, fresh-schema behaviour of P4's twelve new tables
+SZ2-SZ3, 18.12): the live, fresh-schema behaviour of P4's twelve new tables
 and their migration -- idempotence on repeat, foreign-key cascade/restrict
-rules, and ``_validate_upload``'s per-table checks. Section 19 of the plan
-names the mutant each test ID must kill; that mapping is also given inline
-on each assertion.
+rules. SZ4 (``_validate_upload``'s per-table import checks) was removed
+with the database import (storage-release plan 5.5). Section 19 of the
+plan names the mutant each test ID must kill; that mapping is also given
+inline on each assertion.
 
 Real SQLite and real migrations throughout; nothing in the code under test
 is mocked. Synthetic data only: station ids ``ISTATION01``/``ISTATION02``
@@ -31,21 +32,6 @@ from wxverify.db.runtime_state import get_runtime_state
 # ---------------------------------------------------------------------------
 # Shared fixture plumbing
 # ---------------------------------------------------------------------------
-
-_NEW_TABLES = (
-    "forecast_downloads",
-    "forecast_value_changes",
-    "close_pairs",
-    "day_scores",
-    "close_records",
-    "close_record_downloads",
-    "starting_scores",
-    "starting_wind_days",
-    "publications",
-    "publication_rankings",
-    "publication_wind_weights",
-    "publication_coverage",
-)
 
 _STAMP = "2026-07-06T00:00:00Z"
 
@@ -119,16 +105,12 @@ def _seed_cascading_p4_rows(
 
     conn.execute(
         """
-        INSERT INTO close_pairs
-            (site_id, local_date, feed_id, variable, day_ahead, valid_at,
-             lead_hours, forecast, observed, error, abs_error, sq_error,
-             cat_hit, cat_false, cat_miss, cat_correct_neg,
-             rain_threshold_mm, ref_sq_error, download_id, download_date,
-             issued_at, fetched_at, contributors)
-        VALUES (?, ?, ?, 'temperature', 0, ?, 6, 10.0, 8.0, 2.0, 2.0, 4.0,
-                NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, NULL)
+        INSERT INTO forecast_history
+            (site_id, feed_id, variable, day_ahead, valid_at, local_date,
+             value, lead_hours, issued_at, contributors)
+        VALUES (?, ?, 'temperature', 0, ?, ?, 10.0, 6, ?, NULL)
         """,
-        (site_id, local_date, feed_id, _STAMP, download_id, local_date, _STAMP, _STAMP),
+        (site_id, feed_id, _STAMP, local_date, _STAMP),
     )
 
     conn.execute(
@@ -227,7 +209,7 @@ def test_sz3_site_delete_clears_every_p4_row_feed_delete_with_scores_refused() -
 
     direct_site_tables = (
         "forecast_downloads",
-        "close_pairs",
+        "forecast_history",
         "day_scores",
         "close_records",
         "close_record_downloads",
@@ -333,198 +315,6 @@ def test_sz3_the_remaining_tables_declare_the_same_delete_rules(table: str) -> N
         )
 
 
-# --- SZ4 --------------------------------------------------------------------
-
-
-def _build_fresh_v14_file(path: Path) -> Path:
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(conn)
-    conn.commit()
-    conn.close()
-    return path
-
-
-def test_sz4_a_fresh_file_carrying_every_new_table_is_accepted(
-    tmp_path: Path,
-) -> None:
-    """SZ4 (case 1): a freshly migrated file -- every one of P4's twelve
-    tables present, empty -- passes ``_validate_upload``.
-    """
-    from wxverify.api.routes.db_transfer import _validate_upload  # noqa: PLC2701
-
-    path = _build_fresh_v14_file(tmp_path / "all-new-tables.db")
-    check_conn = sqlite3.connect(str(path))
-    try:
-        present = {
-            str(r[0])
-            for r in check_conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-        }
-    finally:
-        check_conn.close()
-    missing = [table for table in _NEW_TABLES if table not in present]
-    assert not missing, (
-        "precondition -> at this assertion: correct = all twelve of P4"
-        " piece 1's new tables (15.2) present on this fresh file, missing"
-        f" = {missing} absent, so this test's _validate_upload call below"
-        " would not exercise P4's per-table import checks (15.6) for them"
-    )
-
-    _validate_upload(path)  # must not raise
-
-
-def test_sz4_a_blob_in_close_pairs_variable_is_refused(tmp_path: Path) -> None:
-    """SZ4 (case 2): a BLOB in ``close_pairs.variable`` is refused at 422,
-    the message naming that table and column (15.6: the text ``variable``
-    columns join ``_BLOB_GUARDED_COLUMNS``).
-    """
-    from wxverify.api.errors import ApiError
-    from wxverify.api.routes.db_transfer import _validate_upload  # noqa: PLC2701
-
-    path = tmp_path / "blob-variable.db"
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(conn)
-    site_id = asof_make_site(conn, "Testsite")
-    feed_id = asof_make_real_feed(conn, "model-a")
-    conn.execute(
-        """
-        INSERT INTO close_pairs
-            (site_id, local_date, feed_id, variable, day_ahead, valid_at,
-             lead_hours, forecast, observed, error, abs_error, sq_error,
-             download_id, download_date, issued_at, fetched_at)
-        VALUES (?, ?, ?, ?, 0, ?, 6, 10.0, 8.0, 2.0, 2.0, 4.0, NULL, ?, ?, ?)
-        """,
-        (
-            site_id,
-            D.isoformat(),
-            feed_id,
-            b"not-a-string",
-            _STAMP,
-            D.isoformat(),
-            _STAMP,
-            _STAMP,
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-    with pytest.raises(ApiError) as excinfo:
-        _validate_upload(path)
-    assert excinfo.value.status_code == 422
-    assert excinfo.value.message == "invalid data in close_pairs.variable", (
-        "M119 -> at this assertion: correct = 'invalid data in"
-        " close_pairs.variable' (close_pairs.variable joins"
-        " _BLOB_GUARDED_COLUMNS, 15.6), mutant M119 (close_pairs left out"
-        " of _BLOB_GUARDED_COLUMNS) = _validate_upload does not raise for"
-        " this file at all"
-    )
-
-
-def test_sz4_a_non_canonical_published_at_is_refused(tmp_path: Path) -> None:
-    """SZ4 (case 3): a non-canonical ``publications.published_at`` is
-    refused at 422 with P1/P3's stamp message (15.6: the stamp columns join
-    ``_CANONICAL_STAMP_COLUMNS``).
-    """
-    from wxverify.api.errors import ApiError
-    from wxverify.api.routes.db_transfer import _validate_upload  # noqa: PLC2701
-
-    path = tmp_path / "bad-published-at.db"
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(conn)
-    site_id = asof_make_site(conn, "Testsite")
-    conn.execute(
-        """
-        INSERT INTO publications
-            (site_id, cutoff, first_record_date, window_days,
-             window_start_date, wind_start_date, settings,
-             methodology_version, scoring_rule, wind_method, wind_constants,
-             build_started_at, published_at)
-        VALUES (?, ?, ?, 30, ?, ?, '{}', 4,
-                'first-stored-download-of-local-day/1', 'persistence_blend',
-                '{}', ?, ?)
-        """,
-        (
-            site_id,
-            D.isoformat(),
-            D.isoformat(),
-            D.isoformat(),
-            D.isoformat(),
-            _STAMP,
-            "2026-07-06T00:00:00.000000Z",  # microseconds: not whole-second canonical
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-    with pytest.raises(ApiError) as excinfo:
-        _validate_upload(path)
-    assert excinfo.value.status_code == 422
-    assert excinfo.value.message == (
-        "invalid timestamp in publications.published_at: "
-        "expected UTC form YYYY-MM-DDTHH:MM:SSZ"
-    ), (
-        "M119 -> at this assertion: correct = the stamp-message above"
-        " (publications.published_at joins _CANONICAL_STAMP_COLUMNS, 15.6),"
-        " mutant M119 (publications left out of _CANONICAL_STAMP_COLUMNS) ="
-        " _validate_upload does not raise for this file at all"
-    )
-
-
-def test_sz4_a_bad_cutoff_date_is_refused(tmp_path: Path) -> None:
-    """SZ4 (case 4): a non-canonical ``publications.cutoff`` is refused at
-    422 with P1's date message (15.6: the date columns join
-    ``_CANONICAL_DATE_COLUMNS``; ``publications.cutoff`` has no foreign key
-    to ``site_days``, unlike P3's record tables, so only the per-column
-    date check can catch this).
-    """
-    from wxverify.api.errors import ApiError
-    from wxverify.api.routes.db_transfer import _validate_upload  # noqa: PLC2701
-
-    path = tmp_path / "bad-cutoff.db"
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(conn)
-    site_id = asof_make_site(conn, "Testsite")
-    conn.execute(
-        """
-        INSERT INTO publications
-            (site_id, cutoff, first_record_date, window_days,
-             window_start_date, wind_start_date, settings,
-             methodology_version, scoring_rule, wind_method, wind_constants,
-             build_started_at, published_at)
-        VALUES (?, ?, ?, 30, ?, ?, '{}', 4,
-                'first-stored-download-of-local-day/1', 'persistence_blend',
-                '{}', ?, ?)
-        """,
-        (
-            site_id,
-            "2026/07/06",
-            D.isoformat(),
-            D.isoformat(),
-            D.isoformat(),
-            _STAMP,
-            _STAMP,
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-    with pytest.raises(ApiError) as excinfo:
-        _validate_upload(path)
-    assert excinfo.value.status_code == 422
-    assert excinfo.value.message == (
-        "invalid date in publications.cutoff: expected YYYY-MM-DD"
-    ), (
-        "M119 -> at this assertion: correct = the date-message above"
-        " (publications.cutoff joins _CANONICAL_DATE_COLUMNS, 15.6), mutant"
-        " M119 (publications.cutoff left out of _CANONICAL_DATE_COLUMNS) ="
-        " _validate_upload does not raise for this file at all"
-    )
+# SZ4 (fresh-file acceptance, BLOB-guarded columns, canonical stamp/date
+# checks on close_pairs/publications) tested only ``_validate_upload``,
+# removed with the database import (storage-release plan 5.5).

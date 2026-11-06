@@ -2,15 +2,7 @@
 
 from __future__ import annotations
 
-from wxverify.collection.forecast_validation import FORECAST_VARIABLES
-
-# Closed candidate space for a score-cache cell identity. Enumerating it and
-# probing idx_pairs_cell per candidate replaces a DISTINCT scan over every
-# forecast_pairs row for the site, which cannot seek on valid_at because the
-# composite predicate binds neither variable nor day_ahead. Both bounds are
-# load-bearing and both are enforced elsewhere: variables by FORECAST_VARIABLES
-# (the single vocabulary every pairing writer uses), day_ahead by the
-# forecast_pairs CHECK(day_ahead BETWEEN 0 AND 7).
+# The largest day ahead of the canonical (variable, day ahead) grid.
 MAX_DAY_AHEAD = 7
 
 
@@ -35,15 +27,6 @@ def active_feed_cte(*, site_param: str = "?") -> str:
               ON sfs.site_id = {site_param} AND sfs.feed_id = f.id
             WHERE {active_competitor_clause(site_expr=site_param)}
         )"""
-
-
-def cell_grid_cte() -> str:
-    """Constant VALUES lists for the variable and day_ahead candidate axes."""
-    variables = ", ".join(f"('{variable}')" for variable in FORECAST_VARIABLES)
-    leads = ", ".join(f"({day})" for day in range(MAX_DAY_AHEAD + 1))
-    return f"""
-        grid_variables(variable) AS (VALUES {variables}),
-        grid_leads(day_ahead) AS (VALUES {leads})"""
 
 
 def active_competitor_clause(

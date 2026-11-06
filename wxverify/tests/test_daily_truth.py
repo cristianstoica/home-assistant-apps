@@ -12,6 +12,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import date
 
+from tests.helpers import close_off
 from wxverify.db.migrations import run_migrations
 from wxverify.db.switch import ensure_site_generation
 from wxverify.scoring.consensus import materialize_consensus
@@ -324,6 +325,7 @@ def test_spring_forward_day_has_23_expected_slots() -> None:
 
 def test_materialize_consensus_marks_affected_truth_rows() -> None:
     conn = _conn()
+    close_off(conn)
     site_id = _make_site(conn)
     day = "2026-06-10"
     _seed_obs(conn, site_id, "temperature", _utc_day(day, range(24), [10.0] * 24))

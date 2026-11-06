@@ -31,7 +31,11 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
-from tests.helpers import seed_rain_ranks
+from tests.helpers import (
+    seed_active_publication,
+    seed_publication_ranking,
+    seed_rain_ranks,
+)
 from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc
 from wxverify.db.migrations import run_migrations
 from wxverify.db.switch import ensure_site_generation
@@ -48,27 +52,10 @@ from wxverify.forecast.service import (
     build_forecast,
     build_hourly,
 )
-from wxverify.scoring.leaderboard import leaderboard_with_status, resolve_window
-from wxverify.scoring.metrics import strategy_for
+from wxverify.scoring.metrics import MetricResult, MetricSums, metrics_from_sums
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.settings.keys import get_number_setting, set_setting
-from wxverify.verification.coverage import (
-    EXCLUDE_BELOW_NEAR_COMPLETE,
-    QUANTITY_PRECIP_OCCURRENCE,
-    QUANTITY_PRECIP_TOTAL,
-)
-from wxverify.verification.methodology import METHODOLOGY_VERSION
 from wxverify.verification.record import build_forecast_record, resolve_snapshot_utc
-from wxverify.verification.runs import (
-    RosterFeed,
-    RunConfig,
-    capture_config_snapshot,
-    input_fingerprint,
-    result_basis_fingerprint,
-)
-from wxverify.verification.simulate import (
-    simulate_snapshot_day,
-)
 from wxverify.web.render import env as jinja_env
 
 # ---------------------------------------------------------------------------
@@ -124,186 +111,119 @@ def _insert_sample(
     )
 
 
-def _insert_pair(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int = 1,
-    feed_id: int,
-    variable: str,
-    issued_at: str,
-    valid_at: str,
-    lead_hours: int,
-    day_ahead: int,
-    forecast: float,
-    observed: float = 10.0,
-    rain_threshold_mm: float = 0.2,
-    first_known_at: str | None = None,
-) -> None:
-    """Insert one scoring pair.
-
-    ``first_known_at`` defaults to ``issued_at`` as a fixture convention;
-    production's ``pair_real_models()`` instead stamps it from the source
-    sample's own ``fetched_at``. It must be non-NULL and <= an as-of snapshot's ``T``
-    for :func:`wxverify.verification.asof.knowable_pair_predicate` to treat
-    the pair as knowable; leaving it NULL silently zeroes out every
-    as-of-filtered leaderboard read (the record path), even though the
-    live path (no ``as_of``) never applies the predicate at all.
-    """
-    error = forecast - observed
-    hit, false, miss, correct_neg = precip_flags(
-        variable,
-        forecast,
-        observed,
-        rain_threshold_mm if variable == "precip" else None,
-    )
-    conn.execute(
-        """
-        INSERT INTO forecast_pairs
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error,
-             cat_hit, cat_false, cat_miss, cat_correct_neg,
-             first_known_at, tz_generation_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            site_id,
-            feed_id,
-            variable,
-            issued_at,
-            valid_at,
-            lead_hours,
-            day_ahead,
-            forecast,
-            observed,
-            error,
-            abs(error),
-            error * error,
-            hit,
-            false,
-            miss,
-            correct_neg,
-            first_known_at if first_known_at is not None else issued_at,
-            ensure_site_generation(conn, site_id),
-        ),
-    )
-
-
-_FAR_FUTURE_VALID_ATS = (
-    "2035-07-01T00:00:00Z",
-    "2035-07-01T01:00:00Z",
-    "2035-07-01T02:00:00Z",
-)
-_FAR_FUTURE_LEAD_HOURS = (1, 2, 3)
-
-# The record path (`build_forecast_record`) always passes an `as_of` snapshot
-# time, which routes the ranking through `knowable_pair_predicate` instead of
-# `score_cache` (forecast_ranking_with_status's as-of branch never reads the
-# cache -- see its own docstring). `_FAR_FUTURE_VALID_ATS` sits after every
-# `_RECORD_DAY` snapshot, so pairs seeded with it are never "knowable" on
-# that path and silently stay unscored/not-confident regardless of
-# `_seed_complete_score_cache`. Record-path scoring fixtures must use dates
-# that are actually knowable before `_record_snapshot_t()`.
-_RECORD_KNOWABLE_VALID_ATS = (
-    "2035-06-15T00:00:00Z",
-    "2035-06-15T01:00:00Z",
-    "2035-06-15T02:00:00Z",
-)
-_RECORD_KNOWABLE_LEAD_HOURS = (4, 5, 6)
-_RECORD_KNOWABLE_ISSUED_AT = "2035-06-14T20:00:00Z"
-
 # A wet/dry-mixed observed baseline for precip's categorical (hit/false/
-# miss/correct-negative) skill strategy: three pairs of the same category
-# (all-wet or all-dry) degenerate to ETS=None (``confident=False`` no
-# matter how many pairs or how low ``min_n`` is), so every precip
-# confidence fixture in this module needs a mixed observed sequence, never
-# a repeated scalar.
+# miss/correct-negative) skill computation (`metrics_from_sums`): three
+# pairs of the same category (all-wet or all-dry) degenerate to ETS=None
+# (``confident=False`` no matter how many pairs or how low ``min_n`` is),
+# so every precip confidence fixture in this module needs a mixed observed
+# sequence, never a repeated scalar.
 _PRECIP_MIXED_OBSERVED = (1.0, 0.0, 1.0)
 _PRECIP_ACCURATE_FORECAST = (1.0, 0.0, 1.0)  # matches observed -> high skill
 _PRECIP_POOR_FORECAST = (0.0, 1.0, 0.0)  # opposite of observed -> poor skill
 
+_TEST_PUBLICATION_WINDOW_DAYS = 30
 
-def _seed_scoring_pairs(
-    conn: sqlite3.Connection,
+
+def _ensure_test_publication(
+    conn: sqlite3.Connection, *, min_n: int
+) -> tuple[int, int]:
+    """This connection's one site-1 publication, created on first use.
+
+    Returns ``(publication id, its window_days)``: a caller seeded first by
+    another helper (``seed_rain_ranks``, say) leaves a publication whose
+    ``window_days`` is that helper's own default, not this file's constant,
+    so callers must read it back rather than assume it.
+
+    ``forecast_ranking_with_status``'s ``rolling`` window now always reads
+    the active publication (9.2), never a live recompute. Mirrors
+    ``tests/test_forecast_service.py``'s identically-named helper.
+    """
+    row = conn.execute(
+        "SELECT id, window_days FROM publications WHERE site_id = 1"
+        " ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row is not None:
+        return int(row["id"]), int(row["window_days"])
+    pub_id = seed_active_publication(
+        conn,
+        site_id=1,
+        cutoff=date(2035, 6, 30),
+        published_at=datetime(2035, 6, 30, tzinfo=UTC),
+        window_days=_TEST_PUBLICATION_WINDOW_DAYS,
+        min_n=min_n,
+    )
+    return pub_id, _TEST_PUBLICATION_WINDOW_DAYS
+
+
+def _precip_metric_result(
     *,
-    feed_id: int,
-    variable: str,
-    day_ahead: int,
     forecast: float | Sequence[float],
-    observed: float | Sequence[float] = 10.0,
-    valid_ats: Sequence[str] = _FAR_FUTURE_VALID_ATS,
-    lead_hours_seq: Sequence[int] = _FAR_FUTURE_LEAD_HOURS,
-    issued_at: str = "2035-06-30T00:00:00Z",
-) -> None:
-    """3 scoring pairs, far-future by default.
+    observed: float | Sequence[float],
+    min_n: int,
+) -> MetricResult:
+    """The precip ``MetricResult`` for one feed's 3 synthetic pairs.
 
     ``forecast``/``observed`` are each either one value repeated for all 3
-    pairs, or a 3-element sequence for per-pair control. Precipitation's
-    categorical skill (:class:`wxverify.scoring.metrics.PrecipStrategy`)
-    degenerates to ``ets=None`` (``confident=False``) when every pair falls
-    in the same hit/miss category, so precip fixtures need an ``observed``
-    sequence that mixes wet and dry outcomes -- a fixed 10.0 baseline (fine
-    for temperature) is never enough on its own.
-
-    Default ``valid_ats``/``issued_at`` are far in the future of any
-    ``_AB_NOW``-style "now" used by the live (`build_forecast`) path. The
-    record path (`build_forecast_record`) instead reads pairs knowable as
-    of a fixed historical snapshot -- pass ``_RECORD_KNOWABLE_VALID_ATS``/
-    ``_RECORD_KNOWABLE_LEAD_HOURS``/``_RECORD_KNOWABLE_ISSUED_AT`` there.
+    pairs, or a 3-element sequence for per-pair control, run through the
+    real :func:`precip_flags` classifier.
     """
     forecasts = [forecast] * 3 if isinstance(forecast, float | int) else list(forecast)
     observeds = [observed] * 3 if isinstance(observed, float | int) else list(observed)
-    pairs = zip(valid_ats, lead_hours_seq, forecasts, observeds, strict=True)
-    for valid_at, lead, fc, obs in pairs:
-        _insert_pair(
-            conn,
-            feed_id=feed_id,
-            variable=variable,
-            issued_at=issued_at,
-            valid_at=valid_at,
-            lead_hours=lead,
-            day_ahead=day_ahead,
-            forecast=fc,
-            observed=obs,
-        )
-
-
-def _seed_complete_score_cache(
-    conn: sqlite3.Connection, *, variable: str, day_ahead: int
-) -> None:
-    """Fresh, complete score_cache snapshot for every feed with pairs at
-    (site 1, `variable`, `day_ahead`).
-    """
-    from wxverify.scoring.cache import upsert_score_cache
-
-    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-    resolved = resolve_window(conn, "rolling")
-    feed_ids = {
-        int(row["feed_id"])
-        for row in conn.execute(
-            "SELECT DISTINCT feed_id FROM forecast_pairs "
-            "WHERE site_id=1 AND variable=? AND day_ahead=?",
-            (variable, day_ahead),
-        ).fetchall()
+    n = err_n = hits = false_alarms = misses = correct_negs = 0
+    err_sum = abs_sum = sq_sum = 0.0
+    for fc, obs in zip(forecasts, observeds, strict=True):
+        error = fc - obs
+        n += 1
+        err_n += 1
+        err_sum += error
+        abs_sum += abs(error)
+        sq_sum += error * error
+        hit, false, miss, correct_neg = precip_flags("precip", fc, obs, 0.2)
+        hits += hit or 0
+        false_alarms += false or 0
+        misses += miss or 0
+        correct_negs += correct_neg or 0
+    sums: MetricSums = {
+        "n": n,
+        "err_n": err_n,
+        "err_sum": err_sum,
+        "abs_sum": abs_sum,
+        "sq_sum": sq_sum,
+        "hits": hits,
+        "false_alarms": false_alarms,
+        "misses": misses,
+        "correct_negs": correct_negs,
     }
-    for feed_id in feed_ids:
-        result = strategy_for(variable).aggregate(
-            conn,
-            site_id=1,
-            feed_id=feed_id,
-            variable=variable,
-            day_ahead=day_ahead,
-            window_cutoff=resolved.cutoff,
-            min_n=min_n,
+    return metrics_from_sums(sums, variable="precip", min_n=min_n)
+
+
+def _seed_score_cache(
+    conn: sqlite3.Connection,
+    *,
+    day_ahead: int,
+    pairs: dict[int, tuple[float | Sequence[float], float | Sequence[float]]],
+) -> None:
+    """Seed one published precip ranking row per feed in ``pairs`` (site 1,
+    ``day_ahead``), each a ``(forecast, observed)`` pair fed through
+    :func:`_precip_metric_result`. ``pairs`` is local to the caller: no
+    module-level state survives this call, so a stale ``id(conn)`` reuse
+    across tests can never leak one test's values into another's.
+    """
+    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
+    pub_id, window_days = _ensure_test_publication(conn, min_n=min_n)
+    window_key = f"w:{window_days}"
+    for feed_id, (forecast, observed) in pairs.items():
+        result = _precip_metric_result(
+            forecast=forecast, observed=observed, min_n=min_n
         )
-        upsert_score_cache(
+        seed_publication_ranking(
             conn,
-            site_id=1,
+            publication_id=pub_id,
             feed_id=feed_id,
-            variable=variable,
+            variable="precip",
             day_ahead=day_ahead,
-            window_key=resolved.window_key,
+            window_key=window_key,
             result=result,
-            computed_at=isoformat_utc(),
         )
 
 
@@ -1190,6 +1110,62 @@ def _record_snapshot_t(local_date: date = _RECORD_DAY) -> datetime:
     return resolve_snapshot_utc("UTC", local_date, "07:00")
 
 
+_RECORD_PUBLICATION_WINDOW_DAYS = 30
+_RECORD_PUBLICATION_WINDOW_KEY = f"w:{_RECORD_PUBLICATION_WINDOW_DAYS}"
+
+
+def _ensure_record_publication(conn: sqlite3.Connection) -> int:
+    """This connection's one site-1 publication, active at T
+    (:func:`_record_snapshot_t`), created on first use.
+
+    Unlike :func:`_ensure_test_publication` (the page-side helper, whose
+    far-future ``published_at`` is only ever read against a far-future
+    ``now``), the record's own ``_record_ranking`` reads the publication
+    active at T -- a publication published AFTER T is never active there,
+    so this seeds one published before T instead.
+    """
+    row = conn.execute(
+        "SELECT id FROM publications WHERE site_id = 1 ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row is not None:
+        return int(row["id"])
+    return seed_active_publication(
+        conn,
+        site_id=1,
+        cutoff=_RECORD_DAY - timedelta(days=1),
+        published_at=_record_snapshot_t() - timedelta(hours=1),
+        window_days=_RECORD_PUBLICATION_WINDOW_DAYS,
+        min_n=3,
+    )
+
+
+def _seed_record_score_cache(
+    conn: sqlite3.Connection,
+    *,
+    day_ahead: int,
+    pairs: dict[int, tuple[float | Sequence[float], float | Sequence[float]]],
+) -> None:
+    """:func:`_seed_score_cache` for a record-side connection: seeds the
+    publication active at T (:func:`_ensure_record_publication`) instead
+    of the page-side far-future one.
+    """
+    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
+    pub_id = _ensure_record_publication(conn)
+    for feed_id, (forecast, observed) in pairs.items():
+        result = _precip_metric_result(
+            forecast=forecast, observed=observed, min_n=min_n
+        )
+        seed_publication_ranking(
+            conn,
+            publication_id=pub_id,
+            feed_id=feed_id,
+            variable="precip",
+            day_ahead=day_ahead,
+            window_key=_RECORD_PUBLICATION_WINDOW_KEY,
+            result=result,
+        )
+
+
 def _record_insert_day(
     conn: sqlite3.Connection,
     *,
@@ -1314,164 +1290,6 @@ def test_persisted_row_suppressed_day() -> None:
     assert displayed["extrema_low_confidence"] is None
     assert displayed["total_mm"] != 0
     assert displayed["wet_hours"] != 0
-
-
-# ===========================================================================
-# G-T21 -- nothing scored moved (the simulator replays the pre-Item-G path).
-# ===========================================================================
-
-
-def test_scored_precip_entities_are_the_pre_g_clearing_subset_values() -> None:
-    assert METHODOLOGY_VERSION == 5
-
-    conn = _record_conn()
-    generation_id = ensure_site_generation(conn, 1)
-    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-
-    local_date = _RECORD_DAY
-    # 20 hours (blend-eligible via clears_coverage, NOT extrema-eligible --
-    # Item G's rule never reaches the simulator). 5 wet, 15 dry.
-    values = [0.5 if i < 5 else 0.0 for i in range(20)]
-    for i, value in enumerate(values):
-        conn.execute(
-            """
-            INSERT INTO forecast_samples
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 value, source_raw, model_run_id, fetched_at)
-            VALUES (1, ?, 'precip', '2035-06-14T20:00:00Z', ?, ?, ?,
-                    '{}', 'run-x', '2035-06-14T20:00:00Z')
-            """,
-            (feed_id, f"2035-06-15T{i:02d}:00:00Z", i + 1, value),
-        )
-    conn.commit()
-
-    snapshot = capture_config_snapshot(conn, 1)
-    period_start = local_date.isoformat()
-    period_end = local_date.isoformat()
-    run_id = int(
-        conn.execute(
-            """
-            INSERT INTO verification_runs
-                (site_id, tz_generation_id, methodology_version, app_version,
-                 state, attempt, config_snapshot, period_start, period_end,
-                 settled_through, bootstrap_seed, bootstrap_resamples,
-                 input_fingerprint)
-            VALUES (1, ?, 2, '0.16.0-test', 'running', 1, ?, ?, ?, ?, 1, 40, ?)
-            """,
-            (
-                generation_id,
-                json.dumps(snapshot),
-                period_start,
-                period_end,
-                period_end,
-                input_fingerprint(conn, 1, snapshot),
-            ),
-        ).lastrowid
-    )
-    conn.commit()
-
-    cfg = RunConfig(
-        site_id=1,
-        run_id=run_id,
-        timezone="UTC",
-        rain_threshold_mm=0.2,
-        wall_clock="07:00",
-        blend_depth=1,
-        blend_depths={"temperature": 1, "wind": 1, "precip": 1},
-        min_n=3,
-        window_days=30,
-        tz_generation_id=generation_id,
-        roster=(
-            RosterFeed(
-                feed_id=feed_id,
-                source="open-meteo",
-                model="ecmwf_ifs",
-                max_lead_hours=192,
-            ),
-        ),
-        period_start=period_start,
-        period_end=period_end,
-        bootstrap_seed=1,
-        bootstrap_resamples=40,
-        wind_basis="pair_max",
-    )
-
-    before_input = input_fingerprint(conn, 1, snapshot)
-    before_basis = result_basis_fingerprint(
-        conn, 1, snapshot, period_start=period_start, period_end=period_end
-    )
-
-    simulate_snapshot_day(conn, cfg, local_date.isoformat())
-    conn.commit()
-
-    after_input = input_fingerprint(conn, 1, snapshot)
-    after_basis = result_basis_fingerprint(
-        conn, 1, snapshot, period_start=period_start, period_end=period_end
-    )
-    assert before_input == after_input
-    assert before_basis == after_basis
-
-    # The asymmetric precip eligibility gate (evaluate_precip): 20 covered
-    # hours never clears the near-complete threshold (24 expected slots - 1
-    # allowance = 23), so the TOTAL is excluded -- but one qualifying wet
-    # slot proves OCCURRENCE "wet" at any coverage, so it stays eligible.
-    # Both read from the same 20-hour blended series; only the gate differs.
-    total_row = conn.execute(
-        """
-        SELECT * FROM verification_evidence
-        WHERE run_id = ? AND snapshot_local_date = ? AND target_local_date = ?
-          AND lead = 0 AND variable = 'precip' AND quantity = ?
-          AND entity_type = 'depth' AND entity_key = '1'
-        """,
-        (run_id, local_date.isoformat(), local_date.isoformat(), QUANTITY_PRECIP_TOTAL),
-    ).fetchone()
-    assert total_row is not None
-    assert total_row["covered_hours"] == 20
-    assert total_row["forecast_eligible"] == 0
-    assert total_row["forecast_exclusion_reason"] == EXCLUDE_BELOW_NEAR_COMPLETE
-
-    occurrence_row_gate = conn.execute(
-        """
-        SELECT * FROM verification_evidence
-        WHERE run_id = ? AND snapshot_local_date = ? AND target_local_date = ?
-          AND lead = 0 AND variable = 'precip' AND quantity = ?
-          AND entity_type = 'depth' AND entity_key = '1'
-        """,
-        (
-            run_id,
-            local_date.isoformat(),
-            local_date.isoformat(),
-            QUANTITY_PRECIP_OCCURRENCE,
-        ),
-    ).fetchone()
-    assert occurrence_row_gate is not None
-    assert occurrence_row_gate["covered_hours"] == 20
-    assert occurrence_row_gate["forecast_eligible"] == 1
-    assert occurrence_row_gate["forecast_exclusion_reason"] is None
-
-    total_row = conn.execute(
-        """
-        SELECT predicted FROM verification_evidence
-        WHERE run_id = ? AND target_local_date = ? AND lead = 0 AND variable = 'precip'
-          AND quantity = ? AND entity_type = 'depth' AND entity_key = '1'
-        """,
-        (run_id, local_date.isoformat(), QUANTITY_PRECIP_TOTAL),
-    ).fetchone()
-    expected_total = displayed_daily("precip", [values], rain_threshold_mm=0.2)[
-        "total_mm"
-    ]
-    assert expected_total == 2.5
-    assert total_row["predicted"] == expected_total
-
-    occurrence_row = conn.execute(
-        """
-        SELECT predicted FROM verification_evidence
-        WHERE run_id = ? AND target_local_date = ? AND lead = 0 AND variable = 'precip'
-          AND quantity = ? AND entity_type = 'depth' AND entity_key = '1'
-        """,
-        (run_id, local_date.isoformat(), QUANTITY_PRECIP_OCCURRENCE),
-    ).fetchone()
-    assert occurrence_row["predicted"] == 1.0  # at least one wet slot
 
 
 # ===========================================================================
@@ -1603,33 +1421,14 @@ def _seed_ab_precip_fixture(
     _stamp_usable_fetch(conn, feed_id=feed_a, at=feed_a_issued_at)
     _stamp_usable_fetch(conn, feed_id=feed_b, at=feed_b_issued_at)
 
-    _seed_scoring_pairs(
-        conn,
-        feed_id=persistence_id,
-        variable="precip",
-        day_ahead=0,
-        forecast=_PRECIP_POOR_FORECAST,
-        observed=_PRECIP_MIXED_OBSERVED,
-    )
-    _seed_scoring_pairs(
-        conn,
-        feed_id=feed_a,
-        variable="precip",
-        day_ahead=0,
-        forecast=_PRECIP_ACCURATE_FORECAST,
-        observed=_PRECIP_MIXED_OBSERVED,
-    )
+    pairs: dict[int, tuple[float | Sequence[float], float | Sequence[float]]] = {
+        persistence_id: (_PRECIP_POOR_FORECAST, _PRECIP_MIXED_OBSERVED),
+        feed_a: (_PRECIP_ACCURATE_FORECAST, _PRECIP_MIXED_OBSERVED),
+    }
     if seed_b_scoring:
         # Wet-always: mid-table skill, strictly below A's perfect skill.
-        _seed_scoring_pairs(
-            conn,
-            feed_id=feed_b,
-            variable="precip",
-            day_ahead=0,
-            forecast=(1.0, 1.0, 1.0),
-            observed=_PRECIP_MIXED_OBSERVED,
-        )
-    _seed_complete_score_cache(conn, variable="precip", day_ahead=0)
+        pairs[feed_b] = ((1.0, 1.0, 1.0), _PRECIP_MIXED_OBSERVED)
+    _seed_score_cache(conn, day_ahead=0, pairs=pairs)
     return feed_a, feed_b
 
 
@@ -1637,13 +1436,24 @@ def test_stale_union_for_precipitation() -> None:
     """Rain release, C4: the rain cell's stale flag covers the feeds the
     tile's rain uses -- the winner and the agreement members -- and no
     other. Each case ranks A (20 h, the selected model, no full day) first
-    and B (24 h, the winner) second."""
+    and B (24 h, the winner) second.
+
+    Every case seeds ``seed_rain_ranks`` BEFORE ``_seed_ab_precip_fixture``:
+    both create a publication if none exists yet, and ``active_publication``
+    picks whichever has the LATEST cutoff, never the most recently
+    published -- seeding the AB fixture second lets its far-future
+    ``_ensure_test_publication`` cutoff (2035-06-30) reuse the rain
+    fixture's publication instead of out-cutoffing it, so the rain ranking
+    stays visible to the same read.
+    """
     # Case 1: the winner B is stale -> stale.
     conn = _make_db()
-    feed_a, feed_b = _seed_ab_precip_fixture(
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
+    seed_rain_ranks(conn, site_id=1, published_at=_AB_NOW, ranked={0: [feed_a, feed_b]})
+    _seed_ab_precip_fixture(
         conn, feed_a_issued_at=_AB_FRESH_ISSUED, feed_b_issued_at=_AB_STALE_ISSUED
     )
-    seed_rain_ranks(conn, site_id=1, published_at=_AB_NOW, ranked={0: [feed_a, feed_b]})
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
@@ -1659,11 +1469,13 @@ def test_stale_union_for_precipitation() -> None:
     # rain is not stale; A is the selected model, though, and B stands in
     # for it, so the cell is a substitute.
     conn2 = _make_db()
-    feed_a2, feed_b2 = _seed_ab_precip_fixture(
-        conn2, feed_a_issued_at=_AB_STALE_ISSUED, feed_b_issued_at=_AB_FRESH_ISSUED
-    )
+    feed_a2 = _feed_id(conn2, "open-meteo", "ecmwf_ifs")
+    feed_b2 = _feed_id(conn2, "open-meteo", "gfs_global")
     seed_rain_ranks(
         conn2, site_id=1, published_at=_AB_NOW, ranked={0: [feed_a2, feed_b2]}
+    )
+    _seed_ab_precip_fixture(
+        conn2, feed_a_issued_at=_AB_STALE_ISSUED, feed_b_issued_at=_AB_FRESH_ISSUED
     )
     conn2.commit()
     view2 = build_forecast(
@@ -1676,10 +1488,15 @@ def test_stale_union_for_precipitation() -> None:
     # Case 3: the winner B is fresh, and a stale third feed C with a full day
     # is an agreement member -> stale.
     conn3 = _make_db()
-    feed_a3, feed_b3 = _seed_ab_precip_fixture(
+    feed_a3 = _feed_id(conn3, "open-meteo", "ecmwf_ifs")
+    feed_b3 = _feed_id(conn3, "open-meteo", "gfs_global")
+    feed_c3 = _feed_id(conn3, "open-meteo", "icon_global")
+    seed_rain_ranks(
+        conn3, site_id=1, published_at=_AB_NOW, ranked={0: [feed_b3, feed_c3, feed_a3]}
+    )
+    _seed_ab_precip_fixture(
         conn3, feed_a_issued_at=_AB_FRESH_ISSUED, feed_b_issued_at=_AB_FRESH_ISSUED
     )
-    feed_c3 = _feed_id(conn3, "open-meteo", "icon_global")
     _seed_varying(
         conn3,
         feed_id=feed_c3,
@@ -1689,9 +1506,6 @@ def test_stale_union_for_precipitation() -> None:
         values=[0.0] * 24,
     )
     _stamp_usable_fetch(conn3, feed_id=feed_c3, at=_AB_STALE_ISSUED)
-    seed_rain_ranks(
-        conn3, site_id=1, published_at=_AB_NOW, ranked={0: [feed_b3, feed_c3, feed_a3]}
-    )
     conn3.commit()
     view3 = build_forecast(
         conn3, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
@@ -1709,10 +1523,18 @@ def test_confident_blend_set_with_unscored_precip_extrema_set() -> None:
     unscored extrema set) is the winner of a settled rain ranking: both of
     the cell's states read normal, and no confidence badge shows. The record
     half (``build_forecast_record``, unchanged by C4) still flags its
-    extrema set low-confidence."""
+    extrema set low-confidence.
+
+    ``seed_rain_ranks`` runs BEFORE ``_seed_ab_precip_fixture`` for the same
+    reason given in ``test_stale_union_for_precipitation``: both create a
+    publication if none exists, and the active one is picked by the
+    LATEST cutoff, not by which was published more recently.
+    """
     conn = _make_db()
-    feed_a, feed_b = _seed_ab_precip_fixture(conn, seed_b_scoring=False)
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     seed_rain_ranks(conn, site_id=1, published_at=_AB_NOW, ranked={0: [feed_a, feed_b]})
+    _seed_ab_precip_fixture(conn, seed_b_scoring=False)
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
@@ -1755,34 +1577,14 @@ def test_confident_blend_set_with_unscored_precip_extrema_set() -> None:
         value=0.15,
     )
     persistence_id = _feed_id(record_conn, "virtual", "_persistence")
-    # `first_known_at` is left at its default (== `issued_at`, here
-    # `_RECORD_KNOWABLE_ISSUED_AT`): a fixture convention that makes these
-    # pairs knowable at the record's as-of instant, not a production
-    # identity -- production stamps `first_known_at` from the sample's own
-    # `fetched_at`, which need not equal `issued_at`.
-    _seed_scoring_pairs(
+    _seed_record_score_cache(
         record_conn,
-        feed_id=persistence_id,
-        variable="precip",
         day_ahead=0,
-        forecast=_PRECIP_POOR_FORECAST,
-        observed=_PRECIP_MIXED_OBSERVED,
-        valid_ats=_RECORD_KNOWABLE_VALID_ATS,
-        lead_hours_seq=_RECORD_KNOWABLE_LEAD_HOURS,
-        issued_at=_RECORD_KNOWABLE_ISSUED_AT,
+        pairs={
+            persistence_id: (_PRECIP_POOR_FORECAST, _PRECIP_MIXED_OBSERVED),
+            rec_a: (_PRECIP_ACCURATE_FORECAST, _PRECIP_MIXED_OBSERVED),
+        },
     )
-    _seed_scoring_pairs(
-        record_conn,
-        feed_id=rec_a,
-        variable="precip",
-        day_ahead=0,
-        forecast=_PRECIP_ACCURATE_FORECAST,
-        observed=_PRECIP_MIXED_OBSERVED,
-        valid_ats=_RECORD_KNOWABLE_VALID_ATS,
-        lead_hours_seq=_RECORD_KNOWABLE_LEAD_HOURS,
-        issued_at=_RECORD_KNOWABLE_ISSUED_AT,
-    )
-    _seed_complete_score_cache(record_conn, variable="precip", day_ahead=0)
     t = _record_snapshot_t()
     build_forecast_record(
         record_conn, 1, _RECORD_DAY.isoformat(), now=t + timedelta(minutes=5)
@@ -1812,6 +1614,29 @@ def test_rebuilding_precedence_on_the_precip_extrema_set() -> None:
     persistence_id = _feed_id(conn, "virtual", "_persistence")
     set_setting(conn, "forecast_blend_depth", "1")
 
+    # The daily close is permanent now, so `leaderboard_with_status` never
+    # reports "rebuilding" for an active publication (status is hit, live
+    # or empty); the guard that used to distinguish day_ahead=0 ("hit") from
+    # day_ahead=1 ("rebuilding") here pinned that removed per-cell status
+    # and is gone with it. The rain cell never reads the leaderboard anyway
+    # (rain release, C4) -- its own "rebuilding" below comes from the rain
+    # ranking's own provisional flag, asserted further down.
+    #
+    # ``seed_rain_ranks`` runs BEFORE the ``_seed_score_cache``
+    # setup below: both create a publication if none exists yet, and
+    # ``active_publication`` picks whichever has the LATEST cutoff, never
+    # the most recently published -- seeding the score-cache publication
+    # second lets its far-future ``_ensure_test_publication`` cutoff
+    # (2035-06-30) reuse the rain fixture's publication instead of
+    # out-cutoffing it, so the rain ranking stays visible to the same read.
+    seed_rain_ranks(
+        conn,
+        site_id=1,
+        published_at=_AB_NOW,
+        ranked={0: [feed_a, feed_b]},
+        provisional={0},
+    )
+
     _seed_varying(
         conn,
         feed_id=feed_a,
@@ -1820,23 +1645,14 @@ def test_rebuilding_precedence_on_the_precip_extrema_set() -> None:
         valid_ats=_hours("2026-07-20", 0, 20),
         values=[0.1 * i for i in range(20)],
     )
-    _seed_scoring_pairs(
+    _seed_score_cache(
         conn,
-        feed_id=persistence_id,
-        variable="precip",
         day_ahead=0,
-        forecast=_PRECIP_POOR_FORECAST,
-        observed=_PRECIP_MIXED_OBSERVED,
+        pairs={
+            persistence_id: (_PRECIP_POOR_FORECAST, _PRECIP_MIXED_OBSERVED),
+            feed_a: (_PRECIP_ACCURATE_FORECAST, _PRECIP_MIXED_OBSERVED),
+        },
     )
-    _seed_scoring_pairs(
-        conn,
-        feed_id=feed_a,
-        variable="precip",
-        day_ahead=0,
-        forecast=_PRECIP_ACCURATE_FORECAST,
-        observed=_PRECIP_MIXED_OBSERVED,
-    )
-    _seed_complete_score_cache(conn, variable="precip", day_ahead=0)
 
     _seed_varying(
         conn,
@@ -1846,35 +1662,7 @@ def test_rebuilding_precedence_on_the_precip_extrema_set() -> None:
         valid_ats=_hours("2026-07-20", 0, 24),
         values=[0.05 * i for i in range(24)],
     )
-    _seed_scoring_pairs(
-        conn,
-        feed_id=feed_b,
-        variable="precip",
-        day_ahead=1,
-        forecast=_PRECIP_ACCURATE_FORECAST,
-        observed=_PRECIP_MIXED_OBSERVED,
-    )
-    conn.commit()
-
-    assert (
-        leaderboard_with_status(
-            conn, site_id=1, variable="precip", day_ahead=0, window="rolling"
-        ).status
-        == "hit"
-    )
-    assert (
-        leaderboard_with_status(
-            conn, site_id=1, variable="precip", day_ahead=1, window="rolling"
-        ).status
-        == "rebuilding"
-    )
-    seed_rain_ranks(
-        conn,
-        site_id=1,
-        published_at=_AB_NOW,
-        ranked={0: [feed_a, feed_b]},
-        provisional={0},
-    )
+    # feed_b has no ranking row at day_ahead=1 -- unconfident there.
     conn.commit()
 
     view = build_forecast(
@@ -1918,17 +1706,11 @@ def test_rebuilding_precedence_on_the_precip_extrema_set() -> None:
         value=0.15,
     )
     persistence_id_rec = _feed_id(record_conn, "virtual", "_persistence")
-    _seed_scoring_pairs(
+    _seed_record_score_cache(
         record_conn,
-        feed_id=persistence_id_rec,
-        variable="precip",
         day_ahead=0,
-        forecast=8.0,
+        pairs={persistence_id_rec: (8.0, 10.0), rec_a: (10.1, 10.0)},
     )
-    _seed_scoring_pairs(
-        record_conn, feed_id=rec_a, variable="precip", day_ahead=0, forecast=10.1
-    )
-    _seed_complete_score_cache(record_conn, variable="precip", day_ahead=0)
     t = _record_snapshot_t()
     build_forecast_record(
         record_conn, 1, _RECORD_DAY.isoformat(), now=t + timedelta(minutes=5)

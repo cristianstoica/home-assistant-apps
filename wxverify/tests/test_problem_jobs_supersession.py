@@ -550,7 +550,10 @@ def test_alternating_failure_and_success_never_leaves_unresolved_row() -> None:
         pytest.param(
             "fetch_current_obs", True, "curobs:1", 0, True, id="fetch_current_obs"
         ),
-        pytest.param("pair_and_score", True, "score", 0, True, id="pair_and_score"),
+        # storage release B18: pair_and_score left the single-row allowlist
+        # (the pipeline it dispatched is gone), so a failed row now counts
+        # by age alone, like the chain types above -- never superseded.
+        pytest.param("pair_and_score", True, "score", 1, False, id="pair_and_score"),
         pytest.param(
             "forecast_record",
             True,

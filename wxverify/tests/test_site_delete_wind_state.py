@@ -4,11 +4,10 @@
 Site and timezone generation ids are reused (``INTEGER PRIMARY KEY``, no
 ``AUTOINCREMENT``), and the ``runtime_state`` and ``settings`` rows keyed by
 them have no foreign key, so the ``sites`` cascade never reaches them. A
-delete drops the site's published run pointer, gap-scan failures and
-per-site snapshot time, and leaves every other site's rows and the shared
-auth hold intact; a create clears whatever a pre-fix delete left on the
-reused id before seeding the new site. A failed cleanup rolls the whole
-delete back.
+delete drops the site's gap-scan failures and per-site snapshot time, and
+leaves every other site's rows and the shared auth hold intact; a create
+clears whatever a pre-fix delete left on the reused id before seeding the
+new site. A failed cleanup rolls the whole delete back.
 
 Isolation: a real tmp-file SQLite DB via ``init_db``/``close_db`` + an idle
 worker + ``TestClient`` (mirrors ``tests/test_forecast_routes.py`` /
@@ -45,7 +44,6 @@ from wxverify.verification.record import (
     gap_scan_failures_key,
     snapshot_wall_clock,
 )
-from wxverify.verification.runs import published_run_id, published_run_key
 
 # ---------------------------------------------------------------------------
 # Harness (mirrors tests/test_forecast_routes.py).
@@ -91,10 +89,7 @@ def _make_site(conn: sqlite3.Connection, name: str) -> int:
 
 
 def _site_keys(site_id: int) -> tuple[str, ...]:
-    return (
-        published_run_key(site_id),
-        gap_scan_failures_key(site_id),
-    )
+    return (gap_scan_failures_key(site_id),)
 
 
 def _post_create(client: Any, headers: dict[str, str], name: str) -> Any:
@@ -134,7 +129,6 @@ def test_delete_site_drops_all_site_state_and_a_reused_id_starts_fresh(
         (site_y, "2026-03-08T07:00:00Z", "06:15"),
         (site_x, "2026-03-09T07:00:00Z", "05:45"),
     ):
-        set_runtime_state(conn, published_run_key(site), "7")
         set_runtime_state(
             conn,
             gap_scan_failures_key(site),
@@ -209,7 +203,6 @@ def test_delete_site_drops_all_site_state_and_a_reused_id_starts_fresh(
             (new_gen,),
         ).fetchone()
         assert tuple(gen_row) == (new_id, "initial", "published")
-        assert published_run_id(conn, new_id) is None
         assert snapshot_wall_clock(conn, new_id) == "05:00"
 
 
@@ -257,7 +250,6 @@ def test_create_site_clears_keys_a_pre_fix_delete_left_on_the_reused_id(
             }
         ),
     )
-    set_runtime_state(conn, published_run_key(orphan), "7")
     set_setting(conn, f"{SNAPSHOT_TIME_KEY}:{orphan}", "05:45")
 
     app = _make_app(monkeypatch)
@@ -287,7 +279,6 @@ def test_create_site_clears_keys_a_pre_fix_delete_left_on_the_reused_id(
             (pointer,),
         ).fetchone()
         assert tuple(gen_row) == (new_id, "initial", "published")
-        assert published_run_id(conn, new_id) is None
         assert gap_scan_degraded_sites(conn) == (1, "2026-03-08T07:00:00Z")
         assert get_setting(conn, f"{SNAPSHOT_TIME_KEY}:{new_id}") is None
         assert site_generation_id(conn, site_y) == gen_y

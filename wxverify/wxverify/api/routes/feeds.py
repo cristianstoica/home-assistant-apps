@@ -15,9 +15,6 @@ from wxverify.provider_ops import (
     SubscriptionResult,
     set_site_subscription,
 )
-from wxverify.provider_ops import (
-    rebuild_mean_for_site as _rebuild_mean_for_site,
-)
 from wxverify.worker.cadence import parse_fetch_interval_minutes
 
 router = APIRouter(tags=["feeds"])
@@ -58,12 +55,7 @@ async def update_feed(feed_id: int, body: FeedUpdate) -> FeedOut:
         row = conn.execute("SELECT * FROM feeds WHERE id=?", (feed_id,)).fetchone()
         if row is None:
             raise ApiError(404, "feed not found")
-        affected_sites: set[int] = set()
         if body.enabled is not None:
-            if body.enabled != bool(row["enabled"]):
-                affected_sites.update(
-                    _affected_sites_for_feed_change(conn, row, inherited_only=False)
-                )
             conn.execute(
                 "UPDATE feeds SET enabled=?, disabled_reason=? WHERE id=?",
                 (
@@ -78,16 +70,10 @@ async def update_feed(feed_id: int, body: FeedUpdate) -> FeedOut:
                 (body.fetch_interval_minutes, feed_id),
             )
         if body.default_subscribed is not None:
-            if body.default_subscribed != bool(row["default_subscribed"]):
-                affected_sites.update(
-                    _affected_sites_for_feed_change(conn, row, inherited_only=True)
-                )
             conn.execute(
                 "UPDATE feeds SET default_subscribed=? WHERE id=?",
                 (1 if body.default_subscribed else 0, feed_id),
             )
-        for site_id in sorted(affected_sites):
-            _rebuild_mean_for_site(conn, site_id)
         updated = conn.execute("SELECT * FROM feeds WHERE id=?", (feed_id,)).fetchone()
         if updated is None:
             raise RuntimeError("feed update failed")
@@ -130,66 +116,6 @@ async def update_subscription(
         "changed": result.changed,
         "fetch_enqueued": None if result.fetch is None else result.fetch.enqueued,
     }
-
-
-def _affected_sites_for_feed_change(
-    conn: sqlite3.Connection, feed: sqlite3.Row, *, inherited_only: bool
-) -> set[int]:
-    if bool(feed["is_virtual"]):
-        return set()
-    source = str(feed["source"])
-    model = str(feed["model"])
-    feed_id = int(feed["id"])
-    if source == "meteoblue" and model == "multimodel":
-        return _affected_sites_for_meteoblue_package(
-            conn, feed_id, inherited_only=inherited_only
-        )
-    if source == "meteoblue" and model != "multimodel" and inherited_only:
-        return set()
-    rows = conn.execute(
-        f"""
-        SELECT DISTINCT fp.site_id
-        FROM forecast_pairs fp
-        LEFT JOIN site_feed_state sfs
-          ON sfs.site_id = fp.site_id AND sfs.feed_id = ?
-        WHERE fp.feed_id = ?
-          {_inheriting_filter("sfs") if inherited_only else ""}
-        """,
-        (feed_id, feed_id),
-    ).fetchall()
-    return {int(row["site_id"]) for row in rows}
-
-
-def _affected_sites_for_meteoblue_package(
-    conn: sqlite3.Connection, package_feed_id: int, *, inherited_only: bool
-) -> set[int]:
-    rows = conn.execute(
-        f"""
-        WITH candidate_sites AS (
-            SELECT DISTINCT fp.site_id
-            FROM forecast_pairs fp
-            JOIN feeds member ON member.id = fp.feed_id
-            WHERE member.source = 'meteoblue'
-              AND member.model != 'multimodel'
-            UNION
-            SELECT site_id
-            FROM site_feed_state
-            WHERE feed_id = ?
-        )
-        SELECT cs.site_id
-        FROM candidate_sites cs
-        LEFT JOIN site_feed_state pkg_sfs
-          ON pkg_sfs.site_id = cs.site_id AND pkg_sfs.feed_id = ?
-        WHERE 1=1
-          {_inheriting_filter("pkg_sfs") if inherited_only else ""}
-        """,
-        (package_feed_id, package_feed_id),
-    ).fetchall()
-    return {int(row["site_id"]) for row in rows}
-
-
-def _inheriting_filter(state_alias: str) -> str:
-    return f"AND {state_alias}.enabled IS NULL"
 
 
 def _wants_html(request: Request) -> bool:

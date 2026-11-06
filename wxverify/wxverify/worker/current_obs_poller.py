@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Final
 
+from wxverify.core import stop
 from wxverify.core.timeutil import parse_utc, utc_now
 from wxverify.db.connection import Database
 from wxverify.db.queue import Job, claim_next_current_obs_job
@@ -84,22 +85,26 @@ async def run_current_obs_poller(db: Database, *, run_job: RunJob) -> None:
 
     Sleeps only when a pass claims nothing; a claimed job, whatever its
     outcome, loops straight back. ``run_job`` is awaited directly after the
-    claim returns; only the synchronous claim line runs in between, so there
-    is no await and its fence capture observes the claim's generation. An
-    error from the loop's own write propagates to the supervisor.
+    claim returns; only the synchronous claim line runs in between. An error
+    from the loop's own write propagates to the supervisor.
+
+    Once a stop has begun (``core.stop.STOP``, storage-release plan 6.3) it
+    claims nothing and goes back to the poll sleep, where the cancel lands.
+    It never returns: a lane that ends on its own is a crash.
     """
     last_heartbeat = 0.0
     while True:
+        if stop.STOP.is_set():
+            await asyncio.sleep(POLL_SECONDS)
+            continue
         now_mono = time.monotonic()
         stamp = (
             last_heartbeat == 0.0
             or now_mono - last_heartbeat >= RUNTIME_HEARTBEAT_INTERVAL_SECONDS
         )
-        # Exempt: the enqueue, the claim and the heartbeat run with no
-        # job-scoped read behind them yet -- there is no generation to fence
-        # against until a job is claimed, and run_job captures it first.
-        # The write is also exempt from the input epoch because it touches
-        # only the current-obs lane's tables.
+        # The enqueue, the claim and the heartbeat run before any job is
+        # claimed. The write is exempt from the input epoch because it
+        # touches only the current-obs lane's tables.
         claimed = await db.write(
             lambda conn, s=stamp: _enqueue_and_claim(conn, stamp_heartbeat=s),
             epoch_exempt=True,
@@ -109,7 +114,6 @@ async def run_current_obs_poller(db: Database, *, run_job: RunJob) -> None:
         if claimed is None:
             await asyncio.sleep(POLL_SECONDS)
             continue
-        # Sync: no await may sit between the claim and run_job's fence capture.
         _log_claim_lateness(claimed)
         await run_job(db, claimed.job, lane="current_obs")
 

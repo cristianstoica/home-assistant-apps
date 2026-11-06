@@ -1,6 +1,6 @@
 """Tests for the 0.16.3 write-lock timing instrumentation (D1.1, connection.py).
 
-Covers the `slow db write` INFO line `Database.write` and `Database.write_fenced`
+Covers the `slow db write` INFO line `Database.write` and `Database.write_if_current`
 emit via `_log_slow_write`: `hold` is measured across the whole locked section
 -- including the exception path, because the stop time is taken in a
 `try/finally` INSIDE `async with self._write_lock` -- `lock_wait` is measured
@@ -258,11 +258,12 @@ def test_raising_write_still_logs_hold(
     assert int(match.group(2)) >= 1000
 
 
-def test_raising_write_fenced_still_logs_hold(
+def test_raising_write_if_current_still_logs_hold(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Same as above through `write_fenced`, `FencedWriter`'s delegate and
-    the other of the two call sites the plan names."""
+    """Same as above through `write_if_current`, the other of the two call
+    sites the plan names (the generation-fenced `write_fenced` this used to
+    drive is gone -- storage-release plan 5.5)."""
 
     async def _drive() -> None:
         db = Database(str(tmp_path / "db.sqlite"))
@@ -271,7 +272,7 @@ def test_raising_write_fenced_still_logs_hold(
                 caplog.at_level(logging.INFO, logger="wxverify.db.connection"),
                 pytest.raises(RuntimeError, match="synthetic write failure"),
             ):
-                await db.write_fenced(_slow_raising_write, generation=db.generation)
+                await db.write_if_current(_slow_raising_write, epoch=db.input_epoch)
         finally:
             db.close()
 

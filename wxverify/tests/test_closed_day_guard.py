@@ -34,39 +34,19 @@ from tests.helpers import (
     NOW,
     D,
     asof_conn,
-    asof_insert_observation,
-    asof_insert_pair,
-    asof_insert_sample,
     asof_make_real_feed,
     day_close_site,
-    note_day_clock,
 )
 from wxverify import config
 from wxverify.api.app import create_app
-from wxverify.api.routes import db_transfer
 from wxverify.core.timeutil import isoformat_utc
-from wxverify.db.connection import Database, close_db, init_db
+from wxverify.db.connection import close_db, init_db
 
 # The arrives-in-Step-4 import: see the module docstring above.
 from wxverify.db.site_days import (
-    begin_close,
     enter_zone_change,
-    fail_close,
 )
-from wxverify.db.switch import ensure_site_generation
-from wxverify.provider_ops import rebuild_mean_for_site
 from wxverify.scoring.consensus import materialize_consensus
-from wxverify.scoring.multimodel import compute_multimodel_mean
-from wxverify.scoring.persistence import compute_persistence_pairs
-from wxverify.scoring.split import (
-    DeleteOp,
-    GenerationResolver,
-    InsertOp,
-    PairDelta,
-    ReplaceOp,
-    apply_pair_ops,
-)
-from wxverify.worker.score_batches import _apply_split_chunk  # noqa: SLF001
 
 _STATION_A: Final = "ISTATION01"
 _STATION_B: Final = "ISTATION02"
@@ -166,15 +146,21 @@ def test_gw4_materialize_consensus_leaves_a_closed_days_hour_alone(
     d3_hour = f"{_d3().isoformat()}T06:00:00Z"
 
     feed_id = asof_make_real_feed(conn, "gw4-model")
-    asof_insert_pair(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        valid_at=d3_hour,
-        issued_at=f"{_d3().isoformat()}T00:00:00Z",
-        forecast=5.0,
-        observed=4.0,
-        first_known_at=d3_hour,
+    # A bare forecast_history row (not tests.helpers.seed_forecast_history,
+    # which also seeds observations -- this test's own oracle below needs
+    # observations EMPTY at d3_hour, to show the guard refused the write).
+    conn.execute(
+        "INSERT INTO forecast_history"
+        " (site_id, feed_id, variable, day_ahead, valid_at, local_date,"
+        "  value, lead_hours, issued_at, contributors)"
+        " VALUES (?, ?, 'temperature', 1, ?, ?, 5.0, 6, ?, NULL)",
+        (
+            site_id,
+            feed_id,
+            d3_hour,
+            _d3().isoformat(),
+            f"{_d3().isoformat()}T00:00:00Z",
+        ),
     )
     conn.execute(
         """
@@ -202,8 +188,10 @@ def test_gw4_materialize_consensus_leaves_a_closed_days_hour_alone(
     )
     conn.commit()
 
-    before_pairs = _rows(
-        conn, "SELECT * FROM forecast_pairs WHERE site_id = ? ORDER BY id", (site_id,)
+    before_hist = _rows(
+        conn,
+        "SELECT * FROM forecast_history WHERE site_id = ? ORDER BY feed_id, valid_at",
+        (site_id,),
     )
     before_cache = _rows(
         conn,
@@ -223,8 +211,10 @@ def test_gw4_materialize_consensus_leaves_a_closed_days_hour_alone(
     )
     conn.commit()
 
-    assert before_pairs == _rows(
-        conn, "SELECT * FROM forecast_pairs WHERE site_id = ? ORDER BY id", (site_id,)
+    assert before_hist == _rows(
+        conn,
+        "SELECT * FROM forecast_history WHERE site_id = ? ORDER BY feed_id, valid_at",
+        (site_id,),
     )
     assert before_cache == _rows(
         conn,
@@ -247,343 +237,18 @@ def test_gw4_materialize_consensus_leaves_a_closed_days_hour_alone(
     )
 
 
-# ---------------------------------------------------------------------------
-# GW9/GW9b/GW9c: W10, apply_pair_ops/_apply_split_chunk and the computes.
-# ---------------------------------------------------------------------------
-
-
-def test_gw9_apply_pair_ops_and_split_chunk_refuse_a_closed_days_ops(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    monkeypatch.setattr("wxverify.scoring.split.utc_now", lambda: NOW)
-    conn = asof_conn()
-    site_id = day_close_site(conn)
-    feed_id = asof_make_real_feed(conn, "gw9-model")
-    d3_hour, d3_hour_insert, d3_hour_delete, d1_hour_a, d1_hour_b, d1_hour_c = (
-        f"{_d3().isoformat()}T06:00:00Z",
-        f"{_d3().isoformat()}T07:00:00Z",
-        f"{_d3().isoformat()}T08:00:00Z",
-        f"{_d1().isoformat()}T06:00:00Z",
-        f"{_d1().isoformat()}T07:00:00Z",
-        f"{_d1().isoformat()}T08:00:00Z",
-    )
-
-    resolver = GenerationResolver((site_id,))
-    resolver.seed(conn)
-    insert_sql = (
-        "INSERT INTO forecast_pairs"
-        " (site_id, feed_id, variable, issued_at, valid_at, lead_hours, day_ahead,"
-        " forecast, observed, error, abs_error, sq_error, first_known_at,"
-        " tz_generation_id)"
-        " VALUES (?, ?, 'temperature', ?, ?, 6, 1, ?, ?, ?, ?, ?, ?, ?)"
-    )
-
-    def _values(valid_at: str, forecast: float, observed: float) -> tuple[object, ...]:
-        error = forecast - observed
-        return (
-            site_id,
-            feed_id,
-            valid_at,
-            valid_at,
-            forecast,
-            observed,
-            error,
-            abs(error),
-            error**2,
-            valid_at,
-        )
-
-    asof_insert_pair(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        valid_at=d3_hour,
-        issued_at=d3_hour,
-        forecast=3.0,
-        observed=4.0,
-        first_known_at=d3_hour,
-    )
-    replace_target = int(
-        conn.execute(
-            "SELECT id FROM forecast_pairs"
-            " WHERE site_id=? AND feed_id=? AND valid_at=?",
-            (site_id, feed_id, d3_hour),
-        ).fetchone()["id"]
-    )
-    asof_insert_pair(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        valid_at=d3_hour_delete,
-        issued_at=d3_hour_delete,
-        forecast=3.0,
-        observed=4.0,
-        first_known_at=d3_hour_delete,
-    )
-    d3_delete_target = int(
-        conn.execute(
-            "SELECT id FROM forecast_pairs"
-            " WHERE site_id=? AND feed_id=? AND valid_at=?",
-            (site_id, feed_id, d3_hour_delete),
-        ).fetchone()["id"]
-    )
-    asof_insert_pair(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        valid_at=d1_hour_a,
-        issued_at=d1_hour_a,
-        forecast=3.0,
-        observed=4.0,
-        first_known_at=d1_hour_a,
-    )
-    d1_replace_target = int(
-        conn.execute(
-            "SELECT id FROM forecast_pairs"
-            " WHERE site_id=? AND feed_id=? AND valid_at=?",
-            (site_id, feed_id, d1_hour_a),
-        ).fetchone()["id"]
-    )
-    asof_insert_pair(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        valid_at=d1_hour_b,
-        issued_at=d1_hour_b,
-        forecast=3.0,
-        observed=4.0,
-        first_known_at=d1_hour_b,
-    )
-    d1_delete_target = int(
-        conn.execute(
-            "SELECT id FROM forecast_pairs"
-            " WHERE site_id=? AND feed_id=? AND valid_at=?",
-            (site_id, feed_id, d1_hour_b),
-        ).fetchone()["id"]
-    )
-    conn.commit()
-
-    before_d3 = _rows(
-        conn,
-        "SELECT * FROM forecast_pairs WHERE site_id=? AND valid_at=?",
-        (site_id, d3_hour),
-    )
-
-    delta = PairDelta((site_id,), (), insert_sql, count=None)
-    d3_ops = (
-        InsertOp(
-            site_id=site_id,
-            values=_values(d3_hour_insert, 5.0, 4.0),
-            valid_at=d3_hour_insert,
-        ),
-        ReplaceOp(
-            row_id=replace_target,
-            site_id=site_id,
-            values=_values(d3_hour, 6.0, 4.0),
-            valid_at=d3_hour,
-        ),
-        DeleteOp(row_id=d3_delete_target, site_id=site_id, valid_at=d3_hour_delete),
-    )
-    d1_ops = (
-        InsertOp(
-            site_id=site_id, values=_values(d1_hour_c, 5.0, 4.0), valid_at=d1_hour_c
-        ),
-        ReplaceOp(
-            row_id=d1_replace_target,
-            site_id=site_id,
-            values=_values(d1_hour_a, 6.0, 4.0),
-            valid_at=d1_hour_a,
-        ),
-        DeleteOp(row_id=d1_delete_target, site_id=site_id, valid_at=d1_hour_b),
-    )
-
-    caplog.set_level(logging.WARNING)
-    result = apply_pair_ops(conn, delta, d3_ops + d1_ops, resolver)
-    assert result == 2
-
-    after_d3 = _rows(
-        conn,
-        "SELECT * FROM forecast_pairs WHERE site_id=? AND valid_at=?",
-        (site_id, d3_hour),
-    )
-    assert before_d3 == after_d3, "D-3's pair rows must be identical"
-    assert (
-        conn.execute(
-            "SELECT 1 FROM forecast_pairs WHERE id=?", (replace_target,)
-        ).fetchone()
-        is not None
-    ), "the replaced D-3 row must still be present"
-
-    # Replay the identical ops through the chunked apply path: roll back the
-    # monolithic apply above so the row ids this test seeded are restored,
-    # then confirm the chunk path reaches the same result row-for-row. Per
-    # risk 10, `_apply_split_chunk` returns the number of ops applied, not
-    # the apply's INSERT rowcount, so it is checked against `len(...)`, not
-    # against `result`.
-    conn.rollback()
-    chunk_result = _apply_split_chunk(
-        conn,
-        site_id,
-        delta,
-        d3_ops + d1_ops,
-        resolver,
-        first=True,
-        require_enabled=False,
-    )
-    conn.commit()
-    assert chunk_result == len(d3_ops) + len(d1_ops)
-
-    after_d3_chunk = _rows(
-        conn,
-        "SELECT * FROM forecast_pairs WHERE site_id=? AND valid_at=?",
-        (site_id, d3_hour),
-    )
-    assert before_d3 == after_d3_chunk, "D-3's pair rows must stay untouched"
-    assert (
-        conn.execute(
-            "SELECT 1 FROM forecast_pairs WHERE id=?", (replace_target,)
-        ).fetchone()
-        is not None
-    ), "the replaced D-3 row must still be present after the chunk apply"
-    d1_replaced_row = conn.execute(
-        "SELECT forecast FROM forecast_pairs WHERE site_id=? AND valid_at=?",
-        (site_id, d1_hour_a),
-    ).fetchone()
-    assert d1_replaced_row is not None and d1_replaced_row["forecast"] == 6.0, (
-        "the open day's replaced row must carry the replacement's values"
-    )
-    assert (
-        conn.execute(
-            "SELECT 1 FROM forecast_pairs WHERE id=?", (d1_delete_target,)
-        ).fetchone()
-        is None
-    ), "the open day's deleted row must be gone"
-    d1_inserted_row = conn.execute(
-        "SELECT forecast FROM forecast_pairs WHERE site_id=? AND valid_at=?",
-        (site_id, d1_hour_c),
-    ).fetchone()
-    assert d1_inserted_row is not None and d1_inserted_row["forecast"] == 5.0, (
-        "the open day's inserted row must be present"
-    )
-    _assert_no_guard_warning(caplog)
-
-
-def test_gw9b_pair_computes_propose_no_ops_for_a_done_or_recordless_day(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    monkeypatch.setattr("wxverify.scoring.pairing.utc_now", lambda: NOW)
-    monkeypatch.setattr("wxverify.scoring.persistence.utc_now", lambda: NOW)
-    monkeypatch.setattr("wxverify.scoring.multimodel.utc_now", lambda: NOW)
-    conn = asof_conn()
-    site_id = day_close_site(conn)
-    feed_id = asof_make_real_feed(conn, "gw9b-model")
-    feed_id_b = asof_make_real_feed(conn, "gw9b-model-b")
-    d5 = D - timedelta(days=5)
-
-    for d in (d5, _d3(), _d1()):
-        hour = f"{d.isoformat()}T12:00:00Z"
-        asof_insert_observation(
-            conn, site_id=site_id, valid_at=hour, value=4.0, computed_at=hour
-        )
-        asof_insert_sample(
-            conn,
-            site_id=site_id,
-            feed_id=feed_id,
-            issued_at=hour,
-            valid_at=hour,
-            lead_hours=6,
-            value=5.0,
-            fetched_at=hour,
-        )
-
-    mean_feed_row = conn.execute(
-        "SELECT id FROM feeds WHERE source='virtual' AND model='_multimodel_mean'"
-    ).fetchone()
-    assert mean_feed_row is not None
-    mean_feed_id = int(mean_feed_row["id"])
-
-    for d in (_d3(), _d1()):
-        hour = f"{d.isoformat()}T18:00:00Z"
-        asof_insert_pair(
-            conn,
-            site_id=site_id,
-            feed_id=feed_id,
-            valid_at=hour,
-            issued_at=hour,
-            forecast=3.0,
-            observed=4.0,
-            first_known_at=hour,
-        )
-        asof_insert_pair(
-            conn,
-            site_id=site_id,
-            feed_id=feed_id_b,
-            valid_at=hour,
-            issued_at=hour,
-            forecast=5.0,
-            observed=4.0,
-            first_known_at=hour,
-        )
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 first_known_at, tz_generation_id)
-            SELECT site_id, ?, 'temperature', issued_at, valid_at, lead_hours,
-                   day_ahead, 99.0, observed, 99.0 - observed,
-                   ABS(99.0 - observed), (99.0 - observed) * (99.0 - observed),
-                   first_known_at, tz_generation_id
-            FROM forecast_pairs
-            WHERE site_id = ? AND feed_id = ? AND valid_at = ?
-            """,
-            (mean_feed_id, site_id, feed_id, hour),
-        )
-    conn.commit()
-
-    for d in (d5, _d3(), _d1()):
-        hour = f"{d.isoformat()}T12:00:00Z"
-        real_delta = asyncio.run(asyncio.to_thread(lambda h=hour: None)) or None
-    from wxverify.scoring.pairing import compute_real_model_pairs
-
-    real_delta = compute_real_model_pairs(conn, site_id)
-    assert all(
-        getattr(op, "valid_at", None)
-        not in {
-            f"{d5.isoformat()}T12:00:00Z",
-            f"{_d3().isoformat()}T12:00:00Z",
-            f"{(D - timedelta(days=2)).isoformat()}T12:00:00Z",
-        }
-        for op in real_delta.ops
-    )
-    d1_hour = f"{_d1().isoformat()}T12:00:00Z"
-    assert all(getattr(op, "valid_at", d1_hour) == d1_hour for op in real_delta.ops)
-
-    persistence_delta = compute_persistence_pairs(conn, site_id)
-    assert len(persistence_delta.ops) == 2
-    assert all(
-        getattr(op, "valid_at", d1_hour) == d1_hour for op in persistence_delta.ops
-    )
-
-    mean_delta = compute_multimodel_mean(conn, site_id)
-    d1_18 = f"{_d1().isoformat()}T18:00:00Z"
-    d3_18 = f"{_d3().isoformat()}T18:00:00Z"
-    assert any(
-        isinstance(op, ReplaceOp) and getattr(op, "valid_at", None) == d1_18
-        for op in mean_delta.ops
-    )
-    assert not any(getattr(op, "valid_at", None) == d3_18 for op in mean_delta.ops)
-    _assert_no_guard_warning(caplog)
-
-
-# GW9c (real_model_pair_pending's probe carries no open-day clause) is
-# removed: the rain release (Part B) deleted the fetch score gate and the
-# probe with it.
+# GW9 (apply_pair_ops/_apply_split_chunk refusing a closed day's ops) and
+# GW9b (the real-model/persistence/multimodel pair computes proposing no
+# ops for a done or recordless day) are removed: the old pair-and-score
+# pipeline they drove -- `wxverify.scoring.split`, `wxverify.scoring.pairing`,
+# `wxverify.scoring.persistence`, `wxverify.scoring.multimodel` and
+# `wxverify.worker.score_batches` -- is gone with it (storage-release plan
+# 2026-11-02, table 1.B). GW9c (real_model_pair_pending's probe) was already
+# removed with the rain release (Part B)'s fetch score gate.
 
 
 # ---------------------------------------------------------------------------
-# GW11/GW12: W12 (PUT /api/sites/{id}) and W13 (rebuild_mean_for_site).
+# GW11: W12 (PUT /api/sites/{id}).
 # ---------------------------------------------------------------------------
 
 
@@ -611,222 +276,11 @@ def _csrf_headers(client: TestClient) -> dict[str, str]:
     return {"Origin": "http://testserver", "X-CSRF-Token": token}
 
 
-def test_gw11_put_site_rain_threshold_leaves_closed_days_pairs_alone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """GW11: ``PUT /api/sites/{id}`` with a new ``rain_threshold_mm``
-    guards the open/closed boundary at its own DELETE (sites.py:173-181),
-    not at ``pair_and_score``. D-1 (open) is a hand-planted precip pair,
-    confirmed present before the PUT; the handler's DELETE removes it and
-    nothing rebuilds it. D-3 (closed) decoys are untouched throughout."""
-    monkeypatch.setattr("wxverify.api.routes.sites.utc_now", lambda: NOW, raising=False)
-    conn = _init_tmp_db(tmp_path)
-    site_id = day_close_site(conn)
-    feed_id = asof_make_real_feed(conn, "gw11-model")
-    d3, d1 = _d3(), _d1()
-    generation_id = ensure_site_generation(conn, site_id)
-    # D3 (closed) decoys: never reach the real-model recompute path (closed
-    # days are excluded by open_day_clause), so a plain hand-planted row is
-    # enough to prove the guard leaves them alone.
-    d3_hour = f"{d3.isoformat()}T12:00:00Z"
-    conn.execute(
-        """
-        INSERT INTO forecast_pairs
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error,
-             first_known_at, tz_generation_id)
-        VALUES (?, ?, 'precip', ?, ?, 6, 1, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            site_id,
-            feed_id,
-            d3_hour,
-            d3_hour,
-            0.3,
-            0.2,
-            0.1,
-            0.1,
-            0.01,
-            d3_hour,
-            generation_id,
-        ),
-    )
-    asof_insert_pair(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        valid_at=d3_hour,
-        issued_at=d3_hour,
-        forecast=0.3,
-        observed=0.2,
-        first_known_at=d3_hour,
-        generation_id=generation_id,
-    )
-    # D1 (open) temperature decoy: update_site's DELETE only targets
-    # variable='precip', so this row is never touched either way.
-    d1_hour = f"{d1.isoformat()}T12:00:00Z"
-    asof_insert_pair(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        valid_at=d1_hour,
-        issued_at=d1_hour,
-        forecast=0.3,
-        observed=0.2,
-        first_known_at=d1_hour,
-        generation_id=generation_id,
-    )
-    # D1 (open) precip: hand-planted, same shape as D-3's decoy above --
-    # update_site's DELETE (sites.py:173-181) takes the open day's precip
-    # row on its own; nothing here needs pair_and_score to rebuild it.
-    conn.execute(
-        """
-        INSERT INTO forecast_pairs
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error,
-             first_known_at, tz_generation_id)
-        VALUES (?, ?, 'precip', ?, ?, 6, 1, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            site_id,
-            feed_id,
-            d1_hour,
-            d1_hour,
-            0.3,
-            0.2,
-            0.1,
-            0.1,
-            0.01,
-            d1_hour,
-            generation_id,
-        ),
-    )
-    conn.commit()
-    d1_precip_before = conn.execute(
-        "SELECT COUNT(*) AS n FROM forecast_pairs"
-        " WHERE site_id=? AND feed_id=? AND variable='precip' AND valid_at=?",
-        (site_id, feed_id, d1_hour),
-    ).fetchone()
-    assert d1_precip_before is not None and int(d1_precip_before["n"]) == 1
-    before_d3 = _rows(
-        conn,
-        "SELECT * FROM forecast_pairs WHERE site_id=? AND valid_at LIKE ?",
-        (site_id, f"{d3.isoformat()}%"),
-    )
-
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        headers = _csrf_headers(client)
-        caplog.set_level(logging.WARNING)
-        resp = client.put(
-            f"/api/sites/{site_id}", json={"rain_threshold_mm": 1.0}, headers=headers
-        )
-        assert resp.status_code == 200
-    _assert_no_guard_warning(caplog)
-
-    # The app's lifespan closes `conn` (the same connection `_init_tmp_db`
-    # handed back) on TestClient exit, so a fresh connection to the same
-    # file is needed to read the result.
-    direct = sqlite3.connect(config.db_path)
-    direct.row_factory = sqlite3.Row
-    try:
-        after_d3 = _rows(
-            direct,
-            "SELECT * FROM forecast_pairs WHERE site_id=? AND valid_at LIKE ?",
-            (site_id, f"{d3.isoformat()}%"),
-        )
-        assert before_d3 == after_d3, "D-3's mean and precipitation pairs unchanged"
-        d1_precip = direct.execute(
-            "SELECT rain_threshold_mm FROM forecast_pairs"
-            " WHERE site_id=? AND feed_id=? AND variable='precip' AND valid_at=?",
-            (site_id, feed_id, f"{d1.isoformat()}T12:00:00Z"),
-        ).fetchone()
-        assert d1_precip is None
-    finally:
-        direct.close()
-
-
-def test_gw12_rebuild_mean_for_site_leaves_closed_days_mean_alone(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    monkeypatch.setattr("wxverify.provider_ops.utc_now", lambda: NOW, raising=False)
-    monkeypatch.setattr("wxverify.scoring.multimodel.utc_now", lambda: NOW)
-    conn = asof_conn()
-    site_id = day_close_site(conn)
-    feed_a = asof_make_real_feed(conn, "gw12-model-a")
-    feed_b = asof_make_real_feed(conn, "gw12-model-b")
-    d3, d1 = _d3(), _d1()
-    for d in (d3, d1):
-        hour = f"{d.isoformat()}T12:00:00Z"
-        asof_insert_pair(
-            conn,
-            site_id=site_id,
-            feed_id=feed_a,
-            valid_at=hour,
-            issued_at=hour,
-            forecast=3.0,
-            observed=4.0,
-            first_known_at=hour,
-        )
-        asof_insert_pair(
-            conn,
-            site_id=site_id,
-            feed_id=feed_b,
-            valid_at=hour,
-            issued_at=hour,
-            forecast=5.0,
-            observed=4.0,
-            first_known_at=hour,
-        )
-    conn.commit()
-    mean_feed = conn.execute(
-        "SELECT id FROM feeds WHERE source='virtual' AND model='_multimodel_mean'"
-    ).fetchone()
-    assert mean_feed is not None
-    mean_feed_id = int(mean_feed["id"])
-    # compute_multimodel_mean never produces a D3 row (open_day_clause keeps
-    # it out of both the existing-rows read and the groups read), so a mean
-    # row must be hand-planted at D3 for the before/after comparison below to
-    # be non-vacuous: without this insert, before_d3_mean == after_d3_mean
-    # == [] regardless of whether the guard fires.
-    d3_generation_id = ensure_site_generation(conn, site_id)
-    d3_hour = f"{d3.isoformat()}T12:00:00Z"
-    conn.execute(
-        """
-        INSERT INTO forecast_pairs
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error,
-             cat_hit, cat_false, cat_miss, cat_correct_neg,
-             rain_threshold_mm, contributors, tz_generation_id)
-        VALUES (?, ?, 'temperature', ?, ?, 6, 1, 10.0, 4.0, 6.0, 6.0, 36.0,
-                NULL, NULL, NULL, NULL, NULL, 2, ?)
-        """,
-        (site_id, mean_feed_id, d3_hour, d3_hour, d3_generation_id),
-    )
-    # 10.0 is deliberately NOT the real group average (3.0+5.0)/2=4.0 from
-    # feed_a/feed_b above: if the day-clause guard is ever dropped from
-    # either the existing-rows read or the groups read in
-    # compute_multimodel_mean, this row would be overwritten to forecast=4.0
-    # and before_d3_mean == after_d3_mean would fail.
-    conn.commit()
-    before_d3_mean = _rows(
-        conn,
-        "SELECT * FROM forecast_pairs WHERE site_id=? AND feed_id=? AND valid_at=?",
-        (site_id, mean_feed_id, d3_hour),
-    )
-    assert before_d3_mean != []
-
-    caplog.set_level(logging.WARNING)
-    rebuild_mean_for_site(conn, site_id)
-    conn.commit()
-    _assert_no_guard_warning(caplog)
-
-    after_d3_mean = _rows(
-        conn,
-        "SELECT * FROM forecast_pairs WHERE site_id=? AND feed_id=? AND valid_at=?",
-        (site_id, mean_feed_id, d3_hour),
-    )
-    assert before_d3_mean == after_d3_mean
+# GW11 (update_site's own DELETE of the open day's pairs/scores before the
+# PUT returns) was removed with storage-release plan B14: update_site no
+# longer deletes, re-pairs or re-scores anything -- it only stores the rain
+# threshold. The test existed solely to pin that DELETE; nothing in it
+# covered kept behaviour.
 
 
 # ---------------------------------------------------------------------------
@@ -834,375 +288,10 @@ def test_gw12_rebuild_mean_for_site_leaves_closed_days_mean_alone(
 # ---------------------------------------------------------------------------
 
 
-def test_gw13_import_of_a_close_on_file_rebuilds_only_the_open_day(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    from tests.helpers import asof_make_site
-
-    conn = _init_tmp_db(tmp_path)
-    asof_make_site(conn, "Pre Import Site")
-    conn.commit()
-
-    b_path = tmp_path / "source-b.db"
-    b_db = Database(str(b_path))
-    try:
-        site_b = day_close_site(b_db._conn)  # noqa: SLF001
-        station_a = _station_id(b_db._conn, site_b, _STATION_A)  # noqa: SLF001
-        station_b = _station_id(b_db._conn, site_b, _STATION_B)  # noqa: SLF001
-        d3, d1 = _d3(), _d1()
-        feed_id = asof_make_real_feed(b_db._conn, "gw13-model")  # noqa: SLF001
-        generation_id = ensure_site_generation(  # noqa: SLF001
-            b_db._conn, site_b
-        )
-        d3_hour = f"{d3.isoformat()}T12:00:00Z"
-        # D-3 (closed): a pair, an observation and a truth row, exactly as a
-        # pre-cutover file would carry them.
-        asof_insert_pair(
-            b_db._conn,  # noqa: SLF001
-            site_id=site_b,
-            feed_id=feed_id,
-            valid_at=d3_hour,
-            issued_at=d3_hour,
-            forecast=5.0,
-            observed=4.0,
-            first_known_at=d3_hour,
-            generation_id=generation_id,
-        )
-        b_db._conn.execute(  # noqa: SLF001
-            "INSERT INTO observations"
-            " (site_id, variable, valid_at, value, n_stations, rejected_stations,"
-            " computed_at)"
-            " VALUES (?, 'temperature', ?, 4.0, 1, 0, ?)",
-            (site_b, d3_hour, d3_hour),
-        )
-        b_db._conn.execute(  # noqa: SLF001
-            """
-            INSERT INTO daily_truth
-                (site_id, local_date, quantity, value, eligible, covered_hours,
-                 expected_slots, day_start_utc, day_end_utc, timezone,
-                 tz_generation_id)
-            VALUES (?, ?, 'temperature_high', 10.0, 1, 24, 24, ?, ?, 'UTC', ?)
-            """,
-            (
-                site_b,
-                d3.isoformat(),
-                f"{d3.isoformat()}T00:00:00Z",
-                f"{(d3 + timedelta(days=1)).isoformat()}T00:00:00Z",
-                generation_id,
-            ),
-        )
-        # D-1 (open): raw station readings the rebuild turns into one
-        # consensus observation.
-        d1_hour = f"{d1.isoformat()}T12:00:00Z"
-        for station_id, value in ((station_a, 10.0), (station_b, 12.0)):
-            b_db._conn.execute(  # noqa: SLF001
-                "INSERT INTO station_observations"
-                " (station_id, variable, valid_at, value, qc_flag, source_raw,"
-                " fetched_at)"
-                " VALUES (?, 'temperature', ?, ?, 'ok', 'synthetic-gw13', ?)",
-                (station_id, d1_hour, value, d1_hour),
-            )
-        b_db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
-        b_db._conn.commit()  # noqa: SLF001
-    finally:
-        b_db.close()
-
-    start, end = _day_bounds(d3)
-    direct_b = sqlite3.connect(str(b_path))
-    direct_b.row_factory = sqlite3.Row
-    try:
-        file_b_pairs = _rows(
-            direct_b,
-            "SELECT * FROM forecast_pairs WHERE site_id=? AND valid_at>=?"
-            " AND valid_at<? ORDER BY feed_id, variable, valid_at",
-            (site_b, start, end),
-        )
-        file_b_obs = _rows(
-            direct_b,
-            "SELECT * FROM observations WHERE site_id=? AND valid_at>=?"
-            " AND valid_at<? ORDER BY variable, valid_at",
-            (site_b, start, end),
-        )
-        file_b_truth = _rows(
-            direct_b,
-            "SELECT * FROM daily_truth WHERE site_id=? AND local_date=?"
-            " ORDER BY quantity",
-            (site_b, d3.isoformat()),
-        )
-    finally:
-        direct_b.close()
-    assert file_b_pairs and file_b_obs and file_b_truth  # non-vacuous
-    payload = b_path.read_bytes()
-
-    def _assert_rebuilt(db_path: str) -> None:
-        direct = sqlite3.connect(db_path)
-        direct.row_factory = sqlite3.Row
-        try:
-            after_pairs = _rows(
-                direct,
-                "SELECT * FROM forecast_pairs WHERE site_id=? AND valid_at>=?"
-                " AND valid_at<? ORDER BY feed_id, variable, valid_at",
-                (site_b, start, end),
-            )
-            after_obs = _rows(
-                direct,
-                "SELECT * FROM observations WHERE site_id=? AND valid_at>=?"
-                " AND valid_at<? ORDER BY variable, valid_at",
-                (site_b, start, end),
-            )
-            after_truth = _rows(
-                direct,
-                "SELECT * FROM daily_truth WHERE site_id=? AND local_date=?"
-                " ORDER BY quantity",
-                (site_b, d3.isoformat()),
-            )
-            assert after_pairs == file_b_pairs, (
-                "D-3's pairs must be exactly file B's, not deleted or rebuilt"
-            )
-            assert after_obs == file_b_obs, "D-3's observations must survive"
-            assert after_truth == file_b_truth, "D-3's truth must survive"
-            d3_row = direct.execute(
-                "SELECT 1 FROM site_days"
-                " WHERE site_id=? AND local_date=? AND state='closed'",
-                (site_b, d3.isoformat()),
-            ).fetchone()
-            assert d3_row is not None, "D-3's close-state record must survive"
-            d1_obs = direct.execute(
-                "SELECT 1 FROM observations WHERE site_id=? AND variable='temperature'"
-                " AND valid_at=?",
-                (site_b, d1_hour),
-            ).fetchone()
-            assert d1_obs is not None, (
-                "D-1 must be rebuilt into a consensus observation"
-            )
-        finally:
-            direct.close()
-
-    # -- direct: the normal import, with its immediate background rebuild. --
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        headers = _csrf_headers(client)
-        caplog.set_level(logging.INFO)
-        resp = client.post("/api/import/db", content=payload, headers=headers)
-        assert resp.status_code == 200
-    _assert_no_guard_warning(caplog)
-    info_hits = [
-        record.getMessage()
-        for record in caplog.records
-        if record.levelno == logging.INFO
-        and "kept" in record.getMessage()
-        and "skipped" in record.getMessage()
-    ]
-    assert len(info_hits) == 1, info_hits
-    counts = re.search(r"kept (\d+) cells, skipped (\d+)", info_hits[0])
-    assert counts is not None, info_hits[0]
-    # One cell on D-1 (both stations' readings collapse to the site's one
-    # temperature hour) is kept; D-3's own hand-planted observations cell is
-    # skipped, not refused -- the file's day states are final.
-    assert (counts.group(1), counts.group(2)) == ("1", "1"), info_hits[0]
-    _assert_rebuilt(config.db_path)
-
-    # -- resume: the same file, imported with its background rebuild
-    # suppressed, then picked up by the next boot (api/app.py's startup
-    # resume), following tests/test_db_transfer.py's
-    # test_boot_resumes_interrupted_import_rebuild. --
-    resume_dir = tmp_path / "resume"
-    resume_dir.mkdir()
-    conn2 = _init_tmp_db(resume_dir)
-    asof_make_site(conn2, "Pre Import Site")
-    conn2.commit()
-
-    async def _rebuild_derived_noop(_backup: Path) -> None:
-        return None
-
-    monkeypatch.setattr(db_transfer, "_rebuild_derived", _rebuild_derived_noop)
-    app1 = _make_app(monkeypatch)
-    with TestClient(app1) as client1:
-        headers1 = _csrf_headers(client1)
-        resp1 = client1.post("/api/import/db", content=payload, headers=headers1)
-        assert resp1.status_code == 200
-
-    direct_pending = sqlite3.connect(config.db_path)
-    try:
-        pending = direct_pending.execute(
-            "SELECT value FROM runtime_state WHERE key='import_rebuild_state'"
-        ).fetchone()
-    finally:
-        direct_pending.close()
-    assert pending is not None and pending[0] == "pending", (
-        "setup check: the background rebuild must have been suppressed"
-    )
-
-    close_db()
-    app2 = _make_app(monkeypatch)
-    with TestClient(app2):
-        pass  # the lifespan's boot-resume runs the real rebuild here.
-
-    _assert_rebuilt(config.db_path)
-
-
-_GW13B_BAD_CASES: Final = (
-    (
-        "site_days",
-        "day_start_utc",
-        "not-a-stamp",
-        "invalid timestamp in site_days.day_start_utc: expected UTC form"
-        " YYYY-MM-DDTHH:MM:SSZ",
-    ),
-    (
-        "site_days",
-        "local_date",
-        "2024/06/10",
-        "invalid date in site_days.local_date: expected YYYY-MM-DD",
-    ),
-    (
-        "station_changes",
-        "effective_date",
-        "2024/06/10",
-        "invalid date in station_changes.effective_date: expected YYYY-MM-DD",
-    ),
-    (
-        "site_zone_changes",
-        "effective_date",
-        "2024/06/10",
-        "invalid date in site_zone_changes.effective_date: expected YYYY-MM-DD",
-    ),
-    (
-        "station_changes",
-        "changed_at",
-        "2024-06-10T00:00:00Z",
-        "invalid timestamp in station_changes.changed_at: expected UTC form"
-        " YYYY-MM-DDTHH:MM:SS.ffffffZ",
-    ),
-    (
-        "site_zone_changes",
-        "entered_at",
-        "2024-06-10T00:00:00Z",
-        "invalid timestamp in site_zone_changes.entered_at: expected UTC form"
-        " YYYY-MM-DDTHH:MM:SS.ffffffZ",
-    ),
-)
-
-
-@pytest.mark.parametrize(("table", "column", "bad_value", "message"), _GW13B_BAD_CASES)
-def test_gw13b_import_rejects_each_new_bound_check(
-    table: str,
-    column: str,
-    bad_value: str,
-    message: str,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _init_tmp_db(tmp_path)
-    from tests.helpers import asof_make_site
-
-    asof_make_site(conn, "Guarded Site")
-    conn.commit()
-
-    b_path = tmp_path / f"bad-{table}-{column}.db"
-    b_db = Database(str(b_path))
-    try:
-        site_b = day_close_site(b_db._conn)  # noqa: SLF001
-        if table == "site_zone_changes":
-            # day_close_site never calls enter_zone_change, so this table
-            # starts with 0 rows and an unscoped UPDATE would be a no-op
-            # over nothing -- the import would then see the ORIGINAL (valid)
-            # row contents and the test could not fail for the stated
-            # reason. Seed one real row to carry the bad value.
-            from wxverify.db.site_days import enter_zone_change
-
-            enter_zone_change(b_db._conn, site_b, "Etc/GMT-1", now_utc=NOW)
-        if table == "site_days":
-            # An unscoped UPDATE sets every row's local_date to the SAME
-            # bad_value under one site_id, which for the local_date case
-            # collides with the (site_id, local_date) PRIMARY KEY on the
-            # second row onward. Scope to one row to avoid that collision.
-            if column == "local_date":
-                # site_day_stations.FOREIGN KEY (site_id, local_date)
-                # REFERENCES site_days(site_id, local_date): changing the
-                # PK's local_date out from under its child rows would
-                # violate that FK before the import is ever reached. Drop
-                # this one day's children first so the file stays
-                # consistent -- not a blanket "foreign_keys off", which
-                # would leave orphaned children able to make the import
-                # refuse the file for a different (wrong) reason.
-                b_db._conn.execute(  # noqa: SLF001
-                    "DELETE FROM site_day_stations"
-                    " WHERE site_id = ? AND local_date = ?",
-                    (site_b, _d1().isoformat()),
-                )
-            b_db._conn.execute(  # noqa: SLF001
-                f"UPDATE site_days SET {column} = ?"  # noqa: S608
-                " WHERE site_id = ? AND local_date = ?",
-                (bad_value, site_b, _d1().isoformat()),
-            )
-        else:
-            b_db._conn.execute(  # noqa: SLF001
-                f"UPDATE {table} SET {column} = ?",  # noqa: S608
-                (bad_value,),
-            )
-        b_db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
-        b_db._conn.commit()  # noqa: SLF001
-    finally:
-        b_db.close()
-    payload = b_path.read_bytes()
-
-    app = _make_app(monkeypatch)
-    with TestClient(app, raise_server_exceptions=False) as client:
-        headers = _csrf_headers(client)
-        resp = client.post("/api/import/db", content=payload, headers=headers)
-    assert resp.status_code == 422, (
-        f"{table}.{column}: expected 422, got {resp.status_code}"
-    )
-    assert resp.json() == {"error": message}
-
-    with TestClient(app, raise_server_exceptions=False) as client:
-        sites = client.get("/api/sites").json()
-    assert {s["name"] for s in sites} == {"Guarded Site"}, (
-        f"{table}.{column}: live DB must be untouched"
-    )
-
-
-def test_gw13b_import_accepts_a_null_retry_at_and_a_set_one(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    conn = _init_tmp_db(tmp_path)
-    from tests.helpers import asof_make_site
-
-    asof_make_site(conn, "Pre Import Site")
-    conn.commit()
-
-    b_path = tmp_path / "retry-at-positive.db"
-    b_db = Database(str(b_path))
-    try:
-        site_b = day_close_site(b_db._conn)  # noqa: SLF001
-        row = b_db._conn.execute(  # noqa: SLF001
-            "SELECT day_end_utc FROM site_days WHERE site_id=? AND local_date=?",
-            (site_b, _d1().isoformat()),
-        ).fetchone()
-        from wxverify.core.timeutil import parse_utc
-
-        # A bare UPDATE ... SET retry_at=? violates the CHECK that ties
-        # retry_at to (attempts=2 OR state='retry_due' OR missed_reason IS
-        # 'retry_not_run'): D1 starts as state='open', attempts=0. Drive it
-        # through the real close/fail cycle (mirrors GW10b) so retry_at
-        # lands set together with the state/attempts the CHECK requires.
-        t = parse_utc(row["day_end_utc"]) + timedelta(minutes=30)
-        begin_close(b_db._conn, site_b, _d1(), now_utc=note_day_clock(t))  # noqa: SLF001
-        fail_close(  # noqa: SLF001
-            b_db._conn, site_b, _d1(), now_utc=note_day_clock(t), reason="x"
-        )
-        b_db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
-        b_db._conn.commit()  # noqa: SLF001
-    finally:
-        b_db.close()
-    payload = b_path.read_bytes()
-
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        headers = _csrf_headers(client)
-        resp = client.post("/api/import/db", content=payload, headers=headers)
-    assert resp.status_code == 200
+# GW13 (the import's rebuild-only-the-open-day behavior), GW13b's bad-case
+# bound checks and GW13b's paired accepted case were removed with the
+# database import (storage-release plan 5.5): every one of them was
+# entirely about the removed import route.
 
 
 # ---------------------------------------------------------------------------
@@ -1293,29 +382,29 @@ _GW17_ALLOWLIST: Final = frozenset(
         ("wxverify.db.station_readings", "prune_raw_readings"),
         # P1 7.3 row: P3's writers, TRUTH.
         ("wxverify.verification.truth", "write_close_truth"),
-        ("wxverify.api.routes.sites", "update_site"),  # 7.3 W12
-        ("wxverify.provider_ops", "_invalidate_mean_for_site"),  # 7.3 W13
-        ("wxverify.api.routes.db_transfer", "_rebuild_all"),  # 7.5 W14
-        ("wxverify.db.site_days", "*"),  # P1 state functions, 4.7 and 6.4
-        # A1's single-generation-per-site keep, only inside migrate_v15_switch
-        # on a file below 15, which holds no closed day (plan 10.1).
-        ("wxverify.db.switch", "keep_read_generations"),
+        # 7.5 W14 (the import's _rebuild_all) was removed with the database
+        # import (storage-release plan 5.5). update_site (7.3 W12) and
+        # _invalidate_mean_for_site (7.3 W13) were removed with the pair
+        # rebuilds (storage-release plan W5, B13/B14): neither writes a
+        # guarded table any longer.
+        # P1 state functions, 4.7 and 6.4; also station_changes (its seed
+        # migration constant and migrate_v15_switch's keep_read_generations,
+        # which wrote it below v15, are both deleted, storage-release plan
+        # 4.1/table 1.B).
+        ("wxverify.db.site_days", "*"),
         # P6 12.5: the owner's one-time wind-history prune, before each
         # site's first record, through P1's guard (WriteKind.HISTORY_PRUNE).
         ("wxverify.db.switch", "prune_station_history"),
-        ("wxverify.verification.runs", "*"),  # verification tables only
-        ("wxverify.db.migrations", "SEED_STATION_CHANGES_SQL"),  # migration (v11)
-        ("wxverify.scoring.consensus", "_invalidate_consensus_dependents"),  # 7.3
-        ("wxverify.scoring.consensus", "_delete_future_persistence_pairs"),  # 7.3 notes
-        ("wxverify.scoring.multimodel", "_MEAN_INSERT_SQL"),  # 7.3 W10
-        ("wxverify.scoring.pairing", "_PAIR_INSERT_SQL"),  # 7.3 W10
-        ("wxverify.scoring.persistence", "_PERSISTENCE_INSERT_SQL"),  # 7.3 W10
-        ("wxverify.scoring.split", "_DELETE_PAIR_BY_ID_SQL"),  # 7.3 W10
-        # The replay's persist_day_evidence; P6 keeps it, uncalled (N7).
-        ("wxverify.verification.simulate", "_EVIDENCE_INSERT_SQL"),  # not a day write
+        # _invalidate_consensus_dependents and _delete_future_persistence_pairs
+        # (7.3) were removed with B6 (storage-release plan W5): neither
+        # writes a guarded table any longer. wxverify.scoring.multimodel,
+        # .pairing, .persistence and .split -- the old pair-and-score
+        # pipeline's own writers -- are themselves gone (storage-release
+        # plan 2026-11-02, table 1.B), so their four entries are dropped
+        # here too, not just the two names above. The replay/verification-run
+        # layer's own writers (runs.py, simulate.py, cleanup.py) are gone the
+        # same way (0.16.14 Part B), so their three entries are dropped too.
         ("wxverify.verification.truth", "mark_daily_truth_stale"),  # 7.3 notes
-        # worksheet cleanup, not a day write (P1 5.4)
-        ("wxverify.verification.cleanup", "_DELETE_SLICE_SQL"),
     }
 )
 

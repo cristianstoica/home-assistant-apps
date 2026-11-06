@@ -46,7 +46,7 @@
                     {{ '%.1f'|format(tile.precip.total_mm) }} mm
                     {%- if tile.precip.wet_hours is not none %} &middot; {{ tile.precip.wet_hours }} h{% endif %}
                     {%- if tile.precip.icon == 'light' %} &#127783;{% elif tile.precip.icon == 'heavy' %} &#9748;{% endif %}
-                    {%- if tile.precip.agreement_pct is not none %} &middot; Agreement {{ tile.precip.agreement_pct }}%{% endif %}
+                    {%- if tile.precip.agreement_pct is not none %} &middot; <span title="Agreement">{{ tile.precip.agreement_pct }}%</span>{% endif %}
                   </strong>
                 {% else %}
                   <strong class="muted">No rain forecast</strong>

@@ -68,6 +68,12 @@ class WriteKind(StrEnum):
 
 # Value: the switch time, a canonical UTC ``...Z`` stamp.
 DAILY_CLOSE_ON_KEY: Final = "daily_close_on_at"
+#: What every retired control answers with (switch-over plan 7.3).
+RETIRED_CONTROL_MESSAGE: Final = (
+    "This control was retired when the daily close turned on. "
+    "Each day is collected and closed once after it ends, "
+    "and past days are not fetched again."
+)
 # Written by the offline close command into the database copy it makes.
 OFFLINE_COPY_KEY: Final = "offline_close_copy_made_at"
 RETRY_DELAY: Final = timedelta(hours=1)
@@ -1099,76 +1105,25 @@ def check_date_write(
 ) -> bool:
     """Whether one write keyed by ``local_date`` may go ahead (7.1).
 
-    While the close is off, ``True`` only for ``READING``, ``HOURLY``,
-    ``TRUTH`` and ``PAIRS``. While it is on, creates the site's missing
-    records, then follows table 5.2 for the record dated ``local_date``;
-    ``RAW_PRUNE`` on a done day follows rule 5.4, and with no record only
-    ``HISTORY_PRUNE`` before the site's first record is allowed. Never
-    raises for a refusal.
+    Creates the site's missing records, then follows table 5.2 for the
+    record dated ``local_date``; ``RAW_PRUNE`` on a done day follows rule
+    5.4, and with no record only ``HISTORY_PRUNE`` before the site's first
+    record is allowed. This holds whether or not ``DAILY_CLOSE_ON_KEY`` is
+    present (storage-release plan 3.2). Never raises for a refusal.
     """
     now = _as_utc(now_utc)
-    if not daily_close_on(conn):
-        allowed = kind in _CLOSE_OFF_KINDS
+    _ensure(conn, site_id, now)
+    record = day_record(conn, site_id, local_date)
+    if record is None:
+        allowed = False
+        if kind == WriteKind.HISTORY_PRUNE:
+            first = _first_record(conn, site_id)
+            allowed = first is not None and local_date < first.local_date
     else:
-        _ensure(conn, site_id, now)
-        record = day_record(conn, site_id, local_date)
-        if record is None:
-            allowed = False
-            if kind == WriteKind.HISTORY_PRUNE:
-                first = _first_record(conn, site_id)
-                allowed = first is not None and local_date < first.local_date
-        else:
-            allowed = _record_allows(conn, record, kind, now)
+        allowed = _record_allows(conn, record, kind, now)
     if not allowed:
         _log_declined(site_id, kind, (local_date,), 1)
     return allowed
-
-
-def open_day_clause(
-    conn: sqlite3.Connection, *, site_expr: str, instant_expr: str
-) -> str:
-    """SQL true for instants on days that are ``open`` or ``closing`` (7.3).
-
-    ``"1"`` while the close is off. Read-only; never creates records. Both
-    expressions must be qualified (contain a ``.``), else ``ValueError``:
-    an unqualified name would bind to ``site_days``' own column.
-    """
-    if "." not in site_expr or "." not in instant_expr:
-        raise ValueError("open_day_clause needs qualified column expressions")
-    if not daily_close_on(conn):
-        return "1"
-    return (
-        "EXISTS (SELECT 1 FROM site_days INDEXED BY idx_site_days_writable"
-        f" WHERE site_days.site_id = {site_expr}"
-        " AND state IN ('open','closing')"
-        f" AND julianday(site_days.day_start_utc) <= julianday({instant_expr})"
-        f" AND julianday({instant_expr}) < julianday(site_days.day_end_utc))"
-    )
-
-
-def writable_pairs_clause(
-    conn: sqlite3.Connection, site_id: int | None, *, now_utc: datetime
-) -> str:
-    """SQL that keeps ``forecast_pairs`` rows on days that take ``PAIRS`` (7.3).
-
-    ``"1"`` while the close is off. Otherwise creates the missing records of
-    the site (of every site when ``site_id`` is ``None``) first.
-    """
-    if not daily_close_on(conn):
-        return "1"
-    now = _as_utc(now_utc)
-    if site_id is None:
-        site_ids = [
-            int(row[0])
-            for row in conn.execute("SELECT id FROM sites ORDER BY id").fetchall()
-        ]
-    else:
-        site_ids = [site_id]
-    for each in site_ids:
-        _ensure(conn, each, now)
-    return open_day_clause(
-        conn, site_expr="forecast_pairs.site_id", instant_expr="forecast_pairs.valid_at"
-    )
 
 
 # ---------------------------------------------------------------------------

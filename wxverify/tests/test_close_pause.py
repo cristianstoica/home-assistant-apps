@@ -196,7 +196,7 @@ def _seed_abc_site(tmp_path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[n
 
     set_runtime_state(conn, "worker_started_at", isoformat_utc(NOW))
     conn.commit()
-    return db, FencedWriter(db, db.generation), site_id, stations
+    return db, FencedWriter(db), site_id, stations
 
 
 def _seed_five_minute_day(

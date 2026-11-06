@@ -74,10 +74,15 @@ def _user_version(conn: sqlite3.Connection) -> int:
 def _build_v4_matrix_db(
     *, google_blend_lead: int, marker: str | None
 ) -> sqlite3.Connection:
-    """A v4 database holding the three rows §4's fixture spec calls for:
-    the target row, a differently-valued other-source row, and a
-    google-non-blend row at a value that is neither 24 nor 168."""
-    conn = _bare_db(user_version=4)
+    """A fresh-build-path (user_version 0) database holding the three rows
+    §4's fixture spec calls for: the target row, a differently-valued
+    other-source row, and a google-non-blend row at a value that is
+    neither 24 nor 168. The correction has no version gate of its own (it
+    runs unconditionally in ``run_migrations``'s fixed corrections step),
+    so 0 stands in for "any pre-fix version" without hitting the
+    storage-release refusal for 1-15 (``run_migrations`` accepts 0 and 16
+    only below 17)."""
+    conn = _bare_db(user_version=0)
     _insert_feed(conn, source="google", model="blend", max_lead_hours=google_blend_lead)
     _insert_feed(conn, source="site-beta-src", model="model-x", max_lead_hours=99)
     _insert_feed(conn, source="google", model="current", max_lead_hours=50)

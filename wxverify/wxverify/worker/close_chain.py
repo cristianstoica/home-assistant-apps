@@ -1,7 +1,7 @@
 """The daily close's night chain: the close of each site-day and its logs.
 
-Holds the chain's constants; the bodies of stages 2 to 8 (``day_close``
-stages 2 to 6, ``day_publish`` stages 7 and 8) under the hand-off rule
+Holds the chain's constants; the bodies of stages 2 to 7 (``day_close``
+stages 2 to 6, ``day_publish`` stage 7) under the hand-off rule
 (plan 8.1-8.3), entered through ``run_day_close`` and ``run_day_publish``;
 the failure writes ``fail_attempt`` and ``fail_publication`` (9.1, 9.4) and
 the hooks ``_fail_job`` calls for them; ``run_close_retention`` (8.4);
@@ -11,11 +11,11 @@ P5 and P6 (14.2); ``record_collection_try``, the writer of the
 collection try log (11.2); and ``enqueue_due_close_work``, the tick's part
 (8.5): stage 1, the missed days, the repair and the publication retry; and
 ``settle_interrupted_closes``, which settles the closes and publications a
-stop cut short, at each start and on an imported file (5.5, 9.4, 12.6);
+stop cut short, at each start (5.5, 9.4);
 and ``begin_offline_close`` and ``run_offline_stage``, with which the
 ``close-day`` command closes one past day on a database copy (8.8).
 
-P4's four call points are always called through ``close_p4``, never
+P4's three call points are always called through ``close_p4``, never
 imported by name, so P4 binds them in that one module.
 
 ``worker/wind_days.py`` imports ``record_collection_try`` at load time, so
@@ -35,6 +35,7 @@ from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from typing import Final, Literal, cast
 
+from wxverify.core import stop
 from wxverify.core.timeutil import (
     isoformat_utc,
     isoformat_utc_micro,
@@ -173,7 +174,7 @@ class _StageJob:
     """A stage job's identity, from its key and payload (plan 8.1).
 
     ``local_date`` is the site-day for stages 2 to 6 and the publication's
-    cutoff for stages 7 and 8; ``attempt`` the close attempt or the
+    cutoff for stage 7; ``attempt`` the close attempt or the
     publication attempt.
     """
 
@@ -636,7 +637,7 @@ def _stage_job(job: Job) -> _StageJob | None:
         elif job.type == "day_publish" and len(parts) == 3 and parts[0] == "publish":
             site_id, stage = int(parts[1]), int(parts[2])
             local_date = job.payload.get("cutoff")
-            valid = stage in (7, 8)
+            valid = stage == 7
         else:
             return None
         if not valid or site_id != job.site_id or not isinstance(local_date, str):
@@ -723,7 +724,7 @@ def _write_stage_row(
     reason: str | None = None,
     detail: dict[str, object] | None = None,
 ) -> None:
-    """Insert one ``close_stage_log`` row for a stage 2 to 8 job (11.1).
+    """Insert one ``close_stage_log`` row for a stage 2 to 7 job (11.1).
 
     ``enqueued_at`` and ``started_at`` are the job row's stamps as stored;
     ``ended_at`` is ``now_utc``, when the completing or failing write runs.
@@ -1211,7 +1212,7 @@ async def _closure_stage(writer: FencedWriter, raw: Job, job: _StageJob) -> None
         await writer.write(lambda conn: run_close_retention(conn, now_utc=utc_now()))
 
 
-# --- stages 7 and 8: the publication -----------------------------------------
+# --- stage 7: the publication ------------------------------------------------
 
 
 def _newer_publication(conn: sqlite3.Connection, job: _StageJob) -> bool:
@@ -1278,7 +1279,7 @@ def _begin_publication(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> bo
 async def _publish_stage(
     db: Database, writer: FencedWriter, raw: Job, job: _StageJob
 ) -> None:
-    """Stage 7: publish up to the cutoff, then stage 8 (8.1, 9.4).
+    """Stage 7, the chain's last: publish up to the cutoff (8.1, 9.4).
 
     An exception from P4 propagates; ``fail_day_publish_job`` records it.
     """
@@ -1320,45 +1321,6 @@ async def _publish_stage(
             outcome="completed",
             detail={"publication_id": publication_id},
         )
-        _enqueue_publish_stage(conn, job.site_id, job.local_date, 8, job.attempt)
-
-    await writer.write(finish)
-
-
-def _check_cleanup(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> None:
-    """Stage 8's checks: a ``published`` record of its cutoff and attempt.
-
-    Otherwise ``JobCancelled``, with nothing written, so the job completes
-    without the success marker (8.2, 9.6). A job claimed too late raises,
-    so its failure is recorded as any stage-8 failure (8.3, 9.4).
-    """
-    _require_close_on(conn, raw)
-    record = publication_record(conn, site_id=job.site_id, cutoff=job.local_date)
-    if record is None or record.state != "published" or record.attempt != job.attempt:
-        raise JobCancelled()
-    if _stalled(*_job_stamps(conn, job.job_id, utc_now())):
-        raise RuntimeError("stalled")
-
-
-async def _cleanup_stage(
-    db: Database, writer: FencedWriter, raw: Job, job: _StageJob
-) -> None:
-    """Stage 8: P4 deletes older runs' worksheets; nothing follows (8.1)."""
-    await db.read(lambda conn: _check_cleanup(conn, raw, job))
-    runs = await close_p4.clean_worksheets(
-        db=db, writer=writer, site_id=job.site_id, now_utc=utc_now()
-    )
-
-    def finish(conn: sqlite3.Connection) -> None:
-        now = utc_now()
-        _write_stage_row(
-            conn,
-            job,
-            _job_stamps(conn, job.job_id, now),
-            now_utc=now,
-            outcome="completed",
-            detail={"runs_finished": runs},
-        )
 
     await writer.write(finish)
 
@@ -1382,7 +1344,10 @@ async def run_day_close(db: Database, writer: FencedWriter, job: Job) -> None:
     ends with ``JobCancelled``. A stale job returns at once; a stage that
     decides it failed records the failure itself and returns. An exception
     propagates, for ``_fail_job`` to record through ``fail_day_close_job``.
+    Once a stop has begun no stage starts: ``StopRequested`` (storage-release
+    plan 6.3), for which ``run_claimed_job`` records nothing.
     """
+    stop.check()
     stage_job = _parse_or_cancel(job, "day_close")
     if stage_job.stage == 2:
         await _gap_fill_stage(db, writer, job, stage_job)
@@ -1397,19 +1362,17 @@ async def run_day_close(db: Database, writer: FencedWriter, job: Job) -> None:
 
 
 async def run_day_publish(db: Database, writer: FencedWriter, job: Job) -> None:
-    """Run one ``day_publish`` job: stage 7 or 8 (plan 8.1, 8.2, 9.4).
+    """Run one ``day_publish`` job: stage 7 (plan 8.1, 8.2, 9.4).
 
     ``dispatch`` calls it as ``await run_day_publish(db, writer, job)``. A
     malformed job, or one found while the close is off (one WARNING, 13.1),
-    ends with ``JobCancelled``, as does a stage 8 with no ``published``
-    record of its attempt. An exception propagates, for ``_fail_job`` to
-    record through ``fail_day_publish_job``.
+    ends with ``JobCancelled``. An exception propagates, for ``_fail_job``
+    to record through ``fail_day_publish_job``. Once a stop has begun no
+    stage starts, as in ``run_day_close``.
     """
+    stop.check()
     stage_job = _parse_or_cancel(job, "day_publish")
-    if stage_job.stage == 7:
-        await _publish_stage(db, writer, job, stage_job)
-    else:
-        await _cleanup_stage(db, writer, job, stage_job)
+    await _publish_stage(db, writer, job, stage_job)
 
 
 # --- the offline close of one past day (8.8) ---------------------------------
@@ -1664,32 +1627,21 @@ def fail_day_publish_job(
 ) -> None:
     """``_fail_job``'s ``day_publish`` branch, in its transaction (plan 9.4).
 
-    Stage 7: ``fail_publication`` with ``reason``. Stage 8: only stage 8's
-    stage-log row, ``failed``; the record stays ``published``. Call it
-    before ``fail()``, as ``fail_day_close_job``.
+    Stage 7: ``fail_publication`` with ``reason``. Call it before
+    ``fail()``, as ``fail_day_close_job``.
     """
     stage_job = _stage_job(job)
     if stage_job is None or job.type != "day_publish":
         logger.warning("malformed day_publish job %s failed", job.id)
         return
-    if stage_job.stage == 7:
-        fail_publication(
-            conn,
-            site_id=stage_job.site_id,
-            cutoff=stage_job.local_date,
-            attempt=stage_job.attempt,
-            reason=reason,
-            now_utc=now_utc,
-            job_id=job.id,
-        )
-        return
-    _write_stage_row(
+    fail_publication(
         conn,
-        stage_job,
-        _job_stamps(conn, job.id, now_utc),
-        now_utc=now_utc,
-        outcome="failed",
+        site_id=stage_job.site_id,
+        cutoff=stage_job.local_date,
+        attempt=stage_job.attempt,
         reason=reason,
+        now_utc=now_utc,
+        job_id=job.id,
     )
 
 
@@ -2326,9 +2278,8 @@ def settle_interrupted_closes(conn: sqlite3.Connection, *, now_utc: datetime) ->
 
     Plan 5.5 and 9.4. Does nothing while the close is off (13.1). ``lifespan``
     calls it at each start, after ``reclaim_all_stale`` and before the
-    ``worker_started_at`` write; ``import_db`` calls it on the staged file
-    before the swap (12.6), so ``now_utc`` is the start or the import's
-    time. Each ``closing`` day, oldest first, then each ``building``
+    ``worker_started_at`` write, so ``now_utc`` is the start's time. Each
+    ``closing`` day, oldest first, then each ``building``
     publication record, oldest cutoff first, is settled under its own
     ``SAVEPOINT close_settle`` (``_settle_day``, ``_settle_publication``);
     one that raises is left as it was, with one ERROR line, and the next

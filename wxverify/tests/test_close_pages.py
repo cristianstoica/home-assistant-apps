@@ -30,19 +30,17 @@ from tests.helpers import (
     NOW,
     D,
     asof_make_real_feed,
-    asof_persistence_feed_id,
+    close_off,
     day_close_site,
     seed_active_publication,
-    seed_closed_pairs,
     seed_coverage,
+    seed_forecast_history,
 )
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.timeutil import isoformat_utc
-from wxverify.db.connection import close_db, get_db, init_db
-from wxverify.db.runtime_state import delete_runtime_state
+from wxverify.db.connection import close_db, init_db
 from wxverify.db.site_days import (
-    DAILY_CLOSE_ON_KEY,
     begin_close,
     day_record,
     ensure_site_days,
@@ -153,60 +151,29 @@ def _close_day(
     finish_close(conn, site_id, local_date, now_utc=t)
 
 
-def _seed_pair(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    feed_id: int,
-    variable: str,
-    issued_at: str,
-    valid_at: str,
-    lead_hours: int,
-    day_ahead: int,
-    forecast: float,
-    observed: float,
-    generation_id: int,
-) -> None:
-    conn.execute(
-        "INSERT INTO forecast_pairs"
-        " (site_id, feed_id, variable, issued_at, valid_at, lead_hours,"
-        "  day_ahead, forecast, observed, tz_generation_id)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            site_id,
-            feed_id,
-            variable,
-            issued_at,
-            valid_at,
-            lead_hours,
-            day_ahead,
-            forecast,
-            observed,
-            generation_id,
-        ),
-    )
-
-
-def test_pg1_closed_day_pairs_replace_forecast_pairs(
+def test_pg1_closed_day_history_replaces_forecast_pairs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PG1 (plan §13.9, §9.2): closed-day pairs (D-3) and the starting
-    history are kept; a missed day (D-2) is dropped and listed in
-    `missed_days`; an open day (D-1) is dropped too (M86, M87). The
-    starting-history row is itself a D+1 forecast (`lead_hours` 24,
-    `issued_at` 24h before its `valid_at`), so the route's default `lead`
-    (D+1) keeps it too (plan row ~812, 9.2)."""
+    """PG1 (plan §13.9, §9.2; storage-release plan A3/A4/3.6): closed-day
+    rows (D-3) and the starting history are kept; a missed day (D-2) is
+    dropped and listed in `missed_days`; an open day (D-1) is dropped too
+    (M86, M87). The starting-history row is itself a D+1 forecast
+    (`lead_hours` 24, `issued_at` 24h before its `valid_at`), so the
+    route's default `lead` (D+1) keeps it too (plan row ~812, 9.2).
+    ``close_pairs``/``forecast_pairs`` are no longer read; both the
+    closed-day row and the starting-history row now live in
+    ``forecast_history``."""
     conn = _init_tmp_db(tmp_path)
     site_id = day_close_site(conn, close_on=True)
     feed_id = asof_make_real_feed(conn, "pg-feed")
-    generation_id = ensure_site_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     _patch_clock(monkeypatch, NOW)
 
     d_minus_3 = D - timedelta(days=3)
     d_minus_2 = D - timedelta(days=2)
     d_minus_1 = D - timedelta(days=1)
     for d in (d_minus_3, d_minus_2, d_minus_1):
-        seed_closed_pairs(
+        seed_forecast_history(
             conn,
             site_id=site_id,
             local_date=d,
@@ -239,18 +206,18 @@ def test_pg1_closed_day_pairs_replace_forecast_pairs(
         )
         - timedelta(hours=24)
     )
-    _seed_pair(
+    seed_forecast_history(
         conn,
         site_id=site_id,
+        local_date=before_first_record,
         feed_id=feed_id,
         variable="temperature",
-        issued_at=before_issued_at,
+        day_ahead=1,
         valid_at=before_valid_at,
         lead_hours=24,
-        day_ahead=1,
         forecast=5.0,
         observed=5.5,
-        generation_id=generation_id,
+        issued_at=before_issued_at,
     )
 
     app = _make_app(monkeypatch)
@@ -274,7 +241,7 @@ def test_pg1_closed_day_pairs_replace_forecast_pairs(
     assert before_valid_at in valid_at, "starting history must always be kept"
     assert d3_valid_at in valid_at, (
         "M87 -> at this assertion: correct = the closed D-3 hour present"
-        " (read through closed_day_pairs), mutant = pairs before the first"
+        " (read through chart_pairs), mutant = pairs before the first"
         f" record dropped, so this hour would be absent too; valid_at={valid_at!r}"
     )
     d2_valid_at = isoformat_utc(
@@ -325,54 +292,6 @@ def test_pg2_provisional_keys_present_with_close_on(
         f" left out with the close on; body keys={sorted(body)!r}"
     )
     assert body.get("provisional_latest_reading_at") is not None
-
-
-def test_pg3_close_off_adds_only_empty_new_keys(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """PG3 (plan §13.9, §9.2): with the close off, the reply equals today's
-    plus the new keys empty/null (M89).
-
-    ``body.get(key, empty)`` reads the SAME ``empty`` value whether the
-    mutant's code drops the key or correct code sets it explicitly to
-    ``empty`` -- an absent key and a key present but empty are the same
-    thing to a ``dict.get`` with a matching default, so the original
-    version of this loop could not tell M89's missing keys from M0's
-    present-and-empty ones. Each key must be checked present first.
-    """
-    conn = _init_tmp_db(tmp_path)
-    site_id = day_close_site(conn, close_on=False)
-    feed_id = asof_make_real_feed(conn, "pg3-feed")
-    _patch_clock(monkeypatch, NOW)
-
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        response = client.get(
-            "/api/timeseries",
-            params={"site": site_id, "variable": "temperature", "feed_id": feed_id},
-        )
-    assert response.status_code == 200
-    body = response.json()
-    for key, empty in (
-        ("missed_days", []),
-        ("zone_days", []),
-        ("provisional", []),
-        ("provisional_valid_at", []),
-        ("provisional_latest_reading_at", None),
-    ):
-        assert key in body, (
-            f"M89 -> at this assertion: correct = {key!r} present with the"
-            " close off (explicitly set to its empty value), mutant = the"
-            f" new keys left out with the close off, so {key!r} would be"
-            f" absent here; body keys={sorted(body)!r}"
-        )
-        value = body[key]
-        assert value == empty or value is None, (
-            f"M89 -> at this assertion: correct = {key} empty/null with the"
-            f" close off, mutant = the new keys left out with the close"
-            f" off would still read as empty here, so a real divergence"
-            f" needs {key}={value!r} to be non-empty, which would fail"
-        )
 
 
 def test_pg4_zone_changeover_day_and_zone_flagged_days(
@@ -678,6 +597,7 @@ def test_pg8_dashboard_close_off_no_coverage(
     comes straight from the (wrongly found) publication lookup.
     """
     conn = _init_tmp_db(tmp_path)
+    close_off(conn)
     site_id = day_close_site(conn, close_on=False)
     feed_id = asof_make_real_feed(conn, "pg8-feed")
     _patch_clock(monkeypatch, NOW)
@@ -776,9 +696,10 @@ def test_pg10_worker_status_close_off_unchanged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """PG10 (plan §13.9, §9.6): with the close off, `last_completed_pair_
-    and_score_at` is today's (the completed job's own time) (M97). PASSES
-    today: with the close off P5 reads nothing new here."""
+    and_score_at` is always null, regardless of any completed
+    `pair_and_score` job (M97)."""
     conn = _init_tmp_db(tmp_path)
+    close_off(conn)
     site_id = day_close_site(conn, close_on=False)
     _patch_clock(monkeypatch, NOW)
     completed_at = isoformat_utc(NOW - timedelta(minutes=10))
@@ -794,16 +715,16 @@ def test_pg10_worker_status_close_off_unchanged(
         response = client.get("/api/worker/status")
     assert response.status_code == 200
     body = response.json()
-    assert body.get("last_completed_pair_and_score_at") == completed_at
+    assert body.get("last_completed_pair_and_score_at") is None
 
 
-def test_pg11_overlay_lists_active_feeds_without_forecast_pairs(
+def test_pg11_overlay_lists_active_feeds_without_forecast_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """PG11 (plan §13.9, §9.2): with the close on, the Overlay feed list
-    comes from the site's active feeds, not the `forecast_pairs` EXISTS --
-    a site whose only pairs are closed-day pairs still lists its feeds and
-    renders the chart (M117)."""
+    comes from the site's active feeds, not a `forecast_history` EXISTS --
+    a site whose only history is a closed day's history still lists its
+    feeds and renders the chart (M117)."""
     conn = _init_tmp_db(tmp_path)
     site_id = day_close_site(conn, close_on=True)
     feed_1 = asof_make_real_feed(conn, "pg11-a")
@@ -811,7 +732,7 @@ def test_pg11_overlay_lists_active_feeds_without_forecast_pairs(
     _patch_clock(monkeypatch, NOW)
 
     d_minus_3 = D - timedelta(days=3)
-    seed_closed_pairs(
+    seed_forecast_history(
         conn,
         site_id=site_id,
         local_date=d_minus_3,
@@ -833,25 +754,29 @@ def test_pg11_overlay_lists_active_feeds_without_forecast_pairs(
     text = response.text
     assert "No overlay data source is available." not in text, (
         "M117 -> at this assertion: correct = a feed resolves (the"
-        " active-feed listing, not the forecast_pairs EXISTS, which finds"
-        " nothing here), mutant = the close-on keeps the forecast_pairs"
+        " active-feed listing, not a forecast_history EXISTS, which finds"
+        " nothing here), mutant = the close-on keeps a forecast_history"
         " EXISTS, so no feed would list and this fallback text would show"
     )
     assert 'data-chart="overlay"' in text
 
 
-def test_pg12_issued_at_selects_one_run_closed_days_excluded(
+def test_pg12_lead_default_excludes_day_ahead_zero_starting_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PG12 (plan §13.9, §9.2): `issued_at=I1` keeps only I1's starting-
-    history rows and no closed-day row (ClosedPair carries no issued_at);
-    with no `issued_at`, D-3's row returns, and I1/I2 (D+0) drop out once
-    the default `lead` (D+1) is applied to the starting history (M124,
-    M136)."""
+    """PG12 (plan §13.9, §9.2): with no `lead` given, the default (D+1)
+    excludes the starting history's `day_ahead=0` rows (I1/I2) but keeps
+    D-3's closed `day_ahead=1` row.
+
+    `issued_at` (M124/M136's original subject) has left the timeseries API
+    entirely (storage-release plan A4) -- passing it now changes nothing,
+    which `tests/test_forecast_history_readers.py::test_timeseries_issued_
+    at_query_parameter_has_no_effect` covers; this test keeps only the fact
+    unrelated to `issued_at`: the default lead still filters the starting
+    history by day ahead."""
     conn = _init_tmp_db(tmp_path)
     site_id = day_close_site(conn, close_on=True)
     feed_id = asof_make_real_feed(conn, "pg12-feed")
-    generation_id = ensure_site_generation(conn, site_id)
     _patch_clock(monkeypatch, NOW)
 
     before_first_record = D - timedelta(days=10)
@@ -874,24 +799,24 @@ def test_pg12_issued_at_selects_one_run_closed_days_excluded(
         )
     )
     for issued_at in (i1, i2):
-        _seed_pair(
+        seed_forecast_history(
             conn,
             site_id=site_id,
+            local_date=before_first_record,
             feed_id=feed_id,
             variable="temperature",
-            issued_at=issued_at,
+            day_ahead=0,
             valid_at=issued_at,
             lead_hours=6,
-            day_ahead=0,
             forecast=5.0,
             observed=5.5,
-            generation_id=generation_id,
+            issued_at=issued_at,
         )
     d_minus_3 = D - timedelta(days=3)
     d3_valid_at = isoformat_utc(
         datetime(d_minus_3.year, d_minus_3.month, d_minus_3.day, 12, tzinfo=UTC)
     )
-    seed_closed_pairs(
+    seed_forecast_history(
         conn,
         site_id=site_id,
         local_date=d_minus_3,
@@ -906,44 +831,21 @@ def test_pg12_issued_at_selects_one_run_closed_days_excluded(
 
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
-        with_issued_at = client.get(
-            "/api/timeseries",
-            params={
-                "site": site_id,
-                "variable": "temperature",
-                "feed_id": feed_id,
-                "issued_at": i1,
-            },
-        )
-        without_issued_at = client.get(
+        without_lead = client.get(
             "/api/timeseries",
             params={"site": site_id, "variable": "temperature", "feed_id": feed_id},
         )
-    assert with_issued_at.status_code == 200 and without_issued_at.status_code == 200
-    with_body = with_issued_at.json()
-    assert i1 in with_body["valid_at"], (
-        "M136 -> at this assertion: correct = I1's starting-history row"
-        " (day_ahead 0) kept though issued_at is given and the default"
-        " lead is D+1 (with issued_at given, k filters nothing for the"
-        " starting history), mutant = the starting history filtered to k"
-        f" while issued_at is given, so I1 would be dropped; valid_at="
-        f"{with_body['valid_at']!r}"
+    assert without_lead.status_code == 200
+    body = without_lead.json()
+    assert d3_valid_at in body["valid_at"], (
+        "the default lead (D+1) must still keep D-3's closed day_ahead=1"
+        f" row -- valid_at={body['valid_at']!r}"
     )
-    assert i2 not in with_body["valid_at"]
-    assert d3_valid_at not in with_body["valid_at"], (
-        "M124 -> at this assertion: correct = no closed-day row while"
-        " issued_at is given (ClosedPair carries no issued_at to match"
-        f" on), mutant = closed-day rows kept regardless; valid_at="
-        f"{with_body['valid_at']!r}"
-    )
-    assert "missed_days" in with_body
-    without_body = without_issued_at.json()
-    assert d3_valid_at in without_body["valid_at"]
-    assert i1 not in without_body["valid_at"] and i2 not in without_body["valid_at"], (
-        "paired negative of the M136 check above: correct = with no"
-        " issued_at given, the starting history IS filtered to the"
-        " default lead (D+1), so I1/I2 (day_ahead 0) drop out here;"
-        f" valid_at={without_body['valid_at']!r}"
+    assert i1 not in body["valid_at"] and i2 not in body["valid_at"], (
+        "PG12 -> at this assertion: correct = I1/I2 (day_ahead 0) dropped"
+        " by the default lead D+1, mutant (the starting history's"
+        " day_ahead filter dropped, so I1/I2 would ride along too) ="
+        f" valid_at={body['valid_at']!r}"
     )
 
 
@@ -1068,22 +970,30 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """PG14 (plan §13.9, §9.2): the `lead` parameter, the day-ahead pick at
-    a closed hour, the starting-history pick, the close-off route and the
-    Overlay's lead control (M127-M135, M137-M140).
+    a closed hour, the starting-history pick and the Overlay's lead
+    control (M127-M129, M131-M135, M137-M140).
 
-    Must FAIL on today's code: `/api/timeseries` has no `lead` parameter at
-    all (`api/routes/timeseries.py:46-52`), `_closed_hour_pick` keeps every
-    row of an hour unconditionally (`:340-349`), `_stored_pairs` has no
-    `day_ahead` keyword (`:189-199`), and `/overlay` has no `lead` control
-    (`web/routes.py:225-231`, `web/templates/overlay/show.html`) -- so a
-    `lead` of "D+8" or "x" is silently ignored rather than 422ing, and every
-    pair at an hour is returned unfiltered rather than picked by day ahead.
+    Storage-release plan A3/A4/3.3: the reads now come from
+    `forecast_history` (via `seed_forecast_history`) -- the close-off reply
+    is gone (B16), so there is no separate close-off path to exercise here
+    any more. `forecast_history`'s primary key is `(site_id, feed_id,
+    variable, day_ahead, valid_at)`, so X's two `day_ahead=1`
+    starting-history runs (a write-time duplicate `_closed_hour_pick` used
+    to break by earliest `issued_at`, M132) cannot both exist as
+    `forecast_history` rows at once -- only the one row (forecast 5.0, the
+    earliest-issued run) is seeded.
+
+    Persistence (feed P) is dropped from this test entirely: under 3.3
+    `forecast_history` never holds a persistence row, so the original
+    M130 check -- two stored leads of the same day ahead, pick the
+    largest -- tests a removed behaviour; persistence's longest-lead pick
+    is rebuilt on read instead and is covered by
+    `tests/test_forecast_history_readers.py::test_history_chart_shows_rebuilt_persistence_at_the_longest_lead`.
     """
     conn = _init_tmp_db(tmp_path)
     site_id = day_close_site(conn, close_on=True)
     feed_x = asof_make_real_feed(conn, "pg14-x")
-    feed_p = asof_persistence_feed_id(conn)
-    generation_id = ensure_site_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     _patch_clock(monkeypatch, NOW)
 
     d_minus_3 = D - timedelta(days=3)
@@ -1093,8 +1003,10 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
     t13 = isoformat_utc(
         datetime(d_minus_3.year, d_minus_3.month, d_minus_3.day, 13, tzinfo=UTC)
     )
-    # X's closed-day pairs on D-3.
-    seed_closed_pairs(
+    # X's closed-day history on D-3. t12's two rows (day_ahead 1 and 2)
+    # forecast the same real hour, so they must share one observed value
+    # (`observations` is keyed on valid_at alone, never per feed/day_ahead).
+    seed_forecast_history(
         conn,
         site_id=site_id,
         local_date=d_minus_3,
@@ -1106,7 +1018,7 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
         forecast=10.0,
         observed=11.0,
     )
-    seed_closed_pairs(
+    seed_forecast_history(
         conn,
         site_id=site_id,
         local_date=d_minus_3,
@@ -1116,9 +1028,9 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
         valid_at=t12,
         lead_hours=48,
         forecast=20.0,
-        observed=21.0,
+        observed=11.0,
     )
-    seed_closed_pairs(
+    seed_forecast_history(
         conn,
         site_id=site_id,
         local_date=d_minus_3,
@@ -1130,33 +1042,7 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
         forecast=21.0,
         observed=22.0,
     )
-    # P's closed-day pairs on D-3 at 12:00, two leads of the same day ahead.
-    seed_closed_pairs(
-        conn,
-        site_id=site_id,
-        local_date=d_minus_3,
-        feed_id=feed_p,
-        variable="temperature",
-        day_ahead=1,
-        valid_at=t12,
-        lead_hours=13,
-        forecast=1.0,
-        observed=1.5,
-    )
-    seed_closed_pairs(
-        conn,
-        site_id=site_id,
-        local_date=d_minus_3,
-        feed_id=feed_p,
-        variable="temperature",
-        day_ahead=1,
-        valid_at=t12,
-        lead_hours=36,
-        forecast=2.0,
-        observed=2.5,
-    )
-    # X's forecast_pairs before the first record, D-10 06:00: two D+1 runs
-    # (different issued_at) and one D+0 run, all valid at the same hour.
+    # X's starting history, before the first record, D-10 06:00.
     before_first_record = D - timedelta(days=10)
     d_minus_11 = before_first_record - timedelta(days=1)
     valid_before = isoformat_utc(
@@ -1171,9 +1057,6 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
     issued_d11_00 = isoformat_utc(
         datetime(d_minus_11.year, d_minus_11.month, d_minus_11.day, 0, tzinfo=UTC)
     )
-    issued_d11_12 = isoformat_utc(
-        datetime(d_minus_11.year, d_minus_11.month, d_minus_11.day, 12, tzinfo=UTC)
-    )
     issued_d10_00 = isoformat_utc(
         datetime(
             before_first_record.year,
@@ -1183,44 +1066,35 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
             tzinfo=UTC,
         )
     )
-    _seed_pair(
+    # X's starting-history forecast_history rows (close-on): only the
+    # earliest-issued D+1 run (forecast 5.0) is seeded, since
+    # forecast_history's primary key forbids a second day_ahead=1 row at
+    # this same valid_at (see the docstring); the D+0 run is unaffected.
+    seed_forecast_history(
         conn,
         site_id=site_id,
+        local_date=before_first_record,
         feed_id=feed_x,
         variable="temperature",
-        issued_at=issued_d11_00,
+        day_ahead=1,
         valid_at=valid_before,
         lead_hours=30,
-        day_ahead=1,
         forecast=5.0,
         observed=5.5,
-        generation_id=generation_id,
+        issued_at=issued_d11_00,
     )
-    _seed_pair(
+    seed_forecast_history(
         conn,
         site_id=site_id,
+        local_date=before_first_record,
         feed_id=feed_x,
         variable="temperature",
-        issued_at=issued_d11_12,
-        valid_at=valid_before,
-        lead_hours=18,
-        day_ahead=1,
-        forecast=6.0,
-        observed=6.5,
-        generation_id=generation_id,
-    )
-    _seed_pair(
-        conn,
-        site_id=site_id,
-        feed_id=feed_x,
-        variable="temperature",
-        issued_at=issued_d10_00,
+        day_ahead=0,
         valid_at=valid_before,
         lead_hours=6,
-        day_ahead=0,
         forecast=7.0,
-        observed=7.5,
-        generation_id=generation_id,
+        observed=5.5,
+        issued_at=issued_d10_00,
     )
 
     app = _make_app(monkeypatch)
@@ -1265,37 +1139,11 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
                 "lead": "x",
             },
         )
-        p_no_lead = client.get(
-            "/api/timeseries",
-            params={"site": site_id, "variable": "temperature", "feed_id": feed_p},
-        )
         overlay_no_lead = client.get(
             "/overlay", params={"site": site_id, "feed_id": feed_x}
         )
         overlay_d2 = client.get(
             "/overlay", params={"site": site_id, "feed_id": feed_x, "lead": "D+2"}
-        )
-        # Close off, still inside the same client/connection: the route
-        # ignores `lead` entirely (all three forecast_pairs rows at the
-        # starting hour, in any order); the Overlay drops the lead
-        # control, its links and its data-src.
-        conn = get_db()._conn  # noqa: SLF001
-        delete_runtime_state(conn, DAILY_CLOSE_ON_KEY)
-        off_no_lead = client.get(
-            "/api/timeseries",
-            params={"site": site_id, "variable": "temperature", "feed_id": feed_x},
-        )
-        off_d2 = client.get(
-            "/api/timeseries",
-            params={
-                "site": site_id,
-                "variable": "temperature",
-                "feed_id": feed_x,
-                "lead": "D+2",
-            },
-        )
-        overlay_off = client.get(
-            "/overlay", params={"site": site_id, "feed_id": feed_x}
         )
 
     # -- No lead (default D+1): starting history's earliest-issued D+1 run,
@@ -1310,14 +1158,16 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
         " and D-3 13:00's day_ahead-2 row (forecast 21.0) would also"
         f" appear; valid_at={no_lead_body['valid_at']!r}"
     )
+    # M132 (the starting history's earliest-vs-latest-issued_at tie-break)
+    # is no longer forced here: forecast_history's primary key holds only
+    # one day_ahead=1 row at this valid_at (the docstring above), so there
+    # is no second-row fixture to distinguish earliest from latest any
+    # more -- that pick is now a write-time concern, outside this reader.
     assert no_lead_body["forecast"] == [5.0, 10.0], (
-        "M132/M133 -> at this assertion: correct = forecast 5.0 at the"
-        " starting hour (the earliest-issued D+1 run) and 10.0 at D-3"
-        " 12:00, mutant M132 = the starting history keeps the LATEST"
-        " issued_at of the hour, so forecast would read 6.0 instead of"
-        " 5.0; mutant M133 = the route's default lead is D+0, so this"
-        f" whole response would read as lead_d0's instead; forecast="
-        f"{no_lead_body['forecast']!r}"
+        "M133 -> at this assertion: correct = forecast 5.0 at the"
+        " starting hour and 10.0 at D-3 12:00, mutant M133 = the route's"
+        " default lead is D+0, so this whole response would read as"
+        f" lead_d0's instead; forecast={no_lead_body['forecast']!r}"
     )
     assert t13 not in no_lead_body["valid_at"], (
         "M129 -> at this assertion: correct = D-3 13:00 absent (no fill:"
@@ -1365,17 +1215,14 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
     )
     assert lead_x.json()["detail"] == "lead is not a day ahead from D+0 to D+7"
 
-    # -- Persistence feed P: two leads of the same day ahead at one hour;
-    # the pick is the LARGEST lead_hours, not the smallest. --
-    assert p_no_lead.status_code == 200
-    p_body = p_no_lead.json()
-    assert p_body["valid_at"] == [t12] and p_body["forecast"] == [2.0], (
-        "M130 -> at this assertion: correct = forecast 2.0 (lead_hours"
-        " 36, the largest of the two day_ahead-1 rows at this hour),"
-        " mutant = `_closed_hour_pick` takes the SMALLEST lead_hours at"
-        f" k, so this would read 1.0 (lead_hours 13) instead; forecast="
-        f"{p_body['forecast']!r}"
-    )
+    # Persistence's longest-lead pick (the old M130 here) is dropped: under
+    # 3.3 forecast_history never holds a persistence row at all, so there
+    # is no `_closed_hour_pick` tie to break any more; the pick is now a
+    # fixed `longest=True` rebuild, covered by test_forecast_history_
+    # readers.py::test_winrate_shortest_lead_differs_from_chart_longest_lead_pick
+    # (the shared readers scenario has only one observation hour a day, so
+    # its own longest-lead test cannot tell `longest=True` from
+    # `longest=False` -- see that test's own comment).
 
     # -- The Overlay's lead control: default D+1 ("Tomorrow" active, lead=
     # D%2B1 in the chart's data-src); explicit D+2 ("+2 days" active, lead=
@@ -1419,30 +1266,4 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
     assert d2_text.count("lead=D%2B2") >= 2, (
         "setup check for the data-src and the site link both carrying"
         f" `lead=D%2B2`; count={d2_text.count('lead=D%2B2')!r}"
-    )
-
-    # -- Close off (requested inside the same client/connection above): the
-    # route ignores `lead` entirely (all three forecast_pairs rows at the
-    # starting hour, in any order); the Overlay drops the lead control, its
-    # links and its data-src. --
-    assert off_no_lead.status_code == 200
-    off_no_lead_body = off_no_lead.json()
-    assert sorted(off_no_lead_body["forecast"]) == [5.0, 6.0, 7.0]
-    assert off_d2.status_code == 200
-    off_d2_body = off_d2.json()
-    assert sorted(off_d2_body["forecast"]) == [5.0, 6.0, 7.0], (
-        "M137 -> at this assertion: correct = all three forecast_pairs"
-        " rows regardless of `lead` (the close-off call passes day_ahead="
-        "None), mutant = the close-off call parses `lead` and passes its"
-        " k, not None, so with lead=D+2 (and none of the three rows at"
-        " day_ahead 2) this would read as an empty list instead; forecast="
-        f"{off_d2_body['forecast']!r}"
-    )
-    assert overlay_off.status_code == 200
-    off_text = overlay_off.text
-    assert "lead=" not in off_text and ">Tomorrow<" not in off_text, (
-        "M139 -> at this assertion: correct = no `lead` group and no"
-        " `lead=` in any link or data-src with the close off, mutant ="
-        " the lead group and `lead` in the links and data-src kept with"
-        " the close off"
     )

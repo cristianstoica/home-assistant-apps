@@ -353,7 +353,7 @@ def test_missing_key_worker_marks_unavailable_and_completes_job(
     # Simulate run_worker's dispatch → complete/fail lifecycle
     dispatch_db = get_db()
     try:
-        dispatch_writer = FencedWriter(dispatch_db, dispatch_db.generation)
+        dispatch_writer = FencedWriter(dispatch_db)
         asyncio.run(dispatch(dispatch_db, dispatch_writer, job))
         # dispatch returned normally → complete (correct impl)
         complete(conn, job.id)

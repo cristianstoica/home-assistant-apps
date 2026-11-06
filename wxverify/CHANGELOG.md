@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.16.16
+
+The database keeps far less. Each closed day now stores one scored
+forecast per feed, hour and day ahead, the multi-model mean is stored as
+its values, and persistence (the yardstick that forecasts an hour with
+an earlier hour's own value) is worked out when a page needs it instead
+of being stored. The dashboard's win rate and the history chart answer
+faster than before.
+
+The Verification page is gone, with the run code and the tables behind
+it; scoring, the daily close and the Forecast page do not use them.
+Database import is removed too; export stays.
+
+The add-on now stops cleanly. When asked to stop, it has up to 64
+seconds to finish or roll back its current work, and Home Assistant
+waits up to 79 seconds before forcing it (before, it got about 3
+seconds). A stop during the database upgrade rolls the upgrade back, and
+the next start runs it again.
+
+The first start of this version upgrades the database (schema 17) and
+then compacts it once. The compaction needs about 1 GB of free disk; if
+there is not enough, it is skipped with a warning and tried again at the
+next start. On a database of several GB the first start takes about two
+minutes on a fast computer and longer on a Raspberry Pi; the add-on does
+not answer until it finishes. Later starts are quick.
+
 ## 0.16.15
 
 The Forecast page's Rain row now shows one model's rain: the model with

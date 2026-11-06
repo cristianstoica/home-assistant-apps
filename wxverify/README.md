@@ -136,13 +136,13 @@ options are the only place a per-variable depth survives.
 That has one consequence worth spelling out, because it is easy to hit and
 leaves no error behind:
 
-> **Set the options BEFORE importing a database, not after.** Importing a
+> **Set the options BEFORE restoring a database, not after.** Restoring a
 > database that carries per-variable depth overrides does not carry the options
 > with it. If the destination's options do not already list those overrides, the
 > next startup clears them and every variable quietly reverts to the global
 > depth — scores then continue to be computed at a depth nobody chose. Put the
 > overrides in the add-on configuration (or the matching `WXV_FORECAST_BLEND_DEPTH_*`
-> environment variables for a standalone run) and only then run the import.
+> environment variables for a standalone run) and only then restore the file.
 
 ### Parse-cap probe (optional, temporary)
 
@@ -377,7 +377,6 @@ Main pages:
 /sites
 /ops
 /overlay
-/verification
 ```
 
 The UI uses CSRF-protected HTMX JSON actions. Mutating actions are not plain HTML
@@ -565,7 +564,6 @@ Available commands:
 ```sh
 python -m wxverify --db /path/to/wxverify.db serve --options /path/to/options.json
 python -m wxverify --db /path/to/wxverify.db fetch <site_id> <feed_id>
-python -m wxverify --db /path/to/wxverify.db score [--site-id <site_id>]
 python -m wxverify --db /path/to/wxverify.db settings list
 python -m wxverify --db /path/to/wxverify.db settings get <key>
 python -m wxverify --db /path/to/wxverify.db settings set <key> <value>
@@ -633,61 +631,48 @@ The command exits non-zero with a one-line message, for example when the site is
 - Weather.com PWS calls are budgeted per enabled station.
 - Forecast and observation provider keys are never stored in the database.
 - `/api/health/keys` reports only present or absent, never secret values.
-- Audit queries against `verification_trigger_decisions`, which is no longer
-  written, must select `MAX(id)` per `(site_id, trigger_date)`: a retried
-  trigger appended a new decision row for the same site and day rather than
-  updating the old one, so the highest `id` is the decision that actually stood.
 
-## Verification Publish Hold
+## Database version 17: the first start after the upgrade
 
-Ops → Nightly Verification Run Hold, and the `verification_publish_hold`
-setting behind it, held the nightly verification run, which the daily close
-replaced. Arming or releasing it now changes only that panel and the banner it
-puts on `/ops` and `/verification`. It starts, stops and delays nothing: each
-day is still closed and scored once after it ends.
+The first start of a release with database version 17 converts the database
+once, before the add-on serves anything:
 
-## Database Export and Import
+- Each forecast is stored once, in `forecast_history`, in place of the old
+  pair tables. The tables of the retired verification runs are dropped, and so
+  are queued jobs of kinds the add-on no longer runs.
+- The file is then compacted once (`VACUUM`), giving the freed space back to
+  the disk. That needs free space on `/data` of about 2.2 times the data the
+  file holds. With less, the compaction is skipped with a WARNING and tried
+  again at the next start; the add-on runs normally meanwhile.
+
+On a large database this first start takes minutes, not seconds. Every start
+after it is quick. A stop during the conversion is safe: the file keeps its
+data, and the next start finishes the conversion.
+
+The conversion accepts only a file at version 16 with the daily close on, which
+is what 0.16.15 writes once the daily close is on. The add-on refuses to start
+on any other file: an older version is told to install 0.16.15 first, and a
+version 16 file without the daily close is told that this release needs it. A
+version 17 file cannot be opened by an older release: to go back, restore an
+export taken before the upgrade.
+
+## Database Export
 
 Ops → Database Export downloads a consistent snapshot of the add-on database
-as a timestamped `.db` file. The snapshot is taken with `VACUUM INTO`, so it is
-a standalone, checkpointed copy — safe to take while the worker is running.
+as a timestamped, gzip-compressed `.db.gz` file. The snapshot is taken with
+`VACUUM INTO`, so it is a standalone, checkpointed copy — safe to take while
+the worker is running.
 
-Ops → Database Import uploads a previously exported `.db` file and **fully
-replaces** the live database with it. Any data collected since that export is
-lost. The upload is validated first (integrity check, wxverify schema version,
-required tables, that each of the add-on's own tables present in the file is
-an ordinary table, that the file's schema and the add-on's own tables hold
-only valid UTF-8 text, and that every forecast and observation time is in the
-add-on's own UTC form, `YYYY-MM-DDTHH:MM:SSZ`), and the current database is
-automatically backed up to `/data/wxverify-<timestamp>-<id>Z.db.bak` before
-the swap. Only the newest `.bak` file is kept; older ones are swept
-automatically after each import and on every add-on startup, so the operator
-never needs to remove them by hand. After a successful import no restart
-is needed. A file exported while the daily close was on keeps the scores
-of its closed days; its days not yet closed are rebuilt in the background
-and closed as usual. A file from before the daily close is kept as it
-stands, and the daily close then turns on for it as at an upgrade, from
-the next full local day. Import needs SQLite 3.37 or newer. The
-add-on image ships a newer SQLite, so this matters only for local standalone
-use. There, on an older SQLite, every import is refused before the add-on
-starts processing the uploaded file (reading, checking or swapping it in), the
-current database is left untouched, and the message names the version it
-found.
-
-**A file from before 0.16.14 is upgraded when the import opens it.** Its
-pending and running jobs of kinds this release no longer runs are deleted, a
-verification run still marked running is failed with `retired at the switch to
-the daily close`, and the partial evidence of every unpublished run is
-deleted. Published runs are untouched.
-
-**Before importing, set the per-variable forecast blend depths in the
-destination's options** — an imported database's overrides are cleared at the
-next startup if the destination's options do not list them. See
+There is no import. To restore an export: stop the add-on, unpack the `.db.gz`,
+copy the `.db` over `/data/wxverify.db`, delete any `wxverify.db-wal` or
+`wxverify.db-shm` file beside it, and start the add-on again. The file is
+checked and upgraded when the add-on opens it, as above. **Set the
+per-variable forecast blend depths in the options first** — see
 [Forecast blend depth is owned by the options, not the database](#forecast-blend-depth-is-owned-by-the-options-not-the-database).
 
-To restore a backup manually: stop the add-on, copy the chosen `.bak` file
-over `/data/wxverify.db`, delete any `wxverify.db-wal` or `wxverify.db-shm`
-file beside it, and start the add-on again.
+Earlier releases kept one `wxverify-<timestamp>-<id>Z.db.bak` in `/data` after
+an import. Nothing creates or removes these files now; delete any that is left
+to free its space.
 
 ## Logging
 
@@ -807,13 +792,7 @@ for that site and feed, which gets slower to compute as history grows. Add
 `?include_sample_count=false` for a lighter check: each row then carries a
 boolean `has_samples` in place of `sample_count`, and every other field, every
 `status` value and the row order are the same as in the default response. The
-default response is unchanged from 0.15.0. `/api/worker/status`
-also carries `read_cache_warm` — the read cache's own report of its most recent
-warm (`state`, `at`, `detail`, `derivations_failed`), or `null` before any warm
-has run. Read `state` together with `at`, never on its own: one slot is shared by
-the warm at startup and the warm after every publish, so a `running` whose `at`
-predates the last publish is a warm that never finished, while a recent
-`running` is simply one still in progress.
+default response is unchanged from 0.15.0.
 
 ### Home Assistant package (REST sensor + automations)
 
@@ -991,12 +970,10 @@ only 225 when scoped to `wxverify tests`, which drops `scripts/`.
 
 CI additionally runs the query-plan tests inside the add-on's base image with
 `WXV_EQP_SHIPPING=1`, so they check the SQLite build that actually ships rather
-than the local one. A green local run does not cover them. The same job also
-runs the import checks that rely on SQLite's own table classification
-(`PRAGMA table_list`), so they are checked against that build as well.
+than the local one. A green local run does not cover them.
 
 Cite code by its owning symbol, never by `file.py:<line>`: a line number
 drifts the moment the file changes. The pytest suite includes a guard
 (`tests/test_citation_anchor_guard.py`) that fails on any `file.py:<line>`
 citation in a production docstring, comment, or Jinja template comment, so
-write "see `_decide_precip` in `decision.py`" rather than a line reference.
+write "see `compact_storage` in `compaction.py`" rather than a line reference.

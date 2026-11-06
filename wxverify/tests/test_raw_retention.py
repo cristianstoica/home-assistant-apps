@@ -30,7 +30,14 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import NOW, D, asof_make_site, day_close_site, note_day_clock
+from tests.helpers import (
+    NOW,
+    D,
+    asof_make_site,
+    close_off,
+    day_close_site,
+    note_day_clock,
+)
 from wxverify import config
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database, close_db, init_db
@@ -600,6 +607,7 @@ def test_rd2_last_five_minute_store_by_source_and_site(tmp_path: Path) -> None:
 
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
+    close_off(conn)
     site_id = asof_make_site(conn, "rd2-site")
     station_b = _make_station(conn, site_id, "ISTATION04")
     station_c = _make_station(conn, site_id, "ISTATION05")

@@ -1,7 +1,9 @@
 """The current-obs lane: claim partition, poller loop and DL3.
 
-Covers plan §14.2 tests P, P2, X, Q, the idle-poller-seam test, H, F, W and
+Covers plan §14.2 tests P, P2, X, Q, the idle-poller-seam test, H, W and
 DL3 -- the 2026-09-23 station-health-and-retries plan, commit 5 (D1.2).
+F (the generation-fence capture race) was removed with the generation
+fence itself (storage-release plan 5.5).
 
 EQP (the query-plan relationship for the two claim clauses) lives in
 ``tests/test_query_plan_regressions.py``, so the shipping-SQLite CI job runs
@@ -38,7 +40,7 @@ from wxverify.collection.budget import (
     is_refundable_transport_error,
 )
 from wxverify.core.timeutil import isoformat_utc
-from wxverify.db.connection import Database, FencedWriter, close_db, init_db
+from wxverify.db.connection import Database, close_db, init_db
 from wxverify.db.migrations import (
     create_schema,
     seed_default_feeds,
@@ -458,274 +460,6 @@ def test_h_heartbeat_stamps_on_first_iteration_then_holds_for_60s(
             await _await_task_done(task)
             with pytest.raises(asyncio.CancelledError):
                 await task
-
-    asyncio.run(run())
-
-
-# ---------------------------------------------------------------------------
-# F: fence capture
-# ---------------------------------------------------------------------------
-
-
-class _BumpingFakeDb:
-    """A fake ``Database`` whose single claim ``write`` schedules a
-    generation bump via ``call_soon`` before returning the claimed job.
-
-    ``call_soon`` fires only once the loop regains control, so the fence
-    capture inside ``run_claimed_job`` -- which must run with NO ``await``
-    between the claim returning and ``FencedWriter(db, db.generation)`` --
-    observes the PRE-bump generation. Any inserted ``await`` before that
-    capture lets the callback run first and would observe the bumped value
-    instead (the named mutant).
-
-    NOTE: the test below only replays this invariant against a bare
-    ``FencedWriter`` construction, never against the poller loop's own
-    claim-to-run_job hand-off -- so it is empirically EQUIVALENT to a real
-    mutant that inserts an ``await`` between the claim and ``run_job`` in
-    ``run_current_obs_poller`` (verified: that mutant leaves the entire
-    suite green, this test included). See
-    ``test_f2_poller_loop_hands_off_to_run_job_before_any_bump_can_land``
-    below for the discriminator that samples the real call site.
-    """
-
-    def __init__(self, job: Job) -> None:
-        self._job = job
-        self.generation = 5
-
-    async def write(self, fn: object) -> Job:
-        loop = asyncio.get_running_loop()
-        loop.call_soon(self._bump)
-        return self._job
-
-    def _bump(self) -> None:
-        self.generation = 6
-
-
-def test_f_fence_capture_observes_the_pre_bump_generation() -> None:
-    job = Job(
-        id=1,
-        type="fetch_current_obs",
-        site_id=1,
-        job_key="curobs:1",
-        payload={"station_id": 1},
-        status="running",
-        retry_count=0,
-        max_retries=5,
-    )
-    fake_db = _BumpingFakeDb(job)
-
-    captured: dict[str, int] = {}
-    real_fenced_writer = FencedWriter
-
-    class _RecordingWriter(real_fenced_writer):  # type: ignore[misc]
-        def __init__(self, db: object, generation: int) -> None:
-            captured["generation"] = generation
-            super().__init__(db, generation)
-
-    async def run() -> None:
-        claimed = await fake_db.write(claim_next_job)
-        _RecordingWriter(fake_db, fake_db.generation)
-        assert claimed is job
-
-    asyncio.run(run())
-    assert captured["generation"] == 5  # pre-bump, not the post-bump 6
-
-
-class _StopPoller(Exception):
-    """Sentinel to unwind the poller's ``while True`` after one claim."""
-
-
-class _PollerFakeDb:
-    """A fake ``Database`` whose single claim ``write`` schedules a
-    generation bump via ``call_soon`` -- same rendezvous shape as
-    ``_BumpingFakeDb`` above -- then drives ``run_current_obs_poller``
-    itself, so ``run_job`` observes whatever generation is live at its own
-    call site instead of one hand-copied by the test.
-
-    Returns a ``ClaimedCurrentObs`` wrapping the job, matching what
-    ``_enqueue_and_claim`` now returns (F2 fix): the real ``write`` call in
-    ``run_current_obs_poller`` no longer yields a bare ``Job``, and
-    ``_log_claim_lateness`` (called synchronously between the claim and
-    ``run_job``) requires the wrapper's ``due_at``/``created_at``/etc.
-    attributes, so a bare ``Job`` here would raise ``AttributeError`` before
-    ``run_job`` is ever reached.
-    """
-
-    def __init__(self, job: Job) -> None:
-        self._job = job
-        self._claimed = False
-        self.generation = 5
-
-    async def write(
-        self, fn: object, *, epoch_exempt: bool = False
-    ) -> ClaimedCurrentObs | None:
-        if self._claimed:
-            return None
-        self._claimed = True
-        loop = asyncio.get_running_loop()
-        loop.call_soon(self._bump)
-        return ClaimedCurrentObs(
-            job=self._job,
-            due_at=None,
-            created_at=None,
-            next_attempt_at=None,
-            retry_count=self._job.retry_count,
-            health_state=None,
-            prev_job=None,
-        )
-
-    def _bump(self) -> None:
-        self.generation = 6
-
-
-def test_f2_poller_loop_hands_off_to_run_job_before_any_bump_can_land() -> None:
-    """F discriminator: drives the real ``run_current_obs_poller`` loop,
-    unlike ``test_f_fence_capture_observes_the_pre_bump_generation`` above,
-    which only replays the invariant against a bare ``FencedWriter`` and
-    never calls the poller loop at all -- so it cannot see a regression at
-    the loop's own claim-to-run_job hand-off, only at the harness's stand-in
-    for it.
-
-    Mutant: an ``await`` inserted between the claim returning and
-    ``await run_job(...)`` in ``run_current_obs_poller`` lets the scheduled
-    bump land first; ``run_job`` would then observe generation 6, not 5.
-    """
-    job = Job(
-        id=1,
-        type="fetch_current_obs",
-        site_id=1,
-        job_key="curobs:1",
-        payload={"station_id": 1},
-        status="running",
-        retry_count=0,
-        max_retries=5,
-    )
-    fake_db = _PollerFakeDb(job)
-    observed: dict[str, int] = {}
-
-    async def _recording_run_job(db: object, claimed_job: object, *, lane: str) -> None:
-        observed["generation"] = fake_db.generation
-        raise _StopPoller
-
-    async def run() -> None:
-        with pytest.raises(_StopPoller):
-            await run_current_obs_poller(fake_db, run_job=_recording_run_job)
-
-    asyncio.run(run())
-    assert observed["generation"] == 5  # pre-bump, not the post-bump 6
-
-
-def test_f3_real_run_claimed_jobs_fence_capture_observes_the_pre_bump_generation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """F real-runner discriminator: neither ``test_f`` (a bare ``FencedWriter``
-    construction) nor ``test_f2`` (a fake ``Database``) ever calls the REAL
-    ``wxverify.worker.processor.run_claimed_job`` -- so an ``await`` inserted
-    at the very top of the real function, before its own fence capture,
-    would pass every other test in this module. This test drives a real
-    ``Database``, a real claimed job, and the real ``run_claimed_job``.
-
-    Construction: schedule a generation bump via ``loop.call_soon`` right
-    after the claim's ``db.write`` returns and before ``run_claimed_job`` is
-    awaited -- the callback only runs once the surrounding task actually
-    suspends, which the correct code does not do until AFTER
-    ``FencedWriter(db, db.generation)`` has already captured the
-    pre-bump value (matching the real function's own claim -- see its
-    docstring -- that no await separates the claim from that capture).
-
-    Mutant: insert ``await asyncio.sleep(0)`` before the fence capture in
-    ``run_claimed_job`` -- the scheduled bump would land first, so the
-    ``FencedWriter`` the recording subclass observes would be constructed
-    with the POST-bump generation, and ``captured["generation"] ==
-    pre_bump_generation`` would fail.
-    """
-
-    def _online_body() -> bytes:
-        return json.dumps(
-            {
-                "observations": [
-                    {
-                        "obsTimeUtc": "2026-07-10T11:55:00Z",
-                        "humidity": 50.0,
-                        "winddir": 180.0,
-                        "uv": 1.0,
-                        "neighborhood": "Test Quarter",
-                        "metric": {
-                            "temp": 20.0,
-                            "dewpt": 10.0,
-                            "windSpeed": 5.0,
-                            "windGust": 8.0,
-                            "pressure": 1012.0,
-                            "precipRate": 0.0,
-                            "precipTotal": 0.0,
-                        },
-                    }
-                ]
-            }
-        ).encode()
-
-    async def _fake_fetch_current_observation(
-        pws_station_id: str,
-        api_key: str,
-        *,
-        client: httpx.AsyncClient | None = None,
-        timeout_seconds: float = 10.0,
-    ) -> httpx.Response:
-        # A genuine suspension point downstream of the claim: guarantees the
-        # scheduled bump below has a chance to land before run_claimed_job
-        # returns, so the test cannot pass merely because nothing ever
-        # yielded.
-        await asyncio.sleep(0)
-        return httpx.Response(
-            200,
-            content=_online_body(),
-            headers={"content-type": "application/json"},
-            request=httpx.Request(
-                "GET", "https://api.weather.com/v2/pws/observations/current"
-            ),
-        )
-
-    monkeypatch.setattr(
-        "wxverify.worker.processor.fetch_current_observation",
-        _fake_fetch_current_observation,
-    )
-
-    captured: dict[str, int] = {}
-    real_fenced_writer = FencedWriter
-
-    class _RecordingWriter(real_fenced_writer):  # type: ignore[misc]
-        def __init__(
-            self, db: object, generation: int, *, epoch_exempt: bool = False
-        ) -> None:
-            captured["generation"] = generation
-            super().__init__(db, generation, epoch_exempt=epoch_exempt)
-
-    monkeypatch.setattr("wxverify.worker.processor.FencedWriter", _RecordingWriter)
-
-    async def run() -> None:
-        db = _init_tmp_db(tmp_path)
-        conn = db._conn  # noqa: SLF001
-        site_id = _seed_site(conn)
-        station_id = _seed_station(conn, site_id)
-        _seed_current_obs_job(conn, site_id, station_id)
-
-        job = await db.write(claim_next_current_obs_job)
-        assert job is not None
-
-        loop = asyncio.get_running_loop()
-        pre_bump_generation = db.generation
-
-        def _bump() -> None:
-            db._generation += 1  # noqa: SLF001 -- simulates an import replacing the db
-
-        loop.call_soon(_bump)
-        await run_claimed_job(db, job, lane="current_obs")
-
-        assert db.generation == pre_bump_generation + 1, (
-            "the bump must actually have landed during this run, or the "
-            "test proves nothing"
-        )
-        assert captured["generation"] == pre_bump_generation
 
     asyncio.run(run())
 
@@ -1574,11 +1308,22 @@ def test_e4a_a_current_obs_lane_run_does_not_move_the_input_epoch(
     )
 
     async def run_current_obs_lane() -> None:
+        from wxverify.core.timeutil import utc_now
+        from wxverify.db.site_days import ensure_site_days
+
         db = _init_tmp_db(tmp_path)
         conn = db._conn  # noqa: SLF001
         site_id = _seed_site(conn)
         station_id = _seed_station(conn, site_id)
         _seed_current_obs_job(conn, site_id, station_id)
+
+        # With the close on, the site's first current-obs write of a day
+        # bootstraps `site_days`/`site_day_stations` for the holding record
+        # (`filter_day_writes` -> `_ensure`); seeding them here, through the
+        # same real "now" the lane run below will read, keeps that
+        # bootstrap out of the write set this test tracks.
+        ensure_site_days(conn, site_id, now_utc=utc_now())
+        conn.commit()
 
         enabled_before = conn.execute(
             "SELECT enabled FROM stations WHERE id = ?", (station_id,)

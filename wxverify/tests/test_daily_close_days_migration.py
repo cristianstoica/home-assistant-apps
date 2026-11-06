@@ -1,18 +1,14 @@
 """The v11 daily-close-days schema's live constraints (plan 2026-10-20-
 daily-close-day-state-and-guard.md §10.2-10.7, test IDs MG5-MG6).
 
-A "version-10 file" is built by migrating a fresh ``:memory:`` connection
-with ``run_migrations``, then genuinely removing the v11 additions: the
-four new tables (dropped ``site_day_stations``, ``site_days``,
-``station_changes``, ``site_zone_changes``, in that order, so the table
-whose foreign key points at ``site_days`` is gone before ``site_days``
-itself is dropped) and the ``stations.retired_at`` column via a real
-``ALTER TABLE ... DROP COLUMN``, before setting ``PRAGMA user_version =
-10`` -- the same drop-then-roll-back shape
-``tests/test_v8_last_usable_fetch_migration.py`` uses for its
-``_drop_stamp_column_and_roll_back`` and ``_v6_db``. It holds station A
-(enabled) and B (turned off) at site 1, and station C (enabled) at site 2,
-per the plan's MG1 fixture note (§10.7-adjacent text above the MG table).
+The fixture is a real database built by migrating a fresh ``:memory:``
+connection with ``run_migrations``, then pinned at user_version 16 (see
+``_v10_db``'s own docstring for why it no longer genuinely removes the
+v11 additions the way ``tests/test_v8_last_usable_fetch_migration.py``'s
+``_drop_stamp_column_and_roll_back``/``_v6_db`` still do). It holds
+station A (enabled) and B (turned off) at site 1, and station C (enabled)
+at site 2, per the plan's MG1 fixture note (§10.7-adjacent text above the
+MG table).
 """
 
 from __future__ import annotations
@@ -29,28 +25,26 @@ _FAKED_NOW = NOW.replace(hour=0, minute=30, second=0, microsecond=0)
 
 
 def _v10_db() -> sqlite3.Connection:
+    """A real database, pinned at user_version 16 rather than fully fresh.
+
+    This fixture used to genuinely remove the v11 additions (the four new
+    tables and the ``stations.retired_at`` column) to stand in for a
+    pre-v11 file. That migration (whatever added them below v16) is
+    deleted along with every other migrate_v2 ... migrate_v16 function,
+    and those tables/column are unconditional parts of ``create_tables``
+    now, with user_version 1-15 refused outright (storage release 4.1) --
+    so there is nothing left to remove onto a reachable schema. Pinning at
+    16 instead of 17 still exercises a real ``run_migrations`` call in
+    ``_migrate`` (migrate_v17_storage's own "already converted" guard
+    makes it a fast no-op here), while this function's own subject -- the
+    live CHECK/foreign-key constraints on these tables -- is unaffected
+    either way.
+    """
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     run_migrations(conn)
-
-    # Genuinely remove the v11 additions rather than guard around them: a
-    # conditional drop would let this fixture silently stay at the wrong
-    # version. site_day_stations first, since its foreign key points at
-    # site_days; station_changes and site_zone_changes have no foreign key
-    # between them or to site_days, so their order does not matter.
-    conn.execute("DROP TABLE site_day_stations")
-    conn.execute("DROP TABLE site_days")
-    conn.execute("DROP TABLE station_changes")
-    conn.execute("DROP TABLE site_zone_changes")
-
-    cols_before = {r["name"] for r in conn.execute("PRAGMA table_info(stations)")}
-    assert "retired_at" in cols_before
-    conn.execute("ALTER TABLE stations DROP COLUMN retired_at")
-    cols_after = {r["name"] for r in conn.execute("PRAGMA table_info(stations)")}
-    assert "retired_at" not in cols_after
-
-    conn.execute("PRAGMA user_version = 10")
+    conn.execute("PRAGMA user_version = 16")
 
     conn.execute(
         """

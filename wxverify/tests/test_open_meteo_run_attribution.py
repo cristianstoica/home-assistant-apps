@@ -51,7 +51,6 @@ from wxverify.feeds.open_meteo import (
 )
 from wxverify.feeds.seam import FetchResult, NormalizedSample
 from wxverify.forecast.data import samples_fingerprint
-from wxverify.verification.runs import capture_config_snapshot, input_fingerprint
 from wxverify.worker.round import enqueue_due_daytime_downloads
 
 _OPEN_METEO_MODELS = (
@@ -685,54 +684,6 @@ def test_e_t16_scheduling_arithmetic_at_the_690_minute_lead_boundary() -> None:
     assert len(jobs_due) == 1
     payload = json.loads(str(jobs_due[0]["payload"]))
     assert payload["feed_id"] == feed_id
-
-
-# ---------------------------------------------------------------------------
-# E-T17 -- no fingerprint movement: the deliberate counterpart to C-T8.
-# ---------------------------------------------------------------------------
-
-
-def test_e_t17_input_fingerprint_unchanged_across_interval_correction_alone() -> None:
-    """Both ``before`` and ``after`` recapture a FRESH ``capture_config_snapshot``
-    (mirroring ``tests/test_daily_truth_admission_migration.py``'s O15 recapture
-    pattern), never reusing one object captured before the mutation -- reusing
-    it would make the equality vacuous, since the roster only ever lives in
-    the snapshot passed to ``input_fingerprint``, not re-read from the DB by
-    that function itself.
-    """
-    conn = asof_conn()
-    site_id = _make_site(conn, "ISTATION01")
-    conn.commit()
-
-    # Force a REAL mutation: reset the marker and gem_global's interval back
-    # to 360, so the correction call below genuinely rewrites a row rather
-    # than being a guaranteed no-op (asof_conn already applied the
-    # correction once).
-    conn.execute(
-        "DELETE FROM runtime_state WHERE key = ?",
-        (OPEN_METEO_INTERVAL_CORRECTION_KEY,),
-    )
-    conn.execute(
-        "UPDATE feeds SET fetch_interval_minutes = 360"
-        " WHERE source = 'open-meteo' AND model = 'gem_global'"
-    )
-    conn.commit()
-
-    snapshot_before = capture_config_snapshot(conn, site_id)
-    conn.commit()
-    before = input_fingerprint(conn, site_id, snapshot_before)
-
-    correct_open_meteo_fetch_intervals(conn)
-    conn.commit()
-
-    # Confirm the call actually did something -- otherwise "unchanged"
-    # would be vacuous.
-    assert _interval(conn, source="open-meteo", model="gem_global") == 720
-
-    snapshot_after = capture_config_snapshot(conn, site_id)
-    conn.commit()
-    after = input_fingerprint(conn, site_id, snapshot_after)
-    assert before == after
 
 
 # ---------------------------------------------------------------------------

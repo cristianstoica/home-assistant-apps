@@ -24,9 +24,6 @@ import pytest
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.db.connection import close_db, init_db
-from wxverify.db.switch import ensure_site_generation
-from wxverify.scoring.cache import upsert_score_cache
-from wxverify.scoring.metrics import MetricResult
 
 # ---------------------------------------------------------------------------
 # Harness (mirrors tests/test_composite_cache_backed.py).
@@ -93,57 +90,9 @@ def _open_meteo_feed_ids(conn: sqlite3.Connection, count: int) -> list[int]:
     ]
 
 
-def _add_temperature_cell(
-    conn: sqlite3.Connection, *, site_id: int, feed_id: int, valid_at: str
-) -> None:
-    """Minimal single-row cell: enough to populate the expected-cells set.
-
-    No matching persistence pair, so live aggregation of this exact cell would
-    yield ``skill_score=None`` -- fine for callers that never inspect the
-    numeric skill.
-    """
-    conn.execute(
-        """
-        INSERT INTO forecast_pairs
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error,
-             tz_generation_id)
-        VALUES (?, ?, 'temperature', '2035-01-01T00:00:00Z', ?, 24, 1,
-                11.0, 10.0, 1.0, 1.0, 1.0, ?)
-        """,
-        (site_id, feed_id, valid_at, ensure_site_generation(conn, site_id)),
-    )
-
-
-def _seed_score_cache(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    feed_id: int,
-    window_key: str,
-    computed_at: str,
-    variable: str = "temperature",
-    day_ahead: int = 1,
-    n: int = 1,
-    skill_score: float | None = 0.5,
-) -> None:
-    upsert_score_cache(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        variable=variable,
-        day_ahead=day_ahead,
-        window_key=window_key,
-        result=MetricResult(n=n, skill_score=skill_score, confident=True),
-        computed_at=computed_at,
-    )
-
-
 __all__ = [
-    "_add_temperature_cell",
     "_init_tmp_db",
     "_make_site",
     "_open_meteo_feed_ids",
-    "_seed_score_cache",
     "_start_app",
 ]

@@ -9,7 +9,7 @@ import re
 import sqlite3
 import time
 from collections.abc import Callable
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from enum import Enum, auto
 from typing import Final, Literal, NoReturn
 
@@ -22,10 +22,11 @@ from wxverify.collection.budget import (
     reserve_budget,
     write_after_reservation,
 )
+from wxverify.core import stop
 from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
-from wxverify.db.connection import Database, FencedWriter, StaleGenerationError
+from wxverify.db.connection import Database, FencedWriter
 from wxverify.db.queue import (
     FailDisposition,
     Job,
@@ -55,7 +56,6 @@ from wxverify.verification.record import (
     persist_forecast_record,
     run_record_gap_scan,
 )
-from wxverify.worker import cutover as cutover_module
 from wxverify.worker.access_hold import (
     AccessHeld,
     check_access_hold,
@@ -76,7 +76,6 @@ from wxverify.worker.current_obs import (
     persist_poll_result,
 )
 from wxverify.worker.current_obs_poller import run_current_obs_poller
-from wxverify.worker.cutover import Cutover, CutoverStep
 from wxverify.worker.domain_backoff import (
     check_domain_backoff,
     record_http_backoff,
@@ -96,22 +95,12 @@ from wxverify.worker.feed_fetch import (
 )
 from wxverify.worker.round import round_try_stale
 from wxverify.worker.scheduler import scheduler_tick
-from wxverify.worker.score_batches import (
-    SCORING_CAS_ATTEMPTS,
-    ScoringInputsBusy,
-    run_batched_scoring,
-    run_split_pair_phases,
-)
 from wxverify.worker.station_pacing import weathercom_call_lock
 from wxverify.worker.wind_days import WIND_DAYS_JOB_KEY, run_wind_days
 
 POLL_INTERVAL = 1.0
 FAILED_JOB_RETENTION_HOURS = 168
 JOB_HOUSEKEEPING_INTERVAL_SECONDS = 3600
-# How long a pair_and_score job whose scoring inputs kept changing
-# (ScoringInputsBusy) waits before it is claimed again; a deferral does not
-# count as a failed attempt.
-_SCORING_BUSY_DEFER: Final = timedelta(seconds=60)
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +116,9 @@ async def run_worker(db: Database) -> None:
     re-raise the first failure by identity, with no reclaim -- as for any
     worker death, the next boot's reclaim_all_stale recovers running jobs.
     Every cancellation path drains both lanes, then runs exactly one
-    shutdown reclaim, then raises CancelledError.
+    shutdown reclaim, then raises CancelledError; once a stop has been
+    requested, the drain and the reclaim each wait only within the stop
+    budget (core.stop, storage-release plan 6.4).
     """
     main = asyncio.create_task(_run_main_lane(db), name="worker-main-lane")
     poller = asyncio.create_task(
@@ -138,61 +129,72 @@ async def run_worker(db: Database) -> None:
     try:
         await asyncio.wait(lanes, return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
-        await _cancel_and_drain(lanes)
+        await _cancel_and_drain(lanes, db)
         _log_lane_failures(lanes)
         await _shutdown_reclaim(db)
         raise
-    if await _cancel_and_drain(lanes):  # a cancel arrived during the drain
+    if await _cancel_and_drain(lanes, db):  # a cancel arrived during the drain
         _log_lane_failures(lanes)
         await _shutdown_reclaim(db)
         raise asyncio.CancelledError
     _raise_lane_outcome(main, poller)
 
 
-async def _cancel_and_drain(lanes: tuple[asyncio.Task[None], ...]) -> bool:
-    """Cancel every lane and wait until each is done.
+async def _cancel_and_drain(
+    lanes: tuple[asyncio.Task[None], ...], db: Database
+) -> bool:
+    """Cancel every lane and wait until each is done, within the stop budget.
 
     Returns True if run_worker was cancelled meanwhile. The same loop as
     core.aio.run_to_completion: ``asyncio.wait`` does not cancel what it
     awaits, so a repeated cancel costs one more iteration, never an
-    abandoned lane.
+    abandoned lane (core.stop.wait_within_budget). Once a stop has been
+    requested and its budget runs out, the writer is interrupted, and a lane
+    still running after the grace is left to the event loop's final sweep;
+    the next start's reclaim_all_stale recovers its job.
     """
     for lane in lanes:
         lane.cancel()
-    interrupted = False
-    while not all(lane.done() for lane in lanes):
-        try:
-            await asyncio.wait([lane for lane in lanes if not lane.done()])
-        except asyncio.CancelledError:
-            interrupted = True  # keep draining; re-raised by the caller
-    return interrupted
+    cancelled = await stop.wait_within_budget(
+        lanes,
+        still_running=lambda: [lane.get_name() for lane in lanes if not lane.done()],
+        # Looked up only when the budget runs out.
+        interrupt_writer=lambda: db.interrupt_writer(),
+        log=logger,
+    )
+    return cancelled is not None  # the caller re-raises it
 
 
 async def _shutdown_reclaim(db: Database) -> None:
     """Run the shutdown reclaim write once and wait until it is done.
 
-    The same loop as core.aio.run_to_completion: one task, awaited under
-    ``asyncio.shield`` until it is done. A bare ``await db.write(...)`` is
-    not enough -- ``db.write`` waits for the writer lock before its
-    executor hop, so a second cancel landing in that wait would skip the
-    reclaim. The task is never cancelled here and never restarted, so the
-    write runs at most once. A cancel delivered meanwhile is absorbed, not
-    re-raised: both callers raise CancelledError as soon as this returns.
-    A failed write is logged. Any other outcome propagates, including a
-    cancel of the task from outside (the event loop's final sweep).
+    The same loop as core.aio.run_to_completion: one task, waited on with
+    ``asyncio.wait`` (core.stop.wait_within_budget) until it is done. A bare
+    ``await db.write(...)`` is not enough -- ``db.write`` waits for the
+    writer lock before its executor hop, so a second cancel landing in that
+    wait would skip the reclaim. The task is never cancelled here and never
+    restarted, so the write runs at most once. A cancel delivered meanwhile
+    is absorbed, not re-raised: both callers raise CancelledError as soon as
+    this returns. A failed write is logged. Any other outcome propagates,
+    including a cancel of the task from outside (the event loop's final
+    sweep). Once a stop has been requested the wait ends with the stop
+    budget (plan 6.4); a reclaim not done by then is left behind, and the
+    next start's reclaim_all_stale does its work.
     """
     # Exempt: a shutdown-time bulk sweep over whatever jobs the
     # live database currently holds, not tied to any one job's read.
     reclaim = asyncio.create_task(
         db.write(reclaim_all_stale), name="worker-shutdown-reclaim"
     )
-    while not reclaim.done():
-        try:
-            await asyncio.shield(reclaim)
-        except asyncio.CancelledError:
-            pass  # absorbed; the caller raises CancelledError itself
-        except BaseException:
-            pass  # the write's own outcome, read below
+    # A cancel is absorbed; the caller raises CancelledError itself.
+    await stop.wait_within_budget(
+        (reclaim,),
+        still_running=lambda: [reclaim.get_name()],
+        interrupt_writer=lambda: db.interrupt_writer(),
+        log=logger,
+    )
+    if not reclaim.done():
+        return
     # exception() raises CancelledError, rather than returning it, if the
     # task was cancelled; nothing here cancels it.
     exc = reclaim.exception()
@@ -263,35 +265,21 @@ def _raise_lane_outcome(
 async def _run_main_lane(db: Database) -> None:
     """Tick the scheduler and run main-lane jobs one at a time, forever.
 
-    While the daily close is off the lane runs the cutover and nothing else
-    (switch-over plan 6.2): one unit per loop, right after the worker
-    heartbeat, with no tick, purge or claim until the cutover writes the
-    key. After a failed unit the attempt is dropped and the lane waits
-    ``CUTOVER_RETRY_SECONDS``; the next attempt is a new ``Cutover``.
+    Once a stop has begun (``core.stop.STOP``, storage-release plan 6.3)
+    the lane claims nothing: it goes back to the poll sleep, where the
+    cancel lands. It never returns -- a lane that ends on its own is a
+    crash to ``api.app._stop_on_worker_done``.
     """
     last_housekeeping_at = 0.0
     last_worker_heartbeat_at = 0.0
     last_scheduler_heartbeat_at = 0.0
-    cutover: Cutover | None = None
     while True:
         now = time.monotonic()
         last_worker_heartbeat_at = await _maybe_stamp_runtime_heartbeat(
             db, "worker_last_loop_at", last_worker_heartbeat_at, now
         )
-        if not await db.read(daily_close_on):
-            cutover = cutover or Cutover(db)
-            step = await cutover.advance()
-            if step is CutoverStep.MORE:
-                continue
-            cutover = None
-            if step is CutoverStep.WAIT:
-                # Read through the module at each wait, not bound here.
-                await asyncio.sleep(cutover_module.CUTOVER_RETRY_SECONDS)
-                continue
-        # Exempt: scheduler_tick, the housekeeping purge, and the claim
-        # itself all run once per loop iteration with no job-scoped read
-        # behind them yet -- there is no generation to fence any of this
-        # against until a job is actually claimed, below.
+        # Plain writes: scheduler_tick, the housekeeping purge, and the claim
+        # itself all run once per loop iteration, before any job is claimed.
         await db.write(scheduler_tick)
         now = time.monotonic()
         last_scheduler_heartbeat_at = await _maybe_stamp_runtime_heartbeat(
@@ -304,6 +292,10 @@ async def _run_main_lane(db: Database) -> None:
                 )
             )
             last_housekeeping_at = now
+        # Right before the claim: the awaits above can end after a stop began.
+        if stop.STOP.is_set():
+            await asyncio.sleep(POLL_INTERVAL)
+            continue
         job = await db.write(_claim_if_on)
         if job is None:
             await asyncio.sleep(POLL_INTERVAL)
@@ -315,8 +307,7 @@ def _claim_if_on(conn: sqlite3.Connection) -> Job | None:
     """Claim the next main-lane job; None while the daily close is off.
 
     The key is read in the claim's own transaction (switch-over plan 6.2),
-    so an import that replaced the file after the loop's gate read is seen
-    here and nothing is claimed from a file without the key.
+    so nothing is claimed from a file without the key.
     """
     if not daily_close_on(conn):
         return None
@@ -326,19 +317,12 @@ def _claim_if_on(conn: sqlite3.Connection) -> Job | None:
 async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
     """Run one claimed job through dispatch to its disposition.
 
-    Callers await this directly after the claim's ``db.write`` returns, with
-    no await in between: awaiting a coroutine runs its body synchronously up
-    to its first await, so the fence capture below observes the claim's
-    generation. ``lane`` names the calling lane in the log lines.
+    ``lane`` names the calling lane in the log lines.
     """
-    # Captured immediately after the claim, before any await that
-    # could let an import replace the database out from under this
-    # job: every write below goes through `writer`, fenced to this
-    # generation, so one that lands after a swap is rejected instead
-    # of silently landing against whatever now owns this job's rows.
-    # A current-obs job's writes are also exempt from the input epoch:
-    # they touch only the current-obs lane's tables.
-    writer = FencedWriter(db, db.generation, epoch_exempt=(lane == "current_obs"))
+    # Every write below goes through `writer`. A current-obs job's writes are
+    # exempt from the input epoch: they touch only the current-obs lane's
+    # tables.
+    writer = FencedWriter(db, epoch_exempt=(lane == "current_obs"))
     claimed_at = time.monotonic()
     logger.info(
         "job claimed id=%s type=%s site=%s lane=%s",
@@ -349,117 +333,103 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
     )
     outcome = "completed"
     try:
-        try:
-            continuation = await dispatch(db, writer, job)
-            # Complete + continuation in ONE write transaction: a
-            # crash between the two would otherwise drop a resumable
-            # chain (the chunk completes but its continuation is
-            # never enqueued).
-            recorded = await writer.write(
-                lambda conn, j=job, cont=continuation: _record_outcome(
-                    conn, j, lambda c: _complete_and_continue(c, j.id, cont)
-                )
+        continuation = await dispatch(db, writer, job)
+        # Complete + continuation in ONE write transaction: a
+        # crash between the two would otherwise drop a resumable
+        # chain (the chunk completes but its continuation is
+        # never enqueued).
+        recorded = await writer.write(
+            lambda conn, j=job, cont=continuation: _record_outcome(
+                conn, j, lambda c: _complete_and_continue(c, j.id, cont)
             )
-            if recorded is _Dropped.OUTCOME:
-                outcome = "dropped"
-            else:
-                logger.debug(
-                    "job completed id=%s type=%s site=%s",
-                    job.id,
-                    job.type,
-                    job.site_id,
-                )
-        except JobDeferred as exc:
-            outcome = "deferred"
-            next_attempt_at = exc.next_attempt_at
-            recorded = await writer.write(
-                lambda conn, j=job, attempt=next_attempt_at: _record_outcome(
-                    conn, j, lambda c: defer_job(c, j.id, attempt)
-                )
-            )
-            if recorded is _Dropped.OUTCOME:
-                outcome = "dropped"
-            else:
-                logger.debug(
-                    "job deferred id=%s type=%s site=%s until=%s",
-                    job.id,
-                    job.type,
-                    job.site_id,
-                    next_attempt_at,
-                )
-        except JobCancelled:
-            outcome = "cancelled"
-            # No success marker: a cancelled job resolved nothing
-            # (the marker is written only by _complete_and_continue).
-            recorded = await writer.write(
-                lambda conn, j=job: _record_outcome(
-                    conn, j, lambda c: complete(c, j.id)
-                )
-            )
-            if recorded is _Dropped.OUTCOME:
-                outcome = "dropped"
-        except StaleGenerationError:
-            raise
-        except Exception as exc:
-            if _is_process_fatal_permission_error(exc):
-                logger.critical(
-                    "fatal OS permission error while processing job id=%s "
-                    "type=%s; terminating worker for process restart",
-                    job.id,
-                    job.type,
-                    exc_info=True,
-                )
-                raise
-            message = sanitized_exception(exc)
-            disposition = await writer.write(
-                lambda conn, j=job, err=message: _record_outcome(
-                    conn, j, lambda c: _fail_job(c, j, err)
-                )
-            )
-            if disposition is _Dropped.OUTCOME or disposition is None:
-                # Nothing was recorded for this run and fail() scheduled
-                # no retry: the claimed row no longer stands
-                # (_record_outcome logs that), or fail() found no row.
-                outcome = "dropped"
-            elif disposition.terminal:
-                outcome = "failed"
-                logger.error(
-                    "job failed permanently id=%s type=%s site=%s "
-                    "attempt %d of %d (retries exhausted): %s",
-                    job.id,
-                    job.type,
-                    job.site_id,
-                    disposition.retry_count,
-                    disposition.max_retries + 1,
-                    message,
-                )
-            else:
-                outcome = "retry"
-                logger.warning(
-                    "job failed id=%s type=%s site=%s attempt=%s/%s next=%s: %s",
-                    job.id,
-                    job.type,
-                    job.site_id,
-                    disposition.retry_count,
-                    disposition.max_retries,
-                    disposition.next_attempt_at,
-                    message,
-                )
-    except StaleGenerationError:
-        # The database was replaced (an import landed) after this
-        # job's data was read. Every row this job knows about
-        # belongs to the discarded generation, so no further write
-        # is safe here -- not even fail(): the job id itself may now
-        # belong to something else. The replacement database has its
-        # own jobs table and its own scheduler/reclaim to govern it.
-        outcome = "stale_generation"
-        logger.info(
-            "job abandoned id=%s type=%s site=%s: database was "
-            "replaced after this job's data was read",
-            job.id,
-            job.type,
-            job.site_id,
         )
+        if recorded is _Dropped.OUTCOME:
+            outcome = "dropped"
+        else:
+            logger.debug(
+                "job completed id=%s type=%s site=%s",
+                job.id,
+                job.type,
+                job.site_id,
+            )
+    except JobDeferred as exc:
+        outcome = "deferred"
+        next_attempt_at = exc.next_attempt_at
+        recorded = await writer.write(
+            lambda conn, j=job, attempt=next_attempt_at: _record_outcome(
+                conn, j, lambda c: defer_job(c, j.id, attempt)
+            )
+        )
+        if recorded is _Dropped.OUTCOME:
+            outcome = "dropped"
+        else:
+            logger.debug(
+                "job deferred id=%s type=%s site=%s until=%s",
+                job.id,
+                job.type,
+                job.site_id,
+                next_attempt_at,
+            )
+    except JobCancelled:
+        outcome = "cancelled"
+        # No success marker: a cancelled job resolved nothing
+        # (the marker is written only by _complete_and_continue).
+        recorded = await writer.write(
+            lambda conn, j=job: _record_outcome(conn, j, lambda c: complete(c, j.id))
+        )
+        if recorded is _Dropped.OUTCOME:
+            outcome = "dropped"
+    except stop.StopRequested:
+        # A stop began before this job's work started (the close chain
+        # checks before each stage, plan 6.3). Nothing is recorded: the
+        # row stays running, and the shutdown reclaim or the next start's
+        # reclaim_all_stale puts it back to pending, to run once.
+        outcome = "stopped"
+    except Exception as exc:
+        if _is_process_fatal_permission_error(exc):
+            logger.critical(
+                "fatal OS permission error while processing job id=%s "
+                "type=%s; terminating worker for process restart",
+                job.id,
+                job.type,
+                exc_info=True,
+            )
+            raise
+        message = sanitized_exception(exc)
+        disposition = await writer.write(
+            lambda conn, j=job, err=message: _record_outcome(
+                conn, j, lambda c: _fail_job(c, j, err)
+            )
+        )
+        if disposition is _Dropped.OUTCOME or disposition is None:
+            # Nothing was recorded for this run and fail() scheduled
+            # no retry: the claimed row no longer stands
+            # (_record_outcome logs that), or fail() found no row.
+            outcome = "dropped"
+        elif disposition.terminal:
+            outcome = "failed"
+            logger.error(
+                "job failed permanently id=%s type=%s site=%s "
+                "attempt %d of %d (retries exhausted): %s",
+                job.id,
+                job.type,
+                job.site_id,
+                disposition.retry_count,
+                disposition.max_retries + 1,
+                message,
+            )
+        else:
+            outcome = "retry"
+            logger.warning(
+                "job failed id=%s type=%s site=%s attempt=%s/%s next=%s: %s",
+                job.id,
+                job.type,
+                job.site_id,
+                disposition.retry_count,
+                disposition.max_retries,
+                disposition.next_attempt_at,
+                message,
+            )
     logger.info(
         "cycle: job=%s type=%s site=%s outcome=%s elapsed=%.1fs lane=%s",
         job.id,
@@ -579,11 +549,7 @@ async def _maybe_stamp_runtime_heartbeat(
         # Exempt from the input epoch too (`epoch_exempt=True`): the only two
         # callers pass the literal keys `worker_last_loop_at` and
         # `scheduler_last_tick_at`, read only by the monitor and
-        # `runtime_status` -- neither a scoring nor a wind-training input. Of
-        # the epoch's two consumers, `score_batches` runs inside a claimed
-        # job, never alongside this stamp, and the wind weights cache does not
-        # read these keys. Moving the epoch every minute here would invalidate
-        # that cache every minute.
+        # `runtime_status` -- neither a scoring nor a wind-training input.
         await db.write(
             lambda conn, state_key=key: set_runtime_state_now(conn, state_key),
             epoch_exempt=True,
@@ -597,92 +563,6 @@ async def dispatch(
     db: Database, writer: FencedWriter, job: Job
 ) -> JobContinuation | None:
     logger.debug("dispatch type=%s site=%s", job.type, job.site_id)
-    if job.type == "pair_and_score":
-        site_id = job.site_id
-        if site_id is None:
-            raise JobCancelled()
-        # Each pair phase, the scoring discovery and each scoring window
-        # compute on a pooled read connection outside the write lock and
-        # apply under the input-epoch compare-and-set
-        # (Database.write_if_current): a pair phase in chunks through
-        # run_split_pair_phases, discovery as its run-stamp transaction, and
-        # a window in SCORE_BATCH_CELLS batches; the sweep is one plain write
-        # transaction. So no write transaction runs a scoring aggregate or
-        # DISTINCT, the event loop (and the Docker healthcheck) gets
-        # scheduled between transactions instead of stalling for the whole
-        # pipeline, and no single transaction holds the write lock for a
-        # whole scoring rebuild.
-        #
-        # CONVERGENCE INVARIANT (do not weaken): the split converges to the
-        # same end state as the monolithic run ONLY because no observation
-        # write can interleave between its transactions:
-        #   (a) the main worker lane is the only executor of jobs that write
-        #       station_observations or any scoring input, so no other job's
-        #       observation write runs between these transactions. The
-        #       current-obs lane executes only fetch_current_obs, whose write
-        #       set is {station_current_obs, station_poll_state, api_budget,
-        #       domain_backoffs, jobs} plus the runtime_state heartbeat,
-        #       disjoint from every table the split pair_and_score reads.
-        #       The current-obs lane's writer is epoch-exempt for exactly
-        #       that disjoint write set; T-E4a/T-E4b
-        #       (tests/test_current_obs_poller.py) pin it; and
-        #   (b) every HTTP route that writes observations (station PUT /
-        #       DELETE, site rain-threshold PUT) runs the monolithic
-        #       pair_and_score INLINE in its own write transaction — it never
-        #       enqueues. Note enqueue_if_absent dedupes against BOTH
-        #       'pending' AND 'running' jobs (db/queue.py), so an enqueue
-        #       issued while this job is mid-split is SWALLOWED, not queued
-        #       behind it: a future route that switches from inline scoring
-        #       to enqueueing would break convergence silently. The dashboard
-        #       enqueue_score_rescore routes do not write observations and
-        #       are safe. An inline route rescore that commits while this job
-        #       computes moves the input epoch, so the apply that follows that
-        #       compute misses and recomputes instead of relying on the
-        #       ordering alone.
-        # One writer lane sits outside (a)/(b): Database.replace_from
-        # (POST /api/import/db) holds both locks and can swap the ENTIRE
-        # database file between any two transactions here. Every write in
-        # this split goes through `writer`, fenced to the generation this
-        # job's site_id was read in (see run_claimed_job), so a swap landing
-        # here is caught deterministically at the next write attempt --
-        # before it can run against the replacement database -- and
-        # StaleGenerationError propagates out of this job, which is then
-        # abandoned rather than completed, failed, or retried (see
-        # run_claimed_job's outer handler). The importer's own
-        # _rebuild_derived background task rebuilds scoring from scratch, so
-        # an abandoned mid-split job leaves nothing for it to converge with.
-        #
-        # Batch scoring runs LAST; its inputs are written by the earlier phases
-        # of the SAME job. Run-stamp/sweep rule: discovery reads the cell
-        # universe at an input epoch, and ONE fixed-width run_stamp is taken
-        # in its own compare-and-set transaction at that epoch. An inline
-        # route rescore is one write transaction, so at the stamp it has
-        # either committed or not started. If it committed before the
-        # discovery read, discovery saw its cells; if after, it moved the
-        # epoch, so the stamp misses and discovery re-reads and sees them.
-        # Either way its cells are re-upserted rather than swept. One that
-        # starts after the stamp writes a LATER stamp and survives the strict
-        # computed_at < run_stamp sweep. Named accepted relaxations: (1) a
-        # same-UTC-day re-run can briefly serve a 'fresh' snapshot mixing two
-        # intra-day generations (both computed from the same day's
-        # observation set); it self-heals when the run completes and does not
-        # affect the midnight staleness contract. (2) Between two chunks of
-        # one multimodel apply, a reader can see some mean keys refreshed and
-        # others not; each visible row is a complete mean for its key, and
-        # the next complete apply of that phase ends the mix.
-        try:
-            await run_split_pair_phases(writer, site_id, require_enabled=True)
-            await run_batched_scoring(writer, site_id)
-        except ScoringInputsBusy as exc:
-            logger.warning(
-                "pair_and_score deferred site=%s step=%s: inputs changed on "
-                "every one of %d attempts",
-                site_id,
-                exc.step,
-                SCORING_CAS_ATTEMPTS,
-            )
-            raise JobDeferred(isoformat_utc(utc_now() + _SCORING_BUSY_DEFER)) from exc
-        return None
     if job.type == "fetch_obs" and job.job_key == WIND_DAYS_JOB_KEY:
         # The wind lane is the one fetch_obs job left; any other key is the
         # retired routine download and ends at the raise below.
@@ -844,7 +724,6 @@ async def _fetch_current_obs(
                 lambda conn, out=transient, res=refund: _persist_poll_result_and_refund(
                     conn, site_id, station_id, out, res
                 ),
-                reservation,
             )
             raise
 
@@ -860,7 +739,6 @@ async def _fetch_current_obs(
                 db,
                 writer,
                 lambda conn, s=status: record_access_refused(conn, "current_obs", s),
-                reservation,
             )
             raise JobDeferred(until)
 
@@ -874,7 +752,6 @@ async def _fetch_current_obs(
                 lambda conn, resp=response, out=outcome: _record_current_obs_backoff(
                     conn, site_id, station_id, resp, out
                 ),
-                reservation,
             )
             # record_http_backoff always returns a next-attempt for 429/>=500.
             raise JobDeferred(next_attempt_at or isoformat_utc())
@@ -885,7 +762,6 @@ async def _fetch_current_obs(
             lambda conn, out=outcome, s=status: _persist_poll_result_clearing(
                 conn, site_id, station_id, out, s
             ),
-            reservation,
         )
 
 

@@ -34,7 +34,6 @@ from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.timeutil import floor_hour, isoformat_utc, utc_now
 from wxverify.db.connection import close_db, get_db, init_db
-from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.service import build_forecast, build_hourly
 from wxverify.settings.keys import set_setting
 
@@ -145,11 +144,14 @@ def test_forecast_tiles_204_when_fingerprint_matches_fragment_when_it_differs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     conn = _init_tmp_db(tmp_path)
-    site_id = _make_site(conn)  # zero samples -> fingerprint is always "0"
+    # Zero samples, no stamps, no active publication -> "0-p0" (the daily
+    # close is permanently on from the build, storage release 3.2, so the
+    # token always carries the "-p<id>" publication suffix; "0" for none).
+    site_id = _make_site(conn)
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
         stale = client.get(f"/forecast/tiles?site={site_id}&fingerprint=")
-        fresh = client.get(f"/forecast/tiles?site={site_id}&fingerprint=0")
+        fresh = client.get(f"/forecast/tiles?site={site_id}&fingerprint=0-p0")
 
     assert stale.status_code == 200
     assert 'id="forecast-tiles"' in stale.text
@@ -246,26 +248,17 @@ def test_forecast_day_clamps_and_embeds_clamped_day_in_chart_src(
 def test_forecast_degrades_to_rebuilding_without_score_cache_no_enqueue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """forecast_pairs + future_samples exist -- enough for a live skill
-    computation to be genuinely confident -- but `score_cache` is left
-    EMPTY. Pre-fix, `leaderboard()`'s live-fallback on a cache miss makes
-    this cell confident/`normal` regardless of the cache; post-fix, an
-    absent cache-backed rolling-window snapshot degrades to a
-    `rebuilding`-empty ranking, so every candidate is unconfident/unscored
-    and the selection ladder falls to the future-sample-count rung ->
-    `rebuilding` (a settled ranking would have read the low-confidence
-    state; this one is not settled at all).
-
-    A ``virtual/_persistence`` baseline with matching (site, variable,
-    valid_at, lead_hours, day_ahead) `forecast_pairs` rows is not required
-    for the `rebuilding` assertions' non-vacuity -- an absent, unseeded
-    `score_cache` snapshot reads `status="rebuilding"` with zero rows
-    whether or not a baseline exists. It is kept for what it actually
-    proves: it is what makes the counterfactual (this same fixture WITH a
-    seeded snapshot) a genuinely *confident*, `normal` cell rather than a
-    differently-degraded one -- so a regression back to live recompute on
-    a cache miss lands on `normal`, not low-confidence, and this test's
-    `rebuilding` assertions kill it at full strength.
+    """future_samples exist, but no publication is ever seeded. With no
+    active publication, `leaderboard_with_status`'s verdict is `empty`, so
+    every candidate is unconfident/unscored; the daily close being
+    permanent means `_state_of` can no longer read this as `rebuilding` --
+    that state required a `rebuilding` leaderboard status, which no
+    longer exists -- so it reads `low_confidence` instead. No pair table
+    or live recompute is read for scoring any more (storage release, table
+    1.B), so an absent publication is the only thing that can produce this
+    state; the only counterfactual worth keeping is the one already
+    covered elsewhere (a seeded publication ranks this feed above
+    persistence and yields `normal`).
 
     Asserts against OBSERVABLE output surfaces only -- `confident` /
     `skill_score` / `pair_n` are candidate-level fields the rendered views
@@ -278,12 +271,7 @@ def test_forecast_degrades_to_rebuilding_without_score_cache_no_enqueue(
     (captured `now`, passed explicitly) and for the HTTP round trip (which
     has no `now` override and always reads the real clock) -- the two must
     exercise the identical degraded-ranking scenario, not a coincidentally
-    already-empty day. `forecast_pairs` use a fixed far-future date
-    (2035-06-30) instead: the rolling window's cutoff is a lower bound
-    only, so a far-future pair stays "in window" regardless of which real
-    day the suite runs on -- the same pattern
-    `test_forecast_blend_depth_option.py::_seed_two_confident_feeds` relies
-    on.
+    already-empty day.
 
     The no-enqueue assertion is HTTP-level: a `rebuilding`-empty ranking
     must degrade gracefully with NO Forecast-side rescore enqueue -- a
@@ -296,11 +284,6 @@ def test_forecast_degrades_to_rebuilding_without_score_cache_no_enqueue(
     feed_id = int(
         conn.execute(
             "SELECT id FROM feeds WHERE source='open-meteo' AND model='ecmwf_ifs'"
-        ).fetchone()["id"]
-    )
-    persistence_id = int(
-        conn.execute(
-            "SELECT id FROM feeds WHERE source='virtual' AND model='_persistence'"
         ).fetchone()["id"]
     )
 
@@ -324,77 +307,33 @@ def test_forecast_degrades_to_rebuilding_without_score_cache_no_enqueue(
                 issued_at,
             ),
         )
-    for i, valid_at in enumerate(
-        ("2035-06-30T00:00:00Z", "2035-06-30T01:00:00Z", "2035-06-30T02:00:00Z")
-    ):
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 tz_generation_id)
-            VALUES (?, ?, 'temperature', '2035-06-29T00:00:00Z', ?, ?, 1,
-                    11.0, 10.0, 1.0, 1.0, 1.0, ?)
-            """,
-            (
-                site_id,
-                feed_id,
-                valid_at,
-                i + 1,
-                ensure_site_generation(conn, site_id),
-            ),
-        )
-    for i, valid_at in enumerate(
-        ("2035-06-30T00:00:00Z", "2035-06-30T01:00:00Z", "2035-06-30T02:00:00Z")
-    ):
-        # Persistence baseline paired on the SAME (site, variable, valid_at,
-        # lead_hours, day_ahead) as the candidate feed's rows above --
-        # required by `_paired_skill`'s join. A worse forecast (15.0 vs
-        # observed 10.0) than the candidate's (11.0 vs 10.0) gives a
-        # nonzero, genuinely-confident skill_score under live recompute.
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 tz_generation_id)
-            VALUES (?, ?, 'temperature', '2035-06-29T00:00:00Z', ?, ?, 1,
-                    15.0, 10.0, 5.0, 5.0, 25.0, ?)
-            """,
-            (
-                site_id,
-                persistence_id,
-                valid_at,
-                i + 1,
-                ensure_site_generation(conn, site_id),
-            ),
-        )
-    # Deliberately NO upsert_score_cache call -- the point of this fixture.
+    # Deliberately NO publication seeded -- the point of this fixture.
 
     view = build_forecast(
         conn, site_id=site_id, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
-    assert view.tiles[1].temp.meta.state == "rebuilding"
+    assert view.tiles[1].temp.meta.state == "low_confidence"
     assert any(ref.feed_id == feed_id for ref in view.tiles[1].temp.meta.feeds)
 
     hourly = build_hourly(conn, site_id=site_id, timezone="UTC", day=1, now=now)
-    assert hourly["states"]["temperature"] == "rebuilding"
+    assert hourly["states"]["temperature"] == "low_confidence"
 
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
         tiles_resp = client.get(f"/forecast/tiles?site={site_id}&fingerprint=")
         assert tiles_resp.status_code == 200
-        # O5: the rendered tile surface carries the new state class and
-        # badge, and NEVER the old "low confidence" wording -- the negative
-        # half is what proves the operator no longer sees the wrong word.
+        # O5: the rendered tile surface carries the state class and badge
+        # that production now returns with no publication -- and NEVER the
+        # old "ranking updating" wording, retired with the per-cell
+        # "rebuilding" leaderboard status it depended on.
         rendered = " ".join(tiles_resp.text.split())
-        assert "state-rebuilding" in rendered
-        assert "ranking updating" in rendered
-        assert "low confidence" not in rendered
+        assert "state-low_confidence" in rendered
+        assert "low confidence" in rendered
+        assert "ranking updating" not in rendered
 
         hourly_resp = client.get(f"/api/forecast/hourly?site={site_id}&day=1")
         assert hourly_resp.status_code == 200
-        assert hourly_resp.json()["states"]["temperature"] == "rebuilding"
+        assert hourly_resp.json()["states"]["temperature"] == "low_confidence"
 
         job_count = get_db().read_sync(
             lambda c: c.execute(
@@ -426,16 +365,16 @@ def test_forecast_degrades_to_rebuilding_without_score_cache_no_enqueue(
 def test_forecast_partial_coverage_rebuilding_agrees_across_both_surfaces(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Same rebuilding-empty-cache scenario as the test above, but the
-    feed's future samples cover only 14 hours -- clears the 12-hour
-    selection floor but NOT the 18-hour coverage guard. `clearing_subset`
-    falls back to the full (single-feed) selection and sets `partial=True`,
-    so `agg_feeds` and `selection.feeds` are the SAME list here: per-surface
+    """Same no-publication scenario as the test above, but the feed's
+    future samples cover only 14 hours -- clears the 12-hour selection
+    floor but NOT the 18-hour coverage guard. `clearing_subset` falls back
+    to the full (single-feed) selection and sets `partial=True`, so
+    `agg_feeds` and `selection.feeds` are the SAME list here: per-surface
     width is a non-issue on this fixture, and both the tile and the
     drill-down must report the same `state`. If the tile's gate were
     resolved over the raw coverage-guard filter instead of over
     `clearing_subset`'s fallback return, it would see an empty rendered set
-    here and read low-confidence over numbers a rebuilding-ranked feed
+    here and read a different state than the numbers an unconfident feed
     produced. (14 hours is also short of the 24 the target local day needs,
     so the feed is not extrema-eligible; this test asserts `state`, not the
     now-suppressed temperature extrema, so that is not a concern here.)
@@ -446,11 +385,6 @@ def test_forecast_partial_coverage_rebuilding_agrees_across_both_surfaces(
     feed_id = int(
         conn.execute(
             "SELECT id FROM feeds WHERE source='open-meteo' AND model='ecmwf_ifs'"
-        ).fetchone()["id"]
-    )
-    persistence_id = int(
-        conn.execute(
-            "SELECT id FROM feeds WHERE source='virtual' AND model='_persistence'"
         ).fetchone()["id"]
     )
 
@@ -474,56 +408,16 @@ def test_forecast_partial_coverage_rebuilding_agrees_across_both_surfaces(
                 issued_at,
             ),
         )
-    for i, valid_at in enumerate(
-        ("2035-06-30T00:00:00Z", "2035-06-30T01:00:00Z", "2035-06-30T02:00:00Z")
-    ):
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 tz_generation_id)
-            VALUES (?, ?, 'temperature', '2035-06-29T00:00:00Z', ?, ?, 1,
-                    11.0, 10.0, 1.0, 1.0, 1.0, ?)
-            """,
-            (
-                site_id,
-                feed_id,
-                valid_at,
-                i + 1,
-                ensure_site_generation(conn, site_id),
-            ),
-        )
-    for i, valid_at in enumerate(
-        ("2035-06-30T00:00:00Z", "2035-06-30T01:00:00Z", "2035-06-30T02:00:00Z")
-    ):
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 tz_generation_id)
-            VALUES (?, ?, 'temperature', '2035-06-29T00:00:00Z', ?, ?, 1,
-                    15.0, 10.0, 5.0, 5.0, 25.0, ?)
-            """,
-            (
-                site_id,
-                persistence_id,
-                valid_at,
-                i + 1,
-                ensure_site_generation(conn, site_id),
-            ),
-        )
-    # Deliberately NO upsert_score_cache call, same as the fixture above.
+    # Deliberately NO publication seeded, same as the fixture above.
 
     view = build_forecast(
         conn, site_id=site_id, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
-    assert view.tiles[1].temp.meta.state == "rebuilding"
+    assert view.tiles[1].temp.meta.state == "low_confidence"
     assert view.tiles[1].temp.meta.partial is True
 
     hourly = build_hourly(conn, site_id=site_id, timezone="UTC", day=1, now=now)
-    assert hourly["states"]["temperature"] == "rebuilding"
+    assert hourly["states"]["temperature"] == "low_confidence"
 
 
 # ---------------------------------------------------------------------------

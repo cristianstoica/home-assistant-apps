@@ -1,9 +1,9 @@
 """Dashboard JSON routes.
 
-With the daily close on, ``/leaderboard``, ``/composite`` and ``/winrate``
-send the active publication's cutoff as an ``X-Evidence-Through`` header
-(ISO date) and keep their bodies' shape; ``/curve`` carries it in its body
-as ``evidence_through`` (9.6). With the close off no header is sent and
+``/leaderboard``, ``/composite`` and ``/winrate`` send the active
+publication's cutoff as an ``X-Evidence-Through`` header (ISO date) and keep
+their bodies' shape; ``/curve`` carries it in its body as
+``evidence_through`` (9.6). With no publication no header is sent and
 ``evidence_through`` is None.
 """
 
@@ -22,11 +22,9 @@ from wxverify.db.connection import get_db, pinned_read_snapshot
 from wxverify.scoring.composite import composite_with_status
 from wxverify.scoring.leaderboard import (
     LeaderboardResult,
-    LeaderboardStatus,
     leaderboard_in_snapshot,
     leaderboard_with_status,
 )
-from wxverify.scoring.rescore import schedule_score_rescore
 from wxverify.scoring.winrate import winrate_with_evidence
 from wxverify.web.context import feed_label
 
@@ -64,7 +62,7 @@ async def leaderboard(
 
     def _read(
         conn: sqlite3.Connection,
-    ) -> tuple[list[LeaderboardOut], LeaderboardStatus, date | None]:
+    ) -> tuple[list[LeaderboardOut], date | None]:
         result = leaderboard_with_status(
             conn,
             site_id=site,
@@ -74,16 +72,11 @@ async def leaderboard(
         )
         return (
             [LeaderboardOut(**row.__dict__) for row in result.rows],
-            result.status,
             result.evidence_through,
         )
 
-    result, status, evidence_through = await get_db().read(_read)
+    result, evidence_through = await get_db().read(_read)
     _set_evidence_header(response, evidence_through)
-
-    if status in ("stale", "rebuilding"):
-        schedule_score_rescore(site)
-
     return result
 
 
@@ -106,9 +99,9 @@ async def curve(
     # emptying the chart or, via naive slicing, blowing past the guarantee.
     top_clamped = max(1, min(_MAX_SERIES, top))
 
-    def _read(conn: sqlite3.Connection) -> tuple[dict[str, object], bool]:
-        # The eight leads in one snapshot, so with the close on every one
-        # reads the same publication (9.3).
+    def _read(conn: sqlite3.Connection) -> dict[str, object]:
+        # The eight leads in one snapshot, so every one reads the same
+        # publication (9.3).
         with pinned_read_snapshot(conn, label="curve"):
             results = [
                 leaderboard_in_snapshot(
@@ -133,14 +126,9 @@ async def curve(
             "evidence_through": (
                 None if evidence_through is None else evidence_through.isoformat()
             ),
-        }, any(result.status in ("stale", "rebuilding") for result in results)
+        }
 
-    result, needs_rescore = await get_db().read(_read)
-    # `empty` leads do not gate: a genuinely inapplicable curve slice must not
-    # turn into a rebuild request of its own.
-    if needs_rescore:
-        schedule_score_rescore(site)
-    return result
+    return await get_db().read(_read)
 
 
 def _coerce_lead_day(lead: str, default: int = 1) -> int:
@@ -248,10 +236,6 @@ async def composite(
         lambda conn: composite_with_status(conn, site_id=site, window=window)
     )
     _set_evidence_header(response, result.evidence_through)
-    # The read connection is already released; the fire-and-forget scheduler
-    # carries the terminal-failure cooldown and never gates the response.
-    if result.status in ("stale", "rebuilding"):
-        schedule_score_rescore(site)
     return result.rows
 
 

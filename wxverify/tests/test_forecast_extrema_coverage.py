@@ -8,9 +8,9 @@ there). This file covers F-T6 through F-T31:
   ``local_day_bounds``, ``covers_local_day``), pure and DB-free.
 * F-T13 through F-T17 — end to end through ``build_forecast``/
   ``build_hourly`` (the live Forecast page's surfaces).
-* F-T18 through F-T21 — the persisted forecast-of-record row, the
-  simulator's purity with respect to the extrema fields, and three-surface
-  agreement.
+* F-T18 and F-T19 — the persisted forecast-of-record row.
+* F-T21 — tile/record agreement on a fully-covered and an under-covered
+  day.
 * F-T22 through F-T25 — the stale and low-confidence/rebuilding badge
   rules: a stale contributor alone, an unscored extrema set beside a
   confident blend set, and suppressed extrema contributing neither warning
@@ -18,14 +18,17 @@ there). This file covers F-T6 through F-T31:
 * F-T26 — confidence states are independent per side (blend vs. extrema)
   when their contributor sets differ, and roll up identically to
   ``today``'s state when the contributor set is shared, swept over fresh,
-  stale, low-confidence and low-confidence-plus-rebuilding.
+  stale and low-confidence.
 * F-T27 — retired with the old wind method: weighted wind's state ignores
   the ranking, and it has no extrema set. (Its precipitation half moved to
   ``tests/test_forecast_precip_coverage.py`` G-T23 through G-T26 once
   precipitation adopted its own extrema-coverage rule under Item G.)
-* F-T28 through F-T30 — tile-level state/confidence-state rollup across
-  variables, badge/tooltip/persisted-metadata agreement, and rebuilding
-  precedence on the extrema set.
+* F-T28 and F-T29 — tile-level state/confidence-state rollup across
+  variables and badge/tooltip/persisted-metadata agreement. F-T30
+  (rebuilding precedence on the extrema set) is retired with the daily
+  close being permanent: ``leaderboard_with_status`` never reports
+  "rebuilding" once a publication is active, so the state it pinned can no
+  longer occur.
 * F-T31 — Lord Howe Island (UTC+10:30/+11), whose DST shift needs every
   UTC-hour instant of the local day, not a fixed hour count.
 
@@ -44,19 +47,20 @@ import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
-from tests.helpers import asof_persistence_feed_id, seed_rain_ranks
+from tests.helpers import (
+    seed_active_publication,
+    seed_publication_ranking,
+    seed_rain_ranks,
+)
 from wxverify.core.timeutil import isoformat_utc, local_day_slots
 from wxverify.db.migrations import run_migrations
 from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.aggregate import (
     EXTREMA_COVERAGE_INSUFFICIENT,
     covers_local_day,
-    displayed_daily,
 )
-from wxverify.forecast.data import FutureSampleRow
 from wxverify.forecast.service import build_forecast, build_hourly
-from wxverify.scoring.leaderboard import leaderboard_with_status, resolve_window
-from wxverify.scoring.metrics import strategy_for
+from wxverify.scoring.metrics import MetricResult, MetricSums, metrics_from_sums
 from wxverify.settings.keys import get_number_setting, set_setting
 from wxverify.verification.coverage import (
     EXCLUDE_INSUFFICIENT_COVERAGE,
@@ -66,17 +70,6 @@ from wxverify.verification.coverage import (
     local_day_bounds,
 )
 from wxverify.verification.record import build_forecast_record, resolve_snapshot_utc
-from wxverify.verification.runs import (
-    RosterFeed,
-    RunConfig,
-    capture_config_snapshot,
-    input_fingerprint,
-    result_basis_fingerprint,
-)
-from wxverify.verification.simulate import (
-    _entities_for_selection,  # pyright: ignore[reportPrivateUsage]
-    simulate_snapshot_day,
-)
 from wxverify.web.context import feed_label
 from wxverify.web.render import env as jinja_env
 
@@ -130,116 +123,94 @@ def _insert_sample(
     )
 
 
-def _insert_pair(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int = 1,
-    feed_id: int,
-    variable: str,
-    issued_at: str,
-    valid_at: str,
-    lead_hours: int,
-    day_ahead: int,
-    forecast: float,
-    observed: float = 10.0,
-) -> None:
-    error = forecast - observed
-    conn.execute(
-        """
-        INSERT INTO forecast_pairs
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error,
-             tz_generation_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            site_id,
-            feed_id,
-            variable,
-            issued_at,
-            valid_at,
-            lead_hours,
-            day_ahead,
-            forecast,
-            observed,
-            error,
-            abs(error),
-            error * error,
-            ensure_site_generation(conn, site_id),
-        ),
-    )
+_TEST_PUBLICATION_WINDOW_DAYS = 30
 
 
-_FAR_FUTURE_VALID_ATS = (
-    "2035-07-01T00:00:00Z",
-    "2035-07-01T01:00:00Z",
-    "2035-07-01T02:00:00Z",
-)
-_FAR_FUTURE_LEAD_HOURS = (1, 2, 3)
+def _ensure_test_publication(
+    conn: sqlite3.Connection, *, min_n: int
+) -> tuple[int, int]:
+    """This connection's one site-1 publication, created on first use.
 
+    Returns ``(publication id, its window_days)``: a caller seeded first by
+    another helper (``seed_rain_ranks``, say) leaves a publication whose
+    ``window_days`` is that helper's own default, not this file's constant,
+    so callers must read it back rather than assume it.
 
-def _seed_scoring_pairs(
-    conn: sqlite3.Connection,
-    *,
-    feed_id: int,
-    variable: str,
-    day_ahead: int,
-    forecast: float,
-) -> None:
-    """3 far-future scoring pairs against a fixed observed=10.0 baseline."""
-    pairs = zip(_FAR_FUTURE_VALID_ATS, _FAR_FUTURE_LEAD_HOURS, strict=True)
-    for valid_at, lead in pairs:
-        _insert_pair(
-            conn,
-            feed_id=feed_id,
-            variable=variable,
-            issued_at="2035-06-30T00:00:00Z",
-            valid_at=valid_at,
-            lead_hours=lead,
-            day_ahead=day_ahead,
-            forecast=forecast,
-        )
-
-
-def _seed_complete_score_cache(
-    conn: sqlite3.Connection, *, variable: str, day_ahead: int
-) -> None:
-    """Fresh, complete score_cache snapshot for every feed with pairs at
-    (site 1, `variable`, `day_ahead`) — required for cache-backed
-    ``forecast_ranking`` to serve live numbers rather than 'rebuilding'.
-    Mirrors ``tests/test_forecast_service.py``'s identically-named helper.
+    ``forecast_ranking_with_status``'s ``rolling`` window now always reads
+    the active publication (9.2), never a live recompute. Mirrors
+    ``tests/test_forecast_service.py``'s identically-named helper.
     """
-    from wxverify.scoring.cache import upsert_score_cache
+    row = conn.execute(
+        "SELECT id, window_days FROM publications WHERE site_id = 1"
+        " ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row is not None:
+        return int(row["id"]), int(row["window_days"])
+    pub_id = seed_active_publication(
+        conn,
+        site_id=1,
+        cutoff=date(2035, 6, 30),
+        published_at=datetime(2035, 6, 30, tzinfo=UTC),
+        window_days=_TEST_PUBLICATION_WINDOW_DAYS,
+        min_n=min_n,
+    )
+    return pub_id, _TEST_PUBLICATION_WINDOW_DAYS
 
+
+def _seed_score_cache(
+    conn: sqlite3.Connection,
+    *,
+    variable: str,
+    day_ahead: int,
+    forecasts: dict[int, float],
+) -> None:
+    """Seed one published-ranking row per feed in ``forecasts`` (site 1,
+    ``variable``, ``day_ahead``) -- required for `forecast_ranking_with_status`
+    to serve live numbers rather than 'rebuilding'. Mirrors
+    ``tests/test_forecast_service.py``'s identically-named helper.
+
+    Every key of ``forecasts`` stands for 3 identical far-future pairs
+    against a fixed observed=10.0 baseline (``n=3``), so bias/MAE/RMSE are
+    exact, not approximated. A feed's skill is computed only when
+    ``forecasts`` also carries the seeded ``virtual/_persistence`` feed
+    id, paired 1:1 against persistence's own (also constant) error over
+    the same 3 valid_ats. ``forecasts`` is local to the caller: no
+    module-level state survives this call, so a stale ``id(conn)`` reuse
+    across tests can never leak one test's values into another's.
+    """
     min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-    resolved = resolve_window(conn, "rolling")
-    feed_ids = {
-        int(row["feed_id"])
-        for row in conn.execute(
-            "SELECT DISTINCT feed_id FROM forecast_pairs "
-            "WHERE site_id=1 AND variable=? AND day_ahead=?",
-            (variable, day_ahead),
-        ).fetchall()
-    }
-    for feed_id in feed_ids:
-        result = strategy_for(variable).aggregate(
+    pub_id, window_days = _ensure_test_publication(conn, min_n=min_n)
+    window_key = f"w:{window_days}"
+    persistence_id = _feed_id(conn, "virtual", "_persistence")
+    persistence_forecast = forecasts.get(persistence_id)
+    persistence_sq = (
+        None if persistence_forecast is None else (persistence_forecast - 10.0) ** 2
+    )
+    for feed_id, forecast in forecasts.items():
+        error = forecast - 10.0
+        sums: MetricSums = {
+            "n": 3,
+            "err_n": 3,
+            "err_sum": error * 3,
+            "abs_sum": abs(error) * 3,
+            "sq_sum": error * error * 3,
+        }
+        if persistence_sq is not None:
+            sums = {
+                **sums,
+                "skill_n": 3,
+                "skill_sq_sum": error * error * 3,
+                "skill_ref_sq_sum": persistence_sq * 3,
+            }
+        result = metrics_from_sums(sums, variable=variable, min_n=min_n)
+        seed_publication_ranking(
             conn,
-            site_id=1,
+            publication_id=pub_id,
             feed_id=feed_id,
             variable=variable,
             day_ahead=day_ahead,
-            window_cutoff=resolved.cutoff,
-            min_n=min_n,
-        )
-        upsert_score_cache(
-            conn,
-            site_id=1,
-            feed_id=feed_id,
-            variable=variable,
-            day_ahead=day_ahead,
-            window_key=resolved.window_key,
+            window_key=window_key,
             result=result,
-            computed_at=isoformat_utc(),
         )
 
 
@@ -618,16 +589,12 @@ def test_fully_covered_feed_beats_higher_skill_partial_feed() -> None:
     )
     # Both confident; the partial feed has the HIGHER skill (closer forecast
     # to the fixed observed=10.0 baseline).
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="temperature", day_ahead=1, forecast=5.0
+    _seed_score_cache(
+        conn,
+        variable="temperature",
+        day_ahead=1,
+        forecasts={persistence_id: 5.0, full_id: 11.0, partial_id: 10.2},
     )
-    _seed_scoring_pairs(
-        conn, feed_id=full_id, variable="temperature", day_ahead=1, forecast=11.0
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=partial_id, variable="temperature", day_ahead=1, forecast=10.2
-    )
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
     conn.commit()
 
     view = build_forecast(
@@ -933,203 +900,18 @@ def test_candidates_json_carries_extrema_eligible_for_real_and_no_sample_feeds()
 
 
 # ===========================================================================
-# F-T20 -- nothing scored moved.
-# ===========================================================================
-
-
-def test_scored_temperature_entity_is_the_pre_f_clearing_subset_value() -> None:
-    # M1 remediation: a self-comparison of two identical
-    # _entities_for_selection calls proves determinism, not "unchanged by
-    # Item F" -- there is no "before" to diff against, and it cannot see
-    # simulate.py:727/734 (the actual mutant sites) because feed_ids is an
-    # argument it hands in, never derived internally. Drive the real
-    # pipeline instead: simulate_snapshot_day -> select_cell_feeds(...,
-    # extrema_coverage_required=False) -> feed_ids=[c.feed_id for c in
-    # selection.feeds] -> _entities_for_selection, with a fixture only that
-    # path can produce -- one confident temperature feed covering 20 of 24
-    # local hours (blend-eligible via clears_coverage/MIN_COVERAGE_HOURS=18,
-    # NOT extrema-eligible via covers_local_day, which needs all 24).
-    from wxverify.verification.methodology import METHODOLOGY_VERSION
-
-    assert METHODOLOGY_VERSION == 5
-
-    conn = _record_conn()
-    site_id = _record_site(conn, "site-a")
-    generation_id = ensure_site_generation(conn, site_id)
-    feed_id = _record_feed(conn, "model-a")
-
-    local_date = _RECORD_DAY  # 2035-06-15
-    values = [10.0 + i * 0.1 for i in range(20)]  # hours 00-19 only (20h)
-    for i, value in enumerate(values):
-        conn.execute(
-            """
-            INSERT INTO forecast_samples
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 value, source_raw, model_run_id, fetched_at)
-            VALUES (?, ?, 'temperature', '2035-06-14T20:00:00Z', ?, ?, ?,
-                    '{}', 'run-x', '2035-06-14T20:00:00Z')
-            """,
-            (
-                site_id,
-                feed_id,
-                f"2035-06-15T{i:02d}:00:00Z",
-                i + 1,
-                value,
-            ),
-        )
-    conn.commit()
-
-    snapshot = capture_config_snapshot(conn, site_id)
-    period_start = local_date.isoformat()
-    period_end = local_date.isoformat()
-    run_id = int(
-        conn.execute(
-            """
-            INSERT INTO verification_runs
-                (site_id, tz_generation_id, methodology_version, app_version,
-                 state, attempt, config_snapshot, period_start, period_end,
-                 settled_through, bootstrap_seed, bootstrap_resamples,
-                 input_fingerprint)
-            VALUES (?, ?, 2, '0.16.0-test', 'running', 1, ?, ?, ?, ?, 1, 40, ?)
-            """,
-            (
-                site_id,
-                generation_id,
-                json.dumps(snapshot),
-                period_start,
-                period_end,
-                period_end,
-                input_fingerprint(conn, site_id, snapshot),
-            ),
-        ).lastrowid
-    )
-    conn.commit()
-
-    cfg = RunConfig(
-        site_id=site_id,
-        run_id=run_id,
-        timezone="UTC",
-        rain_threshold_mm=0.2,
-        wall_clock="07:00",
-        blend_depth=1,
-        blend_depths={"temperature": 1, "wind": 1, "precip": 1},
-        min_n=3,
-        window_days=30,
-        tz_generation_id=generation_id,
-        roster=(
-            RosterFeed(
-                feed_id=feed_id,
-                source="example-src",
-                model="model-a",
-                max_lead_hours=192,
-            ),
-        ),
-        period_start=period_start,
-        period_end=period_end,
-        bootstrap_seed=1,
-        bootstrap_resamples=40,
-        wind_basis="pair_max",
-    )
-
-    # Fingerprint-purity check (E-T17/C-T8's pattern): supporting evidence
-    # only, that build_forecast_record's extrema computation does not touch
-    # what these fingerprints read -- NOT a proof of equivalence to any
-    # pre-Item-F implementation. The literal predicted-high oracle below is
-    # the real guard.
-    before_input = input_fingerprint(conn, site_id, snapshot)
-    before_basis = result_basis_fingerprint(
-        conn, site_id, snapshot, period_start=period_start, period_end=period_end
-    )
-
-    simulate_snapshot_day(conn, cfg, local_date.isoformat())
-    conn.commit()
-
-    after_input = input_fingerprint(conn, site_id, snapshot)
-    after_basis = result_basis_fingerprint(
-        conn, site_id, snapshot, period_start=period_start, period_end=period_end
-    )
-    assert before_input == after_input
-    assert before_basis == after_basis
-
-    row = conn.execute(
-        """
-        SELECT * FROM verification_evidence
-        WHERE run_id = ? AND snapshot_local_date = ? AND target_local_date = ?
-          AND lead = 0 AND variable = 'temperature' AND quantity = 'temperature_high'
-          AND entity_type = 'depth' AND entity_key = '1'
-        """,
-        (run_id, local_date.isoformat(), local_date.isoformat()),
-    ).fetchone()
-    assert row is not None
-    # The clearing subset is just this one feed (its 20h clears the 18h
-    # coverage guard), so displayed_daily's temperature body over its 20
-    # values is max(values) for the high -- computed the same way
-    # displayed_daily computes it, not transcribed as a bare literal.
-    expected_high = displayed_daily("temperature", [values], rain_threshold_mm=0.2)[
-        "high_c"
-    ]
-    assert expected_high == max(values)
-    assert row["predicted"] == expected_high
-    assert row["covered_hours"] == 20
-    assert row["forecast_eligible"] == 1
-    assert row["forecast_exclusion_reason"] is None
-
-
-def test_input_fingerprint_unchanged_across_a_call_that_uses_extrema_logic() -> None:
-    # E-T17's pattern (deliberate counterpart to C-T8): call
-    # input_fingerprint on its own, run something that exercises Item F's
-    # extrema logic (build_forecast_record, which computes CellCandidate.
-    # extrema_eligible and runs select_cell_feeds(extrema_coverage_required
-    # =True) internally), then call input_fingerprint again with the SAME
-    # snapshot -- unchanged, because input_fingerprint/capture_config_
-    # snapshot never read candidates, CellSelection or any extrema field
-    # (verified by reading wxverify/verification/runs.py: the digest
-    # covers only site config + roster + daily_truth/observations/sample
-    # high-water, none of which build_forecast_record's extrema
-    # computation writes to).
-    conn = _record_conn()
-    site_id = _record_site(conn, "site-a")
-    feed_id = _record_feed(conn, "model-a")
-    valid_ats = [
-        datetime(_RECORD_DAY.year, _RECORD_DAY.month, _RECORD_DAY.day, h, tzinfo=UTC)
-        for h in range(24)
-    ]
-    _record_insert_day(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        local_date=_RECORD_DAY,
-        issued_at="2035-06-15T06:00:00Z",
-        valid_ats=valid_ats,
-        value=10.0,
-    )
-    conn.commit()
-
-    snapshot = capture_config_snapshot(conn, site_id)
-    before = input_fingerprint(conn, site_id, snapshot)
-
-    t = _record_snapshot_t()
-    build_forecast_record(
-        conn, site_id, _RECORD_DAY.isoformat(), now=t + timedelta(minutes=5)
-    )
-
-    after = input_fingerprint(conn, site_id, snapshot)
-    assert before == after
-
-
-# ===========================================================================
-# F-T21 -- three-surface agreement.
+# F-T21 -- tile/record agreement.
 #
-# The tile uses the extrema set (temperature and precipitation); the simulator uses the
-# clearing subset of the BLEND set. The two agree only when every candidate
-# covers the whole day, so both fixtures below use a single feed -- with one
-# feed, "the extrema set" and "the clearing subset of the blend set" name
-# the same feed by construction, on both the fully-covered and the
-# under-covered day.
+# The tile uses the extrema set (temperature and precipitation); the record
+# uses the clearing subset of the BLEND set. The two agree only when every
+# candidate covers the whole day, so both fixtures below use a single feed
+# -- with one feed, "the extrema set" and "the clearing subset of the blend
+# set" name the same feed by construction, on both the fully-covered and
+# the under-covered day.
 # ===========================================================================
 
 
-def test_three_surfaces_agree_on_a_fully_covered_day() -> None:
+def test_tile_and_record_agree_on_a_fully_covered_day() -> None:
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 14, 0, tzinfo=UTC)
@@ -1195,49 +977,21 @@ def test_three_surfaces_agree_on_a_fully_covered_day() -> None:
     assert row is not None
     displayed = json.loads(str(row["daily_quantities"]))["displayed"]
 
-    # 3. Simulator.
-    sim_samples = [
-        FutureSampleRow(
-            feed_id=record_feed_id,
-            source="example-src",
-            model="model-a",
-            variable="temperature",
-            issued_at="2035-06-15T06:00:00Z",
-            valid_at=isoformat_utc(valid),
-            value=values[i],
-        )
-        for i, valid in enumerate(record_valid_ats)
-    ]
-    entities = dict(
-        _entities_for_selection(
-            entity_type="depth",
-            entity_key="1",
-            variable="temperature",
-            feed_ids=[record_feed_id],
-            feeds_samples={record_feed_id: sim_samples},
-            timezone="UTC",
-            target_date=_RECORD_DAY,
-            rain_threshold_mm=0.2,
-        )
-    )
-
     expected_high = round(max(values), 10)
     expected_low = round(min(values), 10)
     assert tile.temp.high_c == expected_high
     assert tile.temp.low_c == expected_low
     assert displayed["high_c"] == expected_high
     assert displayed["low_c"] == expected_low
-    assert entities[QUANTITY_TEMPERATURE_HIGH].predicted == expected_high
-    assert entities[QUANTITY_TEMPERATURE_LOW].predicted == expected_low
 
 
-def test_three_surfaces_report_unavailability_own_form_on_uncovered_day() -> None:
+def test_tile_and_record_report_unavailability_own_form_on_uncovered_day() -> None:
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 14, 0, tzinfo=UTC)
 
     # 10 covered hours: under both the 18h clearing guard and the 24h
-    # extrema requirement, so all three surfaces see genuine under-coverage.
+    # extrema requirement, so both surfaces see genuine under-coverage.
     valid_ats = _hours("2026-07-20", 0, 10)
     _seed_hourly(
         conn,
@@ -1300,41 +1054,6 @@ def test_three_surfaces_report_unavailability_own_form_on_uncovered_day() -> Non
     assert displayed["high_c"] is None
     assert displayed["low_c"] is None
     assert displayed["extrema_coverage"] == EXTREMA_COVERAGE_INSUFFICIENT
-
-    # 3. Simulator: its own recorded form -- an ineligible verdict with an
-    # explicit exclusion reason, NOT None (QuantityOutcome retains value as
-    # a labelled diagnostic even when ineligible).
-    sim_samples = [
-        FutureSampleRow(
-            feed_id=record_feed_id,
-            source="example-src",
-            model="model-a",
-            variable="temperature",
-            issued_at="2035-06-15T06:00:00Z",
-            valid_at=isoformat_utc(valid),
-            value=12.0,
-        )
-        for valid in record_valid_ats
-    ]
-    entities = dict(
-        _entities_for_selection(
-            entity_type="depth",
-            entity_key="1",
-            variable="temperature",
-            feed_ids=[record_feed_id],
-            feeds_samples={record_feed_id: sim_samples},
-            timezone="UTC",
-            target_date=_RECORD_DAY,
-            rain_threshold_mm=0.2,
-        )
-    )
-    assert entities[QUANTITY_TEMPERATURE_HIGH].forecast_eligible is False
-    assert (
-        entities[QUANTITY_TEMPERATURE_HIGH].forecast_exclusion_reason
-        == EXCLUDE_INSUFFICIENT_COVERAGE
-    )
-    # Its own form -- not None.
-    assert entities[QUANTITY_TEMPERATURE_HIGH].predicted is not None
 
 
 # ===========================================================================
@@ -1401,13 +1120,13 @@ def _seed_ab_fixture(
 ) -> tuple[int, int]:
     """F.11's shared two-feed fixture. Returns (feed_a, feed_b).
 
-    Both feeds' scoring pairs are seeded alongside matching persistence
-    pairs at the SAME valid_ats -- ``ContinuousStrategy.aggregate``'s
+    Both feeds' ``forecasts`` entries are seeded alongside the seeded
+    ``virtual/_persistence`` feed's own entry: ``metrics_from_sums``'s
     ``confident`` flag requires a non-None skill score, and
-    ``_paired_skill`` only produces one when the persistence feed has
-    pairs at the exact same ``valid_at`` (``wxverify/scoring/metrics.py``).
-    Without a persistence counterpart, ``confident`` is False no matter how
-    many pairs or how low ``min_n`` is set -- the trap this fixture avoids.
+    ``_skill_from_sums`` only produces one when the persistence feed's
+    forecast is also given (``wxverify/scoring/metrics.py``). Without a
+    persistence counterpart, ``confident`` is False no matter how many
+    pairs or how low ``min_n`` is set -- the trap this fixture avoids.
     """
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
@@ -1435,21 +1154,14 @@ def _seed_ab_fixture(
     _stamp_usable_fetch(conn, feed_id=feed_a, at=feed_a_issued_at)
     _stamp_usable_fetch(conn, feed_id=feed_b, at=feed_b_issued_at)
 
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="temperature", day_ahead=0, forecast=8.0
-    )
     # A's forecast is closer to the observed=10.0 baseline than B's -- A
     # wins the blend ladder on skill whenever both are confident, so tests
     # relying on "A is the blend winner" hold regardless of which of the
     # two feeds a reader might otherwise expect to rank higher.
-    _seed_scoring_pairs(
-        conn, feed_id=feed_a, variable="temperature", day_ahead=0, forecast=10.02
-    )
+    forecasts = {persistence_id: 8.0, feed_a: 10.02}
     if seed_b_scoring:
-        _seed_scoring_pairs(
-            conn, feed_id=feed_b, variable="temperature", day_ahead=0, forecast=10.2
-        )
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=0)
+        forecasts[feed_b] = 10.2
+    _seed_score_cache(conn, variable="temperature", day_ahead=0, forecasts=forecasts)
     return feed_a, feed_b
 
 
@@ -1666,13 +1378,12 @@ def test_suppressed_extrema_contribute_to_neither_warning() -> None:
         values=[10.0 + i * 0.1 for i in range(20)],
     )
     _stamp_usable_fetch(conn, feed_id=feed_a, at=_AB_FRESH_ISSUED)
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="temperature", day_ahead=0, forecast=8.0
+    _seed_score_cache(
+        conn,
+        variable="temperature",
+        day_ahead=0,
+        forecasts={persistence_id: 8.0, feed_a: 10.1},
     )
-    _seed_scoring_pairs(
-        conn, feed_id=feed_a, variable="temperature", day_ahead=0, forecast=10.1
-    )
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=0)
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
@@ -1750,13 +1461,12 @@ def test_stale_blend_set_alone_still_sets_the_stale_badge_with_extrema_suppresse
         values=[10.0 + i * 0.1 for i in range(20)],
     )
     _stamp_usable_fetch(conn, feed_id=feed_a, at=_AB_STALE_ISSUED)
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="temperature", day_ahead=0, forecast=8.0
+    _seed_score_cache(
+        conn,
+        variable="temperature",
+        day_ahead=0,
+        forecasts={persistence_id: 8.0, feed_a: 10.1},
     )
-    _seed_scoring_pairs(
-        conn, feed_id=feed_a, variable="temperature", day_ahead=0, forecast=10.1
-    )
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=0)
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
@@ -1771,16 +1481,21 @@ def test_stale_blend_set_alone_still_sets_the_stale_badge_with_extrema_suppresse
 
 
 def test_shared_contributor_set_confidence_states_are_independent_per_side() -> None:
-    # F-T26: sweep the three REACHABLE (blend-side, extrema-side) confidence
+    # F-T26: sweep the two REACHABLE (blend-side, extrema-side) confidence
     # combinations across the SAME two-feed fixture shape, proving the two
     # sides are read independently rather than one leaking into the other.
     # "blend low-confidence, extrema confident" is unreachable: eligible
     # (extrema) candidates are a subset of the >=12h blend coverage pool, so
     # whatever lowers the blend-side ranking's confidence lowers the
     # extrema-side ranking's confidence too whenever they share candidates.
-    # "low confidence" and "ranking updating" are mutually exclusive badge
-    # states (F.6's ``_state_of`` precedence), so each case pins exactly
-    # one outcome and its absence. The plan's shared-CONTRIBUTOR-SET half
+    # A third case used to cover "extrema alone rebuilding" (blend side
+    # confident, extrema side with pairs but no score_cache row), but the
+    # daily close being permanent means ``leaderboard_with_status`` can no
+    # longer report "rebuilding" at all -- that case pinned removed
+    # behaviour and was deleted outright rather than reworked. "low
+    # confidence" and "ranking updating" are mutually exclusive badge
+    # states (F.6's ``_state_of`` precedence), so each remaining case pins
+    # exactly one outcome and its absence. The plan's shared-CONTRIBUTOR-SET half
     # (extrema set == blend set, not just both confidence-linked) is
     # exercised separately below, in
     # ``test_shared_contributor_set_states_roll_up_identically_to_today``;
@@ -1802,10 +1517,13 @@ def test_shared_contributor_set_confidence_states_are_independent_per_side() -> 
 
     # Case 2: both low (min_n raised globally, so it lowers BOTH the
     # blend-side and the extrema-side ranking's confidence at once -- there
-    # is no per-side min_n).
+    # is no per-side min_n). min_n must be raised BEFORE seeding:
+    # `_ensure_test_publication` bakes the live "min_n" setting into the
+    # publication's own min_n at its first build and never re-reads it, so
+    # raising the setting afterward has no effect on the published verdict.
     conn = _make_db()
-    _seed_ab_fixture(conn)
     set_setting(conn, "min_n", "10")
+    _seed_ab_fixture(conn)
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
@@ -1817,81 +1535,12 @@ def test_shared_contributor_set_confidence_states_are_independent_per_side() -> 
     assert '<span class="badge warn">low confidence</span>' in html
     assert '<span class="badge muted">ranking updating</span>' not in html
 
-    # Case 3: extrema alone rebuilding (B has pairs but no score_cache row
-    # at its cell), blend side (A) untouched and confident. A rebuilding
-    # temperature side beside an otherwise-normal blend must still surface
-    # "ranking updating", not silently pass as normal -- and must NOT ALSO
-    # claim "low confidence" (mutually exclusive per _state_of).
-    conn = _make_db()
-    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
-    persistence_id = _feed_id(conn, "virtual", "_persistence")
-    set_setting(conn, "forecast_blend_depth", "1")
-    _seed_varying(
-        conn,
-        feed_id=feed_a,
-        variable="temperature",
-        issued_at=_AB_FRESH_ISSUED,
-        valid_ats=_hours(_AB_VALID_DAY, 0, 20),
-        values=[10.0 + i * 0.1 for i in range(20)],
-    )
-    # B is issued the PRIOR calendar day -- a DIFFERENT representative
-    # day_ahead (1) from A's (0) -- so B's incomplete cache snapshot below
-    # cannot also blank out A's own, separately-cached, ranking cell.
-    # ``leaderboard_with_status``'s verdict is scoped to a single (variable,
-    # day_ahead) cache snapshot: sharing A's day_ahead=0 here would make
-    # B's missing row corrupt A's read too, an artifact of this fixture
-    # rather than the rollup this case means to isolate.
-    _seed_varying(
-        conn,
-        feed_id=feed_b,
-        variable="temperature",
-        issued_at="2026-07-19T20:00:00Z",
-        valid_ats=_hours(_AB_VALID_DAY, 0, 24),
-        values=[10.0 + i * 0.05 for i in range(24)],
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="temperature", day_ahead=0, forecast=8.0
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=feed_a, variable="temperature", day_ahead=0, forecast=10.02
-    )
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=0)
-    # B has pairs at its OWN cell (day_ahead=1) but no score_cache row
-    # there -- genuinely "rebuilding", never cached in the first place.
-    _seed_scoring_pairs(
-        conn, feed_id=feed_b, variable="temperature", day_ahead=1, forecast=9.0
-    )
-    conn.commit()
-    assert (
-        leaderboard_with_status(
-            conn, site_id=1, variable="temperature", day_ahead=0, window="rolling"
-        ).status
-        == "hit"
-    )
-    assert (
-        leaderboard_with_status(
-            conn, site_id=1, variable="temperature", day_ahead=1, window="rolling"
-        ).status
-        == "rebuilding"
-    )
-    view = build_forecast(
-        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
-    )
-    today = view.tiles[0]
-    assert today.temp.meta.state == "normal"  # blend set (A) untouched
-    assert today.temp.meta.extrema_state == "rebuilding"
-    html = _render_tiles(site_id=1, view=view)
-    assert '<span class="badge muted">ranking updating</span>' in html
-    assert '<span class="badge warn">low confidence</span>' not in html
-
 
 def _seed_shared_ab_fixture(
     conn: sqlite3.Connection,
     *,
     feed_a_issued_at: str = _AB_FRESH_ISSUED,
     feed_b_issued_at: str = _AB_FRESH_ISSUED,
-    complete_cache: bool = True,
 ) -> tuple[int, int]:
     """The plan's SHARED-contributor-set fixture for F-T26's second half.
 
@@ -1923,28 +1572,25 @@ def _seed_shared_ab_fixture(
     )
     _stamp_usable_fetch(conn, feed_id=feed_a, at=feed_a_issued_at)
     _stamp_usable_fetch(conn, feed_id=feed_b, at=feed_b_issued_at)
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="temperature", day_ahead=0, forecast=8.0
+    _seed_score_cache(
+        conn,
+        variable="temperature",
+        day_ahead=0,
+        forecasts={persistence_id: 8.0, feed_a: 10.02, feed_b: 10.2},
     )
-    _seed_scoring_pairs(
-        conn, feed_id=feed_a, variable="temperature", day_ahead=0, forecast=10.02
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=feed_b, variable="temperature", day_ahead=0, forecast=10.2
-    )
-    if complete_cache:
-        _seed_complete_score_cache(conn, variable="temperature", day_ahead=0)
     return feed_a, feed_b
 
 
 def test_shared_contributor_set_states_roll_up_identically_to_today() -> None:
     # M2 remediation: the plan's shared-CONTRIBUTOR-SET half of F-T26 --
     # every feed covers the day so ``extrema_feeds`` equals the blend set's
-    # clearing subset exactly. Swept over fresh, stale, low-confidence and
-    # low-confidence-plus-rebuilding: in every state the two sides read
-    # identically, because they ARE the same ranking over the same
-    # candidates. The plan's stale-rebuilding-beside-a-low-confidence-cell
-    # case is F-T28(5), not repeated here.
+    # clearing subset exactly. Swept over fresh, stale and low-confidence:
+    # in every state the two sides read identically, because they ARE the
+    # same ranking over the same candidates. The daily close is always on
+    # now, so there is no longer a "rebuilding" leaderboard verdict to sweep
+    # beside low-confidence (the daily close is permanent; rebuilding was a
+    # close-off-only state). The plan's stale-rebuilding-beside-a-low-
+    # confidence-cell case is F-T28(5), not repeated here.
 
     # Fresh, both confident.
     conn = _make_db()
@@ -1983,10 +1629,12 @@ def test_shared_contributor_set_states_roll_up_identically_to_today() -> None:
     assert '<span class="badge muted">ranking updating</span>' not in html
 
     # Low-confidence: min_n raised globally -- both sides share the same
-    # ranking, so both drop below it together.
+    # ranking, so both drop below it together. Raised BEFORE seeding:
+    # `_ensure_test_publication` bakes the live "min_n" setting into the
+    # publication's own min_n at its first build and never re-reads it.
     conn = _make_db()
-    _seed_shared_ab_fixture(conn)
     set_setting(conn, "min_n", "10")
+    _seed_shared_ab_fixture(conn)
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
@@ -1998,23 +1646,6 @@ def test_shared_contributor_set_states_roll_up_identically_to_today() -> None:
     assert '<article class="tile state-low_confidence">' in html
     assert '<span class="badge warn">low confidence</span>' in html
     assert '<span class="badge muted">ranking updating</span>' not in html
-
-    # Low-confidence plus rebuilding: pairs exist for both feeds at the
-    # SAME day_ahead but the score_cache row is never completed -- genuinely
-    # rebuilding, and shared across both the blend and extrema rankings.
-    conn = _make_db()
-    _seed_shared_ab_fixture(conn, complete_cache=False)
-    conn.commit()
-    view = build_forecast(
-        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
-    )
-    today = view.tiles[0]
-    assert today.temp.meta.extrema_state == today.temp.meta.state == "rebuilding"
-    assert today.confidence_state == today.state == "rebuilding"
-    html = _render_tiles(site_id=1, view=view)
-    assert '<article class="tile state-rebuilding">' in html
-    assert '<span class="badge muted">ranking updating</span>' in html
-    assert '<span class="badge warn">low confidence</span>' not in html
 
 
 def test_tile_level_rollup_across_variables() -> None:
@@ -2044,9 +1675,16 @@ def test_tile_level_rollup_across_variables() -> None:
     # cell on feed_a would be masked by that same feed's fresh stamp -- the
     # trap this isolation avoids. Rain release, C4: the feed is the rain
     # ranking's winner, so it needs a full day.
+    # ``seed_rain_ranks`` runs BEFORE ``_seed_ab_fixture``: both create a
+    # publication if none exists yet, and ``active_publication`` picks
+    # whichever has the LATEST cutoff, never the most recently published --
+    # seeding temperature second lets its far-future ``_ensure_test_publication``
+    # cutoff (2035-06-30) reuse the rain fixture's publication instead of
+    # out-cutoffing it, so the rain ranking stays visible to the same read.
     conn = _make_db()
-    _seed_ab_fixture(conn)
     precip_feed = _feed_id(conn, "open-meteo", "icon_global")
+    seed_rain_ranks(conn, site_id=1, published_at=_AB_NOW, ranked={0: [precip_feed]})
+    _seed_ab_fixture(conn)
     _seed_hourly(
         conn,
         feed_id=precip_feed,
@@ -2056,7 +1694,6 @@ def test_tile_level_rollup_across_variables() -> None:
         value=0.5,
     )
     _stamp_usable_fetch(conn, feed_id=precip_feed, at=_AB_STALE_ISSUED)
-    seed_rain_ranks(conn, site_id=1, published_at=_AB_NOW, ranked={0: [precip_feed]})
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
@@ -2181,95 +1818,56 @@ def test_tile_level_rollup_across_variables() -> None:
     assert "tile-badges" not in html
 
 
-_KNOWABLE_VALID_ATS = (
-    "2035-06-14T10:00:00Z",
-    "2035-06-14T11:00:00Z",
-    "2035-06-14T12:00:00Z",
-)
-_KNOWABLE_FIRST_KNOWN_AT = "2035-06-14T13:00:00Z"
+_RECORD_PUBLICATION_WINDOW_DAYS = 30
+_RECORD_PUBLICATION_WINDOW_KEY = f"w:{_RECORD_PUBLICATION_WINDOW_DAYS}"
 
 
-def _knowable_pair(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    feed_id: int,
-    valid_at: str,
-    first_known_at: str,
-    forecast: float,
-    day_ahead: int,
-    variable: str = "temperature",
-    observed: float = 10.0,
-) -> None:
-    """A ``forecast_pairs`` row genuinely knowable at the record's T
-    (``knowable_pair_predicate``, ``wxverify/verification/asof.py``): both
-    ``first_known_at`` and ``valid_at + CONSENSUS_LAG_HOURS`` are
-    comfortably before T. Seeded a day BEFORE ``_RECORD_DAY`` -- unlike the
-    page-side ``_seed_scoring_pairs``' far-future 2035-07-01 literals, which
-    ``knowable_pair_predicate`` excludes (F.11's fixture trap: the record's
-    as-of ranking, unlike the page's live ``score_cache`` read, never sees
-    those).
+def _ensure_record_publication(conn: sqlite3.Connection, *, site_id: int) -> int:
+    """This connection's one ``site_id`` publication, active at T
+    (:func:`_record_snapshot_t`), created on first use.
+
+    ``_record_ranking`` reads the publication active at T (``as_of``, the
+    resolved snapshot time), never a live recompute from ``forecast_pairs``,
+    so a confident record ranking needs a real ``publication_rankings`` row.
     """
-    error = forecast - observed
-    conn.execute(
-        """
-        INSERT INTO forecast_pairs
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error,
-             first_known_at, tz_generation_id)
-        VALUES (?, ?, ?, ?, ?, 6, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            site_id,
-            feed_id,
-            variable,
-            first_known_at,
-            valid_at,
-            day_ahead,
-            forecast,
-            observed,
-            error,
-            abs(error),
-            error * error,
-            first_known_at,
-            ensure_site_generation(conn, site_id),
-        ),
+    row = conn.execute(
+        "SELECT id FROM publications WHERE site_id = ? ORDER BY id DESC LIMIT 1",
+        (site_id,),
+    ).fetchone()
+    if row is not None:
+        return int(row["id"])
+    return seed_active_publication(
+        conn,
+        site_id=site_id,
+        cutoff=_RECORD_DAY - timedelta(days=1),
+        published_at=_record_snapshot_t() - timedelta(hours=1),
+        window_days=_RECORD_PUBLICATION_WINDOW_DAYS,
+        min_n=3,
     )
 
 
 def _seed_record_confident(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    feed_id: int,
-    day_ahead: int = 0,
-    seed_persistence: bool = True,
+    conn: sqlite3.Connection, *, site_id: int, feed_id: int, day_ahead: int = 0
 ) -> None:
-    """3 pairs (== the declared min_n=3) knowable at T for ``feed_id`` AND
-    the persistence baseline at the SAME ``valid_at``s, so the record's
-    as-of ranking (``knowable_pair_predicate``-gated) reads it confident.
-
-    ``seed_persistence=False`` skips the persistence half: the persistence
-    feed has only one row per (site, valid_at, issued_at) -- a second call
-    against the same ``day_ahead`` for a different ``feed_id`` (as F-T29
-    does, to make two feeds confident in the same fixture) must not
-    re-insert it, or it collides on ``forecast_pairs``' UNIQUE constraint.
+    """Give ``feed_id`` a confident published ranking at (temperature,
+    ``day_ahead``) in the publication active at T, so ``_record_ranking``
+    reads it confident. ``n=3`` matches the declared ``min_n=3``; a
+    positive, present ``skill_score`` is what ``MetricResult.confident``
+    needs alongside ``n >= min_n`` (``metrics_from_sums``).
     """
-    persistence_id = asof_persistence_feed_id(conn)
-    targets = [(feed_id, 10.2)]
-    if seed_persistence:
-        targets.append((persistence_id, 8.0))
-    for target_id, forecast in targets:
-        for valid_at in _KNOWABLE_VALID_ATS:
-            _knowable_pair(
-                conn,
-                site_id=site_id,
-                feed_id=target_id,
-                valid_at=valid_at,
-                first_known_at=_KNOWABLE_FIRST_KNOWN_AT,
-                forecast=forecast,
-                day_ahead=day_ahead,
-            )
+    pub_id = _ensure_record_publication(conn, site_id=site_id)
+    result = MetricResult(
+        n=3, bias=0.2, mae=0.2, rmse=0.2, skill_score=0.1, confident=True
+    )
+    seed_publication_ranking(
+        conn,
+        publication_id=pub_id,
+        feed_id=feed_id,
+        variable="temperature",
+        day_ahead=day_ahead,
+        window_key=_RECORD_PUBLICATION_WINDOW_KEY,
+        result=result,
+    )
 
 
 def test_badge_tooltip_and_persisted_metadata_agree_on_confidence() -> None:
@@ -2329,9 +1927,7 @@ def test_badge_tooltip_and_persisted_metadata_agree_on_confidence() -> None:
         )
         _seed_record_confident(record_conn, site_id=site_id, feed_id=rec_a)
         if extrema_confident:
-            _seed_record_confident(
-                record_conn, site_id=site_id, feed_id=rec_b, seed_persistence=False
-            )
+            _seed_record_confident(record_conn, site_id=site_id, feed_id=rec_b)
         t = _record_snapshot_t()
         build_forecast_record(
             record_conn, site_id, _RECORD_DAY.isoformat(), now=t + timedelta(minutes=5)
@@ -2348,152 +1944,6 @@ def test_badge_tooltip_and_persisted_metadata_agree_on_confidence() -> None:
         assert displayed["extrema_feed_ids"] == [rec_b]
         assert (displayed["extrema_low_confidence"] is False) is extrema_confident
         assert (displayed["extrema_low_confidence"] is True) is (not extrema_confident)
-
-
-def test_rebuilding_precedence_on_the_extrema_set() -> None:
-    # F-T30: extrema set (B) low-confidence AND rebuilding -- _state_of's
-    # precedence collapses that combination to "rebuilding", not "low
-    # confidence". Blend set (A) stays confident/not-rebuilding throughout,
-    # so the tile's own CSS-driving ``state`` stays "normal" while the
-    # rollup ``confidence_state`` reads "rebuilding" -- proving the two
-    # fields are computed independently (F.6).
-    conn = _make_db()
-    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
-    persistence_id = _feed_id(conn, "virtual", "_persistence")
-    set_setting(conn, "forecast_blend_depth", "1")
-
-    # A: rep day_ahead=0 (issued the same calendar day as its valid_ats),
-    # 20h coverage, confident with a complete score_cache row -- the blend
-    # winner.
-    _seed_varying(
-        conn,
-        feed_id=feed_a,
-        variable="temperature",
-        issued_at="2026-07-20T20:00:00Z",
-        valid_ats=_hours("2026-07-20", 0, 20),
-        values=[10.0 + i * 0.1 for i in range(20)],
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="temperature", day_ahead=0, forecast=8.0
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=feed_a, variable="temperature", day_ahead=0, forecast=10.1
-    )
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=0)
-
-    # B: rep day_ahead=1 (issued the PRIOR calendar day) -- a DIFFERENT
-    # ranking cell from A's -- covers the whole local day (extrema-
-    # eligible); has scoring pairs at day_ahead=1 but no score_cache row
-    # there, so its own leaderboard read is genuinely "rebuilding".
-    _seed_varying(
-        conn,
-        feed_id=feed_b,
-        variable="temperature",
-        issued_at="2026-07-19T20:00:00Z",
-        valid_ats=_hours("2026-07-20", 0, 24),
-        values=[10.0 + i * 0.05 for i in range(24)],
-    )
-    # No persistence pairs seeded for B's cell: `leaderboard_with_status`'s
-    # "rebuilding" verdict (unlike `confident`) needs only B's OWN
-    # forecast_pairs and an absent score_cache row -- mirroring
-    # test_forecast_service.py's O8
-    # (`test_coverage_guard_splits_tile_and_drill_down_rebuilding_state`),
-    # which establishes "rebuilding" the same way. A second persistence
-    # insert at the same far-future valid_ats as A's day_ahead=0 pairs
-    # would collide on `forecast_pairs`' UNIQUE constraint anyway (it does
-    # not include day_ahead).
-    _seed_scoring_pairs(
-        conn, feed_id=feed_b, variable="temperature", day_ahead=1, forecast=9.0
-    )
-    conn.commit()
-
-    assert (
-        leaderboard_with_status(
-            conn, site_id=1, variable="temperature", day_ahead=0, window="rolling"
-        ).status
-        == "hit"
-    )
-    # Guard: without this, a fixture that quietly left B "empty" instead of
-    # genuinely "rebuilding" would pass the state assertions vacuously.
-    assert (
-        leaderboard_with_status(
-            conn, site_id=1, variable="temperature", day_ahead=1, window="rolling"
-        ).status
-        == "rebuilding"
-    )
-
-    # Same calendar day as both feeds' valid_ats, so ``view.tiles[0]`` is
-    # this fixture's day.
-    now = _AB_NOW
-    view = build_forecast(
-        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
-    )
-    today = view.tiles[0]
-    assert today.temp.meta.state == "normal"
-    assert today.temp.meta.extrema_state == "rebuilding"
-    assert today.state == "normal"
-    assert today.confidence_state == "rebuilding"
-    html = _render_tiles(site_id=1, view=view)
-    assert '<article class="tile state-normal">' in html
-    assert '<span class="badge muted">ranking updating</span>' in html
-    assert '<span class="badge warn">low confidence</span>' not in html
-
-    # Record side: B is genuinely SCORED (one knowable pair) but below the
-    # declared min_n=3 -- unconfident without being simply absent.
-    record_conn = _record_conn()
-    site_id = _record_site(record_conn, "site-a", timezone="UTC")
-    ensure_site_generation(record_conn, site_id)
-    set_setting(record_conn, "min_n", "3")
-    rec_a = _record_feed(record_conn, "model-a")
-    rec_b = _record_feed(record_conn, "model-b")
-    full_ats = [
-        datetime(_RECORD_DAY.year, _RECORD_DAY.month, _RECORD_DAY.day, h, tzinfo=UTC)
-        for h in range(24)
-    ]
-    partial_ats = full_ats[:20]
-    _record_insert_day(
-        record_conn,
-        site_id=site_id,
-        feed_id=rec_a,
-        local_date=_RECORD_DAY,
-        issued_at="2035-06-15T06:00:00Z",
-        valid_ats=partial_ats,
-        value=10.0,
-    )
-    _record_insert_day(
-        record_conn,
-        site_id=site_id,
-        feed_id=rec_b,
-        local_date=_RECORD_DAY,
-        issued_at="2035-06-15T06:00:00Z",
-        valid_ats=full_ats,
-        value=10.05,
-    )
-    _seed_record_confident(record_conn, site_id=site_id, feed_id=rec_a)
-    _knowable_pair(
-        record_conn,
-        site_id=site_id,
-        feed_id=rec_b,
-        valid_at=_KNOWABLE_VALID_ATS[0],
-        first_known_at=_KNOWABLE_FIRST_KNOWN_AT,
-        forecast=9.0,
-        day_ahead=0,
-    )
-    t = _record_snapshot_t()
-    build_forecast_record(
-        record_conn, site_id, _RECORD_DAY.isoformat(), now=t + timedelta(minutes=5)
-    )
-    row = record_conn.execute(
-        """
-        SELECT * FROM forecast_of_record
-        WHERE site_id = ? AND variable = 'temperature' AND display_lead = 0
-        """,
-        (site_id,),
-    ).fetchone()
-    assert row is not None
-    displayed = json.loads(str(row["daily_quantities"]))["displayed"]
-    assert displayed["extrema_low_confidence"] is True
 
 
 # ===========================================================================

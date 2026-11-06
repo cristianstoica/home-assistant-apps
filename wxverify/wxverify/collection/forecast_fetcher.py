@@ -40,10 +40,9 @@ _SAMPLE_IS_VALID_SQL: Final[str] = (
 #: old ``UNIQUE(..., issued_at, valid_at)``, so that key never fails on its
 #: own. The row is written only when the sample differs from it, so an
 #: identical re-fetch writes nothing and keeps the row's ``fetched_at``. A
-#: changed row takes the next row id, as a new row would: the readers that
-#: find new forecast rows by id (``verification/manifest.py``'s arrivals
-#: probe, the run watermark in ``verification/runs.py``,
-#: ``forecast.data.samples_fingerprint``) then see the change.
+#: changed row takes the next row id, as a new row would: the reader that
+#: finds new forecast rows by id (``forecast.data.samples_fingerprint``) then
+#: sees the change.
 _UPSERT_SAMPLE_SQL: Final = """
     INSERT INTO forecast_samples
         (site_id, feed_id, variable, issued_at, valid_at, lead_hours,

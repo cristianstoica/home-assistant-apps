@@ -190,24 +190,15 @@ class _RealDb:
     single-threaded asyncio.run() test context (no real file I/O needed).
     """
 
-    generation = 0
-
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
-    async def write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+    async def write(
+        self, fn: Callable[[sqlite3.Connection], T], *, epoch_exempt: bool = False
+    ) -> T:
         return fn(self._conn)
 
     async def read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        return fn(self._conn)
-
-    async def write_fenced(
-        self,
-        fn: Callable[[sqlite3.Connection], T],
-        *,
-        generation: int,
-        epoch_exempt: bool = False,
-    ) -> T:
         return fn(self._conn)
 
 
@@ -738,7 +729,7 @@ def test_timeout_default_30_not_10() -> None:
         _patched_now(_NOW),
     ):
         db = _RealDb(conn)
-        writer = FencedWriter(db, db.generation)  # type: ignore[arg-type]
+        writer = FencedWriter(db)  # type: ignore[arg-type]
         # The response is a bare 2xx with no valid JSON obs body; classify_current_obs
         # will return OFFLINE ("empty body" or similar) and persist_poll_result will
         # write the transient/offline state.  That's fine — the assertion is on the

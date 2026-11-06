@@ -16,22 +16,20 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
-from datetime import timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.helpers import seed_active_publication, seed_publication_ranking
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.timeutil import floor_hour, isoformat_utc, utc_now
 from wxverify.db.connection import close_db, get_db, init_db
-from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.data import forecast_fingerprint
-from wxverify.scoring.cache import upsert_score_cache
-from wxverify.scoring.leaderboard import resolve_window
-from wxverify.scoring.metrics import strategy_for
+from wxverify.scoring.metrics import MetricSums, metrics_from_sums
 from wxverify.settings.keys import get_number_setting, set_setting
 from wxverify.web.context import SiteView
 
@@ -154,7 +152,7 @@ def test_tiles_returns_204_without_building_the_view(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     conn = _init_tmp_db(tmp_path)
-    site_id = _make_site(conn)  # zero samples -> fingerprint is always "0"
+    site_id = _make_site(conn)  # zero samples, no publication -> "0-p0"
     app = _make_app(monkeypatch)
 
     def _boom(*_args: object, **_kwargs: object) -> None:
@@ -163,8 +161,11 @@ def test_tiles_returns_204_without_building_the_view(
         )
 
     monkeypatch.setattr("wxverify.web.routes.build_forecast", _boom)
+    current_fp = _current_fingerprint(site_id)
     with TestClient(app) as client:
-        response = client.get(f"/forecast/tiles?site={site_id}&fingerprint=0")
+        response = client.get(
+            f"/forecast/tiles?site={site_id}&fingerprint={current_fp}"
+        )
     assert response.status_code == 204
 
 
@@ -249,7 +250,8 @@ def test_tiles_empty_state_site_polls_without_error(
         assert first.status_code == 200
         assert "Still collecting forecasts" in first.text
 
-        again = client.get(f"/forecast/tiles?site={site_id}&fingerprint=0")
+        current_fp = _current_fingerprint(site_id)
+        again = client.get(f"/forecast/tiles?site={site_id}&fingerprint={current_fp}")
         assert again.status_code == 204
 
 
@@ -291,58 +293,47 @@ def test_tiles_204_when_only_non_sample_state_changed(
                 value=value,
             )
 
-    far_valid_ats = [
-        "2035-06-30T00:00:00Z",
-        "2035-06-30T01:00:00Z",
-        "2035-06-30T02:00:00Z",
-    ]
-    far_lead_hours = [1, 2, 3]
-    for target_feed, forecast in ((persistence_id, 8.0), (feed_a, 10.5), (feed_b, 9.0)):
-        for valid_at, lead_hours in zip(far_valid_ats, far_lead_hours, strict=True):
-            error = forecast - 10.0
-            conn.execute(
-                """
-                INSERT INTO forecast_pairs
-                    (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                     day_ahead, forecast, observed, error, abs_error, sq_error,
-                     tz_generation_id)
-                VALUES (?, ?, 'temperature', '2035-06-29T00:00:00Z', ?, ?, 1, ?,
-                        10.0, ?, ?, ?, ?)
-                """,
-                (
-                    site_id,
-                    target_feed,
-                    valid_at,
-                    lead_hours,
-                    forecast,
-                    error,
-                    abs(error),
-                    error * error,
-                    ensure_site_generation(conn, site_id),
-                ),
-            )
-
     min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-    resolved = resolve_window(conn, "rolling")
+    # leaderboard_with_status's `rolling` window now always reads the
+    # active publication (9.2), never a live recompute, so the three feeds'
+    # rankings land in one site publication instead of score_cache.
+    pub_id = seed_active_publication(
+        conn,
+        site_id=site_id,
+        cutoff=date(2035, 6, 30),
+        published_at=datetime(2035, 6, 30, tzinfo=UTC),
+        window_days=30,
+        min_n=min_n,
+    )
+    # The pair-aggregate SQL that used to compute these (`strategy_for(
+    # ...).aggregate`) is gone (W6b), and no pair table is read for scoring
+    # any more (storage release 3.1): hand-derived here instead, as if from
+    # 3 identical far-future hours (forecast/observed=10.0, persistence
+    # forecast=8.0), through the surviving pure `metrics_from_sums`,
+    # skill-paired 1:1 against persistence's own (also constant) error.
+    forecasts = {persistence_id: 8.0, feed_a: 10.5, feed_b: 9.0}
+    persistence_sq = (forecasts[persistence_id] - 10.0) ** 2
     for target_feed in (feed_a, feed_b, persistence_id):
-        result = strategy_for("temperature").aggregate(
+        error = forecasts[target_feed] - 10.0
+        sums: MetricSums = {
+            "n": 3,
+            "err_n": 3,
+            "err_sum": error * 3,
+            "abs_sum": abs(error) * 3,
+            "sq_sum": error * error * 3,
+            "skill_n": 3,
+            "skill_sq_sum": error * error * 3,
+            "skill_ref_sq_sum": persistence_sq * 3,
+        }
+        result = metrics_from_sums(sums, variable="temperature", min_n=min_n)
+        seed_publication_ranking(
             conn,
-            site_id=site_id,
+            publication_id=pub_id,
             feed_id=target_feed,
             variable="temperature",
             day_ahead=1,
-            window_cutoff=resolved.cutoff,
-            min_n=min_n,
-        )
-        upsert_score_cache(
-            conn,
-            site_id=site_id,
-            feed_id=target_feed,
-            variable="temperature",
-            day_ahead=1,
-            window_key=resolved.window_key,
+            window_key="w:30",
             result=result,
-            computed_at=isoformat_utc(),
         )
 
     app = _make_app(monkeypatch)
@@ -422,11 +413,14 @@ def test_tiles_explicit_site_calls_load_sites_zero_times(
     load the enabled-site list at all -- unlike the page path, which always
     needs it to build the site-picker nav."""
     conn = _init_tmp_db(tmp_path)
-    site_id = _make_site(conn, "Poll Site")  # zero samples -> fingerprint "0"
+    site_id = _make_site(conn, "Poll Site")  # zero samples, no publication
     app = _make_app(monkeypatch)
     calls = _count_load_sites_calls(monkeypatch)
+    current_fp = _current_fingerprint(site_id)
     with TestClient(app) as client:
-        response = client.get(f"/forecast/tiles?site={site_id}&fingerprint=0")
+        response = client.get(
+            f"/forecast/tiles?site={site_id}&fingerprint={current_fp}"
+        )
     assert response.status_code == 204
     assert calls["n"] == 0
 

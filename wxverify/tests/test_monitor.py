@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.helpers import asof_conn, asof_make_site
+from tests.helpers import asof_conn, asof_make_site, close_off
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.options import (
@@ -464,6 +464,7 @@ def test_liveness_no_eligible_work_does_not_trip(
         db = get_db()
 
         def _seed(conn: sqlite3.Connection) -> None:
+            close_off(conn)
             conn.execute(
                 "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
                 "WHERE key='worker_started_at'"
@@ -472,7 +473,7 @@ def test_liveness_no_eligible_work_does_not_trip(
 
         db.write_sync(_seed)
         body = client.get("/api/health/monitor").json()
-        for cid in ("fetch_obs_live", "fetch_feed_live", "pair_score_live"):
+        for cid in ("fetch_obs_live", "fetch_feed_live"):
             assert _cond(body, cid)["ok"] is True
 
 
@@ -488,6 +489,7 @@ def test_liveness_disabled_site_and_unsubscribed_feed_do_not_trip(
         db = get_db()
 
         def _seed(conn: sqlite3.Connection) -> None:
+            close_off(conn)
             conn.execute(
                 "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
                 "WHERE key='worker_started_at'"
@@ -508,7 +510,7 @@ def test_liveness_disabled_site_and_unsubscribed_feed_do_not_trip(
 
         db.write_sync(_seed)
         body = client.get("/api/health/monitor").json()
-        for cid in ("fetch_obs_live", "fetch_feed_live", "pair_score_live"):
+        for cid in ("fetch_obs_live", "fetch_feed_live"):
             assert _cond(body, cid)["ok"] is True
 
 
@@ -541,7 +543,6 @@ def test_fetch_feed_live_trips_when_eligible_feed_but_no_recent_run(
         db.write_sync(_seed)
         body = client.get("/api/health/monitor").json()
         assert _cond(body, "fetch_feed_live")["ok"] is False
-        assert _cond(body, "pair_score_live")["ok"] is False
 
 
 def test_obs_stale_uses_sites_last_obs_at(
@@ -556,6 +557,7 @@ def test_obs_stale_uses_sites_last_obs_at(
         db = get_db()
 
         def _seed(conn: sqlite3.Connection) -> None:
+            close_off(conn)
             conn.execute(
                 "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
                 "WHERE key='worker_started_at'"
@@ -597,6 +599,7 @@ def test_obs_stale_at_cutoff_boundary_does_not_trip(
         db = get_db()
 
         def _seed(conn: sqlite3.Connection) -> None:
+            close_off(conn)
             conn.execute(
                 "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
                 "WHERE key='worker_started_at'"
@@ -642,6 +645,7 @@ def test_obs_stale_one_second_past_cutoff_trips(
         db = get_db()
 
         def _seed(conn: sqlite3.Connection) -> None:
+            close_off(conn)
             conn.execute(
                 "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
                 "WHERE key='worker_started_at'"
@@ -780,7 +784,7 @@ def test_liveness_recent_completed_job_does_not_trip(
     # Pins the _has_completed_within returning True branch (the logical complement
     # of test_fetch_feed_live_trips_when_eligible_feed_but_no_recent_run).
     # Eligible work exists AND a recent completed job exists for each type
-    # → all three liveness conditions must be ok=True.
+    # → both liveness conditions must be ok=True.
     # Without this, a bug where _has_completed_within always returns False (or
     # where the `not` is accidentally doubled) would leave every liveness trip
     # path exercised but the non-trip path silent.
@@ -801,6 +805,7 @@ def test_liveness_recent_completed_job_does_not_trip(
         db = get_db()
 
         def _seed(conn: sqlite3.Connection) -> None:
+            close_off(conn)
             site_id = _seed_site(conn)
             conn.execute(
                 "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
@@ -822,14 +827,13 @@ def test_liveness_recent_completed_job_does_not_trip(
                 """,
                 (site_id,),
             )
-            # Completed jobs for all three types at fixed_now → within every
-            # liveness cutoff window (FETCH_OBS_LIVE=8h, FETCH_FEED=12h, PAIR=12h).
+            # Completed jobs for both types at fixed_now → within every
+            # liveness cutoff window (FETCH_OBS_LIVE=8h, FETCH_FEED=12h).
             # fetch_obs liveness reads only the live "obs" lane (job_key="obs").
             recent = "2026-07-09T12:00:00Z"
             for job_type, job_key in (
                 ("fetch_obs", "obs"),
                 ("fetch_feed", None),
-                ("pair_and_score", None),
             ):
                 conn.execute(
                     """
@@ -842,7 +846,7 @@ def test_liveness_recent_completed_job_does_not_trip(
         db.write_sync(_seed)
         body = client.get("/api/health/monitor").json()
         assert body["grace_active"] is False
-        for cid in ("fetch_obs_live", "fetch_feed_live", "pair_score_live"):
+        for cid in ("fetch_obs_live", "fetch_feed_live"):
             c = _cond(body, cid)
             assert c["ok"] is True, f"{cid} should be ok with recent completed job"
 
@@ -2240,19 +2244,10 @@ def test_missing_db_recreation_reports_missing_liveness_documented_limitation(
     config.db_path = str(db_file)
     config.options_path = str(tmp_path / "missing-options.json")
     monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
-
-    async def _no_warm(db: object) -> None:
-        return None
-
-    monkeypatch.setattr("wxverify.api.app.warm_read_cache", _no_warm)
     app = create_app(root_path="")
     with TestClient(app) as client:
         # close_db() BEFORE deleting so we exercise the init_db() recreation
-        # path, not a stale open connection. The boot-time read-cache warm is
-        # stubbed out above: it schedules its own background db.read against
-        # this same connection, and without the stub it can read through the
-        # connection this test closes below, crashing the process instead of
-        # failing the test.
+        # path, not a stale open connection.
         from wxverify.db.connection import close_db as _close
 
         _close()
@@ -2273,53 +2268,9 @@ def test_missing_db_recreation_reports_missing_liveness_documented_limitation(
         liveness = _cond(body, "main_worker_liveness")
         assert liveness["ok"] is False
         assert liveness["detail"] == (
-            "main-worker liveness evidence missing:"
-            " no loop stamp, worker start or import time"
+            "main-worker liveness evidence missing: no loop stamp or worker start time"
         )
         assert body["overall"] == "warning"
-
-
-def test_normal_shutdown_cancels_and_awaits_the_boot_warm(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The fix above stubs warm_read_cache to a no-op so this DB-close test
-    # doesn't race a real warm. This is the paired proof that the stub is
-    # masking a test-only hazard (a live warm reading through a connection
-    # this test closes), not a real lifecycle bug: on an ORDINARY shutdown --
-    # no connection closed underneath it -- the lifespan's `finally` actually
-    # cancels the warm task and awaits it, rather than leaking it as a
-    # detached background task.
-    #
-    # A blocking fake turns the race into a rendezvous: it signals "entered"
-    # then blocks forever on an Event only cancellation can break. If the
-    # lifespan's `finally` (api/app.py) ever stopped cancelling/awaiting
-    # `warm`, this fake would never observe cancellation and the assertion
-    # below would fail for the right reason.
-    close_db()
-    state = {"entered": False, "cancelled": False}
-
-    async def _blocking_warm(db: object) -> None:
-        state["entered"] = True
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            state["cancelled"] = True
-            raise
-
-    config.db_path = str(tmp_path / "db-shutdown.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
-    monkeypatch.setattr("wxverify.api.app.warm_read_cache", _blocking_warm)
-    app = create_app(root_path="")
-    with TestClient(app) as client:
-        client.get("/api/health/monitor")
-        # The warm task has had the entire test-client startup plus one
-        # request round-trip to reach its blocking await.
-        assert state["entered"] is True
-        assert state["cancelled"] is False
-    # TestClient.__exit__ runs the lifespan's `finally` synchronously before
-    # returning, so by here the cancel-and-await has already happened.
-    assert state["cancelled"] is True
 
 
 def test_db_readable_sqlite_error_composition_invariant(
@@ -2941,7 +2892,7 @@ def test_ocd_failure_cooldown_constant_matches_the_schedulers_enqueue_cooldown()
 _WL_N = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
 
 _WL_WORDING_3 = (
-    "main-worker liveness evidence missing: no loop stamp, worker start or import time"
+    "main-worker liveness evidence missing: no loop stamp or worker start time"
 )
 
 
@@ -2960,7 +2911,7 @@ def _wl_wording1(offset_minutes: float) -> str:
 def _wl_wording2(offset_minutes: float) -> str:
     return (
         "main-worker liveness evidence missing: no loop stamp since worker"
-        f" start or import at {_wl_stamp(offset_minutes)};"
+        f" start at {_wl_stamp(offset_minutes)};"
         " no main-lane job claimed since then is running"
     )
 
@@ -2976,16 +2927,6 @@ def _wl_seed_s(conn: sqlite3.Connection, value: str) -> None:
     conn.execute(
         "INSERT INTO runtime_state(key, value) VALUES ('worker_last_loop_at', ?)",
         (value,),
-    )
-
-
-def _wl_seed_i(conn: sqlite3.Connection, offset_minutes: float) -> None:
-    conn.execute(
-        """
-        INSERT INTO runtime_state(key, value, updated_at)
-        VALUES ('import_rebuild_state', 'done', ?)
-        """,
-        (_wl_stamp(offset_minutes),),
     )
 
 
@@ -3146,27 +3087,6 @@ def test_wl6_running_row_claimed_before_the_last_stamp_is_abandoned() -> None:
     assert cond["detail"] == _wl_wording1(-16)
 
 
-def test_wl7_loop_stamp_older_than_import_falls_back_to_wording2() -> None:
-    """W -60, S -40, I -20, running fetch_obs C -30 (an exporter's row):
-    tripped, wording 2 with <N-20> -- S is older than F, so it is ignored
-    and the basis falls back to F=I.
-
-    Kills: leaving I out of F (B would fall back to S at -40 instead, and
-    C -30 >= -40, so this fixture would read ok); using S even when it is
-    older than F (B would then be S -40, and C -30 >= -40, so this fixture
-    would read ok).
-    """
-    conn = asof_conn()
-    site_id = asof_make_site(conn, "wl-site")
-    _wl_seed_w(conn, -60)
-    _wl_seed_s(conn, _wl_stamp(-40))
-    _wl_seed_i(conn, -20)
-    _wl_seed_running(conn, site_id, "fetch_obs", -30)
-    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
-    assert cond["ok"] is False
-    assert cond["detail"] == _wl_wording2(-20)
-
-
 def test_wl8_running_current_obs_poller_row_never_counts_as_current() -> None:
     """W -60, S -16, running fetch_current_obs C -1, and a fresh poller
     heartbeat at N: tripped, wording 1 with <N-16> -- the poller lane's
@@ -3281,12 +3201,14 @@ def test_wl14_skipped_when_pipeline_disabled() -> None:
 def test_wl15_evidence_is_read_in_exactly_one_statement() -> None:
     """WL1's seed, traced with set_trace_callback around build_verdict:
     exactly one traced statement contains 'worker_last_loop_at', and that
-    statement also contains 'worker_started_at', 'import_rebuild_state' and
-    'FROM jobs' -- confirming the one-snapshot compound read.
+    statement also contains 'worker_started_at' and 'FROM jobs', but never
+    'import_rebuild_state' (the import's generation fence is gone) --
+    confirming the one-snapshot compound read.
 
     Kills: reading the evidence in two statements (a second, separate read
     naming 'worker_last_loop_at' would make the match count 2, or split the
-    four substrings across two different statements).
+    substrings across two different statements); the evidence query
+    regaining an 'import_rebuild_state' read.
     """
     conn = asof_conn()
     _wl_seed_w(conn, -30)
@@ -3301,7 +3223,7 @@ def test_wl15_evidence_is_read_in_exactly_one_statement() -> None:
     assert len(matches) == 1
     (statement,) = matches
     assert "worker_started_at" in statement
-    assert "import_rebuild_state" in statement
+    assert "import_rebuild_state" not in statement
     assert "FROM jobs" in statement
 
 

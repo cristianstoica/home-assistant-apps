@@ -13,10 +13,10 @@ not exist) or imports ``publication_record`` from ``close_chain`` inline (an
 PB1-PB3 and PB7, PB9 drive the real night chain end to end (the pattern of
 ``tests/test_close_chain.py``/``tests/test_close_attempts.py``): the
 publication's own state only exists once stage 6 has genuinely opened it.
-PB4-PB6 and PB8 instead build their precondition directly against
+PB4-PB6 instead build their precondition directly against
 ``close_publications``/``site_days``/``jobs`` and then insert, claim and run
-one stray stage-7 or stage-8 job (plan 15.1's own pattern, and PB6's own
-plan-text description, "a stage-7 job for D, attempt 1, inserted and run"),
+one stray stage-7 job (plan 15.1's own pattern, and PB6's own plan-text
+description, "a stage-7 job for D, attempt 1, inserted and run"),
 since the precondition each needs (two open records, an already-published
 one, an already-failed one) is state stage 6/7's own earlier run would
 produce, not something this test's own code under test builds.
@@ -664,74 +664,6 @@ def test_pb4b_a_retrying_older_record_is_superseded_by_a_published_newer_one(
 
 
 # ---------------------------------------------------------------------------
-# PB5
-# ---------------------------------------------------------------------------
-
-
-def test_pb5_a_failed_cleanup_does_not_undo_the_publication(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """PB5: ``clean_worksheets`` raises. Stage 8's row ``failed``; the
-    record stays ``published``; nothing else changes (9.4).
-
-    Builds the precondition directly: an already-``published``
-    ``close_publications`` row for D, plus its stage-8 job, inserted and
-    run alone (the stray-job pattern PB6's own plan text uses) -- stage 8's
-    own body is what's under test, and a published record is exactly what
-    it is specified to run on (8.2).
-
-    M68 -> at the state assertion below: correct = 'published' (stage 8's
-    own failure changes nothing of the record), mutant M68 (stage 8's
-    failure marks the publication record failed) = 'failed'.
-    """
-
-    async def _run() -> None:
-        db, _writer, site_id, _stations = standard_night(tmp_path)
-        clock = MovingClock(NOW)
-        patch_close_clock(monkeypatch, clock)
-        standins = install_p4_standins(monkeypatch)
-        standins["clean_worksheets"].raises = RuntimeError(
-            "synthetic clean_worksheets failure for PB5"
-        )
-
-        await db.write(
-            lambda c: _seed_publication(
-                c,
-                site_id,
-                D,
-                state="published",
-                opened_at=NOW,
-                started_at=NOW,
-                finished_at=NOW,
-                publication_id="pub-D",
-            )
-        )
-        job_id = await db.write(
-            lambda c: _seed_publish_job(c, site_id, 8, D, 1, created_at=NOW)
-        )
-
-        job = await db.write(claim_next_job)
-        assert job is not None and job.id == job_id
-        await run_claimed_job(db, job, lane="main")
-
-        job_row = await _job_row(db, job_id)
-        assert job_row["status"] == "failed", "stage 8's own job row must fail"
-
-        record = await _publication_row(db, site_id, D)
-        assert (record["state"], record["publication_id"]) == (
-            "published",
-            "pub-D",
-        ), (
-            "M68 -> at this assertion: correct = ('published', 'pub-D')"
-            " (stage 8's own failure changes nothing of the record), mutant"
-            " M68 (stage 8's failure marks the publication record failed)"
-            " = ('failed', 'pub-D')"
-        )
-
-    asyncio.run(_run())
-
-
-# ---------------------------------------------------------------------------
 # PB6
 # ---------------------------------------------------------------------------
 
@@ -1023,181 +955,6 @@ def test_pb7_a_retry_due_record_is_not_repaired_early(
 
 
 # ---------------------------------------------------------------------------
-# PB8
-# ---------------------------------------------------------------------------
-
-
-def test_pb8_a_failed_cleanup_counts_until_a_real_recovery_clears_it(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """PB8: PB5, then the failed-scope count (15.1) read at stage 8's
-    failure + 49 h; then a stage-8 job of S with payload ``{"cutoff": D,
-    "attempt": 2}`` (no record of D in attempt 2) inserted, claimed and run
-    alone, with no tick, and the read repeated; then a later stage 8 of S
-    completes and the read is repeated. 1 failed scope; then the inserted
-    job's row ``completed`` with ``result`` NULL, no ``clean_worksheets``
-    call, no stage-log row added, and still 1 failed scope; then 0 (8.2,
-    9.6).
-
-    M82 -> at the first count assertion below: correct = 1 (``day_publish``
-    IS on the single-row allowlist, once the stage-7 clause excludes only
-    stage 7's own key), mutant M82 (``day_publish`` not added to the
-    single-row allowlist) = 0, since the failed stage-8 job would then
-    never be counted at all.
-
-    M86 -> at the second count/job-row assertions: correct = the mismatched-
-    attempt job completes with ``result`` NULL via ``JobCancelled`` (8.2),
-    so the count stays 1, mutant M86 (stage 8's early return returns
-    normally instead) = ``result='ok'``, which 9.6 treats as a real
-    recovery, clearing the count to 0 one job early.
-
-    M87 -> at the same assertions: correct = stage 8 is still reported in
-    the failed arm (the stage-7 clause names only stage 7's key, leaving
-    stage 8 on the allowlist), mutant M87 (the stage-7 clause written for
-    the whole ``day_publish`` type) = stage 8 is excluded from the failed
-    arm too, and the first count assertion already reads 0 under it.
-    """
-
-    async def _run() -> None:
-        from wxverify.monitor import FAILED_JOB_AGE_HOURS
-
-        db, _writer, site_id, _stations = standard_night(tmp_path)
-        clock = MovingClock(NOW)
-        patch_close_clock(monkeypatch, clock)
-        standins = install_p4_standins(monkeypatch)
-        standins["clean_worksheets"].raises = RuntimeError(
-            "synthetic clean_worksheets failure for PB8"
-        )
-
-        await db.write(
-            lambda c: _seed_publication(
-                c,
-                site_id,
-                D,
-                state="published",
-                opened_at=NOW,
-                started_at=NOW,
-                finished_at=NOW,
-                publication_id="pub-D",
-            )
-        )
-        job1_id = await db.write(
-            lambda c: _seed_publish_job(c, site_id, 8, D, 1, created_at=NOW)
-        )
-        job1 = await db.write(claim_next_job)
-        assert job1 is not None and job1.id == job1_id
-        await run_claimed_job(db, job1, lane="main")
-        failure_at = NOW
-
-        from tests.helpers import failed_scope_count
-
-        later = failure_at + timedelta(hours=FAILED_JOB_AGE_HOURS + 1)
-        count1 = await db.read(lambda c: failed_scope_count(c, now_utc=later))
-        assert count1 == 1, (
-            "M82 -> at this assertion: correct = 1 (day_publish stage 8 is"
-            " on the single-row allowlist once the stage-7 clause excludes"
-            " only stage 7), mutant M82 (day_publish not added to the"
-            " allowlist) = 0"
-        )
-
-        # job1's own run above already called clean_worksheets once (it
-        # raised, which is how job1 failed) -- count calls BEFORE job2
-        # runs, so this only checks that job2 adds none, rather than
-        # wrongly expecting the stand-in's call list to still be empty.
-        calls_before_job2 = len(standins["clean_worksheets"].calls)
-        stage_log_count_before_job2 = (
-            await db.read(
-                lambda c: c.execute(
-                    "SELECT COUNT(*) FROM close_stage_log"
-                    " WHERE site_id = ? AND stage = 8",
-                    (site_id,),
-                ).fetchone()
-            )
-        )[0]
-        job2_id = await db.write(
-            lambda c: (
-                enqueue_if_absent(
-                    c,
-                    "day_publish",
-                    site_id,
-                    f"publish:{site_id}:8",
-                    {"cutoff": D.isoformat(), "attempt": 2},
-                    max_retries=0,
-                ).job_id
-            )
-        )
-        assert job2_id is not None
-        job2 = await db.write(claim_next_job)
-        assert job2 is not None and job2.id == job2_id
-        await run_claimed_job(db, job2, lane="main")
-
-        job2_row = await _job_row(db, job2_id)
-        assert (job2_row["status"], job2_row["result"]) == ("completed", None), (
-            "M86 -> at this assertion: correct = ('completed', None) (the"
-            " mismatched-attempt job ends with JobCancelled, no success"
-            " marker), mutant M86 (stage 8's early return returns normally)"
-            " = ('completed', 'ok')"
-        )
-        assert len(standins["clean_worksheets"].calls) == calls_before_job2, (
-            "the mismatched-attempt job must never call clean_worksheets"
-        )
-        stage_log_count = await db.read(
-            lambda c: c.execute(
-                "SELECT COUNT(*) FROM close_stage_log WHERE site_id = ? AND stage = 8",
-                (site_id,),
-            ).fetchone()
-        )
-        assert stage_log_count[0] == stage_log_count_before_job2, (
-            # job1's own failure already wrote one stage-8 row (its
-            # 'failed' outcome, 11.1); this only checks that job2 (ended
-            # by JobCancelled before any write) added none, rather than
-            # wrongly expecting zero stage-8 rows for the whole site.
-            "no stage-log row may be added by this job"
-        )
-
-        count2 = await db.read(lambda c: failed_scope_count(c, now_utc=later))
-        assert count2 == 1, (
-            "M86/M87 -> at this assertion: correct = 1 (a stage 8 that"
-            " cleaned nothing clears nothing), mutant M86 = 0 (the"
-            " mismatched job's 'ok' result would wrongly read as a"
-            " recovery), mutant M87 (day_publish excluded from the failed"
-            " arm entirely) = 0 as well, for a different reason"
-        )
-
-        standins["clean_worksheets"].raises = None
-        job3_id = await db.write(
-            lambda c: (
-                enqueue_if_absent(
-                    c,
-                    "day_publish",
-                    site_id,
-                    f"publish:{site_id}:8",
-                    {"cutoff": D.isoformat(), "attempt": 1},
-                    max_retries=0,
-                ).job_id
-            )
-        )
-        assert job3_id is not None
-        job3 = await db.write(claim_next_job)
-        assert job3 is not None and job3.id == job3_id
-        await run_claimed_job(db, job3, lane="main")
-
-        job3_row = await _job_row(db, job3_id)
-        assert (job3_row["status"], job3_row["result"]) == ("completed", "ok"), (
-            "the matching-attempt stage 8 must run clean_worksheets and"
-            " complete with the success marker"
-        )
-
-        count3 = await db.read(lambda c: failed_scope_count(c, now_utc=later))
-        assert count3 == 0, (
-            "a real recovery (a later stage 8 of S completing with"
-            " result='ok') must clear the count to 0"
-        )
-
-    asyncio.run(_run())
-
-
-# ---------------------------------------------------------------------------
 # PB9
 # ---------------------------------------------------------------------------
 
@@ -1210,10 +967,12 @@ def test_pb9_both_failed_stage7_jobs_report_no_failed_scope(
     job run in between. 0 failed scopes, though both stage-7 job rows are
     ``failed`` and older than 48 hours; the record still ``failed`` (9.6).
 
-    M85 -> at the count assertion below: correct = 0 (``FAILED_SCOPES_SQL``
-    excludes the stage-7 key specifically), mutant M85 (``FAILED_SCOPES_SQL``
-    without the stage-7 clause) = a nonzero count, since a failed stage-7
-    job would then count as a single-row scope once old enough.
+    ``FAILED_SCOPES_SQL`` excludes the whole ``day_publish`` job type (the
+    publication record itself reports a failed stage 7, `monitor.py`'s
+    ``j.type != 'day_publish'`` clause), so this stays 0 whatever the
+    attempt or stage: at the count assertion below, correct = 0; a mutant
+    that drops that type exclusion gives a nonzero count, since a failed
+    stage-7 job would then count as a scope once old enough.
     """
 
     async def _run() -> None:
@@ -1259,10 +1018,9 @@ def test_pb9_both_failed_stage7_jobs_report_no_failed_scope(
         later = second_failure_at + timedelta(hours=FAILED_JOB_AGE_HOURS + 1)
         count = await db.read(lambda c: failed_scope_count(c, now_utc=later))
         assert count == 0, (
-            "M85 -> at this assertion: correct = 0 (FAILED_SCOPES_SQL"
-            " excludes the stage-7 key specifically), mutant M85"
-            " (FAILED_SCOPES_SQL without the stage-7 clause) = a nonzero"
-            " count"
+            "correct = 0 (FAILED_SCOPES_SQL excludes the whole day_publish"
+            " job type); a mutant that drops that type exclusion gives a"
+            " nonzero count here"
         )
 
     asyncio.run(_run())

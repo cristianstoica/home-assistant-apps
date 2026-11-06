@@ -786,7 +786,7 @@ def _dispatch_the_scan(conn: sqlite3.Connection) -> None:
     job = claim_next_job(conn)
     assert job is not None and job.type == "record_gap_scan"
     db = get_db()
-    asyncio.run(dispatch(db, FencedWriter(db, db.generation), job))
+    asyncio.run(dispatch(db, FencedWriter(db), job))
 
 
 @pytest.mark.parametrize(
@@ -812,9 +812,9 @@ def test_a_control_signal_on_a_later_date_is_not_contained(
     writes must be gone rather than half-committed.
 
     Kills, one at a time:
-    - ``except (JobDeferred, JobCancelled, StaleGenerationError): raise``
-      deleted (the bare ``except Exception`` swallows the signal, the job
-      completes, and the healthy date's rows survive);
+    - ``except (JobDeferred, JobCancelled): raise`` deleted (the bare
+      ``except Exception`` swallows the signal, the job completes, and the
+      healthy date's rows survive);
     - the per-date ``SAVEPOINT`` released rather than rolled back on the
       control path (the earlier date's writes commit).
     """

@@ -59,8 +59,7 @@ VARIABLE_QUANTITIES: dict[str, tuple[str, ...]] = {
 }
 
 # Recorded per-quantity exclusion reasons. Classification is by FIRST
-# failing gate, in the order §4's table states them (same policy as the
-# knowability exclusions in wxverify.verification.asof).
+# failing gate, in the order §4's table states them.
 EXCLUDE_INSUFFICIENT_COVERAGE = "insufficient_coverage"
 EXCLUDE_MISSING_PEAK_WINDOW = "missing_peak_window"
 EXCLUDE_BELOW_NEAR_COMPLETE = "below_near_complete"

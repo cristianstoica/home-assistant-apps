@@ -537,14 +537,13 @@ class _Fill:
                     decision.pws_station_id, key, client=client
                 )
             except httpx.HTTPStatusError as exc:
-                return await self._http_failed(exc.response, reservation, left)
+                return await self._http_failed(exc.response, left)
             except UpstreamPayloadError as exc:
                 if is_hourly_history_no_content(exc):
                     await write_after_reservation(
                         self.db,
                         self.writer,
                         lambda conn: clear_access_refused(conn, "hourly"),
-                        reservation,
                     )
                     return StationFill(
                         outcome="no_readings",
@@ -572,7 +571,6 @@ class _Fill:
                         self.db,
                         self.writer,
                         lambda conn: refund_budget(conn, reservation),
-                        reservation,
                     )
                 return StationFill(
                     outcome="failed",
@@ -584,12 +582,11 @@ class _Fill:
                     readings_kept=0,
                     readings_refused=0,
                 )
-            return await self._store(plan, payload, reservation)
+            return await self._store(plan, payload)
 
     async def _http_failed(
         self,
         response: httpx.Response,
-        reservation: Reservation,
         left: tuple[datetime, ...],
     ) -> StationFill:
         """A non-2xx reply: 401/403 hold ``hourly``, 429/5xx back off (4.5)."""
@@ -600,7 +597,6 @@ class _Fill:
                 self.db,
                 self.writer,
                 lambda conn: record_access_refused(conn, "hourly", status),
-                reservation,
             )
             return StationFill(
                 outcome="refused",
@@ -618,7 +614,6 @@ class _Fill:
                 self.db,
                 self.writer,
                 lambda conn: record_http_backoff(conn, response),
-                reservation,
             )
         return StationFill(
             outcome="failed",
@@ -635,7 +630,6 @@ class _Fill:
         self,
         plan: GapPlan,
         payload: dict[str, object],
-        reservation: Reservation,
     ) -> StationFill:
         """Store a 2xx reply's readings of the hours to fill (7.5, 6.4).
 
@@ -670,9 +664,7 @@ class _Fill:
             hours, readings = _station_day(conn, record, station_id)
             return stored, _to_fill(hours, readings)
 
-        stored, left = await write_after_reservation(
-            self.db, self.writer, persist, reservation
-        )
+        stored, left = await write_after_reservation(self.db, self.writer, persist)
         outcome: FillOutcome = "no_readings"
         reason: str | None = None
         detail = _stored_detail(stored)

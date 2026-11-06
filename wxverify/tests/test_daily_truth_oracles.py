@@ -16,6 +16,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import date
 
+from tests.helpers import close_off
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
 from wxverify.db.switch import ensure_site_generation
@@ -538,6 +539,7 @@ def test_consensus_marks_on_upsert_and_delete_branches() -> None:
     only — the classic relocation below the early return).
     """
     conn = _conn()
+    close_off(conn)
     site_id = _make_site(conn, timezone="UTC")
     day = "2026-06-10"
     _seed_obs(

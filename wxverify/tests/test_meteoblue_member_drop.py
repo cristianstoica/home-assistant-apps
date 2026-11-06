@@ -66,15 +66,20 @@ def _insert_feed(
 
 
 def _seed_members_db(*, members_enabled: bool) -> sqlite3.Connection:
-    """A v4 database holding the six, a kept member, a decoy and the package.
+    """A fresh-build-path (user_version 0) database holding the six, a kept
+    member, a decoy and the package.
 
     The decoy shares a dropped name but not the ``meteoblue`` source; the
     kept member shares the source but not a dropped name; the package row is
     ``('meteoblue', 'multimodel')`` itself. All four stay at ``enabled = 1``
     regardless of the six's state, so each test can see whether the pause
-    reached past its intended rows.
+    reached past its intended rows. The pause has no version gate of its
+    own (it runs unconditionally in ``run_migrations``'s fixed corrections
+    step), so 0 stands in for "any pre-fix version" without hitting the
+    storage-release refusal for 1-15 (``run_migrations`` accepts 0 and 16
+    only below 17).
     """
-    conn = _bare_db(user_version=4)
+    conn = _bare_db(user_version=0)
     for model in config.DROPPED_METEOBLUE_MEMBERS:
         _insert_feed(conn, source="meteoblue", model=model, enabled=members_enabled)
     _insert_feed(conn, source="meteoblue", model="example_member_keep", enabled=True)
@@ -291,7 +296,7 @@ def test_drop_waits_for_the_members_to_exist() -> None:
 
     Catches: a marker written on an empty match.
     """
-    conn = _bare_db(user_version=4)
+    conn = _bare_db(user_version=0)
     run_migrations(conn)
     assert get_runtime_state(conn, METEOBLUE_MEMBER_DROP_KEY) is None
 

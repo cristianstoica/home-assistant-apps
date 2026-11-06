@@ -356,16 +356,32 @@ def _build_base(
     return site_id, feeds, record, now_utc, download_ids, generation_id
 
 
-def _close_pairs(conn, site_id: int, feed_id: int) -> list[dict[str, object]]:
+def _forecast_history_rows(conn, site_id: int, feed_id: int) -> list[dict[str, object]]:
+    """Storage release 3.1/3.3: ``close_pairs``'s replacement for stage 5's
+    scored hours. Raw rows (no join), so an absence check here still catches
+    a row wrongly written with no backing observation (``close_pairs``'s
+    old gap-hour bug, M44) -- joining ``observations`` would hide exactly
+    that case."""
     return [
         dict(row)
         for row in conn.execute(
-            "SELECT * FROM close_pairs"
+            "SELECT * FROM forecast_history"
             " WHERE site_id = ? AND local_date = ? AND feed_id = ?"
             " ORDER BY variable, day_ahead, valid_at",
             (site_id, D.isoformat(), feed_id),
         ).fetchall()
     ]
+
+
+def _observed_value(conn, site_id: int, variable: str, valid_at: str) -> float | None:
+    """D's hourly observed value: joined here from ``observations`` on the
+    same key ``score_day`` paired it by."""
+    row = conn.execute(
+        "SELECT value FROM observations"
+        " WHERE site_id = ? AND variable = ? AND valid_at = ?",
+        (site_id, variable, valid_at),
+    ).fetchone()
+    return None if row is None else float(row["value"])
 
 
 def _day_score_rows(conn, site_id: int, feed_id: int) -> list[dict[str, object]]:
@@ -381,9 +397,9 @@ def _day_score_rows(conn, site_id: int, feed_id: int) -> list[dict[str, object]]
 
 
 _P4_TABLE_ORDER_BY = {
-    # close_pairs and day_scores are WITHOUT ROWID: order by their own
+    # forecast_history and day_scores are WITHOUT ROWID: order by their own
     # primary key columns (wxverify/db/migrations.py), not `rowid`.
-    "close_pairs": "feed_id, variable, day_ahead, valid_at, lead_hours",
+    "forecast_history": "feed_id, variable, day_ahead, valid_at",
     "day_scores": "feed_id, variable, day_ahead",
     "close_records": "rowid",
     "close_record_downloads": "feed_id, day_ahead",
@@ -391,7 +407,12 @@ _P4_TABLE_ORDER_BY = {
 
 
 def _p4_table_snapshot(conn, site_id: int) -> dict[str, list[dict[str, object]]]:
-    tables = ("close_pairs", "day_scores", "close_records", "close_record_downloads")
+    tables = (
+        "forecast_history",
+        "day_scores",
+        "close_records",
+        "close_record_downloads",
+    )
     snapshot: dict[str, list[dict[str, object]]] = {}
     for table in tables:
         order_by = _P4_TABLE_ORDER_BY[table]
@@ -426,11 +447,11 @@ def test_sd1_scored_day_writes_pairs_scores_record(tmp_path) -> None:  # noqa: A
     score_day(conn, record=record, attempt=1, truth_version="fp-1", now_utc=now_utc)
 
     for name, feed_id in feeds.items():
-        pairs = _close_pairs(conn, site_id, feed_id)
+        pairs = _forecast_history_rows(conn, site_id, feed_id)
         day_aheads = sorted({int(p["day_ahead"]) for p in pairs})
         assert day_aheads == list(range(8)), (
             "M38 -> at this assertion: correct = [0, 1, 2, 3, 4, 5, 6, 7],"
-            f" mutant (close_pairs written for one day ahead fewer) ="
+            f" mutant (forecast_history written for one day ahead fewer) ="
             f" {day_aheads} for feed {name}"
         )
         assert len(pairs) == 3 * 8 * 24, (
@@ -438,7 +459,8 @@ def test_sd1_scored_day_writes_pairs_scores_record(tmp_path) -> None:  # noqa: A
             f" got {len(pairs)}"
         )
         for p in pairs:
-            assert p["observed"] == pytest.approx(
+            observed = _observed_value(conn, site_id, p["variable"], p["valid_at"])
+            assert observed == pytest.approx(
                 _OBS_FNS[p["variable"]](int(parse_utc(p["valid_at"]).hour))
             )
 
@@ -452,7 +474,12 @@ def test_sd1_scored_day_writes_pairs_scores_record(tmp_path) -> None:  # noqa: A
                 if p["variable"] == variable and int(p["day_ahead"]) == day_ahead
             ]
             assert row["n"] == len(matching)
-            errors = [p["error"] for p in matching if p["error"] is not None]
+            # error = value - observed, joined from observations here.
+            errors = [
+                p["value"]
+                - _observed_value(conn, site_id, p["variable"], p["valid_at"])
+                for p in matching
+            ]
             if errors:
                 assert row["err_sum"] == pytest.approx(sum(errors))
 
@@ -528,7 +555,9 @@ def test_sd2_missing_download_is_absent_not_scored(tmp_path) -> None:  # noqa: A
     for row in x_k2_rows:
         assert row["status"] == "absent"
     x_pairs_k2 = [
-        p for p in _close_pairs(conn, site_id, feeds["X"]) if int(p["day_ahead"]) == 2
+        p
+        for p in _forecast_history_rows(conn, site_id, feeds["X"])
+        if int(p["day_ahead"]) == 2
     ]
     assert x_pairs_k2 == []
     rec_row = conn.execute(
@@ -551,7 +580,9 @@ def test_sd2_missing_download_is_absent_not_scored(tmp_path) -> None:  # noqa: A
         " traces to the deleted download, not to k=2 in general"
     )
     y_pairs_k2 = [
-        p for p in _close_pairs(conn, site_id, feeds["Y"]) if int(p["day_ahead"]) == 2
+        p
+        for p in _forecast_history_rows(conn, site_id, feeds["Y"])
+        if int(p["day_ahead"]) == 2
     ]
     assert len(y_pairs_k2) > 0
 
@@ -574,7 +605,7 @@ def test_sd3_day_ahead_from_receipt_date_not_run_label(tmp_path) -> None:  # noq
 
     x_pairs_by_label = [
         p
-        for p in _close_pairs(conn, site_id, feeds["X"])
+        for p in _forecast_history_rows(conn, site_id, feeds["X"])
         if p["issued_at"] == f"{(D - timedelta(days=1)).isoformat()}T00:00:00Z"
     ]
     assert x_pairs_by_label, "expected D's own round's run label to produce pairs"
@@ -710,7 +741,7 @@ def test_sd5_gap_hours_unpaired_and_threshold_from_truth_row(tmp_path) -> None: 
     score_day(conn, record=record, attempt=1, truth_version="fp-1", now_utc=now_utc)
 
     for feed_id in feeds.values():
-        pairs = _close_pairs(conn, site_id, feed_id)
+        pairs = _forecast_history_rows(conn, site_id, feed_id)
         for hour in gap_hours:
             gap_valid_at = isoformat_utc(
                 datetime(D.year, D.month, D.day, hour, tzinfo=UTC)
@@ -724,12 +755,26 @@ def test_sd5_gap_hours_unpaired_and_threshold_from_truth_row(tmp_path) -> None: 
 
     rain_pairs = [
         p
-        for p in _close_pairs(conn, site_id, feeds["X"])
+        for p in _forecast_history_rows(conn, site_id, feeds["X"])
         if p["variable"] == "precip" and p["valid_at"] == rain_valid_at
     ]
     assert rain_pairs, "expected a rain pair at the seeded rain hour"
+    # cat_hit and rain_threshold_mm are no longer stored per row (storage
+    # release 3.1), so the fact they protected -- the truth row's threshold
+    # (0.25) wins over sites.rain_threshold_mm (0.5) -- is read here from
+    # day_scores' categorical sum instead: this seeded hour is the day's
+    # only one that can register a hit (every other hour is dry, a 0.0mm
+    # forecast against a 0.0mm observed, a correct negative under either
+    # threshold), so hits == 1 pins the same fact the dropped cat_hit
+    # assertion did.
     for p in rain_pairs:
-        assert p["cat_hit"] == 1, (
+        day_ahead = int(p["day_ahead"])
+        day_score_row = next(
+            r
+            for r in _day_score_rows(conn, site_id, feeds["X"])
+            if r["variable"] == "precip" and int(r["day_ahead"]) == day_ahead
+        )
+        assert day_score_row["hits"] == 1, (
             "M45 -> at this assertion: correct = 1 (cat_hit uses the truth"
             " row's rain_threshold_mm=0.25: 0.3mm forecast and observed"
             " both clear 0.25, a hit), mutant (the threshold read from"
@@ -737,7 +782,6 @@ def test_sd5_gap_hours_unpaired_and_threshold_from_truth_row(tmp_path) -> None: 
             " clear 0.5, so neither side crosses and it reads as a correct"
             " negative, not a hit)"
         )
-        assert p["rain_threshold_mm"] == pytest.approx(0.25)
 
 
 # ---------------------------------------------------------------------------
@@ -765,7 +809,7 @@ def test_sd6_thin_variables_not_counted_and_unpaired(tmp_path) -> None:  # noqa:
     )
 
     for feed_id in feeds.values():
-        pairs = _close_pairs(conn, site_id, feed_id)
+        pairs = _forecast_history_rows(conn, site_id, feed_id)
         thin_pairs = [p for p in pairs if p["variable"] in ("wind", "precip")]
         assert thin_pairs == [], (
             "M46 -> at this assertion: correct = [] (wind and precip are"
@@ -812,7 +856,7 @@ def test_sd7_temperature_scored_by_covered_hours_not_peak_windows(tmp_path) -> N
     score_day(conn, record=record, attempt=1, truth_version="fp-1", now_utc=now_utc)
     temp_pairs = [
         p
-        for p in _close_pairs(conn, site_id, feeds["X"])
+        for p in _forecast_history_rows(conn, site_id, feeds["X"])
         if p["variable"] == "temperature"
     ]
     temp_hours = {int(parse_utc(p["valid_at"]).hour) for p in temp_pairs}
@@ -842,7 +886,7 @@ def test_sd7_temperature_scored_by_covered_hours_not_peak_windows(tmp_path) -> N
     score_day(conn2, record=record2, attempt=1, truth_version="fp-1", now_utc=now_utc2)
     temp_pairs2 = [
         p
-        for p in _close_pairs(conn2, site_id2, feeds2["X"])
+        for p in _forecast_history_rows(conn2, site_id2, feeds2["X"])
         if p["variable"] == "temperature"
     ]
     assert temp_pairs2 == []
@@ -862,8 +906,19 @@ def test_sd7_temperature_scored_by_covered_hours_not_peak_windows(tmp_path) -> N
 def test_sd8_persistence_pairs_at_hours_with_a_source_value(tmp_path) -> None:  # noqa: ARG001
     """SD8: persistence pairs exist at hours with a value at h - L; one
     pair per hour and lead with a source value; day ahead from h - L (4.6).
+
+    Persistence is never written to ``forecast_history``; it is rebuilt on
+    read from the shared ``persistence_cells`` function (3.5), so this
+    test calls that function directly on D's own observations -- the same
+    inputs ``score_day`` fed it -- rather than reading stored pairs. The
+    closing ``day_scores`` assertion then proves ``score_day`` itself
+    produced the same cells, not just that the function does, by
+    comparing its ``n`` to the cells' own count.
     """
+    from zoneinfo import ZoneInfo
+
     from wxverify.scoring.close_scores import score_day
+    from wxverify.scoring.history import PERSISTENCE_MAX_LEAD_HOURS, persistence_cells
 
     conn = asof_conn()
     site_id, feeds, record, now_utc, _ids, _gen = _build_base(conn)
@@ -874,19 +929,38 @@ def test_sd8_persistence_pairs_at_hours_with_a_source_value(tmp_path) -> None:  
         "SELECT id FROM feeds WHERE source = 'virtual' AND model = '_persistence'"
     ).fetchone()
     assert persistence_row is not None, "fixture bug: no seeded persistence feed"
-    persistence_pairs = _close_pairs(conn, site_id, int(persistence_row["id"]))
-    temp_pairs = [p for p in persistence_pairs if p["variable"] == "temperature"]
-    assert temp_pairs, (
-        "M48 -> at this assertion: correct = at least one persistence pair"
+    persistence_id = int(persistence_row["id"])
+
+    assert _forecast_history_rows(conn, site_id, persistence_id) == [], (
+        "M-fh-persist -> at this assertion: correct = [] (persistence is"
+        " never written to forecast_history, storage release 3.3), mutant"
+        " (persistence pairs stored like a real feed) = a row present"
+    )
+
+    temp_obs = [
+        (str(row["valid_at"]), float(row["value"]))
+        for row in conn.execute(
+            "SELECT valid_at, value FROM observations"
+            " WHERE site_id = ? AND variable = 'temperature'",
+            (site_id,),
+        )
+    ]
+    temp_cells = persistence_cells(
+        temp_obs,
+        target_valid_at=[valid_at for valid_at, _value in temp_obs],
+        zone=ZoneInfo(record.timezone),
+        max_lead_hours=PERSISTENCE_MAX_LEAD_HOURS,
+    )
+    assert temp_cells, (
+        "M48 -> at this assertion: correct = at least one persistence cell"
         " (D's own 24 hours of observations give h - L values for L <= h),"
         " mutant (persistence restricted to one lead per hour) would still"
-        " show pairs here -- the per-hour lead count below is the"
+        " show cells here -- the per-hour lead count below is the"
         " discriminating check"
     )
     by_hour: dict[int, set[int]] = {}
-    for p in temp_pairs:
-        hour = int(parse_utc(p["valid_at"]).hour)
-        by_hour.setdefault(hour, set()).add(int(p["lead_hours"]))
+    for cell in temp_cells:
+        by_hour.setdefault(cell.instant.hour, set()).add(cell.lead_hours)
     multi_lead_hours = [hour for hour, leads in by_hour.items() if len(leads) > 1]
     assert multi_lead_hours, (
         "M48 -> at this assertion: correct = at least one hour with more"
@@ -894,12 +968,24 @@ def test_sd8_persistence_pairs_at_hours_with_a_source_value(tmp_path) -> None:  
         " value within D), mutant (persistence restricted to one lead per"
         " hour) = every hour has exactly one lead"
     )
-    for p in temp_pairs:
-        hour = int(parse_utc(p["valid_at"]).hour)
-        lead = int(p["lead_hours"])
-        source_hour = hour - lead
-        assert source_hour >= 0, "fixture bug: a persistence pair referenced before D"
-        assert int(p["day_ahead"]) == 0
+    for cell in temp_cells:
+        source_hour = cell.instant.hour - cell.lead_hours
+        assert source_hour >= 0, "fixture bug: a persistence cell referenced before D"
+        assert cell.day_ahead == 0
+
+    day0_rows = [
+        r
+        for r in _day_score_rows(conn, site_id, persistence_id)
+        if r["variable"] == "temperature" and int(r["day_ahead"]) == 0
+    ]
+    assert day0_rows and day0_rows[0]["status"] == "scored"
+    day0_cells = [c for c in temp_cells if c.day_ahead == 0]
+    assert day0_rows[0]["n"] == len(day0_cells), (
+        "M48-day-scores -> at this assertion: correct ="
+        f" {len(day0_cells)} (score_day's own count of persistence cells at"
+        " day ahead 0 must match the shared function's, 3.5's point),"
+        f" mutant = {day0_rows[0]['n']}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -934,7 +1020,7 @@ def test_sd9_multimodel_mean_over_active_feeds_only(tmp_path) -> None:  # noqa: 
     assert mean_row is not None, "fixture bug: no seeded multimodel-mean feed"
     mean_pairs = [
         p
-        for p in _close_pairs(conn, site_id, int(mean_row["id"]))
+        for p in _forecast_history_rows(conn, site_id, int(mean_row["id"]))
         if p["variable"] == "temperature"
     ]
     assert mean_pairs, (
@@ -967,7 +1053,7 @@ def test_sd9_multimodel_mean_over_active_feeds_only(tmp_path) -> None:  # noqa: 
         "SELECT id FROM feeds WHERE source = 'virtual' AND model = '_multimodel_mean'"
     ).fetchone()
     assert mean_row2 is not None
-    mean_pairs2 = _close_pairs(conn2, site_id2, int(mean_row2["id"]))
+    mean_pairs2 = _forecast_history_rows(conn2, site_id2, int(mean_row2["id"]))
     assert mean_pairs2 == [], (
         "M50 -> at this assertion: correct = [] (only X is active; the"
         " mean needs at least two feeds), mutant (a mean made from one"
@@ -983,7 +1069,9 @@ def test_sd9_multimodel_mean_over_active_feeds_only(tmp_path) -> None:  # noqa: 
 def test_sd10_ref_sq_error_null_when_no_earlier_value(tmp_path) -> None:  # noqa: ARG001
     """SD10: `ref_sq_error` is the squared persistence error where h - L
     has a value, and NULL where it does not; `skill_n` counts only the
-    first (6.3, 6.4).
+    first (6.3, 6.4). Asserted from `score_day`'s own output (`day_scores`),
+    never recomputed from the fixture -- a recomputed check cannot catch a
+    bug in `score_day`'s own `skill_n`/`skill_ref_sq_sum` arithmetic.
     """
     from wxverify.scoring.close_scores import score_day
 
@@ -1006,36 +1094,42 @@ def test_sd10_ref_sq_error_null_when_no_earlier_value(tmp_path) -> None:  # noqa
 
     score_day(conn, record=record, attempt=1, truth_version="fp-1", now_utc=now_utc)
 
-    temp_pairs = [
-        p
-        for p in _close_pairs(conn, site_id, feeds["X"])
-        if p["variable"] == "temperature" and int(p["day_ahead"]) == 0
-    ]
-    # Day-ahead 0's reference, D-1 23:00, has no seeded observation:
-    # ref_sq_error must be NULL for every one of its hours.
-    hour0 = next(p for p in temp_pairs if parse_utc(p["valid_at"]).hour == 0)
-    assert hour0["ref_sq_error"] is None, (
-        "M51 -> at this assertion: correct = NULL (day-ahead 0's reference,"
-        " D-1 23:00, has no seeded observation), mutant (ref_sq_error 0"
-        " where the earlier hour has no value) = 0.0"
+    rows = _day_score_rows(conn, site_id, feeds["X"])
+    row_k0 = next(
+        r for r in rows if r["variable"] == "temperature" and int(r["day_ahead"]) == 0
     )
-    # Day-ahead 1's reference, D-2 23:00, was seeded above: its hours must
-    # have a real ref_sq_error.
-    temp_pairs_k1 = [
-        p
-        for p in _close_pairs(conn, site_id, feeds["X"])
-        if p["variable"] == "temperature" and int(p["day_ahead"]) == 1
-    ]
-    hour5 = next(p for p in temp_pairs_k1 if parse_utc(p["valid_at"]).hour == 5)
-    assert hour5["ref_sq_error"] is not None
+    row_k1 = next(
+        r for r in rows if r["variable"] == "temperature" and int(r["day_ahead"]) == 1
+    )
 
-    temp_row = next(
-        r
-        for r in _day_score_rows(conn, site_id, feeds["X"])
-        if r["variable"] == "temperature" and int(r["day_ahead"]) == 0
+    # Day-ahead 0's reference, D-1 23:00, has no seeded observation: every
+    # one of its 24 hours' ref_sq_error must be NULL, so skill_n is 0.
+    assert row_k0["skill_n"] == 0, (
+        "M51 -> at this assertion: correct = skill_n 0 for day-ahead 0 (its"
+        " reference, D-1 23:00, has no seeded observation, so every hour's"
+        " ref_sq_error is NULL), mutant (ref_sq_error 0 where the earlier"
+        f" hour has no value, counted as non-null) = {row_k0['skill_n']}"
     )
-    non_null_count = sum(1 for p in temp_pairs if p["ref_sq_error"] is not None)
-    assert temp_row["skill_n"] == non_null_count
+
+    # Day-ahead 1's reference, D-2 23:00, was seeded above (value 12.0) and
+    # applies to all 24 of D's seeded hours (_seed_observations skips none),
+    # so skill_n must be 24, with no skipped hour.
+    assert row_k1["skill_n"] == 24, (
+        "M-sd10-skill-n -> at this assertion: correct = 24 (all 24 seeded"
+        " hours of D have a day-ahead-1 reference), mutant (a skipped hour,"
+        f" or the reference check inverted) = {row_k1['skill_n']}"
+    )
+
+    # Hand-computed skill_ref_sq_sum for day-ahead 1: observed(hour) =
+    # 10.0 + hour (_temp_obs); the fixed reference is 12.0 for every hour
+    # (same source instant, D-2 23:00). sum_{h=0}^{23} (12.0 - (10.0+h))**2
+    # = sum_{h=0}^{23} (2-h)**2 = sum(h**2) - 4*sum(h) + 4*24
+    #   = 4324 - 1104 + 96 = 3316.0.
+    assert row_k1["skill_ref_sq_sum"] == 3316.0, (
+        "M-sd10-ref-sq-sum -> at this assertion: correct = 3316.0 (hand-"
+        f"computed over all 24 hours), mutant (wrong reference value, wrong"
+        f" sign, or a different hour set) = {row_k1['skill_ref_sq_sum']}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1108,12 +1202,10 @@ def test_sd11_wind_sums_from_paired_hours_only(tmp_path) -> None:  # noqa: ARG00
     assert y_row["wind_fc_hours"] == 19
     x_pairs = [
         p
-        for p in _close_pairs(conn, site_id, feeds["X"])
+        for p in _forecast_history_rows(conn, site_id, feeds["X"])
         if p["variable"] == "wind" and int(p["day_ahead"]) == 1
     ]
-    assert x_row["wind_fc_high"] == pytest.approx(
-        max(p["forecast"] for p in x_pairs)
-    ), (
+    assert x_row["wind_fc_high"] == pytest.approx(max(p["value"] for p in x_pairs)), (
         "M52 -> at this assertion: correct = the highest of the 21 PAIRED"
         " forecasts, mutant (wind_fc_high over every forecast hour) would"
         " read a higher value from an hour this day score never paired"
@@ -1343,7 +1435,7 @@ def test_sd13_stop_rolls_back_rerun_reaches_sd1(tmp_path) -> None:  # noqa: ARG0
     after_rerun = _p4_table_snapshot(conn, site_id)
     assert after_rerun != before
     for feed_id in feeds.values():
-        pairs = _close_pairs(conn, site_id, feed_id)
+        pairs = _forecast_history_rows(conn, site_id, feed_id)
         assert len(pairs) == 3 * 8 * 24
 
 
@@ -1366,7 +1458,7 @@ def test_sd14_closed_day_refused_nothing_written(tmp_path) -> None:  # noqa: ARG
 
     def _snapshot() -> dict[str, list[dict[str, object]]]:
         tables = (
-            "close_pairs",
+            "forecast_history",
             "day_scores",
             "close_records",
             "close_record_downloads",
@@ -1465,14 +1557,24 @@ def test_sd16_no_stored_download_gives_absent_everywhere_no_failure(tmp_path) ->
             " day with no forecasts raises instead of writing absent"
             " rows) = this line is never reached"
         )
-        assert _close_pairs(conn, site_id, feed_id) == []
+        assert _forecast_history_rows(conn, site_id, feed_id) == []
         assert summary.absent.get(f"feed:{feed_id}") == 8
 
     persistence_row = conn.execute(
         "SELECT id FROM feeds WHERE source = 'virtual' AND model = '_persistence'"
     ).fetchone()
     assert persistence_row is not None
-    assert _close_pairs(conn, site_id, int(persistence_row["id"])) != [], (
+    persistence_id = int(persistence_row["id"])
+    # forecast_history never holds a persistence row -- unlike X/Y above,
+    # this positive case is where a regression (persistence stored like a
+    # real feed) would actually be caught.
+    assert _forecast_history_rows(conn, site_id, persistence_id) == [], (
+        "M-fh-persist -> at this assertion: correct = [] (persistence is"
+        " never written to forecast_history), mutant (persistence stored"
+        " like a real feed) = rows present"
+    )
+    persistence_rows = _day_score_rows(conn, site_id, persistence_id)
+    assert any(r["status"] == "scored" for r in persistence_rows), (
         "the yardsticks have no download and are unaffected by every real"
         " feed being absent (4.6)"
     )
@@ -1605,7 +1707,7 @@ def test_sd18_considered_feeds_switched_on_or_downloaded_not_never_fetched(
         " switched off and never downloaded included) = day_scores rows"
         " for V"
     )
-    assert _close_pairs(conn, site_id, feeds["V"]) == []
+    assert _forecast_history_rows(conn, site_id, feeds["V"]) == []
     v_dl_rows = conn.execute(
         "SELECT 1 FROM close_record_downloads"
         " WHERE site_id = ? AND local_date = ? AND feed_id = ?",

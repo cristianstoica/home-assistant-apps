@@ -33,7 +33,6 @@ from wxverify import config
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import (
     FencedWriter,
-    StaleGenerationError,
     close_db,
     get_db,
     init_db,
@@ -173,7 +172,7 @@ def test_current_obs_write_completes_during_record_build(
         conn = _init_tmp_db(tmp_path)
         site_id, station_id = _seed(conn)
         db = get_db()
-        writer = FencedWriter(db, db.generation)
+        writer = FencedWriter(db)
         t = _snapshot_t()
         monkeypatch.setattr(record_mod, "utc_now", lambda: t + timedelta(minutes=5))
         entered, release = _make_gate(monkeypatch)
@@ -243,7 +242,7 @@ def test_record_build_is_readonly_snapshot_pinned(
         conn = _init_tmp_db(tmp_path)
         site_id, _station_id = _seed(conn)
         db = get_db()
-        writer = FencedWriter(db, db.generation)
+        writer = FencedWriter(db)
         t = _snapshot_t()
         monkeypatch.setattr(record_mod, "utc_now", lambda: t + timedelta(minutes=5))
 
@@ -306,7 +305,7 @@ def test_record_build_readonly_variant_raises_and_resets(
         conn = _init_tmp_db(tmp_path)
         site_id, _station_id = _seed(conn)
         db = get_db()
-        writer = FencedWriter(db, db.generation)
+        writer = FencedWriter(db)
         t = _snapshot_t()
         monkeypatch.setattr(record_mod, "utc_now", lambda: t + timedelta(minutes=5))
 
@@ -359,7 +358,7 @@ def test_record_differential_sync_vs_job(
         site_id_b, _station_b = _seed(conn_b)
         assert site_id_b == site_id_a  # identical fresh-db seeding
         db_b = get_db()
-        writer_b = FencedWriter(db_b, db_b.generation)
+        writer_b = FencedWriter(db_b)
         monkeypatch.setattr(record_mod, "utc_now", lambda: t + timedelta(minutes=5))
         result = await processor.dispatch(db_b, writer_b, _job(site_id_b))
         assert result is None
@@ -382,7 +381,7 @@ def test_record_build_site_disabled_mid_build(
         conn = _init_tmp_db(tmp_path)
         site_id, _station_id = _seed(conn)
         db = get_db()
-        writer = FencedWriter(db, db.generation)
+        writer = FencedWriter(db)
         t = _snapshot_t()
         monkeypatch.setattr(record_mod, "utc_now", lambda: t + timedelta(minutes=5))
         entered, release = _make_gate(monkeypatch)
@@ -414,7 +413,7 @@ def test_record_build_site_deleted_mid_build(
         conn = _init_tmp_db(tmp_path)
         site_id, _station_id = _seed(conn)
         db = get_db()
-        writer = FencedWriter(db, db.generation)
+        writer = FencedWriter(db)
         t = _snapshot_t()
         monkeypatch.setattr(record_mod, "utc_now", lambda: t + timedelta(minutes=5))
         entered, release = _make_gate(monkeypatch)
@@ -449,7 +448,7 @@ def test_record_build_cancelled_without_published_generation(
         conn = _init_tmp_db(tmp_path)
         site_id, _station_id = _seed(conn)
         db = get_db()
-        writer = FencedWriter(db, db.generation)
+        writer = FencedWriter(db)
         t = _snapshot_t()
         monkeypatch.setattr(record_mod, "utc_now", lambda: t + timedelta(minutes=5))
 
@@ -493,69 +492,6 @@ def test_record_build_cancelled_without_published_generation(
 
 
 # ---------------------------------------------------------------------------
-# TR6 -- database replacement during the build.
-# ---------------------------------------------------------------------------
-
-
-def test_record_build_database_replacement_raises_stale_generation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def _run() -> None:
-        conn = _init_tmp_db(tmp_path)
-        site_id, _station_id = _seed(conn)
-        db = get_db()
-        writer = FencedWriter(db, db.generation)
-        t = _snapshot_t()
-        monkeypatch.setattr(record_mod, "utc_now", lambda: t + timedelta(minutes=5))
-
-        backup_src = tmp_path / "pre.db"
-
-        def _backup(c: sqlite3.Connection) -> None:
-            dest = sqlite3.connect(str(backup_src))
-            try:
-                c.backup(dest)
-            finally:
-                dest.close()
-
-        await db.read(_backup)
-
-        entered, release = _make_gate(monkeypatch)
-
-        dispatch_task = asyncio.create_task(
-            processor.dispatch(db, writer, _job(site_id))
-        )
-        try:
-            assert await asyncio.to_thread(entered.wait, 5.0)
-            unused_backup = tmp_path / "unused-backup.db"
-            replace_task = asyncio.create_task(
-                db.replace_from(backup_src, unused_backup)
-            )
-            # replace_from takes the write lock uncontended (nothing else
-            # holds it during a read), clears the read gate, then drains
-            # every pooled read connection -- and blocks on the one
-            # connection the still-gated compute above has checked out.
-            # Poll on the pool actually reaching that drained state instead
-            # of guessing a fixed sleep long enough for the drain to run.
-            deadline = asyncio.get_event_loop().time() + 5.0
-            while db._read_gate.is_set() or db._read_pool.qsize() > 0:  # noqa: SLF001
-                if asyncio.get_event_loop().time() > deadline:
-                    pytest.fail("replace_from never reached its blocked-on-drain state")
-                await asyncio.sleep(0)
-            assert not db._read_gate.is_set()  # noqa: SLF001
-            assert db._write_lock.locked()  # noqa: SLF001
-            assert not replace_task.done()
-        finally:
-            release.set()
-            with pytest.raises(StaleGenerationError):
-                await dispatch_task
-            await replace_task
-
-        assert await db.read(lambda c: _row_count(c, site_id)) == 0
-
-    asyncio.run(_run())
-
-
-# ---------------------------------------------------------------------------
 # TR7 -- cancellation.
 # ---------------------------------------------------------------------------
 
@@ -567,7 +503,7 @@ def test_record_build_cancel_during_compute_writes_nothing(
         conn = _init_tmp_db(tmp_path)
         site_id, _station_id = _seed(conn)
         db = get_db()
-        writer = FencedWriter(db, db.generation)
+        writer = FencedWriter(db)
         t = _snapshot_t()
         monkeypatch.setattr(record_mod, "utc_now", lambda: t + timedelta(minutes=5))
         entered, release = _make_gate(monkeypatch)
@@ -598,7 +534,7 @@ def test_record_build_cancel_during_persist_lets_commit_land(
         conn = _init_tmp_db(tmp_path)
         site_id, _station_id = _seed(conn)
         db = get_db()
-        writer = FencedWriter(db, db.generation)
+        writer = FencedWriter(db)
         t = _snapshot_t()
         monkeypatch.setattr(record_mod, "utc_now", lambda: t + timedelta(minutes=5))
 
@@ -642,7 +578,7 @@ def test_record_build_outside_window(
         conn = _init_tmp_db(tmp_path)
         site_id, _station_id = _seed(conn)
         db = get_db()
-        writer = FencedWriter(db, db.generation)
+        writer = FencedWriter(db)
         t = _snapshot_t()
 
         monkeypatch.setattr(record_mod, "utc_now", lambda: t - timedelta(minutes=5))
@@ -699,7 +635,7 @@ def test_record_build_partial_day_fills_in_first_write_wins(
         )
 
         db = get_db()
-        writer = FencedWriter(db, db.generation)
+        writer = FencedWriter(db)
         t = _snapshot_t()
         monkeypatch.setattr(record_mod, "utc_now", lambda: t + timedelta(minutes=5))
         result = await processor.dispatch(db, writer, _job(site_id, job_id=1))

@@ -118,7 +118,7 @@ def _run_lane(
     monkeypatch.setenv("WXV_WEATHERCOM_KEY", _API_KEY)
     real_client = httpx.AsyncClient
     db = get_db()
-    writer = FencedWriter(db, db.generation)
+    writer = FencedWriter(db)
     with patch(
         "wxverify.worker.wind_days.httpx.AsyncClient",
         lambda *a, **kw: real_client(transport=httpx.MockTransport(handler)),  # type: ignore[arg-type]

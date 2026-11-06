@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
+from tests.helpers import close_off
 from wxverify import config
 from wxverify.core.timeutil import isoformat_utc, local_day_slots
 from wxverify.db.connection import Database, FencedWriter, close_db, init_db
@@ -89,7 +90,7 @@ def _run_wind_chunk(
     handler: Callable[[httpx.Request], httpx.Response],
 ) -> None:
     real_client = httpx.AsyncClient
-    writer = FencedWriter(db, db.generation)
+    writer = FencedWriter(db)
     with patch(
         "wxverify.worker.wind_days.httpx.AsyncClient",
         lambda *a, **kw: real_client(  # type: ignore[arg-type]
@@ -136,6 +137,7 @@ def test_rs1_full_five_minute_reply_stores_every_quantity(
 
     db = _init_tmp_db(tmp_path, monkeypatch)
     conn = db._conn  # noqa: SLF001 -- real writer connection, as other tests do
+    close_off(conn)
     site_id = day_close_site(conn, close_on=False, with_records=False)
     conn.execute("UPDATE stations SET enabled = 0 WHERE pws_station_id = 'ISTATION01'")
     station_b = conn.execute(
@@ -189,6 +191,7 @@ def test_rs2_later_download_replaces_only_what_it_carries(
 
     db = _init_tmp_db(tmp_path, monkeypatch)
     conn = db._conn  # noqa: SLF001
+    close_off(conn)
     site_id = day_close_site(conn, close_on=False, with_records=False)
     conn.execute("UPDATE stations SET enabled = 0 WHERE pws_station_id = 'ISTATION01'")
     station_b = conn.execute(
@@ -261,6 +264,7 @@ def test_rs3_one_instant_from_two_sources_gives_two_rows() -> None:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     run_migrations(conn)
+    close_off(conn)
     _site_id, station_id = _make_plain_site(conn, pws_id="ISTATION03")
 
     instant = datetime(2024, 6, 5, 6, 0, 0, tzinfo=UTC)
@@ -406,6 +410,7 @@ def test_rs5_poll_dedup_and_offline_poll_stores_no_raw_row(
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     run_migrations(conn)
+    close_off(conn)
     site_id, station_id = _make_plain_site(conn, pws_id="ISTATION04")
 
     now = datetime(2024, 6, 5, 6, 0, 0, tzinfo=UTC)
@@ -515,6 +520,7 @@ def test_rs7_poll_values_pass_the_per_value_check_before_the_raw_insert(
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     run_migrations(conn)
+    close_off(conn)
     site_id, station_id = _make_plain_site(conn, pws_id="ISTATION06")
 
     now = datetime(2024, 6, 5, 6, 0, 0, tzinfo=UTC)
@@ -717,6 +723,7 @@ def test_rs8_todays_row_keeps_only_yesterday_and_todays_bounds(
     timezone = "America/New_York"
     db = _init_tmp_db(tmp_path, monkeypatch)
     conn = db._conn  # noqa: SLF001 -- real writer connection, as other tests do
+    close_off(conn)
     site_id = day_close_site(
         conn, timezone=timezone, close_on=False, with_records=False
     )

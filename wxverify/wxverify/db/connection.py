@@ -6,19 +6,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
-import shutil
 import sqlite3
 import threading
 import time
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Final, Literal, TypeVar
 
 from wxverify import config
+from wxverify.core import stop
 from wxverify.core.aio import run_to_completion
 from wxverify.core.timeutil import isoformat_utc
+from wxverify.db.compaction import compact_storage
 from wxverify.db.migrations import run_migrations
 from wxverify.db.sanitize import sanitize_wedge_prone_timestamps
 from wxverify.db.snapshot import read_only_snapshot, read_snapshot
@@ -28,7 +27,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 _db_instance: Database | None = None
 
-# Any single gate wait, pool wait, executor dispatch or query execution at
+# Any single pool wait, executor dispatch or query execution at
 # or above this is worth a log line: /sites, the fastest page, is ~100 ms
 # end to end INCLUDING transport, so 250 ms of DB work alone is already an
 # outlier.
@@ -39,9 +38,8 @@ SLOW_READ_MS = 250.0
 # diagnostic, not a fault. The two halves are checked separately because
 # they have different causes -- `lock_wait` is time queued behind other
 # writers, `hold` is this write's own transaction. With INFO enabled, a log
-# with no such line means every `write`/`write_fenced`/`write_if_current`
-# that acquired the lock and reached its timing `finally` kept both under a
-# second.
+# with no such line means every `write`/`write_if_current` that acquired the
+# lock and reached its timing `finally` kept both under a second.
 SLOW_WRITE_MS = 1000.0
 
 # SQLite in WAL mode lets any number of readers run concurrently with no
@@ -73,11 +71,9 @@ SnapshotPin = InputCounts | PinRefusal
 class ReadTiming:
     calls: int = 0
     errors: int = 0
-    gate_ms: float = 0.0
     wait_ms: float = 0.0
     dispatch_ms: float = 0.0
     exec_ms: float = 0.0
-    max_gate_ms: float = 0.0
     max_wait_ms: float = 0.0
     max_dispatch_ms: float = 0.0
     max_exec_ms: float = 0.0
@@ -116,27 +112,6 @@ def _log_slow_write(
         )
 
 
-class StaleGenerationError(Exception):
-    """A fenced write's captured generation no longer matches the live database.
-
-    Raised by ``Database.write_fenced`` and ``Database.write_if_current``
-    when the database has been replaced (see ``replace_from``) since the
-    caller captured ``Database.generation``; ``write_if_current`` checks the
-    generation before the input epoch.
-    Whatever the caller read before is no longer known to describe the
-    current database, so the write is rejected outright instead of risking
-    it landing against unrelated data.
-    """
-
-    def __init__(self, requested: int, current: int) -> None:
-        super().__init__(
-            f"write rejected: requested generation {requested}, "
-            f"database is now at generation {current}"
-        )
-        self.requested_generation = requested
-        self.current_generation = current
-
-
 class EpochMoved:
     """The outcome of a ``write_if_current`` whose input epoch had moved.
 
@@ -163,33 +138,13 @@ class Database:
         if sqlite3.sqlite_version_info < (3, 35, 0):
             raise RuntimeError("sqlite 3.35.0 or newer is required")
         self.path = path
-        # The write lock, read gate, and read pool are created exactly once,
-        # here, and are deliberately NOT part of _open(): replace_from()
-        # holds the write lock and closes the gate across _open(), so
-        # recreating any of them there would let a coroutine that starts
-        # waiting during the swap window capture a different lock/event/queue
-        # object than the one being held — two writers could then interleave
-        # on the shared write connection, or a reader could queue on a gate
-        # nobody is watching. _open() only ever rebuilds their CONTENTS (the
-        # connections); publishing those into the pool is _stock_pool()'s job.
+        # The write lock and the read pool are created here; _open() creates
+        # the connections, and publishing those into the pool is
+        # _stock_pool()'s job.
         self._write_lock = asyncio.Lock()
-        self._read_gate = asyncio.Event()
-        self._read_gate.set()
         self._read_pool: asyncio.Queue[sqlite3.Connection] = asyncio.Queue(
             maxsize=_READ_POOL_SIZE
         )
-        # Bumped once per (re)open the swap path performs, including a
-        # rollback-and-reopen of the untouched file: even that counts,
-        # because a job that read before the swap window and is about to
-        # write after it must be treated as spanning the swap, the same as
-        # if content had actually changed underneath it.
-        self._generation = 0
-        # In-memory only, deliberately not a runtime_state row: a value that
-        # cannot be imported cannot be foreign. Stamped at each of the three
-        # generation bumps inside replace_from -- never reset elsewhere, so
-        # it always reflects this PROCESS's most recent replace_from, not
-        # anything a restored database could carry.
-        self._last_import_swap_at: str | None = None
         # Written only from the event-loop thread (see `read`'s `finally`),
         # so it needs no lock of its own. Cumulative for the process lifetime
         # of this Database instance; never reset.
@@ -203,13 +158,11 @@ class Database:
         self._input_epoch = 0
         self._dv_seen = 0
         # The external-commit count (`external_commit_seq`) and the lock that
-        # guards it together with the probe's baseline `_probe_dv`. Created
-        # here, not in `_open`: the count only grows, never resets across an
-        # import swap, so no count stored before a swap can recur.
+        # guards it together with the probe's baseline `_probe_dv`. The count
+        # only grows, so no count stored earlier can recur.
         self._probe_lock = threading.Lock()
         self._external_seq = 0
-        # Pooled readers inside `pinned_snapshot`, each with its pin. Here,
-        # not in `_open`, so it survives an import swap.
+        # Pooled readers inside `pinned_snapshot`, each with its pin.
         self._snapshot_pins: dict[sqlite3.Connection, SnapshotPin] = {}
         self._open()
         self._stock_pool()
@@ -221,23 +174,40 @@ class Database:
         return conn
 
     def _open(self) -> None:
-        """(Re)open the writer, sync reader, and pooled readers on
-        ``self.path``. Locks, the gate, and the pool object are untouched.
+        """Open the writer, sync reader, pooled readers and probe on
+        ``self.path``. The write lock and the pool object are ``__init__``'s.
 
-        Creation only: callers MUST call ``_stock_pool()`` afterward to
-        publish the new pooled connections. ``_open()`` deliberately does
-        not do this itself -- see ``_stock_pool``'s own docstring for why.
+        Creation only: ``__init__`` calls ``_stock_pool()`` afterward to
+        publish the pooled connections.
         """
         self._conn = sqlite3.connect(
             self.path, check_same_thread=False, isolation_level=None
         )
         self._conn.row_factory = sqlite3.Row
         self._assert_pragmas(self._conn)
-        self._run_immediate(run_migrations)
-        # Runs on every open, not just first boot: a database swapped in by
-        # hand outside the app (bypassing the import route's own staged-file
-        # pass in api/routes/db_transfer.py) is caught here instead. Cheap
-        # and idempotent when there is nothing to fix.
+        # Registered while the migrations run, so a stop interrupts them
+        # (storage-release plan 6.2); unregistered before anything else.
+        stop.register(self._conn)
+        try:
+            try:
+                self._run_immediate(run_migrations)
+            finally:
+                stop.unregister(self._conn)
+        except Exception as exc:
+            if not stop.stopped_by(exc):
+                raise
+            # The step the stop landed in has rolled back (its savepoint, or
+            # _run_immediate's rollback). user_version is unchanged and every
+            # step converges on re-entry, so the next start reruns from it.
+            self._conn.close()
+            logger.info(
+                "stop during startup step %s; rolled back, reruns at the next start",
+                stop.current_step() or "open",
+            )
+            raise
+        # Runs on every open, not just first boot, so a database swapped in
+        # by hand outside the app is caught here too. Cheap and idempotent
+        # when there is nothing to fix.
         #
         # Best-effort: this is a repair, not a requirement to open the
         # database. Its worst-case failure must degrade to the pre-repair
@@ -259,20 +229,41 @@ class Database:
             # transaction.
             if self._conn.in_transaction:
                 self._conn.rollback()
+        # The one-time compaction (storage-release plan 4.2), before any
+        # reader opens. Registered like the migrations, so a stop interrupts
+        # it; every other failure is logged inside and the open carries on.
+        stop.register(self._conn)
+        try:
+            try:
+                compact_storage(self._conn, self.path)
+            finally:
+                stop.unregister(self._conn)
+        except Exception as exc:
+            if not stop.stopped_by(exc):
+                raise
+            # No marker was written and an interrupted VACUUM leaves the file
+            # as it was, so the next start runs the compaction again.
+            self._conn.close()
+            logger.info(
+                "stop during startup step %s; rolled back, reruns at the next start",
+                stop.current_step() or "open",
+            )
+            raise
         self._read_conns = [self._connect_reader() for _ in range(_READ_POOL_SIZE)]
         self._read_sync_conn = self._connect_reader()
         # The external-commit probe: one more reader, in neither `_read_conns`
         # nor the pool, so no request can draw it. It never writes, so every
         # commit on the file moves its `data_version`. Its baseline is read
-        # here, after the migrations and the sanitizer committed, and only
-        # ever compared with its own later values.
+        # here, after the migrations, the sanitizer and the compaction
+        # committed, and only ever compared with its own later values.
         self._probe = self._connect_reader()
         with self._probe_lock:
             self._probe_dv = int(
                 self._probe.execute("PRAGMA data_version").fetchone()[0]
             )
         # The migrations and the sanitizer above ran through `_run_immediate`
-        # directly; this bump covers both, and an import's reopen with them.
+        # directly, and the compaction on `_conn` itself; this bump covers
+        # all three.
         self._dv_seen = int(self._conn.execute("PRAGMA data_version").fetchone()[0])
         self._input_epoch += 1
 
@@ -280,13 +271,11 @@ class Database:
         """Publish ``self._read_conns`` into the pool queue.
 
         Callable ONLY when every pooled connection is accounted for outside
-        the queue -- the two call sites are ``__init__`` (nothing has ever
-        been handed out yet) and ``replace_from`` (the drain took all
-        ``_READ_POOL_SIZE`` of them back before the swap ran). Emptying the
-        queue first does not make this safe to call at an arbitrary moment:
-        a connection a live reader currently holds is not IN the queue to be
-        emptied, so calling this while one is checked out publishes it a
-        second time.
+        the queue -- the one call site is ``__init__``, where nothing has
+        ever been handed out yet. Emptying the queue first does not make this
+        safe to call at an arbitrary moment: a connection a live reader
+        currently holds is not IN the queue to be emptied, so calling this
+        while one is checked out publishes it a second time.
         """
         while not self._read_pool.empty():
             self._read_pool.get_nowait()
@@ -358,7 +347,7 @@ class Database:
         ``_open``'s own, which run before the probe exists. The absorb takes
         every commit it sees on the probe for its own, so a commit made on
         ``_conn`` any other way would be acknowledged without moving either
-        count, and the wind weights cache could serve a result from before it.
+        count, and a caller comparing the counts would not see that commit.
         """
         # `_body` records the connection and its `total_changes` just before
         # `fn` runs. A list, not `nonlocal` flags: pyright does not see a
@@ -542,92 +531,35 @@ class Database:
                 _log_slow_write(fn, requested, acquired, time.perf_counter())
 
     @property
-    def generation(self) -> int:
-        """Generation counter, bumped by ``replace_from`` after each reopen.
-
-        Safe to read from the event loop with no lock: it is only ever
-        mutated while ``_write_lock`` is held (inside ``_replace_sync``), and
-        ``write_fenced`` and ``write_if_current`` re-check it again under
-        that same lock at write time. An unlocked read here is just an
-        optimistic snapshot for the caller's own bookkeeping -- the actual
-        guarantee comes from the locked recheck, not from this read.
-        """
-        return self._generation
-
-    @property
     def input_epoch(self) -> int:
         """Input epoch: moves on every commit that could change a scoring input.
 
-        Safe to read from the event loop with no lock, exactly like
-        ``generation``: an unlocked read is an optimistic snapshot for the
-        caller's bookkeeping, and the guarantee comes from the recheck that
-        ``_run_epoch_txn`` makes under the write lock, inside
-        ``BEGIN IMMEDIATE``, in ``write_if_current``.
+        Safe to read from the event loop with no lock: an unlocked read is an
+        optimistic snapshot for the caller's bookkeeping, and the guarantee
+        comes from the recheck that ``_run_epoch_txn`` makes under the write
+        lock, inside ``BEGIN IMMEDIATE``, in ``write_if_current``.
         """
         return self._input_epoch
-
-    @property
-    def last_import_swap_at(self) -> str | None:
-        """UTC stamp of this process's most recent ``replace_from`` reopen.
-
-        ``None`` if this process has never run ``replace_from``. In-memory
-        only -- see the field's own comment in ``__init__`` for why.
-        """
-        return self._last_import_swap_at
-
-    async def write_fenced(
-        self,
-        fn: Callable[[sqlite3.Connection], T],
-        *,
-        generation: int,
-        epoch_exempt: bool = False,
-    ) -> T:
-        """Like ``write``, but rejects a write submitted against a generation
-        the database has since moved past.
-
-        The comparison happens after acquiring the write lock, not before:
-        a ``replace_from`` racing the caller between its generation read and
-        this call is exactly what the lock boundary is meant to close.
-        """
-        requested = time.perf_counter()
-        async with self._write_lock:
-            acquired = time.perf_counter()
-            try:
-                if generation != self._generation:
-                    raise StaleGenerationError(generation, self._generation)
-
-                def _call() -> T:
-                    return self._run_epoch_txn(fn, expected=None, exempt=epoch_exempt)
-
-                return await run_to_completion(_call)
-            finally:
-                _log_slow_write(fn, requested, acquired, time.perf_counter())
 
     async def write_if_current(
         self,
         fn: Callable[[sqlite3.Connection], T],
         *,
-        generation: int,
         epoch: int,
     ) -> tuple[T, int] | EpochMoved:
         """Apply ``fn`` only if the input epoch is still ``epoch``.
 
-        Three outcomes. ``StaleGenerationError`` when the database was
-        replaced since ``generation`` was captured -- checked first, so after
-        an import the caller fails as it does on ``write_fenced`` instead of
-        recomputing against the new database. ``EPOCH_MOVED`` when a commit
-        that could change a scoring input landed since ``epoch`` was read;
-        ``fn`` did not run. Otherwise ``(result, epoch_after)``, where
-        ``epoch_after`` includes this write's own bump, so a caller applying
-        the next chunk of the same delta passes it and its own earlier chunk
-        does not count as a foreign change.
+        Two outcomes. ``EPOCH_MOVED`` when a commit that could change a
+        scoring input landed since ``epoch`` was read; ``fn`` did not run.
+        Otherwise ``(result, epoch_after)``, where ``epoch_after`` includes
+        this write's own bump, so a caller applying the next chunk of the
+        same delta passes it and its own earlier chunk does not count as a
+        foreign change.
         """
         requested = time.perf_counter()
         async with self._write_lock:
             acquired = time.perf_counter()
             try:
-                if generation != self._generation:
-                    raise StaleGenerationError(generation, self._generation)
 
                 def _call() -> T:
                     return self._run_epoch_txn(fn, expected=epoch, exempt=False)
@@ -644,21 +576,14 @@ class Database:
     async def read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         label = _read_label(fn)
         requested = time.perf_counter()
-        # None means "this phase was never reached": a read cancelled before
-        # the gate opens never sets `gated`; one cancelled while still queued
-        # for a pooled connection never sets `acquired`; one cancelled or
-        # failed inside the thread never sets `started`/`finished`.
-        gated: float | None = None
+        # None means "this phase was never reached": a read cancelled while
+        # still queued for a pooled connection never sets `acquired`; one
+        # cancelled or failed inside the thread never sets
+        # `started`/`finished`.
         acquired: float | None = None
         started: float | None = None
         finished: float | None = None
         try:
-            # The gate is open unless an import swap is draining or
-            # rebuilding the pool; waiting on it here, before touching the
-            # pool at all, is what lets replace_from() take back every
-            # pooled connection without a new reader sneaking in ahead of it.
-            await self._read_gate.wait()
-            gated = time.perf_counter()
             conn = await self._read_pool.get()
             acquired = time.perf_counter()
 
@@ -684,7 +609,7 @@ class Database:
         finally:
             # This runs on the event-loop thread, which is single-threaded,
             # so `_read_stats` needs no lock of its own.
-            self._record_read(label, requested, gated, acquired, started, finished)
+            self._record_read(label, requested, acquired, started, finished)
 
     def _settle_reader(self, conn: sqlite3.Connection) -> sqlite3.Connection:
         """The connection this read is returning, guaranteed snapshot-free.
@@ -700,9 +625,7 @@ class Database:
         no thread can be mid-statement on this connection -- and nothing
         else that walks ``_read_conns`` can interleave with the swap below:
         ``close``/``close_if_idle`` run on this same thread and the latter
-        refuses while this reader is out; ``replace_from`` drains the pool
-        first and cannot finish that drain until this method has returned
-        its connection.
+        refuses while this reader is out.
 
         Failure policy, in order. A connection that will not roll back is
         closed, replaced by a fresh reader from ``_connect_reader`` at the
@@ -764,25 +687,17 @@ class Database:
         self,
         label: str,
         requested: float,
-        gated: float | None,
         acquired: float | None,
         started: float | None,
         finished: float | None,
     ) -> None:
-        # A read cancelled before the gate opens never sets `gated`; one
-        # cancelled while still queued for a pooled connection never sets
-        # `acquired`. Either boundary is unknowable exactly when it's
-        # missing, so `now` stands in for it, making `gate_ms`/`wait_ms` a
-        # lower bound rather than missing entirely. `wait_ms` is 0 when the
-        # gate itself was never passed: that phase never started.
+        # A read cancelled while still queued for a pooled connection never
+        # sets `acquired`. That boundary is unknowable exactly when it's
+        # missing, so `now` stands in for it, making `wait_ms` a lower bound
+        # rather than missing entirely.
         now = time.perf_counter()
-        gate_end = gated if gated is not None else now
-        gate_ms = (gate_end - requested) * 1000
-        if gated is None:
-            wait_ms = 0.0
-        else:
-            wait_end = acquired if acquired is not None else now
-            wait_ms = (wait_end - gate_end) * 1000
+        wait_end = acquired if acquired is not None else now
+        wait_ms = (wait_end - requested) * 1000
         dispatch_ms = (
             None if acquired is None or started is None else (started - acquired) * 1000
         )
@@ -795,8 +710,6 @@ class Database:
         timing.calls += 1
         if failed:
             timing.errors += 1
-        timing.gate_ms += gate_ms
-        timing.max_gate_ms = max(timing.max_gate_ms, gate_ms)
         timing.wait_ms += wait_ms
         timing.max_wait_ms = max(timing.max_wait_ms, wait_ms)
         if dispatch_ms is not None:
@@ -808,33 +721,28 @@ class Database:
 
         if failed:
             logger.warning(
-                "db read failed or cancelled %s gate=%.0fms wait=%.0fms "
-                "dispatch=%s exec=%s",
+                "db read failed or cancelled %s wait=%.0fms dispatch=%s exec=%s",
                 label,
-                gate_ms,
                 wait_ms,
                 "---" if dispatch_ms is None else f"{dispatch_ms:.0f}ms",
                 "---" if exec_ms is None else f"{exec_ms:.0f}ms",
             )
         elif (
-            gate_ms >= SLOW_READ_MS
-            or wait_ms >= SLOW_READ_MS
+            wait_ms >= SLOW_READ_MS
             or (dispatch_ms or 0) >= SLOW_READ_MS
             or (exec_ms or 0) >= SLOW_READ_MS
         ):
             logger.warning(
-                "slow db read %s gate=%.0fms wait=%.0fms dispatch=%.0fms exec=%.0fms",
+                "slow db read %s wait=%.0fms dispatch=%.0fms exec=%.0fms",
                 label,
-                gate_ms,
                 wait_ms,
                 dispatch_ms or 0,
                 exec_ms or 0,
             )
         else:
             logger.debug(
-                "db read %s gate=%.0fms wait=%.0fms dispatch=%.0fms exec=%.0fms",
+                "db read %s wait=%.0fms dispatch=%.0fms exec=%.0fms",
                 label,
-                gate_ms,
                 wait_ms,
                 dispatch_ms or 0,
                 exec_ms or 0,
@@ -850,12 +758,10 @@ class Database:
         ``calls`` is a read that is failing or being cancelled, not one that
         is slow.
 
-        ``gate_ms`` is time spent parked behind a closed import-swap gate,
-        tracked separately so it is never confused with ``wait_ms``, which
-        is now "every pooled connection was busy" rather than "queued
-        behind the one reader" -- a genuine saturation signal with a pool of
-        concurrent readers, rather than an artifact of whichever read
-        happened to be running. Because reads now overlap, a label's summed
+        ``wait_ms`` is "every pooled connection was busy" rather than
+        "queued behind the one reader" -- a genuine saturation signal with a
+        pool of concurrent readers, rather than an artifact of whichever read
+        happened to be running. Because reads overlap, a label's summed
         ``exec_ms`` can exceed the wall-clock window it was measured over,
         by up to the pool size -- never divide it by elapsed time and call
         the result a share of wall time.
@@ -864,11 +770,9 @@ class Database:
             label: {
                 "calls": timing.calls,
                 "errors": timing.errors,
-                "gate_ms": timing.gate_ms,
                 "wait_ms": timing.wait_ms,
                 "dispatch_ms": timing.dispatch_ms,
                 "exec_ms": timing.exec_ms,
-                "max_gate_ms": timing.max_gate_ms,
                 "max_wait_ms": timing.max_wait_ms,
                 "max_dispatch_ms": timing.max_dispatch_ms,
                 "max_exec_ms": timing.max_exec_ms,
@@ -882,6 +786,17 @@ class Database:
 
     def write_sync(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         return self._run_epoch_txn(fn, expected=None, exempt=False)
+
+    def interrupt_writer(self) -> None:
+        """End the statement running on the writer, if any (plan 6.4).
+
+        Safe from any thread. The statement fails with
+        ``sqlite3.OperationalError: interrupted`` and ``_run_immediate``
+        rolls its transaction back. With nothing running it does nothing,
+        and a closed writer is ignored.
+        """
+        with contextlib.suppress(sqlite3.ProgrammingError):
+            self._conn.interrupt()
 
     def read_sync(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         return fn(self._read_sync_conn)
@@ -904,16 +819,14 @@ class Database:
         here is opened ``check_same_thread=False`` (``_connect_reader``,
         ``_open``) and every query runs in an executor thread, so a
         ``close()`` and a live query can genuinely overlap. ``close()``
-        itself neither clears the gate nor drains the pool -- unlike
-        ``replace_from`` -- so the caller is what has to establish that
-        overlap is impossible.
+        itself does not drain the pool, so the caller is what has to
+        establish that overlap is impossible.
 
         Both checks run on the event-loop thread with no ``await`` between
         them and the ``close()`` they guard, so what they report cannot go
         stale before it is used: a writer holds ``_write_lock`` for the
-        whole of ``write``/``write_fenced``/``write_if_current``, and a
-        reader holds its connection OUT of ``_read_pool`` for the whole of
-        ``read``.
+        whole of ``write``/``write_if_current``, and a reader holds its
+        connection OUT of ``_read_pool`` for the whole of ``read``.
 
         State what that buys exactly, because it is narrower than
         "nothing is going on": when both predicates read idle, no thread
@@ -930,9 +843,8 @@ class Database:
         ``read_sync``/``write_sync`` have no caller inside the server process
         (only ``__main__``'s CLI subcommands and tests).
 
-        The read gate is deliberately NOT cleared. A reader arriving after
-        this returns must fail loudly with ``ProgrammingError`` rather than
-        park forever on an event nobody will set again.
+        A reader arriving after this returns draws a closed connection from
+        the pool and fails loudly with ``ProgrammingError``.
         """
         if self._write_lock.locked():
             logger.warning("close skipped: a write is in flight")
@@ -948,144 +860,18 @@ class Database:
         self.close()
         return True
 
-    async def replace_from(self, new_db: Path, backup: Path) -> None:
-        """Replace the live DB file with ``new_db``, backing up the current DB.
-
-        Lock order is fixed: write lock first. Closing the gate and draining
-        the pool then quiesces every reader for the swap window; neither the
-        lock, the gate, nor the pool object is ever recreated (see
-        ``__init__``), so mutual exclusion across the swap holds by
-        construction.
-        """
-        async with self._write_lock:
-            self._read_gate.clear()
-            drained: list[sqlite3.Connection] = []
-            try:
-                for _ in range(_READ_POOL_SIZE):
-                    drained.append(await self._read_pool.get())
-            except BaseException:
-                # Cancelled mid-drain: return exactly what was taken, reopen
-                # the gate, and let the caller's cancellation propagate. The
-                # swap itself never started, so there is nothing else to
-                # unwind.
-                for conn in drained:
-                    self._read_pool.put_nowait(conn)
-                self._read_gate.set()
-                raise
-
-            # From here on, cancellation is deferred rather than honored:
-            # the drain succeeded, so every pooled connection is now
-            # unaccounted for until _stock_pool() runs. A cancellation that
-            # unwound this coroutine before that happened would leave the
-            # pool permanently short.
-            try:
-                await run_to_completion(self._replace_sync, new_db, backup)
-            finally:
-                self._stock_pool()
-                self._read_gate.set()
-
-    def _replace_sync(self, new_db: Path, backup: Path) -> None:
-        # 1. Flush the WAL into the main file. Fail -> raise; nothing changed.
-        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        # 2. Consistent, self-contained backup of the CURRENT DB. Direct
-        # execute on the autocommit write conn, NOT via _run_immediate:
-        # VACUUM INTO cannot run inside a transaction. The exists pre-check
-        # keeps the unlink-on-failure below from deleting a COMPLETE prior
-        # backup when a same-second import collides on the timestamped name
-        # (VACUUM INTO refuses an existing output file).
-        if backup.exists():
-            raise FileExistsError(f"backup target already exists: {backup}")
-        try:
-            self._conn.execute("VACUUM INTO ?", (str(backup),))
-        except BaseException:
-            backup.unlink(missing_ok=True)
-            raise
-        # 3. On the last close after a checkpoint, SQLite itself removes the
-        # -wal/-shm sidecars. Every open connection must close, not just the
-        # writer: a live pooled or sync reader -- or the external-commit
-        # probe -- still holding the file is what keeps a sidecar (or the
-        # file itself, on some platforms) from being replaceable underneath
-        # it. The next `_open` opens a new probe with its own baseline.
-        self._read_sync_conn.close()
-        self._probe.close()
-        for conn in self._read_conns:
-            conn.close()
-        self._conn.close()
-        # 4. Atomic rename, same filesystem. Fail -> reopen the untouched
-        # live file and re-raise.
-        try:
-            os.replace(new_db, self.path)
-        except BaseException:
-            try:
-                self._open()
-                self._generation += 1
-                self._last_import_swap_at = isoformat_utc()
-            except BaseException:
-                self._close_quietly()
-                raise
-            raise
-        # 5. WAL-sidecar rule: a stale sidecar beside a new main file
-        # corrupts it. Step 3 normally removes them already; this covers a
-        # leftover from a previously crashed process.
-        self._unlink_sidecars()
-        # 6. Reopen on the new file; run_migrations upgrades an
-        # older-user_version import here.
-        try:
-            self._open()
-            self._generation += 1
-            self._last_import_swap_at = isoformat_utc()
-        except BaseException:
-            # 7. Rollback: close any half-open connection (after a failed
-            # _open(), some connections may already be closed — the
-            # suppressed double-close is expected), restore the backup by
-            # COPY (the backup must survive as the reversibility artifact),
-            # reopen, and re-raise the original error.
-            self._close_quietly()
-            try:
-                shutil.copy2(backup, self.path)
-                self._unlink_sidecars()
-                self._open()
-                self._generation += 1
-                self._last_import_swap_at = isoformat_utc()
-            except BaseException as restore_exc:
-                logger.critical(
-                    "database unrecoverable after failed import; "
-                    "restore the .bak in /data manually"
-                )
-                raise RuntimeError(
-                    "database unrecoverable after failed import; "
-                    "restore the .bak in /data manually"
-                ) from restore_exc
-            raise
-
-    def _close_quietly(self) -> None:
-        for conn in (self._conn, self._read_sync_conn, self._probe, *self._read_conns):
-            with contextlib.suppress(Exception):
-                conn.close()
-
-    def _unlink_sidecars(self) -> None:
-        for suffix in ("-wal", "-shm"):
-            Path(f"{self.path}{suffix}").unlink(missing_ok=True)
-
 
 class FencedWriter:
-    """A write handle bound to one ``Database`` generation.
+    """A write handle on one ``Database``, threaded through a job's writes.
 
-    Obtained once (via ``Database.generation``) at the point a caller's read
-    is known to be current, then threaded through everything downstream that
-    writes based on that read. Every write through this handle is rejected
-    with ``StaleGenerationError`` if the database has since been replaced.
     A read whose result feeds a later ``write_if_current`` must come from
     ``read_at_epoch``, which pairs it with the input epoch it was read at.
     ``epoch_exempt`` marks every write through this handle as unable to
     change a scoring input, so none of them moves the input epoch.
     """
 
-    def __init__(
-        self, db: Database, generation: int, *, epoch_exempt: bool = False
-    ) -> None:
+    def __init__(self, db: Database, *, epoch_exempt: bool = False) -> None:
         self._db = db
-        self.generation = generation
         self._epoch_exempt = epoch_exempt
 
     @property
@@ -1094,9 +880,7 @@ class FencedWriter:
         return self._db.input_epoch
 
     async def write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        return await self._db.write_fenced(
-            fn, generation=self.generation, epoch_exempt=self._epoch_exempt
-        )
+        return await self._db.write(fn, epoch_exempt=self._epoch_exempt)
 
     async def read_at_epoch(
         self, fn: Callable[[sqlite3.Connection], T], *, label: str
@@ -1120,10 +904,8 @@ class FencedWriter:
     async def write_if_current(
         self, fn: Callable[[sqlite3.Connection], T], *, epoch: int
     ) -> tuple[T, int] | EpochMoved:
-        """``Database.write_if_current`` at this handle's generation."""
-        return await self._db.write_if_current(
-            fn, generation=self.generation, epoch=epoch
-        )
+        """``Database.write_if_current`` on this handle's database."""
+        return await self._db.write_if_current(fn, epoch=epoch)
 
 
 def init_db(path: str | None = None) -> Database:
@@ -1140,25 +922,12 @@ def get_db() -> Database:
     return _db_instance
 
 
-def current_db_generation() -> int:
-    """The process database's swap generation, or ``0`` when none exists.
-
-    Deliberately does **not** call ``get_db()``: that auto-initialises a
-    ``Database`` against ``config.db_path``, so the obvious simplification to
-    ``get_db().generation`` would materialise the process database inside any
-    caller that only holds a bare ``sqlite3.Connection`` -- unit tests
-    included. This accessor exists so a generation can be read as a plain
-    observation, with no side effect.
-    """
-    return 0 if _db_instance is None else _db_instance.generation
-
-
 def current_db() -> Database | None:
     """The process database, or ``None`` when none exists.
 
-    Like ``current_db_generation``, deliberately does **not** call
-    ``get_db()``, which would open a database against ``config.db_path``
-    inside a caller that only holds a bare ``sqlite3.Connection``.
+    Deliberately does **not** call ``get_db()``, which would open a database
+    against ``config.db_path`` inside a caller that only holds a bare
+    ``sqlite3.Connection``.
     """
     return _db_instance
 

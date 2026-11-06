@@ -10,7 +10,6 @@ import sqlite3
 
 from wxverify.db.migrations import run_migrations
 from wxverify.forecast.data import load_future_samples, served_feed_ids
-from wxverify.verification.runs import roster_feeds
 
 _OPEN_METEO_MODELS = (
     "ecmwf_ifs",
@@ -170,25 +169,6 @@ def test_served_feed_ids_matrix() -> None:
 
     assert _pairs(1) == site1_expected
     assert _pairs(2) == site2_expected
-
-
-def test_served_feed_ids_matches_roster() -> None:
-    """``served_feed_ids`` is exactly the roster's feed-id set at both sites.
-
-    Catches: the two functions diverging on the package-membership branch
-    (any mismatch between ``served_feed_ids`` and ``roster_feeds`` would
-    surface as a set difference here, at either site).
-    """
-    conn = _conn()
-    _make_site(conn, "site-a")
-    _make_site(conn, "site-b")
-    _seed_feeds(conn)
-    conn.commit()
-
-    for site_id in (1, 2):
-        assert served_feed_ids(conn, site_id=site_id) == {
-            feed.feed_id for feed in roster_feeds(conn, site_id)
-        }
 
 
 _SIX_FEED_NAMES = (

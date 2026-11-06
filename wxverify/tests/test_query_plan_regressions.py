@@ -10,27 +10,17 @@ it.
 
 from __future__ import annotations
 
-import ast
 import datetime
-import inspect
 import os
-import re
 import sqlite3
-import textwrap
 
 import pytest
 
-import wxverify.api.routes.verification
-import wxverify.db.runtime_state
-import wxverify.verification.manifest
-import wxverify.verification.runs
-import wxverify.web.verification
 from wxverify.api.routes.health import (
-    FORECAST_PAIRS_COUNT_SQL,
+    FORECAST_HISTORY_COUNT_SQL,
     FORECAST_SAMPLES_COUNT_SQL,
 )
-from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
-from wxverify.db.migrations import SEED_LAST_USABLE_FETCH_SQL, run_migrations
+from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import (
     _CLAIM_ORDER_BY,  # noqa: PLC2701 -- the constant IS the plan input under test
     _CURRENT_OBS_LANE_CLAUSE,  # noqa: PLC2701
@@ -38,7 +28,6 @@ from wxverify.db.queue import (
     ACTIVE_JOB_SQL,
     LATEST_JOB_SQL,
 )
-from wxverify.forecast.wind_blend import training_pairs_query
 from wxverify.monitor import FAILED_SCOPES_SQL
 from wxverify.provider_ops import (
     bad_sample_count_sql,
@@ -47,11 +36,13 @@ from wxverify.provider_ops import (
     recent_sample_rollup_sql,
     sample_rollup_sql,
 )
-from wxverify.scoring.multimodel import existing_mean_rows_sql
-from wxverify.scoring.publication import (
-    _SEED_SKILL_SUMS_SQL,  # noqa: PLC2701 -- the SQL IS the plan input under test
+from wxverify.scoring.close_scores import (
+    _DELETE_FORECAST_HISTORY_SQL,  # noqa: PLC2701 -- the constant IS the plan input under test
 )
-from wxverify.scoring.winrate import winrate_sql
+from wxverify.scoring.history import (
+    _CHART_RANGE_SQL,  # noqa: PLC2701
+    _WINRATE_RANGE_SQL,  # noqa: PLC2701
+)
 
 
 def _fresh_conn() -> sqlite3.Connection:
@@ -231,87 +222,55 @@ def test_bad_sample_count_sql_requires_idx_samples_invalid() -> None:
         conn.execute(sql, params).fetchone()
 
 
-def test_winrate_sql_seeks_idx_pairs_winrate_and_needs_no_extra_sort() -> None:
-    conn = _fresh_conn()
-    sql = winrate_sql("")
-    params = (1, 1, 1, "temperature", 1)
-    plan = _plan(conn, sql, params)
-    assert any(
-        "SEARCH fp USING COVERING INDEX idx_pairs_winrate"
-        " (site_id=? AND variable=? AND day_ahead=?)" in line
-        for line in plan
-    )
-
-    conn.execute("DROP INDEX idx_pairs_winrate")
-    degraded_plan = _plan(conn, sql, params)
-    assert not any(
-        "SEARCH fp USING COVERING INDEX idx_pairs_winrate" in line
-        for line in degraded_plan
-    )
-
-    # idx_pairs_winrate's column order (site_id, variable, day_ahead, feed_id,
-    # valid_at, issued_at DESC) matches the window function's PARTITION BY
-    # fp.feed_id, fp.valid_at ORDER BY fp.issued_at DESC exactly, so seeking
-    # it needs no extra sort step to compute the window. Without it, some
-    # sort step is required to make up the missing ordering. The precise EQP
-    # wording for that ("...LAST N TERMS OF ORDER BY" vs a plain "...ORDER
-    # BY") is a SQLite-build-specific optimizer detail, not a stable
-    # contract, but the number of "TEMP B-TREE" sort steps the plan needs is:
-    # dropping the index must make the plan need strictly more of them.
-    sort_steps = sum("TEMP B-TREE" in line for line in plan)
-    degraded_sort_steps = sum("TEMP B-TREE" in line for line in degraded_plan)
-    assert degraded_sort_steps > sort_steps, (plan, degraded_plan)
-
-
-def test_idx_pairs_winrate_column_order_matches_the_query_shape() -> None:
-    conn = _fresh_conn()
-    columns = [
-        (row["name"], row["desc"])
-        for row in conn.execute("PRAGMA index_xinfo(idx_pairs_winrate)")
-        if row["key"]
-    ]
-    assert columns == [
-        ("site_id", 0),
-        ("variable", 0),
-        ("day_ahead", 0),
-        ("feed_id", 0),
-        ("valid_at", 0),
-        ("issued_at", 1),
-        ("abs_error", 0),
-        ("tz_generation_id", 0),
-    ]
-
-
 def test_worker_status_count_statements_stay_index_only_scans() -> None:
     conn = _fresh_conn()
     samples_plan = _plan(conn, FORECAST_SAMPLES_COUNT_SQL, ())
-    pairs_plan = _plan(conn, FORECAST_PAIRS_COUNT_SQL, ())
+    history_plan = _plan(conn, FORECAST_HISTORY_COUNT_SQL, ())
 
     # Deliberately not pinned to a specific index name: a bare COUNT(*) with
     # no WHERE lets the planner pick whichever index is smallest, and that
     # choice is allowed to drift. What must hold is that it stays an
-    # index-only scan, never a full table scan of forecast_samples/forecast_pairs.
+    # index-only scan, never a full table scan of forecast_samples.
     assert any(
         "SCAN forecast_samples USING COVERING INDEX" in line for line in samples_plan
     )
-    assert any(
-        "SCAN forecast_pairs USING COVERING INDEX" in line for line in pairs_plan
-    )
 
-    # Negative control: the two statements above are plain, unqualified
+    # forecast_history (3.1) is WITHOUT ROWID with no secondary index -- its
+    # one btree IS the primary key, so there is no separate covering index
+    # for the planner to name and "USING COVERING INDEX" can never appear in
+    # its plan. Pin what is actually true and useful instead: the exact-count
+    # statement reads forecast_history alone (no other table, no temp
+    # b-tree), in a single plan line.
+    assert len(history_plan) == 1, history_plan
+    assert "forecast_history" in history_plan[0], history_plan
+    assert "SCAN" in history_plan[0], history_plan
+    assert not any("USE TEMP B-TREE" in line for line in history_plan), history_plan
+
+    # Negative control: the single-line assertion above is not vacuous --
+    # joining a second table into the identical COUNT(*) forces a second
+    # plan line and a table name the "forecast_history alone" pin above
+    # would have caught.
+    degraded_plan = _plan(
+        conn,
+        "SELECT COUNT(*) AS n FROM forecast_history"
+        " JOIN sites ON sites.id = forecast_history.site_id",
+        (),
+    )
+    assert len(degraded_plan) > 1, degraded_plan
+    assert any("sites" in line for line in degraded_plan), degraded_plan
+
+    # Negative control: the samples assertion above is plain, unqualified
     # `SELECT COUNT(*) FROM <table>` text with no table name baked into a
-    # pin, so simply DROPping the named indexes on forecast_samples/
-    # forecast_pairs would not discriminate -- each table's UNIQUE
-    # constraint still leaves a sqlite_autoindex_* behind for the planner to
-    # cover with. Prove the assertion actually distinguishes "index-only"
-    # from "full scan" by running the identical SQL text against index-free
-    # replica tables (same column shape, no UNIQUE constraint, no CREATE
-    # INDEX): there, COUNT(*) has nothing to cover with and must fall back
-    # to a bare table scan.
+    # pin, so simply DROPping the named index on forecast_samples would not
+    # discriminate -- its UNIQUE constraint still leaves a sqlite_autoindex_*
+    # behind for the planner to cover with. Prove the assertion actually
+    # distinguishes "index-only" from "full scan" by running the identical
+    # SQL text against an index-free replica table (same column shape, no
+    # UNIQUE constraint, no CREATE INDEX): there, COUNT(*) has nothing to
+    # cover with and must fall back to a bare table scan.
     conn.execute(
         "CREATE TABLE forecast_samples_noidx (site_id INTEGER, feed_id INTEGER)"
     )
-    conn.execute("CREATE TABLE forecast_pairs_noidx (site_id INTEGER, feed_id INTEGER)")
     degraded_samples_plan = _plan(
         conn,
         FORECAST_SAMPLES_COUNT_SQL.replace(
@@ -319,19 +278,10 @@ def test_worker_status_count_statements_stay_index_only_scans() -> None:
         ),
         (),
     )
-    degraded_pairs_plan = _plan(
-        conn,
-        FORECAST_PAIRS_COUNT_SQL.replace("forecast_pairs", "forecast_pairs_noidx"),
-        (),
-    )
     assert any(
         "SCAN forecast_samples_noidx" in line and "USING COVERING INDEX" not in line
         for line in degraded_samples_plan
     ), degraded_samples_plan
-    assert any(
-        "SCAN forecast_pairs_noidx" in line and "USING COVERING INDEX" not in line
-        for line in degraded_pairs_plan
-    ), degraded_pairs_plan
 
 
 def _seed_jobs_across_two_sites(conn: sqlite3.Connection, *, rows: int) -> int:
@@ -562,616 +512,121 @@ def test_idx_samples_recent_column_order_matches_the_query_shape() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _fs_row(plan: list[str]) -> str:
-    rows = [line for line in plan if line.startswith(("SEARCH fs", "SCAN fs"))]
+# The recent-samples query plan this section checks is pinned below, by
+# ``test_recent_metric_statements_seek_idx_samples_recent_with_issued_at``
+# and its neighbours.
+
+
+# ---------------------------------------------------------------------------
+# §3.6 — forecast_history's three readers/writer each seek it by primary
+# key, never scan it.
+# ---------------------------------------------------------------------------
+
+
+def _assert_forecast_history_search_binds(
+    plan: list[str], columns: tuple[str, ...]
+) -> list[str]:
+    """Relationship check, never the planner's exact wording (the CLI's
+    SQLite and the app's build can word a plan differently): exactly one
+    ``forecast_history`` line, a SEARCH (never a SCAN), whose constraint
+    names every one of ``columns`` as ``col=?`` -- a bare "SEARCH ...
+    USING PRIMARY KEY" prefix check would also accept a seek on ``site_id``
+    alone, which is what the negative controls below produce. Returns
+    ``plan`` for an index check by the caller.
+    """
+    rows = [line for line in plan if "forecast_history" in line]
     assert len(rows) == 1, plan
-    return rows[0]
+    line = rows[0]
+    assert line.startswith("SEARCH forecast_history"), plan
+    assert "SCAN forecast_history" not in line, plan
+    for column in columns:
+        assert f"{column}=?" in line, (line, columns)
+    return plan
 
 
-def test_v8_seed_sql_fs_subquery_matches_a_reference_recent_samples_query() -> None:
-    """The migration's own module-level constant, executed verbatim (never a
-    copy), must read ``forecast_samples fs`` the same way a reference query
-    with the same filter shape does -- a relationship, since the exact
-    ``SEARCH ...`` phrasing is a contract with the shipping SQLite build.
-    This test requires the ``SEARCH fs USING INDEX idx_samples_recent``
-    prefix; it runs locally and in the shipping-SQLite CI job, and is not
-    gated by ``WXV_EQP_SHIPPING``.
-
-    Mutant (plan §14.6): the ``OR`` form of §10.2 (``fs.feed_id = sfs.feed_id
-    OR fs.feed_id IN (SELECT m.id ...)`` in place of the ``UNION ALL``-fed
-    ``IN``) drops the leading ``feed_id`` conjunct from the planner's view,
-    so its ``fs`` row reads ``(site_id=?)`` only instead of seeking on
-    ``site_id`` AND ``feed_id`` -- divergent from the reference query's row
-    at this exact assertion.
+def test_winrate_range_sql_seeks_forecast_history_by_primary_key() -> None:
+    """The win rate's one read (``scoring.history._WINRATE_RANGE_SQL``)
+    searches ``forecast_history`` by site_id, feed_id, variable and
+    day_ahead (its primary key, less the ``valid_at`` range) -- never a
+    scan -- and does so AFTER the active-feeds step, since
+    ``_WINRATE_RANGE_SQL``'s ``CROSS JOIN`` is written to keep the feeds
+    the outer loop (each feed then seeks the whole key; a plain JOIN lets
+    the planner put ``forecast_history`` outside instead, seeking
+    ``site_id`` alone).
     """
     conn = _fresh_conn()
-
-    seed_plan = _plan(conn, SEED_LAST_USABLE_FETCH_SQL, ())
-    seed_row = _fs_row(seed_plan)
-
-    reference_sql = f"""
-        SELECT 1 FROM forecast_samples fs
-        WHERE fs.site_id = ? AND fs.feed_id = ? AND fs.issued_at >= ?
-          AND fs.fetched_at = ? AND NOT {invalid_forecast_sample_sql("fs")}
-        """
-    reference_plan = _plan(
-        conn, reference_sql, (1, 1, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+    params = (
+        1,
+        1,
+        1,
+        "temperature",
+        1,
+        "2024-01-01",
+        "2024-01-03",
+        "2024-01-01",
+        "2024-01-02",
+        "2024-01-01",
     )
-    reference_row = _fs_row(reference_plan)
+    plan = _assert_forecast_history_search_binds(
+        _plan(conn, _WINRATE_RANGE_SQL, params),
+        ("site_id", "feed_id", "variable", "day_ahead"),
+    )
+    fh_line = next(line for line in plan if "forecast_history" in line)
+    assert plan.index(fh_line) > 0, (
+        "M-winrate-order -> at this assertion: correct = forecast_history"
+        f" searched after the active-feeds step, mutant (searched first) = {plan}"
+    )
 
-    assert seed_row.startswith("SEARCH fs USING INDEX idx_samples_recent")
-    assert seed_row == reference_row
-
-
-# ---------------------------------------------------------------------------
-# §18.12 — query-plan expectations for the 0.11.0 verification indexes.
-#
-# Every /api/verification/* collection read must SEEK into an index on its
-# scoping key (run_id or site_id); a plan that SCANs one of these tables is
-# unbounded across runs/sites and is exactly the regression this family
-# exists to fail on. Each positive is paired with an empirically degrading
-# negative control: dropping the index, or dropping the scoping conjunct.
-#
-# The statements are retyped here because the route builds them as f-strings
-# around an optional filter clause rather than exporting a constant; a
-# source-text tripwire below fails if the production text drifts away from
-# what is pinned.
-# ---------------------------------------------------------------------------
-
-_EVIDENCE_PAGE_SQL = """
-            SELECT * FROM verification_evidence
-            WHERE run_id = ?
-            ORDER BY id LIMIT ? OFFSET ?
-            """
-
-_RUNS_PAGE_SQL = """
-            SELECT * FROM verification_runs
-            ORDER BY id DESC LIMIT ? OFFSET ?
-            """
-
-_FAILED_NEWER_SQL = """
-        SELECT 1 FROM verification_runs
-        WHERE site_id = ? AND state = 'failed' AND id > ? LIMIT 1
-        """
+    # Negative control: a plain JOIN (instead of CROSS JOIN) lets the
+    # planner put forecast_history outside the feeds loop, seeking site_id
+    # alone and running first -- proving the checks above are not
+    # vacuously true on this fixture.
+    degraded = _WINRATE_RANGE_SQL.replace(
+        "CROSS JOIN forecast_history", "JOIN forecast_history"
+    )
+    assert degraded != _WINRATE_RANGE_SQL
+    degraded_plan = _plan(conn, degraded, params)
+    degraded_rows = [line for line in degraded_plan if "forecast_history" in line]
+    assert len(degraded_rows) == 1, degraded_plan
+    assert degraded_plan.index(degraded_rows[0]) == 0, degraded_plan
+    assert "feed_id=?" not in degraded_rows[0], degraded_plan
 
 
-def test_verification_route_sql_still_matches_the_pinned_text() -> None:
-    """Drift tripwire: the route composes its statements inline, so the
-    pinned copies above are only trustworthy while the production text
-    still contains them."""
-    source = inspect.getsource(wxverify.api.routes.verification)
-    assert "SELECT * FROM verification_evidence\n            WHERE run_id = ?" in source
-    assert "ORDER BY id LIMIT ? OFFSET ?" in source
-    assert "SELECT * FROM verification_runs {where}\n            ORDER BY id DESC" in (
-        source
+def test_chart_range_sql_seeks_forecast_history_by_primary_key() -> None:
+    """The history chart's one read (``scoring.history._CHART_RANGE_SQL``)
+    searches ``forecast_history`` by site_id, feed_id, variable and
+    day_ahead -- never a scan."""
+    conn = _fresh_conn()
+    _assert_forecast_history_search_binds(
+        _plan(
+            conn,
+            _CHART_RANGE_SQL,
+            (1, 1, "temperature", 1, "2024-01-01", "2024-01-03", "2024-01-01"),
+        ),
+        ("site_id", "feed_id", "variable", "day_ahead"),
     )
 
 
-def test_published_basis_report_sql_still_matches_the_pinned_text() -> None:
-    """Drift tripwire: the newer-failed-attempt check moved into the read
-    snapshot bracket inside ``published_basis_report``, so the pinned copy
-    above is only trustworthy while that module's text still contains it."""
-    source = inspect.getsource(wxverify.verification.freshness)
-    assert (
-        "SELECT 1 FROM verification_runs\n"
-        "                WHERE site_id = ? AND state = 'failed' AND id > ? LIMIT 1"
-        in source
-    )
+def test_stage5_retry_delete_seeks_forecast_history_by_primary_key() -> None:
+    """Stage 5's retry delete (``scoring.close_scores.
+    _DELETE_FORECAST_HISTORY_SQL``) searches ``forecast_history`` by
+    site_id, feed_id, variable and day_ahead -- never a scan, for a
+    statement that runs once per feed/variable/day-ahead on every close
+    retry.
 
-
-def test_evidence_page_seeks_by_run_id_never_scans() -> None:
-    conn = _fresh_conn()
-    plan = _plan(conn, _EVIDENCE_PAGE_SQL, (1, 10, 0))
-    assert any("SEARCH verification_evidence" in line for line in plan), plan
-    assert any("(run_id=?)" in line for line in plan), plan
-    assert not any(line.startswith("SCAN verification_evidence") for line in plan), plan
-    # The run-scoping survives even without the secondary cell index: the
-    # UNIQUE(run_id, ...) autoindex leads on run_id too. Pinning both
-    # configurations records WHY the page can never scan all runs.
-    conn.execute("DROP INDEX idx_verification_evidence_cell")
-    fallback = _plan(conn, _EVIDENCE_PAGE_SQL, (1, 10, 0))
-    assert any(
-        "SEARCH verification_evidence USING INDEX"
-        " sqlite_autoindex_verification_evidence_1 (run_id=?)" in line
-        for line in fallback
-    ), fallback
-
-
-def test_evidence_page_without_run_scoping_degrades_to_a_scan() -> None:
-    """Negative control: the exact regression §18.12 names — a detailed
-    evidence read that loses its run_id binding — plans as a full scan, so
-    the positive above is not vacuously true on this schema."""
-    conn = _fresh_conn()
-    degraded = _EVIDENCE_PAGE_SQL.replace("WHERE run_id = ?", "WHERE variable = ?")
-    assert degraded != _EVIDENCE_PAGE_SQL
-    plan = _plan(conn, degraded, ("wind", 10, 0))
-    assert plan == ["SCAN verification_evidence"], plan
-
-
-def test_runs_page_and_failed_newer_probe_use_idx_verification_runs_site() -> None:
-    conn = _fresh_conn()
-    site_sql = _RUNS_PAGE_SQL.replace(
-        "FROM verification_runs", "FROM verification_runs WHERE site_id = ?"
-    )
-    plan = _plan(conn, site_sql, (1, 10, 0))
-    assert any(
-        "SEARCH verification_runs USING INDEX idx_verification_runs_site (site_id=?)"
-        in line
-        for line in plan
-    ), plan
-    # The status banner's "a newer attempt failed" probe binds all three
-    # index columns and never touches the table.
-    probe = _plan(conn, _FAILED_NEWER_SQL, (1, 0))
-    assert probe == [
-        "SEARCH verification_runs USING COVERING INDEX"
-        " idx_verification_runs_site (site_id=? AND state=? AND id>?)"
-    ], probe
-
-    # Negative control: without the index the site page scans every run and
-    # the status probe falls back to a rowid range over all sites.
-    conn.execute("DROP INDEX idx_verification_runs_site")
-    assert _plan(conn, site_sql, (1, 10, 0)) == ["SCAN verification_runs"]
-    assert _plan(conn, _FAILED_NEWER_SQL, (1, 0)) == [
-        "SEARCH verification_runs USING INTEGER PRIMARY KEY (rowid>?)"
-    ]
-
-
-def test_trigger_decision_lookup_uses_its_site_date_index() -> None:
-    conn = _fresh_conn()
-    sql = """
-        SELECT * FROM verification_trigger_decisions
-        WHERE site_id = ? AND trigger_date = ? ORDER BY id DESC LIMIT 1
-        """
-    plan = _plan(conn, sql, (1, "2026-05-01"))
-    assert plan == [
-        "SEARCH verification_trigger_decisions USING INDEX"
-        " idx_verification_trigger_site_date (site_id=? AND trigger_date=?)"
-    ], plan
-    conn.execute("DROP INDEX idx_verification_trigger_site_date")
-    assert _plan(conn, sql, (1, "2026-05-01")) == [
-        "SCAN verification_trigger_decisions"
-    ]
-
-
-def test_new_verification_index_column_order_matches_the_query_shapes() -> None:
-    """Structure asserted via PRAGMA index_xinfo, never a DDL string copy."""
-    conn = _fresh_conn()
-
-    def keyed(index: str) -> list[tuple[str, int]]:
-        return [
-            (str(row["name"]), int(row["desc"]))
-            for row in conn.execute(f"PRAGMA index_xinfo({index})")  # noqa: S608
-            if row["key"]
-        ]
-
-    assert keyed("idx_verification_runs_site") == [
-        ("site_id", 0),
-        ("state", 0),
-        ("id", 0),
-    ]
-    assert keyed("idx_verification_evidence_cell") == [
-        ("run_id", 0),
-        ("entity_type", 0),
-        ("quantity", 0),
-        ("lead", 0),
-        ("target_local_date", 0),
-    ]
-    assert keyed("idx_verification_trigger_site_date") == [
-        ("site_id", 0),
-        ("trigger_date", 0),
-        ("id", 0),
-    ]
-
-
-# ---------------------------------------------------------------------------
-# §18.12 — the input-fingerprint statements (NB-2).
-#
-# `input_fingerprint` runs in the WORKER only: the nightly no-change gate,
-# the decide-to-run divergence guard and the bootstrap seed. Its three
-# growth-proportional reads over `observations`, `forecast_samples` and
-# `daily_truth` LEFT the request path when the freshness warning moved to
-# `result_basis_fingerprint` (pinned in the sub-block below), taking the
-# ~29 ms/site measured at three years of data -- ~21.7 ms of it the
-# observations COUNT(*) -- off the /status and /verification page budget.
-# They stay pinned here because the worker runs them per site every night:
-# a plan that scans any of these tables grows with the whole install
-# instead of with the site.
-#
-# Relationships are pinned (site binding present, table never scanned), not
-# planner phrasing. The `runtime_state` pointer probe is the one statement
-# below that IS still on the request path: `current_result_basis_fingerprint`
-# resolves the generation the same non-seeding way (NB-9).
-#
-# Retyped + tripwired like the route statements above: `runs.py` composes
-# these inline rather than exporting constants.
-# ---------------------------------------------------------------------------
-
-_FINGERPRINT_OBS_SQL = """
-        SELECT COUNT(*) AS n, MAX(computed_at) AS latest
-        FROM observations WHERE site_id = ?
-        """
-
-_FINGERPRINT_SAMPLES_SQL = (
-    "SELECT COALESCE(MAX(id), 0) AS hi FROM forecast_samples WHERE site_id = ?"
-)
-
-_FINGERPRINT_TRUTH_SQL = """
-        SELECT local_date, quantity, value, eligible, covered_hours, stale
-        FROM daily_truth
-        WHERE site_id = ? AND tz_generation_id = ?
-        ORDER BY local_date, quantity
-        """
-
-_TZ_POINTER_SQL = "SELECT value FROM runtime_state WHERE key = ?"
-
-
-def test_fingerprint_sql_still_matches_the_pinned_text() -> None:
-    """Drift tripwire for the four statements pinned below."""
-    source = inspect.getsource(wxverify.verification.runs)
-    assert (
-        "SELECT COUNT(*) AS n, MAX(computed_at) AS latest\n"
-        "        FROM observations WHERE site_id = ?" in source
-    )
-    # Exactly once: the manifest writer runs an identical MAX(id) statement
-    # from its own module. A consolidation that moved it here would satisfy
-    # a bare substring check with the copy and stop guarding
-    # `input_fingerprint`'s own statement.
-    assert source.count(_FINGERPRINT_SAMPLES_SQL) == 1
-    assert (
-        "SELECT local_date, quantity, value, eligible, covered_hours, stale\n"
-        "        FROM daily_truth\n"
-        "        WHERE site_id = ? AND tz_generation_id = ?\n"
-        "        ORDER BY local_date, quantity" in source
-    )
-    # The generation resolution reaches the request path through
-    # site_generation_id's own SELECT on timezone_generations.
-    assert "site_generation_id(conn, site_id)" in source
-
-
-def test_fingerprint_observation_count_seeks_by_site_never_scans() -> None:
-    conn = _fresh_conn()
-    plan = _plan(conn, _FINGERPRINT_OBS_SQL, (1,))
-    assert any(
-        "SEARCH observations" in line and "(site_id=?)" in line for line in plan
-    ), plan
-    assert not any(line.startswith("SCAN observations") for line in plan), plan
-    # Negative control: the same aggregate without its site scoping is the
-    # whole-install scan this pin exists to keep off the request path.
-    unscoped = _FINGERPRINT_OBS_SQL.replace(" WHERE site_id = ?", "")
-    assert unscoped != _FINGERPRINT_OBS_SQL
-    assert _plan(conn, unscoped, ()) == ["SCAN observations"], unscoped
-
-
-def test_fingerprint_sample_high_water_stays_site_scoped() -> None:
-    conn = _fresh_conn()
-    # The site binding comes from the UNIQUE key, not from any one secondary
-    # index, so it survives losing them one at a time. Pinning the whole
-    # fallback ladder records WHY this read can never degrade to a scan.
-    for dropped in (None, "idx_samples_runs", "idx_samples_site_var_valid"):
-        if dropped is not None:
-            conn.execute(f"DROP INDEX {dropped}")  # noqa: S608
-        plan = _plan(conn, _FINGERPRINT_SAMPLES_SQL, (1,))
-        assert any(
-            "SEARCH forecast_samples USING COVERING INDEX" in line
-            and "(site_id=?)" in line
-            for line in plan
-        ), (dropped, plan)
-
-
-def test_fingerprint_truth_rows_seek_by_site_and_sort_in_a_temp_btree() -> None:
-    conn = _fresh_conn()
-    plan = _plan(conn, _FINGERPRINT_TRUTH_SQL, (1, 1))
-    assert any(
-        "SEARCH daily_truth" in line and "(site_id=?)" in line for line in plan
-    ), plan
-    assert not any(line.startswith("SCAN daily_truth") for line in plan), plan
-    # The UNIQUE key is (site_id, quantity, local_date, tz_generation_id), so
-    # ORDER BY (local_date, quantity) cannot be served from it: the sort is a
-    # temp b-tree over the site's truth rows. Pinned as the KNOWN cost of
-    # this read -- if an index ever makes the ordering index-served, this is
-    # the line that records the improvement.
-    assert any("USE TEMP B-TREE FOR ORDER BY" in line for line in plan), plan
-    # Negative control: lose the site conjunct and the read scans every
-    # site's whole truth history.
-    degraded = _FINGERPRINT_TRUTH_SQL.replace("site_id = ?", "timezone = ?")
-    assert degraded != _FINGERPRINT_TRUTH_SQL
-    assert _plan(conn, degraded, ("UTC", 1))[0] == "SCAN daily_truth", degraded
-
-
-def test_tz_generation_pointer_probe_is_a_key_lookup() -> None:
-    conn = _fresh_conn()
-    plan = _plan(conn, _TZ_POINTER_SQL, ("tz_generation_published:1",))
-    assert any("SEARCH runtime_state" in line and "(key=?)" in line for line in plan), (
-        plan
-    )
-    # Negative control: probing by value instead of by key scans the table.
-    degraded = _TZ_POINTER_SQL.replace("WHERE key = ?", "WHERE value = ?")
-    assert _plan(conn, degraded, ("1",)) == ["SCAN runtime_state"], degraded
-
-
-# ---------------------------------------------------------------------------
-# §18.12 — the result-basis statement, the fingerprint read that REPLACED
-# the three above on the request path.
-#
-# `GET /api/verification/status` and the /verification page recompute
-# `result_basis_fingerprint` per site on the REQUEST PATH: the pointer probe
-# pinned above plus this one horizon-scoped read over `daily_truth`. The
-# `BETWEEN` bounds buy stability, NOT a smaller read -- `period_start` is the
-# site's earliest truth day, so the scoped range is very nearly its whole
-# truth history and the row count is within a day or two of the unscoped
-# digest's. So the same rule applies: site-scoped through an index, never a
-# scan.
-#
-# Retyped + tripwired like the statements above.
-# ---------------------------------------------------------------------------
-
-_RESULT_BASIS_TRUTH_SQL = """
-        SELECT local_date, quantity, value, eligible, covered_hours
-        FROM daily_truth
-        WHERE site_id = ? AND tz_generation_id = ?
-          AND local_date BETWEEN ? AND ?
-        ORDER BY local_date, quantity
-        """
-
-
-def test_result_basis_truth_sql_still_matches_the_pinned_text() -> None:
-    """Drift tripwire for the statement pinned below.
-
-    The `BETWEEN` clause is asserted TEXTUALLY because the plan pin cannot
-    see it: the `daily_truth` UNIQUE key is (site_id, quantity, local_date,
-    tz_generation_id), so with `quantity` unconstrained the planner cannot
-    use `local_date` as a range bound and the scoped and unscoped statements
-    produce the identical plan shape. Losing the filter is what would
-    reintroduce the permanently-true staleness warning -- newly settled days
-    landing above the run's horizon would move the digest every night -- so
-    this line, not the plan, is that clause's guard.
+    This is the one copy of this pin -- CI's shipping-SQLite job
+    (``WXV_EQP_SHIPPING=1``) runs only this file and
+    ``test_index_predicate_reconciliation.py``, so a duplicate kept
+    elsewhere would never run against the shipping build.
     """
-    source = inspect.getsource(wxverify.verification.runs)
-    assert (
-        "SELECT local_date, quantity, value, eligible, covered_hours\n"
-        "        FROM daily_truth\n"
-        "        WHERE site_id = ? AND tz_generation_id = ?\n"
-        "          AND local_date BETWEEN ? AND ?\n"
-        "        ORDER BY local_date, quantity" in source
-    )
-
-
-def test_result_basis_truth_rows_seek_by_site_and_sort_in_a_temp_btree() -> None:
     conn = _fresh_conn()
-    params = (1, 1, "2026-01-01", "2026-06-30")
-    plan = _plan(conn, _RESULT_BASIS_TRUTH_SQL, params)
-    assert any(
-        "SEARCH daily_truth" in line and "(site_id=?)" in line for line in plan
-    ), plan
-    assert not any(line.startswith("SCAN daily_truth") for line in plan), plan
-    # Same known cost as the unscoped digest: ORDER BY (local_date, quantity)
-    # cannot be served from the UNIQUE key, so the sort is a temp b-tree over
-    # the site's truth rows. The horizon filter does not change that.
-    assert any("USE TEMP B-TREE FOR ORDER BY" in line for line in plan), plan
-    # Negative control: lose the site conjunct and the read scans every
-    # site's whole truth history.
-    degraded = _RESULT_BASIS_TRUTH_SQL.replace("site_id = ?", "timezone = ?")
-    assert degraded != _RESULT_BASIS_TRUTH_SQL
-    assert _plan(conn, degraded, ("UTC", 1, "2026-01-01", "2026-06-30"))[0] == (
-        "SCAN daily_truth"
-    ), degraded
-
-
-# ---------------------------------------------------------------------------
-# §18.12 — the /verification PAGE's two run-scoped reads (Round B).
-#
-# Rendering one run loads every persisted result row (`_load_results`) and
-# aggregates the run's evidence into realized contributor depths
-# (`_load_contributor_depths`). Both tables accumulate one set of rows per
-# run FOREVER, so these are the two reads that grow with the install's whole
-# verification history rather than with the run being shown: only a run_id
-# seek keeps the page's cost proportional to one run.
-#
-# Both statements are composed inline in `wxverify/web/verification.py`, so
-# they are retyped here and guarded by a source tripwire below.
-#
-# Relationships are pinned -- the named index is used and the table is never
-# scanned -- never the planner's exact phrasing, which differs between the
-# `sqlite3` CLI, the interpreter this suite runs under, and CI.
-# ---------------------------------------------------------------------------
-
-_PAGE_RESULTS_SQL = """
-        SELECT variable, lead, quantity, entity_type, entity_key, headline,
-               common_days, mae, bias, rmse, hits, misses, false_alarms,
-               correct_negatives, ets, availability_rate, delta_vs_incumbent,
-               detail
-        FROM verification_results
-        WHERE run_id = ?
-        ORDER BY variable, quantity, lead, entity_type, entity_key
-        """
-
-_PAGE_CONTRIBUTORS_SQL = """
-        SELECT variable, lead, quantity, entity_key,
-               MIN(realized_contributors) AS lo,
-               MAX(realized_contributors) AS hi
-        FROM verification_evidence
-        WHERE run_id = ? AND entity_type = 'depth'
-          AND forecast_eligible = 1 AND realized_contributors IS NOT NULL
-        GROUP BY variable, lead, quantity, entity_key
-        """
-
-
-def test_verification_page_sql_still_matches_the_pinned_text() -> None:
-    """Drift tripwire for the two page reads pinned below."""
-    source = inspect.getsource(wxverify.web.verification)
-    assert _PAGE_RESULTS_SQL in source
-    assert _PAGE_CONTRIBUTORS_SQL in source
-
-
-def test_page_result_load_seeks_by_run_never_scans_the_results_table() -> None:
-    conn = _fresh_conn()
-    plan = _plan(conn, _PAGE_RESULTS_SQL, (1,))
-    assert any(
-        "SEARCH verification_results" in line and "(run_id=?)" in line for line in plan
-    ), plan
-    assert not any(line.startswith("SCAN verification_results") for line in plan), plan
-    # Negative control: the UNIQUE key leads on run_id, so DROPping a
-    # secondary index proves nothing -- removing the run scoping is what
-    # empirically degrades this read to a whole-history scan.
-    unscoped = _PAGE_RESULTS_SQL.replace("WHERE run_id = ?\n", "")
-    assert unscoped != _PAGE_RESULTS_SQL
-    assert _plan(conn, unscoped, ())[0] == "SCAN verification_results", unscoped
-
-
-def test_page_contributor_rollup_uses_the_evidence_cell_index() -> None:
-    conn = _fresh_conn()
-    plan = _plan(conn, _PAGE_CONTRIBUTORS_SQL, (1,))
-    assert any(
-        "SEARCH verification_evidence USING INDEX idx_verification_evidence_cell"
-        in line
-        and "(run_id=? AND entity_type=?)" in line
-        for line in plan
-    ), plan
-    assert not any(line.startswith("SCAN verification_evidence") for line in plan), plan
-    # The GROUP BY is not index-served (the cell index orders by quantity,
-    # lead, target_local_date), so the rollup sorts in a temp b-tree over ONE
-    # run's evidence. Pinned as this read's known, run-bounded cost.
-    assert any("USE TEMP B-TREE FOR GROUP BY" in line for line in plan), plan
-    # Negative control: drop the run scoping (not the index -- the UNIQUE
-    # autoindex also leads on run_id, so an index drop is not a real
-    # degradation) and the rollup walks every run's evidence ever recorded.
-    unscoped = _PAGE_CONTRIBUTORS_SQL.replace("run_id = ? AND ", "")
-    assert unscoped != _PAGE_CONTRIBUTORS_SQL
-    degraded_plan = _plan(conn, unscoped, ())
-    assert any(
-        line.startswith("SCAN verification_evidence") for line in degraded_plan
-    ), degraded_plan
-
-
-@pytest.mark.skipif(
-    os.environ.get("WXV_EQP_SHIPPING") != "1",
-    reason="exact-plan pin: planner phrasing is build-specific (WXV_EQP_SHIPPING=1)",
-)
-def test_verification_page_reads_have_the_expected_shipping_plans() -> None:
-    conn = _fresh_conn()
-    assert _plan(conn, _PAGE_RESULTS_SQL, (1,)) == [
-        "SEARCH verification_results USING INDEX"
-        " sqlite_autoindex_verification_results_1 (run_id=?)",
-        # The UNIQUE key is (run_id, variable, lead, quantity, entity_type,
-        # entity_key), so the seek delivers rows already ordered by the
-        # ORDER BY's FIRST term; only the remaining four are sorted.
-        "USE TEMP B-TREE FOR LAST 4 TERMS OF ORDER BY",
-    ]
-    assert _plan(conn, _PAGE_CONTRIBUTORS_SQL, (1,)) == [
-        "SEARCH verification_evidence USING INDEX"
-        " idx_verification_evidence_cell (run_id=? AND entity_type=?)",
-        "USE TEMP B-TREE FOR GROUP BY",
-    ]
-
-
-# ---------------------------------------------------------------------------
-# §18.13 — the input-manifest arrivals probes (2026-09-02 input manifest, D7).
-#
-# `run_input_freshness` runs one of these per arrivals component on the
-# REQUEST PATH (`GET /api/verification/status` and the /verification page):
-# "did a row land inside the run's scored horizon after the watermark it
-# pinned at start". `NOT INDEXED` is the whole cost decision. Without it the
-# planner takes the site-scoped covering index -- a walk over the site's
-# entire history, 25.6 ms measured at three years of data -- where the
-# rowid range seek it forbids everything BUT reads only the rows added since
-# the pin: 0.13 ms, and constant. No functional test can see the difference,
-# so the directive is pinned here at three levels: the text (a), the
-# build-independent plan relationship (b), and the shipping build's exact
-# phrasing (c).
-#
-# The `valid_at` bounds are asserted TEXTUALLY for the same reason
-# `_RESULT_BASIS_TRUTH_SQL`'s BETWEEN is: the rowid seek is the only
-# predicate the plan reflects, so a dropped bound leaves the plan identical.
-# O4/O5 in tests/test_run_input_manifest.py catch that behaviourally.
-#
-# Retyped + tripwired like the statements above; the plan pins run the
-# statement LIFTED from the module, so a source edit that drops the
-# directive fails (b), not only the text tripwire.
-# ---------------------------------------------------------------------------
-
-_MANIFEST_SAMPLES_PROBE_SQL = """
-        SELECT EXISTS(
-            SELECT 1 FROM forecast_samples NOT INDEXED
-            WHERE site_id = ? AND id > ?
-              AND valid_at >= ? AND valid_at < ?
-        ) AS moved
-        """
-
-_MANIFEST_PAIRS_PROBE_SQL = """
-        SELECT EXISTS(
-            SELECT 1 FROM forecast_pairs NOT INDEXED
-            WHERE site_id = ? AND id > ?
-              AND valid_at >= ? AND valid_at < ?
-        ) AS moved
-        """
-
-_MANIFEST_PROBE_PARAMS = (1, 0, "2026-06-01T00:00:00Z", "2026-06-06T00:00:00Z")
-
-
-def _lifted_statement(fn: object) -> str:
-    """The one SELECT literal inside ``fn``'s body, as the module runs it."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
-    literals = [
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant)
-        and isinstance(node.value, str)
-        and "SELECT" in node.value
-    ]
-    assert len(literals) == 1, literals
-    return literals[0]
-
-
-def test_manifest_probe_sql_still_matches_the_pinned_text() -> None:
-    """Drift tripwire for the two statements pinned below (O16 (a))."""
-    source = inspect.getsource(wxverify.verification.manifest)
-    for pinned, fn in (
-        (_MANIFEST_SAMPLES_PROBE_SQL, wxverify.verification.manifest._samples_arrived),
-        (_MANIFEST_PAIRS_PROBE_SQL, wxverify.verification.manifest._pairs_arrived),
-    ):
-        assert pinned in source
-        assert _lifted_statement(fn) == pinned
-        assert "NOT INDEXED" in pinned
-        assert "AND valid_at >= ?" in pinned
-        assert "AND valid_at < ?" in pinned
-
-
-@pytest.mark.parametrize(
-    ("table", "fn"),
-    [
-        ("forecast_samples", wxverify.verification.manifest._samples_arrived),
-        ("forecast_pairs", wxverify.verification.manifest._pairs_arrived),
-    ],
-)
-def test_manifest_probes_seek_the_rowid_never_an_index(table: str, fn: object) -> None:
-    """O16 (b): build-independent -- no plan line names an index."""
-    conn = _fresh_conn()
-    statement = _lifted_statement(fn)
-    plan = _plan(conn, statement, _MANIFEST_PROBE_PARAMS)
-    assert any(f"SEARCH {table}" in line for line in plan), plan
-    assert all("INDEX" not in line for line in plan), plan
-    # Negative control: drop the directive and the planner takes the
-    # site-scoped covering index -- the whole-history walk this pin forbids.
-    control = statement.replace(" NOT INDEXED", "")
-    assert control != statement
-    control_plan = _plan(conn, control, _MANIFEST_PROBE_PARAMS)
-    assert any("INDEX" in line for line in control_plan), control_plan
-
-
-@pytest.mark.skipif(
-    os.environ.get("WXV_EQP_SHIPPING") != "1",
-    reason="exact-plan pin: planner phrasing is build-specific (WXV_EQP_SHIPPING=1)",
-)
-def test_manifest_probes_have_the_expected_shipping_plans() -> None:
-    """O16 (c): the rowid range seek, in the shipping build's own words."""
-    conn = _fresh_conn()
-    samples = _lifted_statement(wxverify.verification.manifest._samples_arrived)
-    assert "SEARCH forecast_samples USING INTEGER PRIMARY KEY (rowid>?)" in _plan(
-        conn, samples, _MANIFEST_PROBE_PARAMS
-    )
-    pairs = _lifted_statement(wxverify.verification.manifest._pairs_arrived)
-    assert "SEARCH forecast_pairs USING INTEGER PRIMARY KEY (rowid>?)" in _plan(
-        conn, pairs, _MANIFEST_PROBE_PARAMS
+    _assert_forecast_history_search_binds(
+        _plan(
+            conn,
+            _DELETE_FORECAST_HISTORY_SQL,
+            (1, 1, "temperature", 1, "2024-01-01", "2024-01-03", "2024-01-01"),
+        ),
+        ("site_id", "feed_id", "variable", "day_ahead"),
     )
 
 
@@ -1257,197 +712,3 @@ def test_eqp_claim_partition_clauses_keep_todays_claim_plan() -> None:
     degraded_plan = _claim_subselect_plan(conn, degraded_clause)
     assert degraded_plan != baseline_plan
     assert any("idx_jobs_type_key_site" in line for line in degraded_plan)
-
-
-def test_existing_mean_rows_sql_stays_indexed_site_scoped() -> None:
-    """EQP -- the multimodel diff's site-scoped X read (``scoring/split.py``
-    apply, ``scoring/multimodel.py:compute_multimodel_mean``) must seek
-    ``forecast_pairs`` on ``(site_id, feed_id)``, never a bare table scan.
-    """
-    conn = _fresh_conn()
-    plan = _plan(conn, existing_mean_rows_sql(site_scoped=True, day_clause="1"), (1, 1))
-    assert plan == [
-        "SEARCH forecast_pairs USING INDEX idx_pairs_cell (site_id=? AND feed_id=?)"
-    ], plan
-
-    # Negative control: the site-unscoped form has no equality predicate to
-    # seek forecast_pairs on, so it degrades to a bare scan -- proving the
-    # healthy assertion above is discriminating, not vacuously true.
-    degraded_plan = _plan(
-        conn, existing_mean_rows_sql(site_scoped=False, day_clause="1"), (1,)
-    )
-    assert any("SCAN forecast_pairs" in line for line in degraded_plan), degraded_plan
-
-
-# ---------------------------------------------------------------------------
-# T62 -- wind-pair-max training/scoring reads
-# ---------------------------------------------------------------------------
-
-_LEADERBOARD_SEEK = re.compile(
-    r"^SEARCH fp USING (COVERING )?INDEX idx_pairs_leaderboard \("
-)
-
-
-def test_training_pairs_query_seeks_leaderboard_index_with_valid_at_range() -> None:
-    """T62(a) -- ``forecast/wind_blend.py:training_pairs_query``'s feed-side
-    training read must seek ``idx_pairs_leaderboard`` with a bound ``valid_at``
-    range, both without and with the ``as_of`` knowability predicate, and must
-    never degrade to an ``IN``-list binary search (``ANY(...)``) over the
-    index.
-    """
-    conn = _fresh_conn()
-
-    for as_of in (None, "2026-01-02T00:00:00+00:00"):
-        sql, params = training_pairs_query(
-            site_id=1, lo="2026-01-01", hi="2026-01-02", as_of=as_of
-        )
-        plan = _plan(conn, sql, params)
-        seeks = [line for line in plan if _LEADERBOARD_SEEK.match(line)]
-        assert len(seeks) == 1, plan
-        assert "valid_at>?" in seeks[0] and "valid_at<?" in seeks[0], plan
-        assert not any("ANY(" in line for line in plan), plan
-
-    sql, params = training_pairs_query(
-        site_id=1, lo="2026-01-01", hi="2026-01-02", as_of=None
-    )
-
-    # Negative control 1: swapping the index hint away from
-    # idx_pairs_leaderboard loses the valid_at-bounded seek entirely (the
-    # planner walks idx_pairs_winrate's (site_id, variable, day_ahead)
-    # columns with no range term at all) -- proving the healthy assertion
-    # above is pinned to the real index, not vacuously true.
-    swapped_sql = sql.replace(
-        "INDEXED BY idx_pairs_leaderboard", "INDEXED BY idx_pairs_winrate"
-    )
-    swapped_plan = _plan(conn, swapped_sql, params)
-    assert not any(_LEADERBOARD_SEEK.match(line) for line in swapped_plan), swapped_plan
-
-    # Negative control 2: dropping the day_ahead IN (...) term leaves the
-    # index in use, but the seek can no longer reach past
-    # (site_id, variable) to bind valid_at -- idx_pairs_leaderboard's column
-    # order requires day_ahead equality before a valid_at range is usable.
-    dropped_sql = re.sub(r"AND fp\.day_ahead IN \([^)]*\)\s*\n", "", sql)
-    dropped_plan = _plan(conn, dropped_sql, params)
-    dropped_seeks = [line for line in dropped_plan if _LEADERBOARD_SEEK.match(line)]
-    assert len(dropped_seeks) == 1, dropped_plan
-    assert "valid_at>?" not in dropped_seeks[0], dropped_plan
-
-
-# -- §11.6 "T-EQP" (REAL_MODEL_PAIR_PROBE_SQL, plan #79 fetch-scoring-gate) is
-# removed: the rain release (Part B) deleted the fetch score gate and its probe.
-
-
-def test_open_day_clause_seeks_idx_site_days_writable() -> None:
-    """QP1 (daily-close plan §16): ``open_day_clause``'s correlated
-    ``site_days`` lookup must seek the partial index
-    ``idx_site_days_writable``, not scan ``site_days``. No
-    ``WXV_EQP_SHIPPING`` skip -- plan §16 requires this pin in both the
-    7-gate suite and the shipping-sqlite CI job.
-
-    Imported inside the test body, not at module top, so the rest of this
-    file's tests keep collecting while ``wxverify.db.site_days`` does not
-    exist yet.
-    """
-    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY, open_day_clause
-
-    conn = _fresh_conn()
-    wxverify.db.runtime_state.set_runtime_state(
-        conn, DAILY_CLOSE_ON_KEY, "2024-06-10T00:00:00Z"
-    )
-    site_id = int(
-        conn.execute(
-            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-            " timezone) VALUES ('QueryPlanOpenDay', 40, -105, 900, 'UTC')"
-        ).lastrowid
-    )
-    conn.execute(
-        "INSERT INTO observations (site_id, variable, valid_at, value,"
-        " n_stations) VALUES (?, 'temperature', '2024-06-10T06:00:00Z', 1.0, 1)",
-        (site_id,),
-    )
-
-    clause = open_day_clause(
-        conn, site_expr="observations.site_id", instant_expr="observations.valid_at"
-    )
-    sql = f"SELECT 1 FROM observations WHERE {clause}"
-    plan = _plan(conn, sql, ())
-    assert any(
-        "site_days" in line and "USING INDEX idx_site_days_writable" in line
-        for line in plan
-    ), plan
-
-    conn.execute("DROP INDEX idx_site_days_writable")
-    with pytest.raises(sqlite3.OperationalError, match="no such index"):
-        conn.execute(sql).fetchone()
-
-
-# ---------------------------------------------------------------------------
-# SH6 -- daily-close switch-over plan (2026-10-22-daily-close-switch-over.md,
-# test ID SH6 of 17.12; step 7a, 9.4).
-#
-# Background: the skill join's WHERE clause lets SQLite carry the bound
-# ``fp.valid_at < ?`` across the join's ``pp.valid_at = fp.valid_at``
-# equality, so ``pp`` is sought on ``valid_at<?`` too -- walking the
-# persistence feed's whole history for every pair instead of the single row
-# the join predicate actually names. Relational, not a whole-plan pin, so it
-# runs in the seven gates and in the shipping-SQLite job with no
-# ``WXV_EQP_SHIPPING`` skip.
-# ---------------------------------------------------------------------------
-
-
-def test_sh6_seed_skill_sums_sql_seeks_both_sides_with_no_transitive_valid_at() -> None:
-    """SH6: ``_SEED_SKILL_SUMS_SQL``'s plan must seek both ``fp`` and ``pp``
-    (``SEARCH``, never ``SCAN``), with ``pp`` bound by ``valid_at=?`` --
-    never a transitively-derived ``valid_at<?``/``valid_at>?`` range carried
-    over from ``fp.valid_at < ?`` through the join's
-    ``pp.valid_at = fp.valid_at`` equality.
-
-    M74 -> at the "exactly two loop lines, both SEARCH" / "no transitive
-    valid_at range" assertions below: correct = two ``SEARCH`` lines (``fp``
-    then ``pp``), neither carrying ``valid_at<``/``valid_at>``, mutant M74
-    (the as-built statement on ``76a22dc``, with no leading ``+`` on
-    ``fp.valid_at < ?``) = the optimizer applies that bound to ``pp`` too,
-    walking it on ``valid_at<?``/``valid_at>?`` instead of seeking the
-    single row the join predicate actually names.
-    """
-    conn = _fresh_conn()
-    params = (1, 1, "2024-06-11T00:00:00Z", 1, 1)
-    plan = _plan(conn, _SEED_SKILL_SUMS_SQL, params)
-
-    loop_lines = [line for line in plan if line.startswith(("SEARCH", "SCAN"))]
-    assert len(loop_lines) == 2 and all(
-        line.startswith("SEARCH") for line in loop_lines
-    ), (
-        "M74 -> at this assertion: correct = exactly two loop lines over fp"
-        f" and pp, both SEARCH, mutant M74 (as built on 76a22dc) = {plan}"
-    )
-    assert not any("valid_at<" in line or "valid_at>" in line for line in plan), (
-        "M74 -> at this assertion: correct = no plan line holds valid_at<"
-        f" or valid_at>, mutant M74 (as built on 76a22dc) = {plan}"
-    )
-    assert "valid_at=?" in loop_lines[1], (
-        "M74 -> at this assertion: correct = the second loop line (pp)"
-        " holds valid_at=?, mutant M74 (as built on 76a22dc) ="
-        f" {loop_lines[1]!r}"
-    )
-
-    # Control: the statement with its "+fp.valid_at < ?" guard stripped back
-    # to a bare "fp.valid_at < ?" -- the exact edit that lets SQLite carry
-    # the bound transitively onto pp. Checked AFTER the statement's own
-    # assertions above: on 76a22dc the statement has no "+" at all, so this
-    # precondition would fail there first if it ran before them.
-    assert _SEED_SKILL_SUMS_SQL.count("+fp.valid_at < ?") == 1, (
-        "setup check: the statement must carry the leading + exactly once"
-        " for the control's replace below to be meaningful"
-    )
-    control = _SEED_SKILL_SUMS_SQL.replace("+fp.valid_at < ?", "fp.valid_at < ?")
-    control_plan = _plan(conn, control, params)
-    control_loop_lines = [
-        line for line in control_plan if line.startswith(("SEARCH", "SCAN"))
-    ]
-    assert any(
-        "valid_at<" in line or "valid_at>" in line for line in control_loop_lines
-    ), (
-        "control: the bare fp.valid_at < ? form must show the transitive"
-        f" valid_at walk this statement exists to avoid, got {control_plan}"
-    )

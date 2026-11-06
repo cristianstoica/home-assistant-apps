@@ -81,7 +81,7 @@ def _jobs(conn: sqlite3.Connection) -> list[tuple[str, str | None]]:
 def test_re1_catchup_and_backfill_routes_answer_410_whatever_the_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from wxverify.worker.cutover import RETIRED_CONTROL_MESSAGE
+    from wxverify.db.site_days import RETIRED_CONTROL_MESSAGE
 
     _init_tmp_db(tmp_path, "re1")
 
@@ -467,37 +467,6 @@ def test_re5_no_file_imports_verification_run_module_or_function() -> None:
     assert not offenders, (
         "no file may import `wxverify.worker.verification_run`, at module "
         f"level or inside a function body; found {offender_names!r}"
-    )
-
-
-def test_re5_read_publish_hold_keeps_no_local_import_of_verification_run() -> None:
-    """M73: a local import of ``wxverify.worker.verification_run`` left in a
-    kept function (``read_publish_hold``)."""
-    path = PACKAGE_ROOT / "verification" / "publish_hold.py"
-    text = path.read_text(encoding="utf-8")
-    tree = ast.parse(text, filename=str(path))
-
-    read_publish_hold = next(
-        (
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef) and node.name == "read_publish_hold"
-        ),
-        None,
-    )
-    assert read_publish_hold is not None, (
-        "expected a `read_publish_hold` function in verification/publish_hold.py"
-    )
-    offending = [
-        node
-        for node in ast.walk(read_publish_hold)
-        if isinstance(node, ast.ImportFrom)
-        and node.module == "wxverify.worker.verification_run"
-    ]
-    assert not offending, (
-        "M73 -> at this assertion: correct = `read_publish_hold` has no "
-        "local import of `wxverify.worker.verification_run`, mutant = it "
-        f"still does, found {len(offending)} such import(s)"
     )
 
 

@@ -1,7 +1,7 @@
-"""The publication: P3's stage 7, and the starting history P6 builds once.
+"""The publication: P3's stage 7.
 
 Daily-close P4 plan (``plans/2026-10-22-daily-close-pairs-and-publication.md``)
-sections 7 and 8, and the two calls 16.3 gives P6. A publication covers one
+sections 7 and 8. A publication covers one
 site and one cutoff C, the last closed day it includes: rankings for the
 windows ``w:{N}`` and ``w:all``, wind weights over the ``TRAINING_DAYS``
 dates ending at C, coverage, and the rain ranking of each day ahead with its
@@ -12,15 +12,11 @@ summed from stored rows --
 ``starting_wind_days`` for the dates before the site's first record (the
 starting history, 7.3) -- and its rows never change once written.
 
-``publish`` (P3's stage 7) and ``publish_first`` (P6's first publication)
-read everything in one read-only snapshot, outside the write lock, and swap
-the result in with one ``writer.write`` (8.2, 8.3). ``seed_starting_history``
-reads the starting history in one read-only snapshot and writes the site's
-rows in one ``writer.write``; a site gone by then raises
-``PublicationFailed("no_site")`` and a replaced file ``StaleGenerationError``,
-each writing nothing. Every function reads the clock only through
-``now_utc`` (16), so both stamps of a publication are ``now_utc`` to the
-whole second (7.1, 15.2).
+``publish`` (P3's stage 7) reads everything in one read-only snapshot,
+outside the write lock, and swaps the result in with one ``writer.write``
+(8.2, 8.3). Every function reads the
+clock only through ``now_utc`` (16), so both stamps of a publication are
+``now_utc`` to the whole second (7.1, 15.2).
 
 The readers (sections 9, 12, 13.1 and 16.2) find the active publication and
 read its rows for the leaderboard, composite, served forecast, wind serving
@@ -37,9 +33,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Final, Literal, cast
-from zoneinfo import ZoneInfo
 
-from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc
+from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.connection import Database, FencedWriter
 from wxverify.db.site_days import daily_close_on, day_record
 from wxverify.db.snapshot import read_snapshot
@@ -114,8 +109,6 @@ _SUM_COLUMNS: Final = (
     "skill_sq_sum",
     "skill_ref_sq_sum",
 )
-_PAIR_SUM_COLUMNS: Final = _SUM_COLUMNS[:9]
-_SKILL_SUM_COLUMNS: Final = _SUM_COLUMNS[9:]
 
 _PUBLICATION_ID_SQL: Final = (
     "SELECT id FROM publications WHERE site_id = ? AND cutoff = ?"
@@ -154,8 +147,7 @@ _STARTING_SUMS_SQL: Final = """
     WHERE site_id = ? AND local_date >= ? AND local_date <= ?
     GROUP BY feed_id, variable, day_ahead
 """
-# Wind weights (8.2 step 4), real feeds less the meteoblue package, as
-# today's training reads them (``training_pairs_query``).
+# Wind weights (8.2 step 4), real feeds less the meteoblue package.
 _CLOSED_WIND_SQL: Final = f"""
     SELECT ds.local_date, ds.feed_id, ds.day_ahead,
            ds.wind_fc_high, ds.wind_fc_hours, ds.wind_obs_high
@@ -258,90 +250,6 @@ _DELETE_OLD_VALUE_CHANGES_SQL: Final = (
     "    AND ended_at < ?)"
 )
 
-# The starting history (7.3): today's pairs of the passed generation, before
-# the first record's local midnight, summed per UTC hour here and per local
-# date in Python (the zone's dates cannot be computed in SQL).
-_SEED_PAIR_SUMS_SQL: Final = """
-    SELECT valid_at, feed_id, variable, day_ahead,
-           COUNT(*) AS n, COUNT(error) AS err_n, SUM(error) AS err_sum,
-           SUM(abs_error) AS abs_sum, SUM(sq_error) AS sq_sum,
-           SUM(cat_hit) AS hits, SUM(cat_false) AS false_alarms,
-           SUM(cat_miss) AS misses, SUM(cat_correct_neg) AS correct_negs
-    FROM forecast_pairs
-    WHERE site_id = ? AND tz_generation_id = ? AND valid_at < ?
-    GROUP BY valid_at, feed_id, variable, day_ahead
-"""
-# Today's skill join (``scoring/metrics.py`` ``_paired_skill``), both sides
-# of the passed generation. The plus on ``+fp.valid_at`` is load-bearing:
-# without it SQLite carries the bound across ``pp.valid_at = fp.valid_at``
-# onto pp and walks the persistence feed's history for every pair (measured
-# on a production-sized copy); with it no range on ``valid_at`` is left that
-# an index can use, so pp is sought on the hour. The plan is pinned in
-# ``tests/test_query_plan_regressions.py``.
-_SEED_SKILL_SUMS_SQL: Final = """
-    SELECT fp.valid_at, fp.feed_id, fp.variable, fp.day_ahead,
-           COUNT(*) AS skill_n, SUM(fp.sq_error) AS skill_sq_sum,
-           SUM(pp.sq_error) AS skill_ref_sq_sum
-    FROM forecast_pairs fp
-    JOIN forecast_pairs pp
-      ON pp.site_id = fp.site_id
-     AND pp.variable = fp.variable
-     AND pp.valid_at = fp.valid_at
-     AND pp.lead_hours = fp.lead_hours
-     AND pp.day_ahead = fp.day_ahead
-    WHERE fp.site_id = ? AND fp.tz_generation_id = ? AND +fp.valid_at < ?
-      AND pp.feed_id = ? AND pp.tz_generation_id = ?
-    GROUP BY fp.valid_at, fp.feed_id, fp.variable, fp.day_ahead
-"""
-_PERSISTENCE_FEED_SQL: Final = (
-    "SELECT id FROM feeds WHERE source = 'virtual' AND model = '_persistence'"
-)
-# Today's wind training read (``forecast/wind_blend.py``
-# ``training_pairs_query``), over the passed generation: one row per run and
-# day ahead with at least ``MIN_RUN_HOURS`` hours.
-_SEED_WIND_RUNS_SQL: Final = f"""
-    SELECT fp.feed_id, fp.issued_at, fp.day_ahead,
-           MAX(fp.forecast) AS high, MIN(fp.valid_at) AS first_valid
-    FROM forecast_pairs fp
-    JOIN feeds f ON f.id = fp.feed_id
-    WHERE fp.site_id = ? AND fp.tz_generation_id = ? AND fp.variable = 'wind'
-      AND fp.valid_at < ? AND {EXCLUDED_FEEDS_SQL}
-    GROUP BY fp.feed_id, fp.issued_at, fp.day_ahead
-    HAVING COUNT(DISTINCT fp.valid_at) >= {MIN_RUN_HOURS}
-"""
-_SEED_WIND_OBS_SQL: Final = (
-    "SELECT valid_at, value FROM observations"
-    " WHERE site_id = ? AND variable = 'wind' AND valid_at < ?"
-)
-# The dates today's training leaves out of the observed side: an enabled
-# station's inventory row still to fetch, retryable, or waiting on a refetch
-# (the predicate of ``forecast/wind_blend.py`` ``_UNSETTLED_DAYS_SQL``).
-# CROSS JOIN is load-bearing: it keeps stations in the outer loop, so
-# station_wind_days is sought on its key (station_id, local_date) instead of
-# walked; SQLite's CROSS JOIN gives the same rows as an inner join.
-_SEED_UNSETTLED_SQL: Final = """
-    SELECT DISTINCT d.local_date
-    FROM stations st CROSS JOIN station_wind_days d ON d.station_id = st.id
-    WHERE st.site_id = ? AND st.enabled = 1 AND d.local_date < ?
-      AND (d.status IN ('pending', 'partial')
-           OR (d.status = 'failed' AND d.attempts < 3)
-           OR (d.refetch_at IS NOT NULL AND d.refetched = 0))
-"""
-_DELETE_STARTING_SCORES_SQL: Final = "DELETE FROM starting_scores WHERE site_id = ?"
-_DELETE_STARTING_WIND_SQL: Final = "DELETE FROM starting_wind_days WHERE site_id = ?"
-_INSERT_STARTING_SCORE_SQL: Final = """
-    INSERT INTO starting_scores
-        (site_id, local_date, feed_id, variable, day_ahead, n, err_n, err_sum,
-         abs_sum, sq_sum, hits, false_alarms, misses, correct_negs, skill_n,
-         skill_sq_sum, skill_ref_sq_sum)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-"""
-_INSERT_STARTING_WIND_SQL: Final = """
-    INSERT INTO starting_wind_days
-        (site_id, local_date, feed_id, day_ahead, forecast_high, observed_high)
-    VALUES (?, ?, ?, ?, ?, ?)
-"""
-
 # Readers (section 9). The defaults the build reads the two ranking
 # settings with (8.2).
 _DEFAULT_WINDOW_DAYS: Final = 30
@@ -427,15 +335,6 @@ _COMPETITOR_FEEDS_SQL: Final = f"""
     WHERE {active_competitor_clause(site_expr="?")}
     ORDER BY f.source, f.model
 """
-_CLOSED_DAY_PAIRS_SQL: Final = """
-    SELECT cp.feed_id, cp.variable, cp.valid_at, cp.day_ahead, cp.lead_hours,
-           cp.forecast, cp.observed, cp.download_date, cp.fetched_at
-    FROM close_pairs cp
-    JOIN site_days sd ON sd.site_id = cp.site_id AND sd.local_date = cp.local_date
-    WHERE cp.site_id = ? AND cp.local_date = ? AND sd.state = 'closed'
-      AND (? IS NULL OR cp.feed_id = ?)
-    ORDER BY cp.feed_id, cp.variable, cp.valid_at, cp.day_ahead, cp.lead_hours
-"""
 
 _Number = float | int | None
 _Key = tuple[int, str, int]
@@ -452,14 +351,6 @@ class PublicationFailed(Exception):
     def __init__(self, reason: PublicationFailure) -> None:
         super().__init__(reason)
         self.reason: PublicationFailure = reason
-
-
-@dataclass(frozen=True, slots=True)
-class SeedCounts:
-    """The rows ``seed_starting_history`` wrote for the site (7.3)."""
-
-    starting_scores: int
-    starting_wind_days: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -510,21 +401,6 @@ class Coverage:
 
 
 @dataclass(frozen=True, slots=True)
-class ClosedPair:
-    """One ``close_pairs`` row of a closed date (16.2)."""
-
-    feed_id: int
-    variable: str
-    valid_at: str
-    day_ahead: int
-    lead_hours: int
-    forecast: float
-    observed: float
-    download_date: date | None
-    fetched_at: str | None
-
-
-@dataclass(frozen=True, slots=True)
 class RainRank:
     """One ranked rain model of a publication's day ahead (rain release, C3)."""
 
@@ -559,14 +435,6 @@ class _Build:
     #: (day ahead, selected feed or None) per day ahead (C3).
     rain_ranks: tuple[_Values, ...]
     rain_picks: tuple[tuple[int, int | None], ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _StartingHistory:
-    """What the seed read, ready for its one write: the site's rows."""
-
-    scores: tuple[_Values, ...]
-    wind_days: tuple[_Values, ...]
 
 
 class _Cell:
@@ -606,71 +474,7 @@ async def publish(
         writer,
         site_id=site_id,
         cutoff=cutoff,
-        first_record_date=None,
         now_utc=now_utc,
-    )
-
-
-async def publish_first(
-    db: Database,
-    writer: FencedWriter,
-    *,
-    site_id: int,
-    first_record_date: date,
-    now_utc: datetime,
-) -> str:
-    """Build the site's first publication, for P6's cutover (16.3).
-
-    As ``publish``, with cutoff ``first_record_date`` - 1 and every window
-    date a starting-history date, so no P1 record is needed or read; the row
-    saves ``first_record_date``. A repeat for the same date returns the same
-    id and writes nothing; a site with no starting scores gets a publication
-    with no ranking rows.
-    """
-    return await _publish(
-        db,
-        writer,
-        site_id=site_id,
-        cutoff=_shift(first_record_date, -1),
-        first_record_date=first_record_date,
-        now_utc=now_utc,
-    )
-
-
-async def seed_starting_history(
-    writer: FencedWriter,
-    *,
-    site_id: int,
-    first_record_date: date,
-    generation_id: int,
-    timezone: str,
-) -> SeedCounts:
-    """Build the site's starting history from today's pairs, once (7.3).
-
-    For every local date in ``timezone`` before ``first_record_date`` that
-    has pairs of generation ``generation_id``: ``starting_scores``, the sums
-    of 6.4 over that date's ``forecast_pairs`` rows (today's issue-time day
-    ahead, every download, the skill sums from today's persistence join), and
-    ``starting_wind_days``, the forecast and observed daily highs today's
-    wind training reads for it. The site's earlier rows are replaced. It
-    reads in one read-only snapshot and writes the site's rows in one
-    ``writer.write``; a site gone by then raises
-    ``PublicationFailed("no_site")`` and a replaced file
-    ``StaleGenerationError``, each writing nothing. Reads no subscription:
-    readers apply it (9.1, 9.4).
-    """
-    _epoch, history = await writer.read_at_epoch(
-        lambda conn: _read_starting_history(
-            conn,
-            site_id=site_id,
-            first_record_date=first_record_date,
-            generation_id=generation_id,
-            timezone=timezone,
-        ),
-        label="starting_history_read",
-    )
-    return await writer.write(
-        lambda conn: _write_starting_history(conn, site_id, history)
     )
 
 
@@ -685,22 +489,18 @@ async def _publish(
     *,
     site_id: int,
     cutoff: date,
-    first_record_date: date | None,
     now_utc: datetime,
 ) -> str:
     """Repeat check, build snapshot, swap (8.2, 8.3).
 
-    ``first_record_date`` None is ``publish``: the cutoff's record must be
-    ``closed`` and the first record is read. Given, it is ``publish_first``.
+    The cutoff's record must be ``closed`` and the first record is read.
     """
     existing = await db.read(lambda conn: _publication_id(conn, site_id, cutoff))
     if existing is not None:
         return str(existing)
     published = _whole_second(now_utc)
     _epoch, build = await writer.read_at_epoch(
-        lambda conn: _build(
-            conn, site_id=site_id, cutoff=cutoff, first_record_date=first_record_date
-        ),
+        lambda conn: _build(conn, site_id=site_id, cutoff=cutoff),
         label="publication_build",
     )
     publication_id = await writer.write(
@@ -721,24 +521,21 @@ def _build(
     *,
     site_id: int,
     cutoff: date,
-    first_record_date: date | None,
 ) -> _Build:
     """8.2 steps 2 to 5, in the caller's read-only snapshot. Never writes.
 
-    The settings are read once, here, as ``scoring/engine.py`` reads them,
-    and every later value comes from them. ``compute_wind_weights`` is pure.
+    The settings are read once, here, and every later value comes from
+    them. ``compute_wind_weights`` is pure.
     """
     window_days = get_number_setting(conn, "rolling_window_days", 30, minimum=1)
     min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-    first = first_record_date
-    if first is None:
-        record = day_record(conn, site_id, cutoff)
-        if record is None or record.state != "closed":
-            raise PublicationFailed("cutoff_not_closed")
-        row = conn.execute(_FIRST_RECORD_SQL, (site_id,)).fetchone()
-        if row is None or row[0] is None:
-            raise PublicationFailed("cutoff_not_closed")
-        first = date.fromisoformat(str(row[0]))
+    record = day_record(conn, site_id, cutoff)
+    if record is None or record.state != "closed":
+        raise PublicationFailed("cutoff_not_closed")
+    row = conn.execute(_FIRST_RECORD_SQL, (site_id,)).fetchone()
+    if row is None or row[0] is None:
+        raise PublicationFailed("cutoff_not_closed")
+    first = date.fromisoformat(str(row[0]))
     window_start = _shift(cutoff, -(window_days - 1))
     wind_start = _shift(cutoff, -(TRAINING_DAYS - 1))
     rankings: list[_Values] = []
@@ -1057,142 +854,6 @@ def _delete_superseded(
 
 
 # ---------------------------------------------------------------------------
-# The starting history (7.3)
-# ---------------------------------------------------------------------------
-
-
-def _read_starting_history(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    first_record_date: date,
-    generation_id: int,
-    timezone: str,
-) -> _StartingHistory:
-    """The seed's reads, in the caller's read-only snapshot. Never writes."""
-    tz = ZoneInfo(timezone)
-    bound = isoformat_utc(local_day_slots(first_record_date, timezone)[0])
-    scores = _seed_scores(conn, site_id, generation_id, tz, bound)
-    wind_days = _seed_wind_days(
-        conn, site_id, generation_id, tz, bound, first_record_date
-    )
-    return _StartingHistory(scores=tuple(scores), wind_days=tuple(wind_days))
-
-
-def _write_starting_history(
-    conn: sqlite3.Connection, site_id: int, history: _StartingHistory
-) -> SeedCounts:
-    """The seed's one write: the site check, then the site's rows replaced.
-
-    Reads ``sites`` alone, so the rows are the ones the snapshot read.
-    """
-    if conn.execute("SELECT 1 FROM sites WHERE id = ?", (site_id,)).fetchone() is None:
-        raise PublicationFailed("no_site")
-    conn.execute(_DELETE_STARTING_SCORES_SQL, (site_id,))
-    conn.execute(_DELETE_STARTING_WIND_SQL, (site_id,))
-    conn.executemany(_INSERT_STARTING_SCORE_SQL, history.scores)
-    conn.executemany(_INSERT_STARTING_WIND_SQL, history.wind_days)
-    return SeedCounts(
-        starting_scores=len(history.scores), starting_wind_days=len(history.wind_days)
-    )
-
-
-def _seed_scores(
-    conn: sqlite3.Connection,
-    site_id: int,
-    generation_id: int,
-    tz: ZoneInfo,
-    bound: str,
-) -> list[_Values]:
-    """``starting_scores`` rows: per local date, feed, variable and day ahead."""
-    cells: dict[tuple[date, int, str, int], dict[str, _Number]] = {}
-    for row in conn.execute(_SEED_PAIR_SUMS_SQL, (site_id, generation_id, bound)):
-        local_date = _local_date(row["valid_at"], tz)
-        if local_date is not None:
-            key = (local_date, *_cell_key(row))
-            _add_sums(cells.setdefault(key, {}), row, _PAIR_SUM_COLUMNS)
-    persistence = conn.execute(_PERSISTENCE_FEED_SQL).fetchone()
-    if persistence is not None:
-        params = (site_id, generation_id, bound, int(persistence["id"]), generation_id)
-        for row in conn.execute(_SEED_SKILL_SUMS_SQL, params):
-            local_date = _local_date(row["valid_at"], tz)
-            if local_date is None:
-                continue
-            sums = cells.get((local_date, *_cell_key(row)))
-            if sums is not None:
-                _add_sums(sums, row, _SKILL_SUM_COLUMNS)
-    return [
-        (
-            site_id,
-            local_date.isoformat(),
-            feed_id,
-            variable,
-            day_ahead,
-            *(sums.get(column) for column in _SUM_COLUMNS),
-        )
-        for (local_date, feed_id, variable, day_ahead), sums in sorted(cells.items())
-    ]
-
-
-def _seed_wind_days(
-    conn: sqlite3.Connection,
-    site_id: int,
-    generation_id: int,
-    tz: ZoneInfo,
-    bound: str,
-    first_record_date: date,
-) -> list[_Values]:
-    """``starting_wind_days`` rows, as ``load_wind_training`` reads the highs.
-
-    The forecast high of a (feed, day ahead, date) is the latest run's with
-    at least ``MIN_RUN_HOURS`` hours; the observed high is the date's, when
-    it has at least ``MIN_OBS_HOURS`` hours and a settled station inventory,
-    else NULL. A row whose stamp does not parse is skipped, as there.
-    """
-    latest: dict[tuple[int, int, date], tuple[datetime, float]] = {}
-    for row in conn.execute(_SEED_WIND_RUNS_SQL, (site_id, generation_id, bound)):
-        try:
-            issued = parse_utc(str(row["issued_at"]))
-            target = parse_utc(str(row["first_valid"])).astimezone(tz).date()
-        except ValueError:
-            continue
-        key = (int(row["feed_id"]), int(row["day_ahead"]), target)
-        held = latest.get(key)
-        if held is None or issued > held[0]:
-            latest[key] = (issued, float(row["high"]))
-    hours: dict[date, set[datetime]] = {}
-    highs: dict[date, float] = {}
-    for row in conn.execute(_SEED_WIND_OBS_SQL, (site_id, bound)):
-        try:
-            moment = parse_utc(str(row["valid_at"]))
-        except ValueError:
-            continue
-        local_date = moment.astimezone(tz).date()
-        hours.setdefault(local_date, set()).add(moment)
-        value = float(row["value"])
-        held_high = highs.get(local_date)
-        if held_high is None or value > held_high:
-            highs[local_date] = value
-    unsettled: set[date] = set()
-    for row in conn.execute(
-        _SEED_UNSETTLED_SQL, (site_id, first_record_date.isoformat())
-    ):
-        try:
-            unsettled.add(date.fromisoformat(str(row["local_date"])))
-        except ValueError:
-            continue
-    observed = {
-        local_date: high
-        for local_date, high in highs.items()
-        if len(hours[local_date]) >= MIN_OBS_HOURS and local_date not in unsettled
-    }
-    return [
-        (site_id, target.isoformat(), feed_id, day_ahead, high, observed.get(target))
-        for (feed_id, day_ahead, target), (_issued, high) in sorted(latest.items())
-    ]
-
-
-# ---------------------------------------------------------------------------
 # Readers (sections 9, 12, 13.1 and 16.2)
 # ---------------------------------------------------------------------------
 
@@ -1344,37 +1005,6 @@ def published_coverage(
         )
         for row in rows
     }
-
-
-def closed_day_pairs(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    local_date: date,
-    feed_id: int | None = None,
-) -> list[ClosedPair]:
-    """A closed date's ``close_pairs`` rows, one feed's when ``feed_id`` is
-    given; ``[]`` for a date whose record is not ``closed`` (16.2).
-
-    Ordered by feed, variable, hour, day ahead and lead.
-    """
-    rows = conn.execute(
-        _CLOSED_DAY_PAIRS_SQL, (site_id, local_date.isoformat(), feed_id, feed_id)
-    )
-    return [
-        ClosedPair(
-            feed_id=int(row["feed_id"]),
-            variable=str(row["variable"]),
-            valid_at=str(row["valid_at"]),
-            day_ahead=int(row["day_ahead"]),
-            lead_hours=int(row["lead_hours"]),
-            forecast=float(row["forecast"]),
-            observed=float(row["observed"]),
-            download_date=_optional_date(row["download_date"]),
-            fetched_at=None if row["fetched_at"] is None else str(row["fetched_at"]),
-        )
-        for row in rows
-    ]
 
 
 def pending_ranking_settings(
@@ -1616,22 +1246,6 @@ def _add_sums(
             into[column] = value
         elif value is not None:
             into[column] = held + value
-
-
-def _local_date(value: object, tz: ZoneInfo) -> date | None:
-    try:
-        return parse_utc(str(value)).astimezone(tz).date()
-    except ValueError:
-        return None
-
-
-def _optional_date(value: object) -> date | None:
-    if value is None:
-        return None
-    try:
-        return date.fromisoformat(str(value))
-    except ValueError:
-        return None
 
 
 def _optional_float(value: object) -> float | None:

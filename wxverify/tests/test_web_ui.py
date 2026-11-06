@@ -8,12 +8,13 @@ Ingress with the active-nav oracle), and the two empty-state oracles.
 
 Isolation: every test builds its own tmp DB via ``_init_tmp_db`` (mirrors the
 ``tests/test_static_ingress.py`` harness) and, for HTTP tests, an idle-worker
-app + ``TestClient``. State is controlled by seeding the ``score_cache`` table
-directly under the ``w:all`` window (``is_cache_fresh`` is unconditional for
-``w:all`` so skill values are exact and deterministic), except the two
-metric-boundary tests which seed real ``forecast_pairs`` and exercise the live
-metric strategies so the boundary (skill None) is produced by production code,
-not asserted around.
+app + ``TestClient``. State is controlled by seeding a ``publication_rankings``
+row directly under the ``w:all`` window (the published read never
+live-recomputes, so skill values are exact and deterministic). The two
+metric-boundary tests hand-derive their ``MetricSums`` and run them through
+the surviving pure ``metrics_from_sums`` so the boundary (skill None) is
+produced by real metric math, not asserted around -- no pair table exists
+any more for either to read live (storage release 3.1, W6b).
 
 Synthetic fixtures only — fake site names/coords, no real keys or station IDs.
 """
@@ -23,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -33,15 +35,15 @@ from tests.helpers import (
     assert_summary_mount_not_nested_in_chart,
     assert_summary_status_pre_mounted_empty,
     collect_tags,
+    seed_active_publication,
+    seed_publication_ranking,
 )
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.lead import parse_day_ahead
 from wxverify.db.connection import close_db, init_db
-from wxverify.db.switch import ensure_site_generation
-from wxverify.scoring.cache import upsert_score_cache
-from wxverify.scoring.metrics import strategy_for
-from wxverify.settings.keys import set_setting
+from wxverify.scoring.metrics import MetricResult, MetricSums, metrics_from_sums
+from wxverify.settings.keys import get_number_setting, set_setting
 from wxverify.web.context import (
     LEAD_OPTIONS,
     VARIABLE_LABELS,
@@ -59,8 +61,6 @@ from wxverify.web.context import (
 _INGRESS_TOKEN = "abc123synthetic"
 _INGRESS_PREFIX = f"/api/hassio_ingress/{_INGRESS_TOKEN}"
 _SUPERVISOR_IP = "172.30.32.2"
-
-_COMPUTED_AT = "2035-01-02T00:00:00Z"
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +128,32 @@ def _feed_id(conn: sqlite3.Connection, model: str, source: str = "open-meteo") -
     )
 
 
+def _ensure_test_publication(conn: sqlite3.Connection, *, site_id: int) -> int:
+    """This site's one test publication, created on first use.
+
+    ``leaderboard_in_snapshot``'s ``window=all`` read now always reads the
+    active publication (9.2), never ``score_cache``; its ``min_n`` is baked
+    in at creation from the runtime ``min_n`` setting active at that point
+    (every caller here sets it before the first ``_seed_cell``), so the
+    read-time confidence check agrees with the real strategy math asserted
+    alongside it.
+    """
+    row = conn.execute(
+        "SELECT id FROM publications WHERE site_id = ? ORDER BY id DESC LIMIT 1",
+        (site_id,),
+    ).fetchone()
+    if row is not None:
+        return int(row["id"])
+    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
+    return seed_active_publication(
+        conn,
+        site_id=site_id,
+        cutoff=date(2035, 1, 1),
+        published_at=datetime(2035, 1, 1, tzinfo=UTC),
+        min_n=min_n,
+    )
+
+
 def _seed_cell(
     conn: sqlite3.Connection,
     *,
@@ -138,46 +164,23 @@ def _seed_cell(
     skill: float | None,
     n: int,
 ) -> None:
-    """Seed one leaderboard cell: a forecast_pairs anchor + a score_cache row.
+    """Seed one leaderboard cell: a published ranking row.
 
-    The forecast_pairs anchor establishes the "expected active feed" set the
-    cached-leaderboard path validates against; the score_cache row (window_key
-    ``w:all`` -> always fresh) supplies the exact ``skill``/``n`` so the cache
-    path — not the live strategies — serves the read, giving deterministic
-    control of eligibility and skill.
+    The composite/coverage panels and the leaderboard all read only the
+    active publication now, never a live recompute (storage release, table
+    1.B) -- the ``publication_rankings`` row (window_key ``w:all``) alone
+    supplies the exact ``skill``/``n`` that serves the leaderboard, giving
+    deterministic control of eligibility and skill.
     """
-    valid_at = f"2035-01-{2 + day_ahead:02d}T00:00:00Z"
-    lead_hours = 24 * (day_ahead + 1)
-    # Real error/category values so the live composite/win-rate panels (which
-    # aggregate forecast_pairs directly, independent of score_cache) don't hit
-    # a NULL AVG — the leaderboard skill still comes from the cache row below.
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO forecast_pairs
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error,
-             cat_hit, cat_false, cat_miss, cat_correct_neg, tz_generation_id)
-        VALUES (?, ?, ?, '2035-01-01T00:00:00Z', ?, ?, ?, 12.0, 10.0,
-                2.0, 2.0, 4.0, 1, 0, 0, 0, ?)
-        """,
-        (
-            site_id,
-            feed_id,
-            variable,
-            valid_at,
-            lead_hours,
-            day_ahead,
-            ensure_site_generation(conn, site_id),
-        ),
-    )
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO score_cache
-            (site_id, feed_id, variable, day_ahead, window_key, n, skill_score,
-             computed_at)
-        VALUES (?, ?, ?, ?, 'w:all', ?, ?, ?)
-        """,
-        (site_id, feed_id, variable, day_ahead, n, skill, _COMPUTED_AT),
+    pub_id = _ensure_test_publication(conn, site_id=site_id)
+    seed_publication_ranking(
+        conn,
+        publication_id=pub_id,
+        feed_id=feed_id,
+        variable=variable,
+        day_ahead=day_ahead,
+        window_key="w:all",
+        result=MetricResult(n=n, skill_score=skill, confident=True),
     )
 
 
@@ -836,79 +839,56 @@ def test_metric_boundary_continuous_persistence_mse_zero_is_neutral(
     site_id = _make_site(conn, "Persistence Zero Site")
     feed = _feed_id(conn, "ecmwf_ifs")
     persistence = _feed_id(conn, "_persistence", source="virtual")
-    # Persistence forecasts are perfect (sq_error 0) at every matched valid_at
-    # -> persistence_mse == 0 -> _paired_skill returns None despite a baseline
-    # existing. The feed itself has plenty of samples (n=3 >= min_n=2).
-    for day in range(3):
-        valid_at = f"2035-02-{10 + day:02d}T00:00:00Z"
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 tz_generation_id)
-            VALUES (?, ?, 'temperature', '2035-02-01T00:00:00Z', ?, 24, 1,
-                    12.0, 10.0, 2.0, 2.0, 4.0, ?)
-            """,
-            (site_id, feed, valid_at, ensure_site_generation(conn, site_id)),
-        )
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 tz_generation_id)
-            VALUES (?, ?, 'temperature', '2035-02-01T00:00:00Z', ?, 24, 1,
-                    10.0, 10.0, 0.0, 0.0, 0.0, ?)
-            """,
-            (
-                site_id,
-                persistence,
-                valid_at,
-                ensure_site_generation(conn, site_id),
-            ),
-        )
-    conn.commit()
 
-    # Direct strategy assertion: skill None, withheld, at n >= min_n.
-    result = strategy_for("temperature").aggregate(
-        conn,
-        site_id=site_id,
-        feed_id=feed,
-        variable="temperature",
-        day_ahead=1,
-        window_cutoff=None,
-        min_n=2,
-    )
+    # Direct metrics assertion: skill None, withheld, at n >= min_n. The
+    # pair-aggregate SQL that used to compute these (`strategy_for(
+    # "temperature").aggregate`) is gone (W6b), and no pair table is read
+    # for scoring any more (storage release 3.1): hand-derived here as if
+    # from 3 matched valid_ats where persistence forecasts perfectly
+    # (sq_error 0) and the feed has error 2.0 (n=3 >= min_n=2), through the
+    # surviving pure `metrics_from_sums`: persistence_mse == 0 makes
+    # `_skill_from_sums` return None regardless of the feed's own error.
+    feed_sums: MetricSums = {
+        "n": 3,
+        "err_n": 3,
+        "err_sum": 6.0,
+        "abs_sum": 6.0,
+        "sq_sum": 12.0,
+        "skill_n": 3,
+        "skill_sq_sum": 12.0,
+        "skill_ref_sq_sum": 0.0,
+    }
+    result = metrics_from_sums(feed_sums, variable="temperature", min_n=2)
     assert result.n >= 2
     assert result.skill_score is None
     assert result.confident is False
 
-    # Cache-backed windows never live-recompute (SWR migration): the
-    # dashboard's `window=all` read serves exclusively from score_cache, so
-    # the fixture seeds a COMPLETE `w:all` snapshot of the expected active
-    # feed universe (the feed AND virtual/_persistence, both of which have
-    # pairs) from the SAME live aggregates asserted above — the boundary
+    # The published `window=all` read never live-recomputes: the fixture
+    # seeds a COMPLETE `w:all` snapshot of the expected active feed
+    # universe (the feed AND virtual/_persistence, both of which have
+    # pairs) from the SAME hand-derived sums asserted above — the boundary
     # semantics (skill withheld at n >= min_n) still come from the real
-    # strategy math, the render just reads them through the cache.
-    for cached_feed in (feed, persistence):
-        upsert_score_cache(
+    # metric math, the render just reads them through the publication.
+    persistence_sums: MetricSums = {
+        "n": 3,
+        "err_n": 3,
+        "err_sum": 0.0,
+        "abs_sum": 0.0,
+        "sq_sum": 0.0,
+        "skill_n": 3,
+        "skill_sq_sum": 0.0,
+        "skill_ref_sq_sum": 0.0,
+    }
+    pub_id = _ensure_test_publication(conn, site_id=site_id)
+    for cached_feed, sums in ((feed, feed_sums), (persistence, persistence_sums)):
+        seed_publication_ranking(
             conn,
-            site_id=site_id,
+            publication_id=pub_id,
             feed_id=cached_feed,
             variable="temperature",
             day_ahead=1,
             window_key="w:all",
-            result=strategy_for("temperature").aggregate(
-                conn,
-                site_id=site_id,
-                feed_id=cached_feed,
-                variable="temperature",
-                day_ahead=1,
-                window_cutoff=None,
-                min_n=2,
-            ),
-            computed_at=_COMPUTED_AT,
+            result=metrics_from_sums(sums, variable="temperature", min_n=2),
         )
     conn.commit()
 
@@ -930,48 +910,41 @@ def test_metric_boundary_precip_all_dry_all_correct_is_neutral(
     feed = _feed_id(conn, "ecmwf_ifs")
     # All samples dry and correctly forecast dry: h=f=m=0, cn=N -> ETS
     # denominator empty -> skill None despite ample samples.
-    for day in range(4):
-        valid_at = f"2035-03-{10 + day:02d}T00:00:00Z"
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 cat_hit, cat_false, cat_miss, cat_correct_neg,
-                 tz_generation_id)
-            VALUES (?, ?, 'precip', '2035-03-01T00:00:00Z', ?, 24, 1,
-                    0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0, 1, ?)
-            """,
-            (site_id, feed, valid_at, ensure_site_generation(conn, site_id)),
-        )
-    conn.commit()
 
-    result = strategy_for("precip").aggregate(
-        conn,
-        site_id=site_id,
-        feed_id=feed,
-        variable="precip",
-        day_ahead=1,
-        window_cutoff=None,
-        min_n=2,
-    )
+    # The pair-aggregate SQL that used to compute these (`strategy_for(
+    # "precip").aggregate`) is gone (W6b), and no pair table is read for
+    # scoring any more (storage release 3.1): hand-derived here as if from
+    # 4 days all correctly forecast dry (h=f=m=0, cn=4), through the
+    # surviving pure `metrics_from_sums`: h+f+m all zero makes ETS's
+    # denominator (and numerator) 0/0 -> None.
+    sums: MetricSums = {
+        "n": 4,
+        "err_n": 4,
+        "err_sum": 0.0,
+        "abs_sum": 0.0,
+        "sq_sum": 0.0,
+        "hits": 0,
+        "false_alarms": 0,
+        "misses": 0,
+        "correct_negs": 4,
+    }
+    result = metrics_from_sums(sums, variable="precip", min_n=2)
     assert result.n >= 2
     assert result.skill_score is None
     assert result.confident is False
 
-    # SWR migration (see the temperature boundary test above): the
-    # cache-backed `window=all` read never live-recomputes, so seed the
+    # The published `window=all` read never live-recomputes, so seed the
     # complete `w:all` snapshot (this feed is the whole expected universe —
     # no persistence pairs exist for precip here) from the asserted aggregate.
-    upsert_score_cache(
+    pub_id = _ensure_test_publication(conn, site_id=site_id)
+    seed_publication_ranking(
         conn,
-        site_id=site_id,
+        publication_id=pub_id,
         feed_id=feed,
         variable="precip",
         day_ahead=1,
         window_key="w:all",
         result=result,
-        computed_at=_COMPUTED_AT,
     )
     conn.commit()
 
@@ -1586,10 +1559,9 @@ def test_overlay_chart_fallback_svg_hidden_and_summary_mount_outside_container(
     conn = _init_tmp_db(tmp_path)
     site_id = _make_site(conn, "Overlay Chart Site")
     feed_id = _feed_id(conn, "ecmwf_ifs")
-    # load_overlay only lists a feed once it has forecast_pairs for the
-    # requested variable -- without this, feed_id resolves to None and the
-    # chart div (behind the template's `{% if site and feed_id %}` guard)
-    # never renders at all.
+    # A published ranking cell so the Overlay's skill panel has something
+    # to render; `load_overlay`'s own feed list comes from the site's
+    # active feeds regardless (storage release), not from this seed.
     _seed_cell(
         conn,
         site_id=site_id,

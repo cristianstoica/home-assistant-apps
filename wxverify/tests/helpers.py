@@ -39,38 +39,9 @@ from wxverify.db.runtime_state import set_runtime_state
 from wxverify.db.switch import ensure_site_generation
 from wxverify.feeds.seam import CostEstimate, FetchResult, NormalizedSample
 from wxverify.scoring.consensus import materialize_consensus, write_station_observation
-from wxverify.verification.decision import ContinuousLead, OccurrenceLead
-from wxverify.verification.methodology import (
-    CONTINUOUS_BASELINES,
-    OCCURRENCE_BASELINES,
-)
+from wxverify.scoring.metrics import MetricResult
 from wxverify.worker.processor import run_claimed_job
 from wxverify.worker.scheduler import scheduler_tick
-
-
-def occurrence_baseline_set(
-    per_lead: Mapping[int, OccurrenceLead],
-) -> dict[str, dict[int, OccurrenceLead]]:
-    """Fan one series out over every required occurrence baseline (§8).
-
-    The baseline gate validates a required SET, so a fixture that supplies
-    only one baseline no longer reaches a verdict. Fixtures whose subject
-    is not the gate use this to satisfy the set with a single series.
-    """
-    return {
-        name: {lead: dict(series) for lead, series in per_lead.items()}
-        for name in OCCURRENCE_BASELINES
-    }
-
-
-def continuous_baseline_set(
-    quantity: str, per_lead: Mapping[int, ContinuousLead]
-) -> dict[str, dict[str, dict[int, ContinuousLead]]]:
-    """Fan one series out over every required continuous baseline (§8)."""
-    return {
-        name: {quantity: {lead: dict(series) for lead, series in per_lead.items()}}
-        for name in CONTINUOUS_BASELINES
-    }
 
 
 def assert_read_pool_at_rest(db: Database) -> None:
@@ -230,7 +201,10 @@ def assert_summary_mount_not_nested_in_chart(html: str, *, summary_id: str) -> N
 
 # ---------------------------------------------------------------------------
 # As-of / outcome-knowability fixture builders (plan §6, §18.1, §18.6).
-# Shared by test_asof_leakage.py and test_asof_live_equivalence.py.
+# Shared by test_asof_leakage.py, test_asof_reconstruction.py, and other
+# files still exercising knowable-pair fixtures (e.g. test_record_oracles.py,
+# test_publication_readers.py) after the as-of ranking/leaderboard machinery
+# itself was removed with the daily close made permanent (W6b).
 # All values are synthetic (fake site names, fake source/model ids).
 # ---------------------------------------------------------------------------
 
@@ -296,55 +270,6 @@ def asof_insert_sample(
         VALUES (?, ?, 'temperature', ?, ?, ?, ?, '{}', 'run-x', ?)
         """,
         (site_id, feed_id, issued_at, valid_at, lead_hours, value, fetched_at),
-    )
-
-
-def asof_insert_pair(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    feed_id: int,
-    valid_at: str,
-    issued_at: str,
-    forecast: float,
-    observed: float,
-    first_known_at: str | None,
-    day_ahead: int = 1,
-    lead_hours: int = 6,
-    generation_id: int | None = None,
-) -> None:
-    """Generation-bound pair insert for crafting knowability scenarios.
-
-    ``generation_id=None`` binds the row to the site's PUBLISHED generation
-    (seeding it on first use); pass an explicit id to plant decoys under a
-    non-published generation.
-    """
-    if generation_id is None:
-        generation_id = ensure_site_generation(conn, site_id)
-    error = forecast - observed
-    conn.execute(
-        """
-        INSERT INTO forecast_pairs
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error,
-             first_known_at, tz_generation_id)
-        VALUES (?, ?, 'temperature', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            site_id,
-            feed_id,
-            issued_at,
-            valid_at,
-            lead_hours,
-            day_ahead,
-            forecast,
-            observed,
-            error,
-            abs(error),
-            error**2,
-            first_known_at,
-            generation_id,
-        ),
     )
 
 
@@ -470,6 +395,7 @@ def day_close_site(
     # plan; importing it inside this function body, rather than at module
     # top, keeps every other test module that imports this file collecting
     # until then.
+    from wxverify.db.runtime_state import delete_runtime_state
     from wxverify.db.site_days import (
         DAILY_CLOSE_ON_KEY,
         begin_close,
@@ -509,6 +435,8 @@ def day_close_site(
 
     if close_on:
         set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(NOW))
+    else:
+        delete_runtime_state(conn, DAILY_CLOSE_ON_KEY)
 
     if with_records:
         d_minus_3 = D - timedelta(days=3)
@@ -953,8 +881,8 @@ class RecordingStandIn:
 
 class AsyncRecordingStandIn(RecordingStandIn):
     """:class:`RecordingStandIn` for an async P4 call point (``publish``,
-    ``clean_worksheets``, plan §14.1; §18.13). Awaits what the call-through,
-    or a callable ``result``, returns when that value is awaitable.
+    plan §14.1; §18.13). Awaits what the call-through, or a callable
+    ``result``, returns when that value is awaitable.
     """
 
     async def __call__(self, *args: object, **kwargs: object) -> object:
@@ -977,28 +905,25 @@ class AsyncRecordingStandIn(RecordingStandIn):
 def install_p4_standins(
     monkeypatch: pytest.MonkeyPatch,
 ) -> dict[str, RecordingStandIn]:
-    """Patch ``close_p4``'s other three call points -- ``score_day``,
-    ``publish``, ``clean_worksheets`` -- with generic recorders that call
-    through to P4's real body when the test leaves neither ``result`` nor
-    ``raises`` set (plan §15.1 "P4."; §18.13; stage 1's ``round_state`` has
-    its own :func:`install_round_state_standin`, since its answer is keyed
-    by round date and may need to fault one site only). Raises
-    ``ModuleNotFoundError`` until piece 3 adds ``close_p4.py``.
+    """Patch ``close_p4``'s other two call points -- ``score_day``,
+    ``publish`` -- with generic recorders that call through to P4's real
+    body when the test leaves neither ``result`` nor ``raises`` set (plan
+    §15.1 "P4."; §18.13; stage 1's ``round_state`` has its own
+    :func:`install_round_state_standin`, since its answer is keyed by round
+    date and may need to fault one site only). ``clean_worksheets`` (stage
+    8, the worksheet cleanup) had its own stand-in here; stage 8 and
+    ``clean_worksheets`` were removed with the daily-close chain's cleanup
+    step (0.16.14 Part B), so there is nothing left to stand in for it.
     """
     from wxverify.worker import close_p4
 
     score_day = RecordingStandIn(close_p4.score_day)
     publish = AsyncRecordingStandIn(close_p4.publish)
-    clean_worksheets = AsyncRecordingStandIn(close_p4.clean_worksheets)
     monkeypatch.setattr("wxverify.worker.close_p4.score_day", score_day, raising=False)
     monkeypatch.setattr("wxverify.worker.close_p4.publish", publish, raising=False)
-    monkeypatch.setattr(
-        "wxverify.worker.close_p4.clean_worksheets", clean_worksheets, raising=False
-    )
     return {
         "score_day": score_day,
         "publish": publish,
-        "clean_worksheets": clean_worksheets,
     }
 
 
@@ -1238,7 +1163,7 @@ def standard_night(
 
     set_runtime_state(conn, "worker_started_at", isoformat_utc(NOW))
     conn.commit()
-    return db, FencedWriter(db, db.generation), site_id, stations
+    return db, FencedWriter(db), site_id, stations
 
 
 # ---------------------------------------------------------------------------
@@ -1326,6 +1251,26 @@ def meteoblue_package_feed_id(conn: sqlite3.Connection) -> int:
     ).fetchone()
     assert row is not None, "meteoblue/multimodel feed is not seeded"
     return int(row["id"])
+
+
+def close_off(conn: sqlite3.Connection) -> None:
+    """Put a test database in the close-off state (deletes
+    ``DAILY_CLOSE_ON_KEY`` and commits).
+
+    A fresh database now starts with the daily close ON (the storage
+    release's v17 upgrade stamps ``DAILY_CLOSE_ON_KEY`` on every fresh
+    build, ``_record_fresh_build_keys``); production never turns it back
+    off again -- the close is permanent (storage-release plan §3.2). Only
+    the close-off branches kept in other code for a later cleanup card
+    still read this state; call this right after the database is built,
+    before anything reads the key, for a test whose subject is one of
+    those close-off branches.
+    """
+    from wxverify.db.runtime_state import delete_runtime_state
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY
+
+    delete_runtime_state(conn, DAILY_CLOSE_ON_KEY)
+    conn.commit()
 
 
 def subscribe_meteoblue_package(conn: sqlite3.Connection, site_id: int) -> int:
@@ -1785,6 +1730,7 @@ def seed_active_publication(
     window_days: int = 7,
     window_start_date: date | None = None,
     wind_start_date: date | None = None,
+    min_n: int = 0,
     methodology_version: int = 1,
     scoring_rule: str = "synthetic-rule",
     wind_method: str = "synthetic-wind",
@@ -1798,7 +1744,9 @@ def seed_active_publication(
     Plain INSERT: P4 writes this row only from inside ``publish``/
     ``publish_first``, which run a real build. Returns the new row's id.
     ``first_record_date``/``window_start_date``/``wind_start_date`` default
-    to ``cutoff`` minus ``window_days`` - 1 when not given.
+    to ``cutoff`` minus ``window_days`` - 1 when not given. ``min_n`` is
+    baked into the publication's own settings (9.1), read back by
+    ``Publication.min_n`` -- never the runtime ``min_n`` setting.
     """
     first_record_date = first_record_date or (cutoff - timedelta(days=window_days - 1))
     window_start_date = window_start_date or first_record_date
@@ -1817,7 +1765,7 @@ def seed_active_publication(
             window_days,
             window_start_date.isoformat(),
             wind_start_date.isoformat(),
-            json.dumps({"rolling_window_days": window_days, "min_n": 0}),
+            json.dumps({"rolling_window_days": window_days, "min_n": min_n}),
             methodology_version,
             scoring_rule,
             wind_method,
@@ -1828,6 +1776,50 @@ def seed_active_publication(
     )
     assert cur.lastrowid is not None
     return int(cur.lastrowid)
+
+
+def seed_publication_ranking(
+    conn: sqlite3.Connection,
+    *,
+    publication_id: int,
+    feed_id: int,
+    variable: str,
+    day_ahead: int,
+    window_key: str,
+    result: MetricResult,
+) -> None:
+    """One ``publication_rankings`` row (R4.1, 9.2) carrying a computed
+    ``MetricResult``.
+
+    What ``published_ranking`` reads, keyed by ``(publication_id, variable,
+    day_ahead, window_key, feed_id)``; ``confident`` is derived at read time
+    from the publication's own ``min_n``, never stored here. ``INSERT OR
+    REPLACE`` on that primary key: P4 writes this table only during a
+    build, but callers here may re-seed a cell.
+    """
+    conn.execute(
+        "INSERT OR REPLACE INTO publication_rankings"
+        " (publication_id, variable, day_ahead, window_key, feed_id,"
+        "  n, bias, mae, rmse, pod, far, csi, ets, hss, skill_score)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            publication_id,
+            variable,
+            day_ahead,
+            window_key,
+            feed_id,
+            result.n,
+            result.bias,
+            result.mae,
+            result.rmse,
+            result.pod,
+            result.far,
+            result.csi,
+            result.ets,
+            result.hss,
+            result.skill_score,
+        ),
+    )
 
 
 def seed_coverage(
@@ -1919,7 +1911,7 @@ def seed_rain_ranks(
     return publication_id
 
 
-def seed_closed_pairs(
+def seed_forecast_history(
     conn: sqlite3.Connection,
     *,
     site_id: int,
@@ -1931,35 +1923,41 @@ def seed_closed_pairs(
     lead_hours: int,
     forecast: float,
     observed: float,
-    download_date: date | None = None,
-    fetched_at: str | None = None,
+    issued_at: str | None = None,
 ) -> None:
-    """R4.3's closed-day pair (one ``close_pairs`` row, over P4's
-    ``close_pairs``, P4 §16.2).
+    """A storage-release ``forecast_history`` row (plan 3.1) plus the
+    ``observations`` row it joins to (3.6) -- the one table the win rate
+    and the history chart now read for both a closed day's forecast and
+    the days before the site's first record (A2-A5; ``close_pairs`` and
+    ``forecast_pairs`` are no longer read by either, W4).
 
-    What ``closed_day_pairs(conn, site_id=…, local_date=…, feed_id=…)``
-    returns: one hour's forecast and observed value for a closed day and
-    feed, the forecast and the observed value the scores rest on. Plain
-    INSERT: P4 writes ``close_pairs`` only from inside ``score_day``.
+    ``observations`` is keyed on ``(site_id, variable, valid_at)`` alone --
+    one shared truth value, never per feed -- so a second call at the same
+    ``valid_at`` for a different feed must pass the same ``observed`` and
+    is a silent no-op on that insert (``INSERT OR IGNORE``).
     """
     conn.execute(
-        "INSERT INTO close_pairs"
-        " (site_id, local_date, feed_id, variable, day_ahead, valid_at,"
-        "  lead_hours, forecast, observed, download_date, fetched_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO forecast_history"
+        " (site_id, feed_id, variable, day_ahead, valid_at, local_date,"
+        "  value, lead_hours, issued_at, contributors)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
         (
             site_id,
-            local_date.isoformat(),
             feed_id,
             variable,
             day_ahead,
             valid_at,
-            lead_hours,
+            local_date.isoformat(),
             forecast,
-            observed,
-            None if download_date is None else download_date.isoformat(),
-            fetched_at,
+            lead_hours,
+            issued_at or valid_at,
         ),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO observations"
+        " (site_id, variable, valid_at, value, n_stations, computed_at)"
+        " VALUES (?, ?, ?, ?, 3, ?)",
+        (site_id, variable, valid_at, observed, valid_at),
     )
 
 

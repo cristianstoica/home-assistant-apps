@@ -3,6 +3,8 @@ bashio::log.info "Starting Weather Verify..."
 
 export WXV_INGRESS_ENTRY="$(bashio::addon.ingress_entry)"
 export WXV_LOG_LEVEL="$(bashio::config 'log_level')"
+# SQLite's temp files, VACUUM's copy included, go on the data disk.
+export SQLITE_TMPDIR=/data
 
 exec python3 -m wxverify serve \
     --options /data/options.json \

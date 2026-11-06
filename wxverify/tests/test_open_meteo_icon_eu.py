@@ -15,16 +15,9 @@ from datetime import timedelta
 import httpx
 import pytest
 
-from tests.helpers import (
-    asof_conn,
-    asof_insert_observation,
-    asof_insert_pair,
-    asof_insert_sample,
-    asof_make_real_feed,
-    asof_make_site,
-)
+from tests.helpers import asof_conn
 from wxverify import config
-from wxverify.core.timeutil import day_ahead, floor_hour, isoformat_utc, parse_utc
+from wxverify.core.timeutil import floor_hour, isoformat_utc, parse_utc
 from wxverify.db.migrations import (
     OPEN_METEO_HORIZON_CORRECTION_KEY,
     OPEN_METEO_INTERVAL_CORRECTION_KEY,
@@ -39,8 +32,6 @@ from wxverify.feeds.open_meteo import (
     _snap_run,  # noqa: SLF001
 )
 from wxverify.feeds.seam import ForecastRequest
-from wxverify.scoring.multimodel import materialize_multimodel_mean
-from wxverify.scoring.pairing import pair_real_models
 from wxverify.web.context import feed_description
 
 # The seven models seeded before D1 added icon_eu.
@@ -291,47 +282,6 @@ def test_d1_t9a_label_arithmetic_across_one_day() -> None:
         assert next_label.hour % 6 == label.hour % 6
 
 
-def test_d1_t9b_pairing_keeps_every_lead_up_to_the_seeded_horizon() -> None:
-    conn = asof_conn()
-    site_id = asof_make_site(conn, "D1-T9b site")
-    feed_id = _icon_eu_feed_id(conn)
-    issued_at = "2026-06-02T09:00:00Z"
-    label = parse_utc(issued_at)
-
-    leads = (1, 117, 120, 121)
-    for lead in leads:
-        valid_at = isoformat_utc(label + timedelta(hours=lead))
-        asof_insert_sample(
-            conn,
-            site_id=site_id,
-            feed_id=feed_id,
-            issued_at=issued_at,
-            valid_at=valid_at,
-            lead_hours=lead,
-            value=15.0,
-            fetched_at="2026-06-02T10:35:00Z",
-        )
-        asof_insert_observation(
-            conn,
-            site_id=site_id,
-            valid_at=valid_at,
-            value=14.5,
-            computed_at="2026-06-03T00:00:00Z",
-        )
-
-    assert pair_real_models(conn, site_id=site_id) == 3
-
-    pairs = conn.execute(
-        "SELECT lead_hours, valid_at, day_ahead FROM forecast_pairs"
-        " WHERE site_id=? AND feed_id=?",
-        (site_id, feed_id),
-    ).fetchall()
-    assert {int(p["lead_hours"]) for p in pairs} == {1, 117, 120}
-    for pair in pairs:
-        expected_day_ahead = day_ahead(issued_at, str(pair["valid_at"]), "UTC")
-        assert int(pair["day_ahead"]) == expected_day_ahead
-
-
 def test_d1_t9b_adapter_normalization_keeps_every_lead_up_to_120(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -393,86 +343,3 @@ def test_d1_t9b_adapter_normalization_keeps_every_lead_up_to_120(
     for variable, leads in leads_by_variable.items():
         expected = range(1, 119 + 1) if variable == "precip" else range(1, 121)
         assert sorted(leads) == list(expected), variable
-
-
-def test_d1_t9c_multimodel_mean_main_and_side_class() -> None:
-    # Main class: both pairs issued at the same label -> one mean row,
-    # contributors == 2.
-    conn = asof_conn()
-    site_id = asof_make_site(conn, "D1-T9c main site")
-    icon_eu_feed = _icon_eu_feed_id(conn)
-    other_feed = asof_make_real_feed(conn, "ecmwf_ifs")
-    valid_at = "2026-06-02T12:00:00Z"
-
-    for feed_id, forecast in ((icon_eu_feed, 10.0), (other_feed, 14.0)):
-        asof_insert_pair(
-            conn,
-            site_id=site_id,
-            feed_id=feed_id,
-            valid_at=valid_at,
-            issued_at="2026-06-02T06:00:00Z",
-            forecast=forecast,
-            observed=12.0,
-            first_known_at="2026-06-02T07:00:00Z",
-            day_ahead=0,
-            lead_hours=6,
-        )
-    conn.commit()
-
-    assert materialize_multimodel_mean(conn, site_id=site_id) == 1
-    mean_feed = conn.execute(
-        "SELECT id FROM feeds WHERE source='virtual' AND model='_multimodel_mean'"
-    ).fetchone()
-    assert mean_feed is not None
-    mean_row = conn.execute(
-        "SELECT forecast, contributors FROM forecast_pairs"
-        " WHERE site_id=? AND feed_id=? AND valid_at=?",
-        (site_id, int(mean_feed["id"]), valid_at),
-    ).fetchone()
-    assert mean_row is not None
-    assert mean_row["forecast"] == 12.0
-    assert mean_row["contributors"] == 2
-
-    # Side class, on a second fresh connection: icon_eu issued 3 hours later
-    # than the other feed (leads differ by 3) -> no mean row at all.
-    conn2 = asof_conn()
-    site_id2 = asof_make_site(conn2, "D1-T9c side site")
-    icon_eu_feed2 = _icon_eu_feed_id(conn2)
-    other_feed2 = asof_make_real_feed(conn2, "ecmwf_ifs")
-
-    asof_insert_pair(
-        conn2,
-        site_id=site_id2,
-        feed_id=icon_eu_feed2,
-        valid_at=valid_at,
-        issued_at="2026-06-02T09:00:00Z",
-        forecast=10.0,
-        observed=12.0,
-        first_known_at="2026-06-02T10:00:00Z",
-        day_ahead=0,
-        lead_hours=3,
-    )
-    asof_insert_pair(
-        conn2,
-        site_id=site_id2,
-        feed_id=other_feed2,
-        valid_at=valid_at,
-        issued_at="2026-06-02T06:00:00Z",
-        forecast=14.0,
-        observed=12.0,
-        first_known_at="2026-06-02T07:00:00Z",
-        day_ahead=0,
-        lead_hours=6,
-    )
-    conn2.commit()
-
-    assert materialize_multimodel_mean(conn2, site_id=site_id2) == 0
-    mean_feed2 = conn2.execute(
-        "SELECT id FROM feeds WHERE source='virtual' AND model='_multimodel_mean'"
-    ).fetchone()
-    assert mean_feed2 is not None
-    no_mean_row = conn2.execute(
-        "SELECT 1 FROM forecast_pairs WHERE site_id=? AND feed_id=? AND valid_at=?",
-        (site_id2, int(mean_feed2["id"]), valid_at),
-    ).fetchone()
-    assert no_mean_row is None

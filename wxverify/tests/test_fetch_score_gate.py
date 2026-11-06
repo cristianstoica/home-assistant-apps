@@ -71,7 +71,7 @@ def test_save_error_rolls_back_fetch(
     db = get_db()
     # Both writer paths share db_obj._conn, so one assertion target covers
     # both parametrized cases.
-    writer = FencedWriter(db, db.generation) if fenced else None
+    writer = FencedWriter(db) if fenced else None
 
     class _Adapter:
         def estimate_cost(self, req: Any) -> CostEstimate:

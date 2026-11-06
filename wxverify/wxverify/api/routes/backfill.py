@@ -10,7 +10,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from wxverify.api.errors import ApiError
-from wxverify.worker.cutover import RETIRED_CONTROL_MESSAGE
+from wxverify.db.site_days import RETIRED_CONTROL_MESSAGE
 
 router = APIRouter(prefix="/api", tags=["backfill"])
 

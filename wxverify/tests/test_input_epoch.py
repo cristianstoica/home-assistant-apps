@@ -24,7 +24,6 @@ from wxverify.db.connection import (
     EPOCH_MOVED,
     Database,
     FencedWriter,
-    StaleGenerationError,
     close_db,
     init_db,
 )
@@ -120,7 +119,7 @@ def test_gate_bumps_only_on_an_actual_change(tmp_path: Path) -> None:
     T-gate -> at `epoch_after_insert_then_noop_update`: correct =
     epoch_after_readonly + 1 (the INSERT changed a row, so the transaction's
     cumulative `total_changes` moved even though the trailing no-op UPDATE
-    changed nothing), mutant (M1, plain `write`/`write_fenced` call
+    changed nothing), mutant (M1, plain `write`/a `FencedWriter` write call
     `_run_immediate` directly and never reach `_run_epoch_txn` at all, so
     they never bump under any condition) = epoch_after_readonly + 0: `assert
     1 == 2` (the epoch is still 1, one step behind the required 2). M1 first
@@ -132,9 +131,9 @@ def test_gate_bumps_only_on_an_actual_change(tmp_path: Path) -> None:
     implementation's normal bump, and no listed mutant first fails here.
     T-gate -> at `epoch_after_fenced_insert`: correct =
     epoch_after_plain_insert + 1. Also a paired positive here, not a
-    mutant-killing step: `write_fenced` bumping normally on a real change
-    confirms the fenced path isn't itself broken, independent of the
-    mutants above (all already dead by step 1 or 2).
+    mutant-killing step: a write through `FencedWriter` bumping normally
+    on a real change confirms that path isn't itself broken, independent
+    of the mutants above (all already dead by step 1 or 2).
     """
     db = _init_tmp_db(tmp_path)
     _make_probe(db)
@@ -161,7 +160,7 @@ def test_gate_bumps_only_on_an_actual_change(tmp_path: Path) -> None:
         await db.write(_plain_insert)
         epoch_after_plain_insert = db.input_epoch
 
-        await db.write_fenced(_plain_insert, generation=db.generation)
+        await FencedWriter(db).write(_plain_insert)
         epoch_after_fenced_insert = db.input_epoch
 
         return (
@@ -247,13 +246,13 @@ def test_ex_epoch_exempt_suppresses_the_bump_on_both_paths(tmp_path: Path) -> No
         await db.write(_insert(1), epoch_exempt=True)
         epoch_after_exempt_write = db.input_epoch
 
-        await FencedWriter(db, db.generation, epoch_exempt=True).write(_insert(2))
+        await FencedWriter(db, epoch_exempt=True).write(_insert(2))
         epoch_after_exempt_fenced_write = db.input_epoch
 
         await db.write(_insert(3))
         epoch_after_plain_write = db.input_epoch
 
-        await FencedWriter(db, db.generation).write(_insert(4))
+        await FencedWriter(db).write(_insert(4))
         epoch_after_plain_fenced_write = db.input_epoch
 
         row_count = db.read_sync(
@@ -375,7 +374,7 @@ def test_m15_data_version_is_read_inside_begin_immediate_not_before(
         e0 = db.input_epoch
         db._conn.set_trace_callback(_trace)  # noqa: SLF001
         try:
-            result = await db.write_if_current(_fn, generation=db.generation, epoch=e0)
+            result = await db.write_if_current(_fn, epoch=e0)
         finally:
             db._conn.set_trace_callback(None)  # noqa: SLF001
         return e0, result
@@ -451,7 +450,7 @@ def test_m16b_a_fresh_database_cas_hits_on_its_own_read_at_epoch(
     its very first write.
     """
     db = _init_tmp_db(tmp_path)
-    writer = FencedWriter(db, db.generation)
+    writer = FencedWriter(db)
 
     async def _run() -> object:
         epoch, _result = await writer.read_at_epoch(lambda c: None, label="t")
@@ -461,42 +460,6 @@ def test_m16b_a_fresh_database_cas_hits_on_its_own_read_at_epoch(
 
     assert isinstance(result, tuple)
     assert result is not EPOCH_MOVED
-
-
-# ---------------------------------------------------------------------------
-# T-gen (MX-gen-order)
-# ---------------------------------------------------------------------------
-
-
-def test_gen_stale_generation_is_checked_before_the_epoch(tmp_path: Path) -> None:
-    """Both the generation check and the epoch check fail in this
-    construction, so only their ORDER decides the outcome.
-
-    T-gen -> at the raised exception: correct = `StaleGenerationError` (the
-    generation check runs first, so a caller whose database was replaced
-    fails loudly instead of quietly recomputing against a database that is
-    not the one it read from), mutant (MX-gen-order, the epoch check placed
-    first) = `EPOCH_MOVED`, a value the caller would treat as "recompute",
-    not "this is a different database now".
-    T-gen -> at `ran`: correct = [] (`fn` never runs on either check
-    failing), mutant = [] as well here -- this assertion alone does not
-    distinguish the mutant; it is paired with the exception-type assertion
-    above, which does.
-    """
-    db = _init_tmp_db(tmp_path)
-    ran: list[int] = []
-
-    async def _run() -> None:
-        with pytest.raises(StaleGenerationError):
-            await db.write_if_current(
-                lambda c: ran.append(1),
-                generation=db.generation + 1,
-                epoch=db.input_epoch + 1,
-            )
-
-    asyncio.run(_run())
-
-    assert ran == []
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +499,7 @@ def test_m5_read_at_epoch_reads_the_epoch_before_the_snapshot(tmp_path: Path) ->
             raise TimeoutError("release was never set")
         return int(count)
 
-    writer = FencedWriter(db, db.generation)
+    writer = FencedWriter(db)
 
     async def _run() -> object:
         task = asyncio.ensure_future(writer.read_at_epoch(_gated, label="t"))
@@ -589,9 +552,7 @@ def test_label_slow_write_log_names_the_callback_not_the_wrapper(
 
     async def _run() -> None:
         await db.write(_named_probe_write)
-        await db.write_if_current(
-            _named_probe_write, generation=db.generation, epoch=db.input_epoch
-        )
+        await db.write_if_current(_named_probe_write, epoch=db.input_epoch)
 
     asyncio.run(_run())
 

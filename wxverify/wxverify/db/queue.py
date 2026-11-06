@@ -161,7 +161,7 @@ def enqueue_if_absent_with_cooldown(
     this (type, site_id, job_key) is a terminal failure inside ``cooldown``.
 
     Opt-in wrapper for automatic/scheduled call sites only (scheduler due-job
-    checks, post-read rescore triggers) -- never call this from an
+    checks) -- never call this from an
     operator-initiated path (an API route or CLI command): a manual retry
     must never be silently dropped by a stale cooldown. Those callers keep
     using ``enqueue_if_absent`` directly.

@@ -24,7 +24,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from tests.helpers import NOW, D, asof_conn, day_close_site
+from tests.helpers import NOW, D, asof_conn, close_off, day_close_site
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.monitor import build_verdict
 from wxverify.worker.access_hold import record_access_refused
@@ -320,6 +320,7 @@ def test_ac6_detail_unchanged_with_close_off(monkeypatch: pytest.MonkeyPatch) ->
     exact text.
     """
     conn = asof_conn()
+    close_off(conn)
     day_close_site(conn, close_on=False)
 
     refusal_at = datetime(D.year, D.month, D.day, 9, 0, tzinfo=UTC)

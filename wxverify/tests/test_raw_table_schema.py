@@ -1,6 +1,8 @@
-"""The widened ``station_wind_records`` schema and its import checks (plan
-2026-10-21-daily-close-download-and-raw-store.md, section 11, test IDs
-SC1-SC5).
+"""The widened ``station_wind_records`` schema (plan 2026-10-21-daily-
+close-download-and-raw-store.md, section 11, test IDs SC3-SC4): its live
+CHECK/key constraints and the site-delete cascade. SC1 and SC2, which
+pinned the now-deleted migration that used to build this shape onto an
+older file, are retired (see the note below).
 
 Real SQLite and real migrations throughout; nothing in the code under test
 is mocked. Synthetic data only: station id ``ISTATION01``, site name
@@ -11,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -19,30 +20,12 @@ from fastapi.testclient import TestClient
 
 from wxverify import config
 from wxverify.api.app import create_app
-from wxverify.api.errors import ApiError
-from wxverify.api.routes.db_transfer import _validate_upload  # noqa: PLC2701
 from wxverify.db.connection import close_db, get_db, init_db
-from wxverify.db.migrations import (
-    TARGET_USER_VERSION,
-    migrate_v12_widen_raw_readings,
-    run_migrations,
-)
+from wxverify.db.migrations import run_migrations
 
 # ---------------------------------------------------------------------------
 # Shared fixture helpers
 # ---------------------------------------------------------------------------
-
-# Today's pre-widening shape (db/migrations.py:100-106), copied verbatim, the
-# way tests/helpers.py's make_v8_wind_state freezes the v8 station_wind_days
-# shape.
-_V11_STATION_WIND_RECORDS_DDL = """
-    CREATE TABLE station_wind_records (
-        station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
-        obs_at TEXT NOT NULL,
-        speed_kmh REAL NOT NULL CHECK (speed_kmh >= 0),
-        PRIMARY KEY (station_id, obs_at)
-    ) WITHOUT ROWID;
-"""
 
 
 def _migrated_conn() -> sqlite3.Connection:
@@ -67,226 +50,35 @@ def _make_station(conn: sqlite3.Connection, pws_station_id: str = "ISTATION01") 
     return int(station_id)
 
 
-def _v11_fixture_conn() -> tuple[sqlite3.Connection, int]:
-    """A fully migrated database with ``station_wind_records`` put back in
-    today's pre-widening shape and ``user_version`` forced back to 11.
-
-    ``run_migrations`` above also brings ``station_wind_days`` to the
-    CURRENT shape, which once P2's migration lands already carries
-    ``refused_at`` (11.2) -- a version-11 file never had it. Drop it here,
-    guarded by its own presence check, so SC1's ``assert "refused_at" in
-    wind_days_cols`` actually exercises the migration's own column-add
-    (3.) instead of a column the full migration above already put there.
-    """
-    conn = _migrated_conn()
-    conn.execute("DROP TABLE station_wind_records")
-    conn.executescript(_V11_STATION_WIND_RECORDS_DDL)
-    columns = {
-        r["name"] for r in conn.execute("PRAGMA table_xinfo(station_wind_records)")
-    }
-    assert columns == {"station_id", "obs_at", "speed_kmh"}, (
-        "the v11 DDL copy must carry none of the widened columns"
-    )
-    wind_days_columns = {
-        r["name"] for r in conn.execute("PRAGMA table_info(station_wind_days)")
-    }
-    if "refused_at" in wind_days_columns:
-        conn.execute("ALTER TABLE station_wind_days DROP COLUMN refused_at")
-    station_id = _make_station(conn)
-    conn.execute(
-        "INSERT INTO station_wind_records (station_id, obs_at, speed_kmh)"
-        " VALUES (?, '2026-10-27T10:00:00Z', 7.0)",
-        (station_id,),
-    )
-    conn.execute("PRAGMA user_version = 11")
-    conn.commit()
-    return conn, station_id
-
-
-# --- SC1 ----------------------------------------------------------------
-
-
-def test_sc1_v11_file_rebuilds_to_the_fresh_shape_with_rows_kept() -> None:
-    """SC1 (14.11): opening a version-11 file rebuilds ``station_wind_records``
-    to exactly the fresh shape, with its existing rows copied forward as
-    ``source='five_minute'`` and the widened columns NULL; ``refused_at`` is
-    present on ``station_wind_days``.
-
-    M66 -> at the ``len(rows)`` assertion below: correct = 1 (the existing
-    row survives the rebuild), mutant (the rebuild drops the existing rows,
-    no ``INSERT ... SELECT``) = 0.
-    """
-    old_conn, station_id = _v11_fixture_conn()
-    run_migrations(old_conn)
-
-    fresh_conn = _migrated_conn()
-
-    old_shape = [
-        dict(r) for r in old_conn.execute("PRAGMA table_xinfo(station_wind_records)")
-    ]
-    fresh_shape = [
-        dict(r) for r in fresh_conn.execute("PRAGMA table_xinfo(station_wind_records)")
-    ]
-    assert old_shape == fresh_shape
-
-    for conn in (old_conn, fresh_conn):
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
-        assert version == TARGET_USER_VERSION, (
-            "the version is read from TARGET_USER_VERSION, never a literal, "
-            "since P3-P6 raise it further"
-        )
-
-    rows = old_conn.execute(
-        "SELECT station_id, source, local_date, speed_kmh, temp_c,"
-        " precip_total_mm, fetched_at FROM station_wind_records"
-    ).fetchall()
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["station_id"] == station_id
-    assert row["source"] == "five_minute"
-    assert row["speed_kmh"] == 7.0
-    assert row["local_date"] is None
-    assert row["temp_c"] is None
-    assert row["precip_total_mm"] is None
-    assert row["fetched_at"] is None
-
-    wind_days_cols = {
-        r["name"] for r in old_conn.execute("PRAGMA table_info(station_wind_days)")
-    }
-    assert "refused_at" in wind_days_cols
-
-
-# --- SC2 ----------------------------------------------------------------
-
-
-def test_sc2_rerun_guard_skips_the_rebuild_when_source_already_present() -> None:
-    """SC2 (14.11): the rebuild already committed but ``user_version`` was
-    left at 11 (a crash between the two) -- re-entry opens straight to
-    ``TARGET_USER_VERSION`` with no error and both rows unchanged, column for
-    column: one ``five_minute`` row and, at another instant, a
-    ``current_obs`` row with speed, temperature, rain total, local date and
-    fetch time.
-
-    M67 -> at the ``after_rows == before_rows`` assertion: correct = True
-    (the re-run guard skips the ``INSERT ... SELECT`` when the column
-    already exists, so neither row changes); mutant (the re-run guard
-    dropped) = False, the ``current_obs`` row comes back with ``source``
-    overwritten to ``'five_minute'`` and its ``local_date``, ``temp_c``,
-    ``precip_total_mm`` and ``fetched_at`` all NULL, the copy running a
-    second time against the already-widened table.
-    """
-    conn = _migrated_conn()
-    station_id = _make_station(conn)
-    conn.execute(
-        "INSERT INTO station_wind_records (station_id, obs_at, source,"
-        " speed_kmh) VALUES (?, '2026-10-27T10:00:00Z', 'five_minute', 7.0)",
-        (station_id,),
-    )
-    conn.execute(
-        "INSERT INTO station_wind_records (station_id, obs_at, source,"
-        " speed_kmh, temp_c, precip_total_mm, local_date, fetched_at)"
-        " VALUES (?, '2026-10-27T10:05:00Z', 'current_obs', 5.0, 12.3, 0.4,"
-        " '2026-10-27', '2026-10-27T10:06:00Z')",
-        (station_id,),
-    )
-    # The crash: the rebuild (step 2) already committed, but the version
-    # PRAGMA (written only at the end of run_migrations) was not.
-    conn.execute("PRAGMA user_version = 11")
-    conn.commit()
-
-    before_rows = [
-        dict(r)
-        for r in conn.execute(
-            "SELECT station_id, obs_at, source, local_date, speed_kmh,"
-            " temp_c, precip_total_mm, fetched_at FROM station_wind_records"
-            " ORDER BY obs_at, source"
-        )
-    ]
-
-    run_migrations(conn)
-
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == TARGET_USER_VERSION
-
-    after_rows = [
-        dict(r)
-        for r in conn.execute(
-            "SELECT station_id, obs_at, source, local_date, speed_kmh,"
-            " temp_c, precip_total_mm, fetched_at FROM station_wind_records"
-            " ORDER BY obs_at, source"
-        )
-    ]
-    assert after_rows == before_rows
-
-    # Calling the migration directly on a connection whose table already
-    # carries `source` (the guard's own condition) must change nothing: the
-    # re-run guard skips the rebuild, and `refused_at` is already present.
-    before_shape = [
-        dict(r) for r in conn.execute("PRAGMA table_xinfo(station_wind_records)")
-    ]
-    before_count = conn.execute("SELECT COUNT(*) FROM station_wind_records").fetchone()[
-        0
-    ]
-
-    migrate_v12_widen_raw_readings(conn)
-
-    after_shape = [
-        dict(r) for r in conn.execute("PRAGMA table_xinfo(station_wind_records)")
-    ]
-    after_count = conn.execute("SELECT COUNT(*) FROM station_wind_records").fetchone()[
-        0
-    ]
-    assert after_shape == before_shape
-    assert after_count == before_count
+# SC1 (opening a version-11 file rebuilds station_wind_records to the
+# fresh shape, rows kept) and SC2 (the rebuild's own re-run guard) are
+# retired: both pinned migrate_v12_widen_raw_readings, deleted along with
+# every other migrate_v2 ... migrate_v16 function (storage release 4.1).
+# station_wind_records' widened shape is an unconditional part of
+# create_tables now, with no separate rebuild step left to guard or
+# compare against a fresh file, and user_version 1-15 is refused outright
+# rather than migrated.
 
 
 # --- SC3 ----------------------------------------------------------------
 
 
-def _fresh_station_conn() -> tuple[sqlite3.Connection, int]:
-    """SC3's first builder: a fresh ``create_tables``-shaped table."""
-    conn = _migrated_conn()
-    return conn, _make_station(conn)
-
-
-def _v11_rebuilt_station_conn() -> tuple[sqlite3.Connection, int]:
-    """SC3's second builder: a version-11 file rebuilt via ``run_migrations``,
-    as SC1 does -- the version-12 rebuild's own copy of the CREATE
-    statement (``_rebuild_station_wind_records``), not the one
-    ``create_tables`` runs on a fresh file.
-    """
-    conn, station_id = _v11_fixture_conn()
-    run_migrations(conn)
-    return conn, station_id
-
-
-@pytest.mark.parametrize(
-    "build_conn",
-    [_fresh_station_conn, _v11_rebuilt_station_conn],
-    ids=["fresh_create_tables", "v11_file_rebuilt"],
-)
-def test_sc3_checks_and_key_reject_every_bad_row(
-    build_conn: Callable[[], tuple[sqlite3.Connection, int]],
-) -> None:
+def test_sc3_checks_and_key_reject_every_bad_row() -> None:
     """SC3 (14.11): each CHECK and the PRIMARY KEY refuses its bad row with
     ``sqlite3.IntegrityError``.
 
-    Run on BOTH of ``station_wind_records``'s two builders: a fresh
-    ``create_tables``-built table, and one rebuilt from a version-11 file
-    through ``run_migrations`` (SC1's own ``_v11_fixture_conn`` plus
-    ``run_migrations``, the version-12 migration's own copy of the CREATE
-    statement, ``_rebuild_station_wind_records``). SC1 compares only
-    ``table_xinfo``, which carries no CHECKs, so without this parametrize
-    the rebuild's own CREATE-statement copy had no CHECK/key coverage of
-    its own -- a CHECK present on the fresh table but dropped from the
-    rebuild's copy would pass this test on the ``fresh_create_tables`` case
-    alone.
+    This used to also run against a version-11 file rebuilt through
+    ``run_migrations`` (the version-12 migration's own copy of the CREATE
+    statement) -- that comparison is retired with ``migrate_v12_widen_raw_
+    readings`` (see the SC1/SC2 note above): there is now only the one
+    ``create_tables`` definition of this table left to check.
 
     M68 -> at the rain-``CHECK`` insert below: correct = raises
     ``sqlite3.IntegrityError`` (``precip_total_mm >= 0``), mutant (the rain
     CHECK dropped) = the insert succeeds.
     """
-    conn, station_id = build_conn()
+    conn = _migrated_conn()
+    station_id = _make_station(conn)
 
     def _bad_insert(sql: str, params: tuple[object, ...]) -> None:
         with pytest.raises(sqlite3.IntegrityError):
@@ -402,104 +194,6 @@ def test_sc4_site_delete_route_cascades_to_station_wind_records(
         assert fk_violations == []
 
 
-# --- SC5 ----------------------------------------------------------------
-
-
-def _make_upload_db(
-    path: Path, *, fetched_at: str | None, local_date: str | None, drop_table: bool
-) -> None:
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(conn)
-    if drop_table:
-        conn.execute("DROP TABLE station_wind_records")
-        conn.commit()
-        conn.close()
-        return
-    station_id = _make_station(conn)
-    conn.execute(
-        "INSERT INTO station_wind_records (station_id, obs_at, source,"
-        " speed_kmh, local_date, fetched_at) VALUES (?, ?, 'five_minute',"
-        " 7.0, ?, ?)",
-        (station_id, "2026-10-27T10:00:00Z", local_date, fetched_at),
-    )
-    conn.commit()
-    conn.close()
-
-
-def _make_v11_shape_upload_db(path: Path) -> None:
-    """A backup from before this release: ``station_wind_records`` still in
-    its version-11 shape (no ``source``, no ``fetched_at``, no
-    ``local_date``), with one canonical row.
-    """
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(conn)
-    conn.execute("DROP TABLE station_wind_records")
-    conn.executescript(_V11_STATION_WIND_RECORDS_DDL)
-    station_id = _make_station(conn)
-    conn.execute(
-        "INSERT INTO station_wind_records (station_id, obs_at, speed_kmh)"
-        " VALUES (?, '2026-10-27T10:00:00Z', 7.0)",
-        (station_id,),
-    )
-    conn.commit()
-    conn.close()
-
-
-def test_sc5_fetched_at_and_local_date_checked_the_table_absent_skipped(
-    tmp_path: Path,
-) -> None:
-    """SC5 (14.11): import files with a non-canonical ``fetched_at``, a bad
-    ``local_date``, then all NULL, then no table, then the table in its
-    version-11 shape (no ``fetched_at``, no ``local_date``) -- 422 for the
-    first two with the existing messages; the last three accepted.
-
-    M70 -> if ``("station_wind_records", "fetched_at")`` joined
-    ``_CANONICAL_STAMP_COLUMNS`` (which refuses NULL), the ``all_null``
-    file below -- whose ``fetched_at`` IS NULL -- would be refused too;
-    correct = ``_validate_upload`` does not raise on it, mutant = it does.
-    """
-    bad_fetched_at = tmp_path / "bad_fetched_at.db"
-    _make_upload_db(
-        bad_fetched_at,
-        fetched_at="2026-10-27 10:00:00",
-        local_date=None,
-        drop_table=False,
-    )
-    with pytest.raises(ApiError) as excinfo:
-        _validate_upload(bad_fetched_at)
-    assert excinfo.value.status_code == 422
-    assert (
-        "invalid timestamp in station_wind_records.fetched_at: expected UTC"
-        " form YYYY-MM-DDTHH:MM:SSZ" in str(excinfo.value)
-    )
-
-    bad_local_date = tmp_path / "bad_local_date.db"
-    _make_upload_db(
-        bad_local_date,
-        fetched_at=None,
-        local_date="2026/10/27",
-        drop_table=False,
-    )
-    with pytest.raises(ApiError) as excinfo:
-        _validate_upload(bad_local_date)
-    assert excinfo.value.status_code == 422
-    assert (
-        "invalid date in station_wind_records.local_date: expected"
-        " YYYY-MM-DD" in str(excinfo.value)
-    )
-
-    all_null = tmp_path / "all_null.db"
-    _make_upload_db(all_null, fetched_at=None, local_date=None, drop_table=False)
-    _validate_upload(all_null)  # must not raise
-
-    no_table = tmp_path / "no_table.db"
-    _make_upload_db(no_table, fetched_at=None, local_date=None, drop_table=True)
-    _validate_upload(no_table)  # must not raise
-
-    v11_shape = tmp_path / "v11_shape.db"
-    _make_v11_shape_upload_db(v11_shape)
-    _validate_upload(v11_shape)  # must not raise
+# SC5 (import-file validation of fetched_at/local_date in
+# station_wind_records via `_validate_upload`) was removed with the database
+# import (storage-release plan 5.5).

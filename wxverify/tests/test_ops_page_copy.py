@@ -6,15 +6,13 @@ A scripted deletion removed explanatory prose from the publish-hold panel
 the one fact the deleted prose carried -- that a run already in progress
 continues and may publish while the hold is armed -- was moved into the
 arm confirmation dialog in `app.js`. The Ops timezone-correction panel
-this file's O42/O43 tests once covered was removed in 0.16.14 Part 6; its
-own coverage went with it.
-
-O44-O45 assert on rendered `/ops` output (and, for the rename sweep,
-`README.md`) wherever the branch can be driven, never on template source.
+this file's O42/O43 tests once covered was removed in 0.16.14 Part 6, and
+the publish-hold panel this file's O44/O45 tests once covered was removed
+with the rest of the publish-hold feature in the storage-release plan
+(W6a); both panels' own coverage went with them.
 
 Isolation: HTTP-route oracles drive a real app over `TestClient` against a
-file-backed `tmp_path` database with an idle worker stand-in, mirroring
-`tests/test_publish_hold_control.py`.
+file-backed `tmp_path` database with an idle worker stand-in.
 
 Synthetic data only (public repo): no real station or device identifiers.
 """
@@ -23,8 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
-from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -41,7 +37,7 @@ from wxverify.worker.access_hold import access_hold_key
 ROOT = Path(__file__).resolve().parents[1]
 
 # ---------------------------------------------------------------------------
-# Harness (mirrors tests/test_publish_hold_control.py).
+# Harness.
 # ---------------------------------------------------------------------------
 
 
@@ -61,107 +57,6 @@ def _boot(tmp_path: Path, name: str, monkeypatch: pytest.MonkeyPatch) -> object:
 def _norm(text: str) -> str:
     """Collapse the template's line-wrapped whitespace for substring checks."""
     return " ".join(text.split())
-
-
-# ---------------------------------------------------------------------------
-# O44 -- the publish-hold panel keeps every element; the rename is swept.
-# ---------------------------------------------------------------------------
-
-_PUBLISH_HOLD_ID_RE = re.compile(r'id="(publish-hold-[a-z-]+)"')
-
-_EXPECTED_PUBLISH_HOLD_IDS = frozenset(
-    {
-        "publish-hold-panel",
-        "publish-hold-state",
-        "publish-hold-chain-active",
-        "publish-hold-last-transition",
-        "publish-hold-bootstrap-marker",
-        "publish-hold-toggle",
-        "publish-hold-result",
-        "publish-hold-banner",
-    }
-)
-
-
-def test_o44_heading_renamed_ids_intact_and_readme_swept(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The fixture forces `publish_hold.held`, `.last_state` and
-    `.bootstrap` all truthy so every conditional id renders, matching the
-    eight-id set named in the plan."""
-    real_load_ops = context_module.load_ops
-
-    def _wrapped(conn: object) -> dict[str, object]:
-        ctx = real_load_ops(conn)  # type: ignore[arg-type]
-        ctx["publish_hold"] = replace(
-            ctx["publish_hold"],
-            held=True,
-            chain_active=False,
-            last_state="held",
-            last_source="ops",
-            last_changed_at="2026-07-01T00:00:00Z",
-            bootstrap="install",
-        )
-        return ctx
-
-    monkeypatch.setattr("wxverify.web.routes.load_ops", _wrapped)
-    app = _boot(tmp_path, "o44.db", monkeypatch)
-    with TestClient(app) as client:
-        resp = client.get("/ops")
-    assert resp.status_code == 200, resp.text
-    html = resp.text
-
-    assert "Nightly Verification Run Hold" in html
-    assert "Nightly Verification Publishing" not in html
-
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "Nightly Verification Publishing" not in readme
-
-    for badge_id in (
-        "publish-hold-state",
-        "publish-hold-chain-active",
-        "publish-hold-last-transition",
-        "publish-hold-bootstrap-marker",
-        "publish-hold-toggle",
-        "publish-hold-result",
-        "publish-hold-banner",
-    ):
-        assert f'id="{badge_id}"' in html, f"missing surviving element {badge_id!r}"
-
-    found_ids = frozenset(_PUBLISH_HOLD_ID_RE.findall(html))
-    assert found_ids == _EXPECTED_PUBLISH_HOLD_IDS
-    close_db()
-
-
-# ---------------------------------------------------------------------------
-# O45 -- the dropped fact lives in the arm dialog; the banner-duplication
-# guard is untouched by this item's edits.
-# ---------------------------------------------------------------------------
-
-_ARM_STRING = (
-    "Hold nightly verification runs? New runs will not start until "
-    "released. A run already in progress continues and may publish."
-)
-_RELEASE_STRING = "Release the nightly verification run hold?"
-
-
-def test_o45_arm_dialog_carries_the_in_progress_fact() -> None:
-    app_js = (ROOT / "wxverify" / "web" / "static" / "app.js").read_text(
-        encoding="utf-8"
-    )
-    assert _ARM_STRING in app_js
-    assert _RELEASE_STRING in app_js
-    assert "A run already in progress continues and may publish." in app_js
-
-
-def test_o45_banner_duplication_guard_still_passes_unedited() -> None:
-    """Imports and re-runs `test_app_js_publish_hold.py`'s own guard
-    function directly, proving this item did not need to touch it -- if the
-    arm string had drifted into the banner's 6-word window, the string
-    would be wrong, not this test."""
-    import tests.test_app_js_publish_hold as guard_module
-
-    guard_module.test_banner_safety_copy_is_not_duplicated_into_javascript()
 
 
 # ---------------------------------------------------------------------------

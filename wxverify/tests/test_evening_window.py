@@ -75,7 +75,7 @@ def _run(
 ) -> None:
     monkeypatch.setenv("WXV_WEATHERCOM_KEY", _API_KEY)
     real_client = httpx.AsyncClient
-    writer = FencedWriter(db, db.generation)
+    writer = FencedWriter(db)
     with patch(
         "wxverify.worker.wind_days.httpx.AsyncClient",
         lambda *a, **kw: real_client(transport=httpx.MockTransport(handler)),  # type: ignore[arg-type]
@@ -541,7 +541,9 @@ def test_ew8_evening_slots_are_not_spaced_by_the_success_cooldown(
 ) -> None:
     """EW8: the lane completed at 23:56; a row due at 23:57: the
     scheduler's 5-minute success-spacing (``WIND_DAYS_SPACING``) must not
-    block the enqueue (M40)."""
+    block the enqueue (M40). The close is permanent (storage-release plan
+    3.2); ``start_site_days`` gives the site its ``_DAY`` record, so
+    ``_lane_today`` finds today open."""
     import wxverify.db.queue as queue_module
     import wxverify.worker.scheduler as scheduler_module
 
@@ -559,6 +561,8 @@ def test_ew8_evening_slots_are_not_spaced_by_the_success_cooldown(
     station_id = _make_station(conn, site_id, "ISTATION01")
     _, end, _ = local_day_slots(_DAY, tz)
     late_slot = end - timedelta(minutes=4)
+    now = late_slot + timedelta(minutes=1)
+    start_site_days(conn, site_id, _DAY, now_utc=now)
     _insert_day(conn, station_id, _DAY, next_attempt_at=isoformat_utc(late_slot))
     conn.execute(
         "INSERT INTO jobs (type, site_id, job_key, status, updated_at)"
@@ -567,7 +571,6 @@ def test_ew8_evening_slots_are_not_spaced_by_the_success_cooldown(
     )
     conn.commit()
 
-    now = late_slot + timedelta(minutes=1)
     monkeypatch.setattr(scheduler_module, "utc_now", lambda: now)
     monkeypatch.setattr(queue_module, "utc_now", lambda: now)
 

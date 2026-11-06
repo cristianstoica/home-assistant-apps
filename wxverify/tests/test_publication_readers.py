@@ -33,10 +33,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import D, asof_conn, asof_insert_pair, day_close_site, note_day_clock
+from tests.helpers import D, asof_conn, day_close_site, note_day_clock
 from wxverify.core.timeutil import isoformat_utc, parse_utc
-from wxverify.scoring.cache import upsert_score_cache
-from wxverify.scoring.metrics import MetricResult
 from wxverify.settings.keys import set_setting
 
 # ---------------------------------------------------------------------------
@@ -216,7 +214,7 @@ def _seed_day_score(
     )
 
 
-def _seed_close_pair(
+def _seed_forecast_history(
     conn,
     *,
     site_id: int,
@@ -228,39 +226,40 @@ def _seed_close_pair(
     lead_hours: int,
     forecast: float,
     observed: float,
-    download_date=None,
-    fetched_at: str | None = None,
     issued_at: str | None = None,
 ) -> None:
-    error = forecast - observed
+    """A ``forecast_history`` row plus the ``observations`` row it joins to
+    (storage-release plan 3.1, 3.6). ``observations`` is keyed on
+    ``(site_id, variable, valid_at)`` alone -- one shared truth value, never
+    per feed -- so a second call at the same ``valid_at`` (a second feed's
+    row) must pass the same ``observed`` and is a silent no-op on that
+    insert (``INSERT OR IGNORE``)."""
     conn.execute(
         """
-        INSERT INTO close_pairs
-            (site_id, local_date, feed_id, variable, day_ahead, valid_at,
-             lead_hours, forecast, observed, error, abs_error, sq_error,
-             cat_hit, cat_false, cat_miss, cat_correct_neg,
-             rain_threshold_mm, ref_sq_error, download_id, download_date,
-             issued_at, fetched_at, contributors)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL,
-                NULL, NULL, NULL, ?, ?, ?, NULL)
+        INSERT INTO forecast_history
+            (site_id, feed_id, variable, day_ahead, valid_at, local_date,
+             value, lead_hours, issued_at, contributors)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
         """,
         (
             site_id,
-            local_date.isoformat(),
             feed_id,
             variable,
             day_ahead,
             valid_at,
-            lead_hours,
+            local_date.isoformat(),
             forecast,
-            observed,
-            error,
-            abs(error),
-            error**2,
-            (download_date or local_date).isoformat(),
+            lead_hours,
             issued_at or valid_at,
-            fetched_at or valid_at,
         ),
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO observations
+            (site_id, variable, valid_at, value, n_stations, computed_at)
+        VALUES (?, ?, ?, ?, 3, ?)
+        """,
+        (site_id, variable, valid_at, observed, valid_at),
     )
 
 
@@ -381,9 +380,7 @@ def _rolling_fixture(conn):
     open and D-2 missed, which no publication for D-1 can follow; a
     publication for D-1 with ``first_record_date`` D-3 (the site's first
     record), ``window_days=5``/``min_n=3`` while the saved settings are
-    7/10; its rows put X above Y; ``score_cache`` seeded with the opposite
-    order (``w:7``, the saved window, so a reader that wrongly fell back
-    to it would show Y on top instead of X).
+    7/10; its rows put X above Y.
     """
     site_id = day_close_site(conn, close_on=True, with_records=False)
     _close_through_with_missed(conn, site_id, first_date=_D3, last_closed_date=_D1)
@@ -421,26 +418,6 @@ def _rolling_fixture(conn):
         n=5,
         skill_score=0.3,
     )
-    upsert_score_cache(
-        conn,
-        site_id=site_id,
-        feed_id=x,
-        variable="temperature",
-        day_ahead=1,
-        window_key="w:7",
-        result=MetricResult(n=3, skill_score=0.1, confident=True),
-        computed_at=isoformat_utc(),
-    )
-    upsert_score_cache(
-        conn,
-        site_id=site_id,
-        feed_id=y,
-        variable="temperature",
-        day_ahead=1,
-        window_key="w:7",
-        result=MetricResult(n=5, skill_score=0.9, confident=True),
-        computed_at=isoformat_utc(),
-    )
     conn.commit()
     return site_id, x, y, pub_id
 
@@ -452,10 +429,9 @@ def _rolling_fixture(conn):
 
 def test_rd1_leaderboard_rolling_reads_publication_min_n_not_saved() -> None:
     """RD1: with the close on, ``rolling`` reads the active publication's
-    rows (not ``score_cache``'s, seeded in the opposite order) and takes
-    ``confident`` from the PUBLICATION's ``min_n`` (3), not the saved
-    setting (10); status ``hit``; ``evidence_through`` the publication's
-    cutoff (9.2)."""
+    rows and takes ``confident`` from the PUBLICATION's ``min_n`` (3), not
+    the saved setting (10); status ``hit``; ``evidence_through`` the
+    publication's cutoff (9.2)."""
     from wxverify.scoring.leaderboard import leaderboard_with_status_in_transaction
 
     conn = asof_conn()
@@ -468,8 +444,7 @@ def test_rd1_leaderboard_rolling_reads_publication_min_n_not_saved() -> None:
     assert result.status == "hit"
     feed_ids = [row.feed_id for row in result.rows]
     assert feed_ids[0] == x, (
-        "the publication ranks X above Y (skill 0.8 vs 0.3); score_cache's"
-        f" rows (seeded in the opposite order) must have no effect -- got {feed_ids!r}"
+        f"the publication ranks X above Y (skill 0.8 vs 0.3) -- got {feed_ids!r}"
     )
     x_row = next(row for row in result.rows if row.feed_id == x)
     assert x_row.confident is True, (
@@ -495,9 +470,7 @@ def test_rd1_composite_rolling_reads_publication_not_score_cache() -> None:
     feed_ids = {row.get("feed_id") for row in result.rows}
     assert x in feed_ids and y in feed_ids, (
         "M79 -> at this assertion: correct = both X and Y present (read"
-        " from the publication's rows), mutant (the composite falls back to"
-        " score_cache under the close-on rolling branch) could diverge --"
-        f" got {feed_ids!r}"
+        f" from the publication's rows), mutant = {feed_ids!r}"
     )
 
 
@@ -558,31 +531,18 @@ def test_rd3_no_publication_is_empty(window: str) -> None:
     """RD3 (i): with the close on and no publication row at all, every
     window answers ``empty`` (9.2).
 
-    Live data a wrong fallback could surface is seeded first -- a
-    ``score_cache`` row at the DEFAULT ``rolling_window_days`` (30, so
-    ``rolling``'s own cache key is live, never just absent), a ``w:all``
-    row, and ``day_scores`` rows across D-2 to D (so an ``Nd`` view that
-    forgot the no-publication gate would still find rows to sum for
-    ``3d``). Without this seed the row would pass "empty" merely because
-    there was nothing at all to read -- a vacuous pass that could not
-    distinguish P4's no-publication rule from an ordinary empty database."""
+    Live data a wrong fallback could surface is seeded first --
+    ``day_scores`` rows across D-2 to D (so an ``Nd`` view that forgot the
+    no-publication gate would still find rows to sum for ``3d``). Without
+    this seed the row would pass "empty" merely because there was nothing
+    at all to read -- a vacuous pass that could not distinguish P4's
+    no-publication rule from an ordinary empty database."""
     from wxverify.scoring.leaderboard import leaderboard_with_status_in_transaction
 
     conn = asof_conn()
     site_id = day_close_site(conn, close_on=True, with_records=True)
     x = _seed_feed(conn, "X")
     _subscribe(conn, site_id, x)
-    for window_key in ("w:30", "w:all"):
-        upsert_score_cache(
-            conn,
-            site_id=site_id,
-            feed_id=x,
-            variable="temperature",
-            day_ahead=1,
-            window_key=window_key,
-            result=MetricResult(n=3, skill_score=0.5, confident=True),
-            computed_at=isoformat_utc(),
-        )
     for day in (D - timedelta(days=2), D - timedelta(days=1), D):
         _seed_day_score(conn, site_id=site_id, local_date=day, feed_id=x, n=5)
     conn.commit()
@@ -593,10 +553,9 @@ def test_rd3_no_publication_is_empty(window: str) -> None:
     assert result.status == "empty", (
         "M81 -> at this assertion: correct = 'empty' (no active publication:"
         " the no-input gate runs before any window-specific read, so the"
-        " seeded score_cache/day_scores rows must never surface, 9.2),"
-        " mutant M81 (the leaderboard with no publication falls back to"
-        " score_cache) = the seeded live row would be read instead --"
-        f" got {result.status!r}"
+        " seeded day_scores rows must never surface, 9.2), mutant M81 (the"
+        " leaderboard with no publication falls back to a live read) = the"
+        f" seeded live row would be read instead -- got {result.status!r}"
     )
     assert result.rows == []
 
@@ -733,10 +692,12 @@ def test_rd4_ii_nd_window_excludes_a_missed_dates_leftover_day_scores() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_rd5_winrate_reads_close_pairs_closed_and_forecast_pairs_starting() -> None:
-    """RD5: the win rate credits a win from a closed date's ``close_pairs``
-    row AND a win from a starting-history date's ``forecast_pairs`` row,
-    inside the same (rolling, 5-date) window (9.2)."""
+def test_rd5_winrate_reads_forecast_history_closed_and_starting() -> None:
+    """RD5: the win rate credits a win from a closed date's
+    ``forecast_history`` row AND a win from a starting-history date's
+    ``forecast_history`` row, inside the same (rolling, 5-date) window
+    (9.2; storage-release plan A2/3.6 -- both rows now live in the one
+    table, told apart only by the date's ``site_days`` state)."""
     from wxverify.scoring.winrate import winrate
 
     conn = asof_conn()
@@ -744,7 +705,7 @@ def test_rd5_winrate_reads_close_pairs_closed_and_forecast_pairs_starting() -> N
 
     # A closed date (D-1, inside the 5-date window) where X wins the hour.
     valid_closed = f"{_D1.isoformat()}T00:00:00Z"
-    _seed_close_pair(
+    _seed_forecast_history(
         conn,
         site_id=site_id,
         local_date=_D1,
@@ -756,7 +717,7 @@ def test_rd5_winrate_reads_close_pairs_closed_and_forecast_pairs_starting() -> N
         forecast=10.0,
         observed=10.0,
     )
-    _seed_close_pair(
+    _seed_forecast_history(
         conn,
         site_id=site_id,
         local_date=_D1,
@@ -772,29 +733,31 @@ def test_rd5_winrate_reads_close_pairs_closed_and_forecast_pairs_starting() -> N
     # A starting-history date (D-5, before the site's first record D-3, but
     # still inside the 5-date rolling window) where Y wins the hour.
     valid_starting = f"{_D5.isoformat()}T00:00:00Z"
-    asof_insert_pair(
+    _seed_forecast_history(
         conn,
         site_id=site_id,
+        local_date=_D5,
         feed_id=x,
+        variable="temperature",
+        day_ahead=1,
         valid_at=valid_starting,
-        issued_at=f"{(_D5 - timedelta(hours=6)).isoformat()}T00:00:00Z",
+        lead_hours=6,
         forecast=10.0,
         observed=5.0,
-        first_known_at=valid_starting,
-        day_ahead=1,
-        lead_hours=6,
+        issued_at=f"{(_D5 - timedelta(hours=6)).isoformat()}T00:00:00Z",
     )
-    asof_insert_pair(
+    _seed_forecast_history(
         conn,
         site_id=site_id,
+        local_date=_D5,
         feed_id=y,
+        variable="temperature",
+        day_ahead=1,
         valid_at=valid_starting,
-        issued_at=f"{(_D5 - timedelta(hours=6)).isoformat()}T00:00:00Z",
+        lead_hours=6,
         forecast=5.0,
         observed=5.0,
-        first_known_at=valid_starting,
-        day_ahead=1,
-        lead_hours=6,
+        issued_at=f"{(_D5 - timedelta(hours=6)).isoformat()}T00:00:00Z",
     )
     conn.commit()
 
@@ -805,24 +768,24 @@ def test_rd5_winrate_reads_close_pairs_closed_and_forecast_pairs_starting() -> N
 
     assert wins_by_feed.get(x, 0.0) >= 1.0, (
         "the win rate must credit X's win from the CLOSED date's"
-        f" close_pairs row (9.2) -- got {wins_by_feed!r}"
+        f" forecast_history row (9.2) -- got {wins_by_feed!r}"
     )
     assert wins_by_feed.get(y, 0.0) >= 1.0, (
         "M83 -> at this assertion: correct = Y credited a win from the"
-        " STARTING-HISTORY date's forecast_pairs row, mutant M83 (the win"
-        " rate's starting part dropped) = Y gets no win from that date --"
-        f" got {wins_by_feed!r}"
+        " STARTING-HISTORY date's forecast_history row, mutant M83 (the"
+        " win rate's starting part dropped) = Y gets no win from that date"
+        f" -- got {wins_by_feed!r}"
     )
 
 
-def test_rd5_ii_winrate_excludes_a_missed_dates_leftover_close_pairs() -> None:
+def test_rd5_ii_winrate_excludes_a_missed_dates_leftover_forecast_history() -> None:
     """RD5 (ii): as (i) -- X wins a closed date's hour, Y wins a
     starting-history date's hour, inside the same (rolling, 5-date)
     window -- plus a ``missed`` date inside the window (D-2, via P1's
     ``begin_close`` then ``fail_close``, twice) whose leftover
-    ``close_pairs`` row gives Y a perfect, winning hour. Read, it would
-    raise Y's win count to 2; excluded (7.2, 9.2), Y's count must stay 1,
-    the same as (i).
+    ``forecast_history`` row gives Y a perfect, winning hour. Read, it
+    would raise Y's win count to 2; excluded (7.2, 9.2), Y's count must
+    stay 1, the same as (i).
 
     A dedicated site/close-chain, not ``_rolling_fixture``, for the same
     reason as RD4 (ii): a cross-test ``missed`` state from a shared
@@ -852,7 +815,7 @@ def test_rd5_ii_winrate_excludes_a_missed_dates_leftover_close_pairs() -> None:
 
     # A closed date (D-1, inside the 5-date window) where X wins the hour.
     valid_closed = f"{_D1.isoformat()}T00:00:00Z"
-    _seed_close_pair(
+    _seed_forecast_history(
         conn,
         site_id=site_id,
         local_date=_D1,
@@ -864,7 +827,7 @@ def test_rd5_ii_winrate_excludes_a_missed_dates_leftover_close_pairs() -> None:
         forecast=10.0,
         observed=10.0,
     )
-    _seed_close_pair(
+    _seed_forecast_history(
         conn,
         site_id=site_id,
         local_date=_D1,
@@ -880,37 +843,39 @@ def test_rd5_ii_winrate_excludes_a_missed_dates_leftover_close_pairs() -> None:
     # A starting-history date (D-5, before the site's first record D-3, but
     # still inside the 5-date rolling window) where Y wins the hour.
     valid_starting = f"{_D5.isoformat()}T00:00:00Z"
-    asof_insert_pair(
+    _seed_forecast_history(
         conn,
         site_id=site_id,
+        local_date=_D5,
         feed_id=x,
+        variable="temperature",
+        day_ahead=1,
         valid_at=valid_starting,
-        issued_at=f"{(_D5 - timedelta(hours=6)).isoformat()}T00:00:00Z",
+        lead_hours=6,
         forecast=10.0,
         observed=5.0,
-        first_known_at=valid_starting,
-        day_ahead=1,
-        lead_hours=6,
+        issued_at=f"{(_D5 - timedelta(hours=6)).isoformat()}T00:00:00Z",
     )
-    asof_insert_pair(
+    _seed_forecast_history(
         conn,
         site_id=site_id,
+        local_date=_D5,
         feed_id=y,
+        variable="temperature",
+        day_ahead=1,
         valid_at=valid_starting,
-        issued_at=f"{(_D5 - timedelta(hours=6)).isoformat()}T00:00:00Z",
+        lead_hours=6,
         forecast=5.0,
         observed=5.0,
-        first_known_at=valid_starting,
-        day_ahead=1,
-        lead_hours=6,
+        issued_at=f"{(_D5 - timedelta(hours=6)).isoformat()}T00:00:00Z",
     )
 
-    # The missed D-2's leftover close_pairs: Y perfect (would win the hour
-    # if read), X well off. Left in place, as 7.2 describes a missed
+    # The missed D-2's leftover forecast_history: Y perfect (would win the
+    # hour if read), X well off. Left in place, as 7.2 describes a missed
     # date's rows ("left in place") -- the record's own `closed` state is
     # the only thing that must exclude them.
     valid_missed = f"{_D2.isoformat()}T00:00:00Z"
-    _seed_close_pair(
+    _seed_forecast_history(
         conn,
         site_id=site_id,
         local_date=_D2,
@@ -922,7 +887,7 @@ def test_rd5_ii_winrate_excludes_a_missed_dates_leftover_close_pairs() -> None:
         forecast=20.0,
         observed=10.0,
     )
-    _seed_close_pair(
+    _seed_forecast_history(
         conn,
         site_id=site_id,
         local_date=_D2,
@@ -947,11 +912,11 @@ def test_rd5_ii_winrate_excludes_a_missed_dates_leftover_close_pairs() -> None:
     )
     assert wins_by_feed.get(y, 0.0) == 1.0, (
         "M153 -> at this assertion: correct = 1.0 (Y's win from the"
-        " STARTING-HISTORY D-5 hour only; D-2's leftover close_pairs row"
-        " is excluded because its record is missed, 7.2/9.2), mutant M153"
-        " (the win rate reads close_pairs without the record's closed"
-        " state) = 2.0 (D-2's leftover perfect Y row wrongly also counted)"
-        f" -- got {wins_by_feed!r}"
+        " STARTING-HISTORY D-5 hour only; D-2's leftover forecast_history"
+        " row is excluded because its record is missed, 7.2/9.2), mutant"
+        " M153 (the win rate reads forecast_history without the record's"
+        " closed state) = 2.0 (D-2's leftover perfect Y row wrongly also"
+        f" counted) -- got {wins_by_feed!r}"
     )
 
 
@@ -1219,16 +1184,13 @@ def test_rd7_curve_route_itself_reads_one_publication_version_throughout(
 
 def test_rd8_served_forecast_follows_the_publication_order_at_blend_depth_1() -> None:
     """RD8: read at D 08:00Z, with ``forecast_blend_depth=1``, the served
-    temperature at D+1 is X's -- the publication's order, not
-    ``score_cache``'s. X and Y each have a sample at every hour 00-23Z of
-    D+1 (so both cover the whole local day and ``meta.feeds``, the
-    extrema set, names the serving feed) and a day-ahead-1
-    ``forecast_pairs`` row an hour before the real clock, in the site's
-    published generation -- so that M86's read finds a COMPLETE w:7
-    ``score_cache`` (``_expected_active_feed_ids`` requires a recent
-    ``forecast_pairs`` row per feed, read at the real clock because
-    ``resolve_window``'s cutoff is never threaded ``now=`` on this path,
-    plan row RD8, :908)."""
+    temperature at D+1 is X's -- the publication's order, never a live
+    recompute. X and Y each have a sample at every hour 00-23Z of D+1 (so
+    both cover the whole local day and ``meta.feeds``, the extrema set,
+    names the serving feed); ``_rolling_fixture``'s published ranking
+    alone decides X over Y (skill 0.8 vs 0.3, both confident under the
+    publication's own ``min_n=3``) -- no pair table or live recompute is
+    read for serving any more (storage release, table 1.B)."""
     from wxverify.forecast.service import build_forecast
 
     conn = asof_conn()
@@ -1250,24 +1212,6 @@ def test_rd8_served_forecast_follows_the_publication_order_at_blend_depth_1() ->
                 (site_id, feed_id, issued_at, valid_at, value, issued_at),
             )
 
-    # A day-ahead-1 forecast_pairs row each, an hour before the real clock
-    # (resolve_window's cutoff for this path reads the real clock, never
-    # build_forecast's `now=`), so _expected_active_feed_ids finds both
-    # feeds and the w:7 score_cache snapshot is complete, not a miss.
-    real_now = datetime.now(UTC)
-    pair_valid_at = isoformat_utc(real_now - timedelta(hours=1))
-    for feed_id, value in ((x, 20.0), (y, 10.0)):
-        asof_insert_pair(
-            conn,
-            site_id=site_id,
-            feed_id=feed_id,
-            valid_at=pair_valid_at,
-            issued_at=pair_valid_at,
-            forecast=value,
-            observed=value,
-            first_known_at=pair_valid_at,
-            day_ahead=1,
-        )
     conn.commit()
 
     view = build_forecast(
@@ -1481,17 +1425,20 @@ def test_rd12_active_publication_resolves_by_published_at_not_by_id() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_rd14_closed_day_pairs_returns_only_a_closed_dates_rows() -> None:
-    """RD14: ``closed_day_pairs`` returns D-1's (closed) ``close_pairs``
-    rows, and ``[]`` for D -- open, but holding a leftover ``close_pairs``
+def test_rd14_chart_pairs_returns_only_a_closed_dates_rows() -> None:
+    """RD14: the history chart reads D-1's (closed) ``forecast_history``
+    row, and omits D's -- open, but holding a leftover ``forecast_history``
     row, as a failed close attempt's stage 5 leaves it (plan row RD14,
-    :913; 16.2)."""
-    from wxverify.scoring.publication import closed_day_pairs
+    :913; 16.2). ``closed_day_pairs`` itself is gone (storage-release plan
+    A3): its one caller, the history chart, now reads this through
+    ``chart_pairs`` (A4/3.6), so this is where the fact it protected is
+    checked."""
+    from wxverify.scoring.history import chart_pairs
 
     conn = asof_conn()
     site_id, x, _y, _pub_id = _rolling_fixture(conn)
     valid_at = f"{_D1.isoformat()}T00:00:00Z"
-    _seed_close_pair(
+    _seed_forecast_history(
         conn,
         site_id=site_id,
         local_date=_D1,
@@ -1504,10 +1451,10 @@ def test_rd14_closed_day_pairs_returns_only_a_closed_dates_rows() -> None:
         observed=9.0,
     )
     # D is open, but a failed close attempt's stage 5 can leave a
-    # close_pairs row for it in place anyway -- closed_day_pairs must
-    # still answer [] for an open date, leftover row or not.
+    # forecast_history row for it in place anyway -- chart_pairs must
+    # still omit an open date's rows, leftover row or not.
     valid_at_open = f"{D.isoformat()}T00:00:00Z"
-    _seed_close_pair(
+    _seed_forecast_history(
         conn,
         site_id=site_id,
         local_date=D,
@@ -1521,15 +1468,31 @@ def test_rd14_closed_day_pairs_returns_only_a_closed_dates_rows() -> None:
     )
     conn.commit()
 
-    closed_rows = closed_day_pairs(conn, site_id=site_id, local_date=_D1)
-    assert len(closed_rows) == 1 and closed_rows[0].feed_id == x
+    closed_rows = chart_pairs(
+        conn,
+        site_id=site_id,
+        feed_id=x,
+        variable="temperature",
+        day_ahead=1,
+        low=parse_utc(valid_at),
+        high=parse_utc(valid_at),
+    )
+    assert len(closed_rows) == 1 and closed_rows[0][0] == valid_at
 
-    open_rows = closed_day_pairs(conn, site_id=site_id, local_date=D)
+    open_rows = chart_pairs(
+        conn,
+        site_id=site_id,
+        feed_id=x,
+        variable="temperature",
+        day_ahead=1,
+        low=parse_utc(valid_at_open),
+        high=parse_utc(valid_at_open),
+    )
     assert open_rows == [], (
         "M93 -> at this assertion: correct = [] for the open date D (its"
-        " record is not closed, 16.2), mutant M93 (closed_day_pairs"
-        " returns an open day's rows too) = a 1-row list holding the"
-        f" leftover close_pairs row just seeded for D -- got {open_rows!r}"
+        " record is not closed, 16.2), mutant M93 (chart_pairs returns an"
+        " open day's rows too) = a 1-row list holding the leftover"
+        f" forecast_history row just seeded for D -- got {open_rows!r}"
     )
 
 

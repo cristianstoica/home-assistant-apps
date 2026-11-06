@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from tests.helpers import NOW, D, asof_conn, day_close_site
+from tests.helpers import NOW, D, asof_conn, close_off, day_close_site
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.monitor import build_verdict
 
@@ -28,7 +28,6 @@ _TODAY_PIPELINE_IDS = (
     "obs_stale",
     "fetch_obs_live",
     "fetch_feed_live",
-    "pair_score_live",
     "problem_jobs",
     "forecast_record_gap",
     "record_gap_scan_degraded",
@@ -40,7 +39,6 @@ _TODAY_PIPELINE_IDS = (
 _RETIRED_IDS = (
     "obs_stale",
     "fetch_obs_live",
-    "pair_score_live",
     "obs_station_history_failing",
     "wind_history",
 )
@@ -106,6 +104,7 @@ def _trip_retired_checks(conn, site_id: int) -> None:
 def test_rt1_switch_off_pipeline_ids_and_skipped_list() -> None:
     """RT1: close off; pipeline_enabled true, then false (M1, M2)."""
     conn = asof_conn()
+    close_off(conn)
     day_close_site(conn, close_on=False)
 
     on = build_verdict(

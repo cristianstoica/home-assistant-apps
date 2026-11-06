@@ -153,12 +153,9 @@ async def fetch_feed_once(
 ) -> FetchFeedOutcome:
     """Fetch one feed's forecast and persist it.
 
-    ``writer`` fences every write here to the generation it was obtained at
-    (see ``worker.processor.run_claimed_job``): a database replace landing
-    mid-fetch is then rejected instead of silently persisting against the
-    replacement database. ``writer=None`` (the CLI entry point's case) runs
-    plain, unfenced writes -- a one-shot operator command has no claimed
-    generation to fence against.
+    Every write here goes through ``writer`` (the claimed job's, see
+    ``worker.processor.run_claimed_job``). ``writer=None`` (the CLI entry
+    point's case) runs plain ``db.write`` calls.
 
     ``slot`` is the try's place in the feed's schedule. A reply that is
     persisted writes its ``stored`` or ``no_usable`` download row with it,
@@ -233,7 +230,6 @@ async def fetch_feed_once(
                 lambda conn, err=error, resp=response: mark_feed_error_and_backoff(
                     conn, target, err, resp
                 ),
-                reservation,
             )
             logger.debug(
                 "fetch http error site=%s feed=%s source=%s backoff=%s: %s",
@@ -255,7 +251,6 @@ async def fetch_feed_once(
                 lambda conn, err=error, res=refund: _mark_feed_error_and_refund(
                     conn, target, err, res
                 ),
-                reservation,
             )
             logger.debug(
                 "fetch transport error site=%s feed=%s source=%s refund=%s: %s",
@@ -272,7 +267,6 @@ async def fetch_feed_once(
         lambda conn, fetch_result=result: _persist_fetch_success(
             conn, target, fetch_result, slot=slot
         ),
-        reservation,
     )
     if persist_outcome.usable_sample_count == 0:
         logger.warning(
@@ -360,9 +354,9 @@ def fetch_feed_retry_floor_seconds(conn: sqlite3.Connection, job: Job) -> int | 
     Note job.retry_count == 0 means no RECORDED failure yet, not no prior
     attempt: reclaim_all_stale re-pends a running job without touching
     retry_count, so a job abandoned mid-attempt (process kill, a fatal
-    permission path, or a StaleGenerationError abandon) can reach this
-    function again with retry_count still 0 and skip the floor a second
-    time -- bounded and pre-existing.
+    permission path, or a stop) can reach this function again with
+    retry_count still 0 and skip the floor a second time -- bounded and
+    pre-existing.
     Any lookup or parse miss, or an interval too small or too large to be a
     real cadence, fails closed to a fixed fallback ceiling regardless of
     retry_count, rather than let a missing/foreign value fall through to the

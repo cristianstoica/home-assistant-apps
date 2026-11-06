@@ -19,12 +19,10 @@ from wxverify.api.ingress import IngressPathMiddleware
 from wxverify.collection.budget import Reservation, refund_budget, reserve_budget
 from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.connection import (
-    StaleGenerationError,
     close_db,
     get_db,
     init_db,
 )
-from wxverify.db.migrations import TARGET_USER_VERSION
 from wxverify.db.queue import (
     FailDisposition,
     Job,
@@ -35,7 +33,7 @@ from wxverify.db.queue import (
 from wxverify.feeds.seam import CostEstimate, FetchResult
 from wxverify.obs.pws_adapter import decode_observations_payload
 from wxverify.provider_ops import enqueue_fetch_for_feed
-from wxverify.worker.control import JobCancelled, JobDeferred
+from wxverify.worker.control import JobDeferred
 from wxverify.worker.domain_backoff import record_http_backoff
 from wxverify.worker.feed_fetch import (
     BackoffActive,
@@ -97,15 +95,6 @@ def _subscribe(conn: sqlite3.Connection, site_id: int, feed_id: int) -> None:
     )
 
 
-def _index_exists(conn: sqlite3.Connection, name: str) -> bool:
-    return (
-        conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (name,)
-        ).fetchone()
-        is not None
-    )
-
-
 def _make_job(
     job_type: str = "fetch_feed",
     site_id: int = 1,
@@ -128,40 +117,10 @@ def _make_job(
 class _FakeDb:
     """Minimal shim for worker loop logging tests (passes None as conn)."""
 
-    generation = 0
-
     async def write(self, fn, *, epoch_exempt: bool = False):  # type: ignore[no-untyped-def]
         return fn(None)
 
     async def read(self, fn):  # type: ignore[no-untyped-def]
-        return fn(None)
-
-    async def write_fenced(  # type: ignore[no-untyped-def]
-        self, fn, *, generation, epoch_exempt=False
-    ):
-        return fn(None)
-
-
-class _GenerationFenceDb:
-    """Fake Database whose write_fenced enforces the same generation check
-    as the real one, with a `.generation` a test can bump mid-loop to
-    simulate a replace_from landing between a job's claim and its outcome
-    write -- without any real concurrency or a second sqlite file."""
-
-    def __init__(self) -> None:
-        self.generation = 0
-
-    async def write(self, fn, *, epoch_exempt: bool = False):  # type: ignore[no-untyped-def]
-        return fn(None)
-
-    async def read(self, fn):  # type: ignore[no-untyped-def]
-        return fn(None)
-
-    async def write_fenced(  # type: ignore[no-untyped-def]
-        self, fn, *, generation, epoch_exempt=False
-    ):
-        if generation != self.generation:
-            raise StaleGenerationError(generation, self.generation)
         return fn(None)
 
 
@@ -1447,80 +1406,6 @@ def test_worker_deferred_job_cycle_line_info_deferred_line_debug(
     )
 
 
-_STALE_GENERATION_OUTCOMES = ("success", "deferred", "cancelled", "failure")
-
-
-@pytest.mark.parametrize("outcome_kind", _STALE_GENERATION_OUTCOMES)
-def test_worker_loop_survives_a_stale_generation_on_every_outcome(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    outcome_kind: str,
-) -> None:
-    """A database replace landing between a job's claim and its outcome
-    write must abandon only that one job, never the worker loop -- for
-    every one of the four ways dispatch can finish (plain return,
-    JobDeferred, JobCancelled, or an ordinary failure).
-
-    'failure' is the case that actually kills the loop if the fence's catch
-    is a sibling `except` arm instead of one wrapping the whole per-job
-    try/except: the write that trips the fence happens inside `except
-    Exception`'s own body, so only a handler around the entire statement --
-    never a sibling of it -- can ever see the exception it raises. 'success'
-    would misleadingly still pass under that same bug, since its triggering
-    write sits directly in the try body a sibling handler does reach.
-    """
-    job1 = _make_job(job_type="fetch_feed", site_id=42, job_id=1)
-    job2 = _make_job(job_type="fetch_feed", site_id=43, job_id=2)
-    pending_jobs = [job1, job2]
-
-    def _claim(conn: Any) -> Job | None:
-        if pending_jobs:
-            return pending_jobs.pop(0)
-        raise _StopLoop()
-
-    dispatched_ids: list[int] = []
-
-    async def _fake_dispatch(db_arg: Any, writer_arg: Any, job_arg: Job) -> None:
-        dispatched_ids.append(job_arg.id)
-        if job_arg.id == 1:
-            db_arg.generation += 1
-            if outcome_kind == "success":
-                return None
-            if outcome_kind == "deferred":
-                raise JobDeferred("2099-01-01T00:00:00.000Z")
-            if outcome_kind == "cancelled":
-                raise JobCancelled()
-            raise RuntimeError("synthetic failure for the generation-fence oracle")
-        return None
-
-    completed: list[int] = []
-    _patch_worker_infra(monkeypatch)
-    monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim)
-    monkeypatch.setattr("wxverify.worker.processor.dispatch", _fake_dispatch)
-    monkeypatch.setattr(
-        "wxverify.worker.processor.complete",
-        lambda c, jid, result=None: completed.append(jid),
-    )
-
-    with (
-        caplog.at_level(logging.INFO, logger="wxverify.worker.processor"),
-        pytest.raises(_StopLoop),
-    ):
-        asyncio.run(run_worker(_GenerationFenceDb()))  # type: ignore[arg-type]
-
-    # The loop reached job 2 and completed it normally -- proof the stale
-    # write on job 1 abandoned only job 1, not the loop itself.
-    assert dispatched_ids == [1, 2]
-    assert completed == [2], (
-        "job 1's outcome write must never run once its generation is stale"
-    )
-
-    abandoned = [r for r in caplog.records if "job abandoned" in r.getMessage()]
-    assert len(abandoned) == 1
-    assert abandoned[0].levelno == logging.INFO
-    assert "id=1" in abandoned[0].getMessage()
-
-
 def test_domain_backoff_429_logs_warning_with_domain_and_retry(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1705,32 +1590,7 @@ def test_worker_retry_read_timeout_logs_class_name_only(
     assert recorded_errors == ["ReadTimeout"]
 
 
-# ---------------------------------------------------------------------------
-# idx_pairs_cell index + phase-split write discipline
-# ---------------------------------------------------------------------------
-
-
-def test_idx_pairs_cell_created_on_fresh_db(tmp_path: Path) -> None:
-    conn = _init_tmp_db(tmp_path)
-    assert _index_exists(conn, "idx_pairs_cell")
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == TARGET_USER_VERSION
-
-
-def test_idx_pairs_cell_created_on_pre_existing_v2_db(tmp_path: Path) -> None:
-    """idx_pairs_cell is added to a v2 DB that lacks it; the migration bumps to 3."""
-    # Build a full-migration DB, then drop the index to simulate the old 0.1.0 schema.
-    conn = _init_tmp_db(tmp_path)
-    assert _index_exists(conn, "idx_pairs_cell")
-    conn.execute("DROP INDEX idx_pairs_cell")
-    assert not _index_exists(conn, "idx_pairs_cell")
-
-    # Re-initialize — simulates upgrade install booting with 0.1.1.
-    close_db()
-    db2 = init_db(str(tmp_path / "wxverify.db"))
-    conn2 = db2._conn  # noqa: SLF001
-
-    assert _index_exists(conn2, "idx_pairs_cell"), "idx_pairs_cell must be re-created"
-    version = conn2.execute("PRAGMA user_version").fetchone()[0]
-    assert version == TARGET_USER_VERSION, (
-        "user_version must reach TARGET_USER_VERSION after the migration"
-    )
+# idx_pairs_cell index + phase-split write discipline: retired.
+# idx_pairs_cell was forecast_pairs's own index, added by a v2 migration;
+# both the table and that migration are deleted (storage release 3.1,
+# 4.1), so there is no index left to create, drop or re-create here.

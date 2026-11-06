@@ -41,6 +41,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+from tests.helpers import close_off
 from wxverify import config
 from wxverify.core.timeutil import isoformat_utc, local_day_slots
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
@@ -197,6 +198,7 @@ def test_persist_day_window_and_record_count_scope() -> None:
     exact [start, end). A reading in yesterday's bounds is stored but not
     counted; one before yesterday's start is dropped from both."""
     conn = _make_db()
+    close_off(conn)
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
     local_date = date(2020, 1, 15)
@@ -287,6 +289,7 @@ def test_ensure_wind_days_deletes_unparseable_local_date(
 
 def test_persist_day_today_204_stays_partial_with_refresh_schedule() -> None:
     conn = _make_db()
+    close_off(conn)
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
     today = date(2026, 3, 10)
@@ -373,7 +376,7 @@ def _t97_run_wind_days(
     monkeypatch.setenv("WXV_WEATHERCOM_KEY", _T97_API_KEY)
     real_client = httpx.AsyncClient
     db = get_db()
-    writer = FencedWriter(db, db.generation)
+    writer = FencedWriter(db)
     with patch(
         "wxverify.worker.wind_days.httpx.AsyncClient",
         lambda *a, **kw: real_client(transport=httpx.MockTransport(handler)),  # type: ignore[arg-type]
@@ -453,6 +456,7 @@ def test_dispatch_sends_a_fetch_obs_job_with_another_key_to_the_raise(
 
 def test_enqueue_due_wind_days_enqueues_for_a_site_with_an_enabled_station() -> None:
     conn = _make_db()
+    close_off(conn)
     site_id = _make_site(conn)
     _make_station(conn, site_id, "WSTATION01")
     # nothing due + today's row already present would make wind_lane_due
@@ -542,6 +546,7 @@ def test_enqueue_due_wind_days_respects_the_success_cooldown_spacing(
     minutes after -- both inside the SAME frozen ``now``, isolating the
     cooldown boundary itself rather than any other due condition."""
     conn = _make_db()
+    close_off(conn)
     site_id = _make_site(conn)
     _make_station(conn, site_id, "WSTATION01")
     now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
@@ -603,6 +608,7 @@ def test_enqueue_due_wind_days_fails_open_on_an_unreadable_success_stamp(
     (fail OPEN) when the stamp doesn't parse, logging its own WARNING
     distinct from the wrapper's."""
     conn = _make_db()
+    close_off(conn)
     site_id = _make_site(conn)
     _make_station(conn, site_id, "WSTATION01")
     _insert_job(
@@ -661,6 +667,7 @@ def test_enqueue_due_wind_days_skips_a_site_with_an_unusable_time_zone(
     (dropping the ``ValueError`` arm) lets the second bad site's exception
     escape uncaught, which this test also catches."""
     conn = _make_db()
+    close_off(conn)
     good1_id = _make_site(conn, name="Testsite-good1", tz="UTC")
     _make_station(conn, good1_id, "KTEST001")
 
@@ -799,6 +806,7 @@ def test_final_call_429_leaves_row_due_until_the_backoff_ends(
     Once the backoff clears, the next run makes the call and finishes the
     evening window normally."""
     conn = _t97_init_tmp_db(tmp_path)
+    close_off(conn)
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
     D = date(2026, 3, 10)

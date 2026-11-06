@@ -30,10 +30,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest
-
-from wxverify.api.errors import ApiError
-from wxverify.api.routes.db_transfer import _validate_upload  # noqa: PLC2701
+from tests.helpers import close_off
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
 from wxverify.monitor import (
@@ -102,6 +99,7 @@ def test_t73_wind_days_completion_does_not_satisfy_live_obs_liveness(
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     run_migrations(conn)
+    close_off(conn)
     site_id = _seed_site(conn)
     _seed_enabled_station(conn, site_id, "WSTATION01")
     now = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
@@ -282,6 +280,7 @@ def test_t78_wind_history_skipped_when_pipeline_disabled(tmp_path: Path) -> None
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     run_migrations(conn)
+    close_off(conn)
     body = build_verdict(
         conn,
         pipeline_enabled=False,
@@ -295,49 +294,6 @@ def test_t78_wind_history_skipped_when_pipeline_disabled(tmp_path: Path) -> None
     assert cond["skipped"] is True
 
 
-# ---------------------------------------------------------------------------
-# T79 -- db-transfer upload validator's wind-column stamp guard
-# ---------------------------------------------------------------------------
-
-
-def _make_valid_upload_db(path: Path, *, obs_at: str) -> None:
-    """A minimal but import-admissible DB: migrated schema, one
-    ``station_wind_records`` row carrying ``obs_at``.
-    """
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    run_migrations(conn)
-    site_id = _seed_site(conn)
-    station_id = _seed_enabled_station(conn, site_id, "WSTATION01")
-    conn.execute(
-        "INSERT INTO station_wind_records (station_id, obs_at, source,"
-        " speed_kmh) VALUES (?, ?, 'five_minute', 7.2)",
-        (station_id, obs_at),
-    )
-    conn.commit()
-    conn.close()
-
-
-def test_t79_canonical_wind_obs_at_passes_validation(tmp_path: Path) -> None:
-    db_path = tmp_path / "upload.db"
-    _make_valid_upload_db(db_path, obs_at="2026-09-22T11:00:00Z")
-    _validate_upload(db_path)  # must not raise
-
-
-def test_t79_noncanonical_wind_obs_at_rejected(tmp_path: Path) -> None:
-    """``_CANONICAL_STAMP_COLUMNS`` already includes
-    (``station_wind_records``, ``obs_at``) (``db_transfer.py``) -- a stamp
-    missing the trailing ``Z`` must be refused at import, paired against the
-    identical fixture above that passes on a canonical stamp.
-
-    Kills: dropping this pair from ``_CANONICAL_STAMP_COLUMNS`` -- at this
-    oracle's assertion, correct = raises ``ApiError``, mutant = returns None
-    (no exception). The fixture forces the divergence because ``obs_at``
-    here is exactly non-canonical (no trailing "Z") and nothing else in the
-    row trips any of the validator's other guards.
-    """
-    db_path = tmp_path / "upload.db"
-    _make_valid_upload_db(db_path, obs_at="2026-09-22 11:00:00")
-    with pytest.raises(ApiError) as excinfo:
-        _validate_upload(db_path)
-    assert "station_wind_records.obs_at" in str(excinfo.value)
+# T79 (the db-transfer upload validator's wind-column stamp guard on
+# station_wind_records.obs_at) was removed with the database import
+# (storage-release plan 5.5).

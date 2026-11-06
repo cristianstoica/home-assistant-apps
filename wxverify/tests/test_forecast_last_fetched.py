@@ -35,6 +35,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import wxverify
+from tests.helpers import close_off
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.collection.forecast_fetcher import persist_fetch_result
@@ -281,6 +282,7 @@ def test_unknown_fallback_no_stamp_omits_data_updated_at() -> None:
 
 def test_unparseable_stamp_alone_reads_as_unknown_and_fingerprint_ignores_it() -> None:
     conn = _make_db()
+    close_off(conn)
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
     _seed_hourly(
@@ -312,6 +314,7 @@ def test_unparseable_stamp_alone_reads_as_unknown_and_fingerprint_ignores_it() -
 
 def test_unparseable_stamp_paired_with_valid_stamp_keeps_the_good_one() -> None:
     conn = _make_db()
+    close_off(conn)
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -354,6 +357,7 @@ def test_unparseable_stamp_paired_with_valid_stamp_keeps_the_good_one() -> None:
 
 def test_blob_stamp_is_skipped_by_forecast_fingerprints_non_string_guard() -> None:
     conn = _make_db()
+    close_off(conn)
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     _seed_hourly(
         conn,

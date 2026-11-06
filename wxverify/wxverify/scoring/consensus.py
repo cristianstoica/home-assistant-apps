@@ -7,12 +7,12 @@ import math
 import sqlite3
 import statistics
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Final
 
 from pydantic import BaseModel, ConfigDict
 
-from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
+from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.day_guard_log import warn_refused_instants
 from wxverify.db.site_days import (
     WriteKind,
@@ -301,20 +301,13 @@ def materialize_consensus(
 ) -> None:
     """Recompute the consensus observation for one (site, variable, hour).
 
-    LOAD-BEARING CONTRACT: this function ALWAYS runs
-    ``_invalidate_consensus_dependents`` before it writes or deletes the
-    ``observations`` row, and every write/delete of ``observations`` goes
-    through here. The incremental persistence materializer
-    (``wxverify.scoring.persistence``) relies on this to guarantee that any
-    existing forecast pair is derivable from current observations — that is
-    what makes its pair-count-equality skip sound. Bypassing the
-    invalidation step makes the incremental materializer silently retain
-    stale pairs.
+    Every write or delete of ``observations`` goes through here. The daily
+    close scores each closed day from ``observations`` itself
+    (storage-release plan, table 1.B row B6).
 
     The closed-day guard (``HOURLY``) checks the hour after the site
-    lookup: a refused hour returns before anything is invalidated, marked
-    or written, and logs the refusal WARNING. ``now_utc`` defaults to
-    ``utc_now()``.
+    lookup: a refused hour returns before anything is marked or written,
+    and logs the refusal WARNING. ``now_utc`` defaults to ``utc_now()``.
     """
     site = conn.execute(
         "SELECT elevation_m FROM sites WHERE id = ?", (site_id,)
@@ -368,9 +361,6 @@ def materialize_consensus(
         variable=variable,
         site_elevation_m=float(site["elevation_m"]),
         mad_floor=MAD_FLOORS.get(variable, 0.0),
-    )
-    _invalidate_consensus_dependents(
-        conn, site_id=site_id, variable=variable, valid_at=valid_at
     )
     # Plan §4: every consensus mutation (all of which funnel through here,
     # the sole `observations` writer) marks the affected local day's
@@ -430,57 +420,3 @@ def _consensus_station_filter(
         return "0", ()
     placeholders = ", ".join("?" for _ in station_ids)
     return f"so.station_id IN ({placeholders})", station_ids
-
-
-def _invalidate_consensus_dependents(
-    conn: sqlite3.Connection, *, site_id: int, variable: str, valid_at: str
-) -> None:
-    # Deletes every pair that depends on the observation at (site, variable,
-    # valid_at): pairs where the hour is the pair's valid_at (all feeds) and
-    # persistence pairs where the hour is the pair's SOURCE (issued_at), plus
-    # the affected score-cache rows. Part of the load-bearing contract
-    # documented on materialize_consensus.
-    conn.execute(
-        """
-        DELETE FROM forecast_pairs
-        WHERE site_id=? AND variable=? AND valid_at=?
-        """,
-        (site_id, variable, valid_at),
-    )
-    _delete_future_persistence_pairs(
-        conn, site_id=site_id, variable=variable, source_valid_at=valid_at
-    )
-    conn.execute(
-        "DELETE FROM score_cache WHERE site_id=? AND variable=?",
-        (site_id, variable),
-    )
-
-
-def _delete_future_persistence_pairs(
-    conn: sqlite3.Connection, *, site_id: int, variable: str, source_valid_at: str
-) -> None:
-    feed = conn.execute(
-        """
-        SELECT id, max_lead_hours
-        FROM feeds
-        WHERE source='virtual' AND model='_persistence'
-        """
-    ).fetchone()
-    if feed is None:
-        return
-    source_valid = parse_utc(source_valid_at)
-    feed_id = int(feed["id"])
-    for lead in range(1, int(feed["max_lead_hours"]) + 1):
-        target_valid_at = isoformat_utc(source_valid + timedelta(hours=lead))
-        conn.execute(
-            """
-            DELETE FROM forecast_pairs
-            WHERE site_id=?
-              AND feed_id=?
-              AND variable=?
-              AND issued_at=?
-              AND valid_at=?
-              AND lead_hours=?
-            """,
-            (site_id, feed_id, variable, source_valid_at, target_valid_at, lead),
-        )

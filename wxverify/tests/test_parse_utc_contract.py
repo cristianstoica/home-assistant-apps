@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.helpers import close_off
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.timeutil import parse_utc
@@ -111,6 +112,7 @@ def test_monitor_route_survives_boundary_offset_worker_started_at(
         db = get_db()
 
         def _seed(conn: sqlite3.Connection) -> None:
+            close_off(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO runtime_state(key, value)"
                 " VALUES ('worker_started_at', ?)",
@@ -129,7 +131,6 @@ def test_monitor_route_survives_boundary_offset_worker_started_at(
             "obs_stale",
             "fetch_obs_live",
             "fetch_feed_live",
-            "pair_score_live",
             "problem_jobs",
             "main_worker_liveness",
         ):

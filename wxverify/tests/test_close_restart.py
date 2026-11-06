@@ -1,5 +1,5 @@
 """Stops and restarts (plan 2026-10-21-daily-close-close-job.md section
-15.6): RS1 to RS7.
+15.6): RS1 to RS6.
 
 Written before ``close_chain.settle_interrupted_closes``,
 ``close_chain.run_close_retention`` and ``close_chain.fail_publication``
@@ -20,9 +20,9 @@ style ``tests/test_close_timeline.py``'s TL9 uses for
 ``run_close_retention``, applied directly rather than through a tick.
 
 Section 16.2 names the mutant each test ID kills; the mapping is given
-inline on the exact assertion it kills at. RS4 and RS7 have no listed
-mutant (16.2 lists none for either), so their assertions carry plain
-messages, never ``M??``.
+inline on the exact assertion it kills at. RS4 has no listed mutant
+(16.2 lists none for it), so its assertions carry plain messages,
+never ``M??``.
 
 Real SQLite only (``tests.helpers.standard_night``/``day_close_site``,
 real ``run_migrations`` via ``init_db`` on a ``tmp_path`` file). Station
@@ -38,10 +38,8 @@ import asyncio
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import pytest
-from starlette.testclient import TestClient
 
 from tests.helpers import (
     NOW,
@@ -56,15 +54,10 @@ from tests.helpers import (
     install_round_state_standin,
     note_day_clock,
     patch_close_clock,
-    patch_weathercom_transport,
     run_due_jobs,
     standard_night,
 )
-from wxverify import config
-from wxverify.api.app import create_app
-from wxverify.api.routes import db_transfer
 from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro
-from wxverify.db.connection import close_db, init_db
 from wxverify.db.queue import Job, enqueue_if_absent, reclaim_all_stale
 from wxverify.db.runtime_state import set_runtime_state
 from wxverify.db.site_days import (
@@ -886,234 +879,3 @@ def test_rs6_a_retention_failure_does_not_undo_a_closure_or_a_start(
 
     asyncio.run(_run_i())
     asyncio.run(_run_ii())
-
-
-# ---------------------------------------------------------------------------
-# RS7
-# ---------------------------------------------------------------------------
-
-
-async def _rs7_idle_worker(_db: object) -> None:
-    await asyncio.Event().wait()
-
-
-def _rs7_make_live_app(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
-    """The idle-worker app of ``tests/test_db_transfer.py``'s own
-    ``_make_app`` -- RS7-only, so it is not added to ``tests/helpers.py``.
-    """
-    monkeypatch.setattr("wxverify.api.app.run_worker", _rs7_idle_worker)
-    return create_app(root_path="")
-
-
-def _rs7_init_live_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The import TARGET: a fresh, minimal, fully migrated database at a
-    path distinct from the uploaded source file (the pattern of
-    ``tests/test_db_transfer.py``'s own ``_init_tmp_db``).
-
-    ``config.db_path``/``config.options_path`` are set through
-    ``monkeypatch``, not by plain attribute assignment: a bare
-    ``config.options_path = ...`` is never undone when the test ends, so it
-    leaks forward as the next test's own ``config.options_path`` -- an
-    EXISTING, key-less ``options.json`` that makes ``resolve_secret`` raise
-    "weathercom key is not configured" instead of going on to build a real
-    ``httpx`` request, masking a later P3 test's own missing network
-    isolation (VD6 in ``tests/test_close_verdict.py``, which this file
-    happened to run immediately before)."""
-    close_db()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    db_path = tmp_path / "wxverify.db"
-    monkeypatch.setattr(config, "db_path", str(db_path))
-    options_path = tmp_path / "options.json"
-    options_path.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(config, "options_path", str(options_path))
-    init_db(str(db_path))
-
-
-def _rs7_csrf_headers(client: TestClient) -> dict[str, str]:
-    token = client.get("/api/csrf").json()["csrf_token"]
-    return {
-        "Origin": "http://testserver",
-        "X-CSRF-Token": token,
-        "Content-Type": "application/octet-stream",
-    }
-
-
-def test_rs7_an_imported_closing_day_is_settled_before_use(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """RS7: an imported file, its close on, with D ``closing`` (attempt 1,
-    ``last_stage`` 3, a ``pending`` stage-4 job, ``last_progress_at``
-    R 00:52Z, ``worker_last_loop_at`` R 00:50Z) and a ``building``
-    publication record for D - 1 at attempt 2; imported at R + 3 d. D
-    ``missed``, ``retry_not_run``; D's ``day_close`` jobs ``completed``
-    with no success marker; D - 1's record ``failed``; after the swap
-    ``run_due_jobs`` claims no ``day_close`` job of D and the transport
-    saw no request for D. Then a variant imported at R 01:30Z: D
-    ``retry_due``, ``retry_at`` R 01:52Z (12.6).
-
-    Drives the REAL ``POST /api/import/db`` route (``_make_app``/
-    ``TestClient``, the pattern of ``tests/test_closed_day_guard.py``'s
-    GW13 and ``tests/test_db_transfer.py``), not
-    ``settle_interrupted_closes`` called directly: 12.6 states that
-    ``import_db`` must call a new ``_settle_imported_closes(tmp)`` on the
-    staged file, after ``_stage_pending_rebuild_state`` and before
-    ``replace_from`` swaps it in, and today's route does neither -- the
-    route exists and runs end to end, but nothing in it settles an
-    imported interrupted close, so D is left exactly as the uploaded file
-    carried it (``closing``) instead of being moved to ``missed``/
-    ``retry_due``. Plan section 16.2 names no mutant for RS7; its own
-    Catches column is "an imported interrupted close resumed as if never
-    stopped", which only the real route -- not a direct call to
-    ``settle_interrupted_closes`` -- can show.
-
-    The one guess beyond 12.6's own text: "the import's time" is read
-    through ``utc_now`` where ``wxverify.api.routes.db_transfer`` imports
-    it by name (grepped: line 33); this patches that name directly,
-    alongside ``patch_close_clock`` for the post-swap ``run_due_jobs``
-    check, since ``db_transfer`` is not one of ``patch_close_clock``'s own
-    ``_CLOSE_CLOCK_MODULES``.
-    """
-
-    progress_at = datetime(BOUND.year, BOUND.month, BOUND.day, 0, 52, tzinfo=UTC)
-    last_loop_at = datetime(BOUND.year, BOUND.month, BOUND.day, 0, 50, tzinfo=UTC)
-    d_minus_1 = D - timedelta(days=1)
-    # standard_night closes D - 1 at its own day_end_utc + 30 minutes; under
-    # the fixture's UTC zone, D - 1's day_end_utc is D's own midnight.
-    d_minus_1_closed_at = datetime(D.year, D.month, D.day, 0, 30, tzinfo=UTC)
-    d_minus_1_building_at = d_minus_1_closed_at + timedelta(minutes=5)
-
-    async def _run(
-        import_time: datetime, suffix: str
-    ) -> tuple[str, str | None, str | None, list[sqlite3.Row], str | None]:
-        source_dir = tmp_path / f"source_{suffix}"
-        db, _writer, site_id, _stations = standard_night(source_dir)
-        await db.write(lambda c: begin_close(c, site_id, D, now_utc=BOUND))
-        await db.write(
-            lambda c: _seed_attempt_record(
-                c,
-                site_id,
-                D,
-                1,
-                started_at=BOUND,
-                last_stage=3,
-                last_progress_at=progress_at,
-            )
-        )
-        await db.write(
-            lambda c: _seed_day_close_job(c, site_id, D, 4, 1, status="pending")
-        )
-        await db.write(
-            lambda c: set_runtime_state(
-                c, "worker_last_loop_at", isoformat_utc(last_loop_at)
-            )
-        )
-        await db.write(
-            lambda c: _seed_publication(
-                c,
-                site_id,
-                d_minus_1,
-                attempt=2,
-                state="building",
-                opened_at=d_minus_1_closed_at,
-                started_at=d_minus_1_building_at,
-            )
-        )
-        db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
-        close_db()
-        payload = (source_dir / "wxverify.db").read_bytes()
-
-        _rs7_init_live_db(tmp_path / f"live_{suffix}", monkeypatch)
-        clock = MovingClock(import_time)
-        patch_close_clock(monkeypatch, clock)
-        monkeypatch.setattr(db_transfer, "utc_now", clock.now)
-
-        app = _rs7_make_live_app(monkeypatch)
-        with TestClient(app) as client:
-            headers = _rs7_csrf_headers(client)
-            resp = client.post("/api/import/db", content=payload, headers=headers)
-            assert resp.status_code == 200, resp.text
-
-        direct = sqlite3.connect(config.db_path)
-        direct.row_factory = sqlite3.Row
-        try:
-            record = day_record(direct, site_id, D)
-            assert record is not None
-            close_jobs = direct.execute(
-                "SELECT status, result FROM jobs WHERE type = 'day_close'"
-                " AND site_id = ?",
-                (site_id,),
-            ).fetchall()
-            publication = direct.execute(
-                "SELECT state FROM close_publications WHERE site_id = ?"
-                " AND cutoff = ? AND attempt = 2",
-                (site_id, d_minus_1.isoformat()),
-            ).fetchone()
-        finally:
-            direct.close()
-
-        disable_other_enqueuers(monkeypatch)
-        requests: list[object] = []
-
-        def _no_requests(request):  # type: ignore[no-untyped-def]
-            requests.append(request)
-            raise AssertionError("no weather.com request may be made for RS7")
-
-        patch_weathercom_transport(monkeypatch, _no_requests)
-        close_db()
-        live_db = init_db(config.db_path)
-        claims = await run_due_jobs(live_db, clock)
-        assert not requests, "the transport must see no request for D"
-        assert not any(
-            claim_key is not None
-            and claim_key.startswith(f"close:{site_id}:{D.isoformat()}:")
-            for _claim_type, claim_key, _outcome in claims
-        ), "run_due_jobs must claim no day_close job of D after the swap"
-
-        return (
-            record.state,
-            record.missed_reason,
-            None if record.retry_at is None else isoformat_utc(record.retry_at),
-            close_jobs,
-            None if publication is None else publication["state"],
-        )
-
-    import_late = BOUND + timedelta(days=3)
-    state, missed_reason, _retry_at, close_jobs, pub_state = asyncio.run(
-        _run(import_late, "late")
-    )
-    assert (state, missed_reason) == ("missed", "retry_not_run"), (
-        "the real import route must call _settle_imported_closes (12.6):"
-        " an import 3 days after the stop must settle D as missed/"
-        "retry_not_run, the retry (R 01:52Z) having fallen due long before"
-        " the import's own time -- today's route calls nothing of the"
-        " sort, so D is left exactly as the uploaded file carried it"
-        " ('closing'), which is the right reason for this assertion to"
-        " fail first"
-    )
-    assert len(close_jobs) == 1, (
-        "exactly one day_close job of D was ever seeded (the pending"
-        " stage-4 job above) -- without this, the all() below would also"
-        " pass vacuously on an empty list"
-    )
-    assert all(
-        (row["status"], row["result"]) == ("completed", None) for row in close_jobs
-    ), "every day_close job of D must be completed with no success marker"
-    assert pub_state == "failed", (
-        "D - 1's building publication record, at attempt 2, must be"
-        " settled as failed by the same import-time call"
-    )
-
-    import_soon = datetime(BOUND.year, BOUND.month, BOUND.day, 1, 30, tzinfo=UTC)
-    state2, missed_reason2, retry_at2, _close_jobs2, _pub_state2 = asyncio.run(
-        _run(import_soon, "soon")
-    )
-    expected_retry_at = isoformat_utc(progress_at + timedelta(hours=1))
-    assert (state2, missed_reason2, retry_at2) == (
-        "retry_due",
-        None,
-        expected_retry_at,
-    ), (
-        "the variant, imported at R 01:30Z -- before the retry's own"
-        f" due instant {expected_retry_at!r} -- must leave D retry_due,"
-        " not yet missed"
-    )

@@ -6,11 +6,11 @@
 scan). A value that sorts AFTER the current ISO-8601 stamp -- a garbage
 string like ``'zzzz'``, or a plausible far-future date -- is never SELECTED
 by that comparison, so none of those paths' own unreadable-row handling ever
-runs on it: the row is simply never picked up again. An imported, restored,
-or hand-edited database can carry exactly such a value, and left alone it
-wedges the row permanently. These passes catch it before that comparison
-ever runs: once on a staged upload before promotion, and once at boot for a
-database swapped in by hand outside the app.
+runs on it: the row is simply never picked up again. A restored or
+hand-edited database can carry exactly such a value, and left alone it
+wedges the row permanently. These passes catch it at boot, before that
+comparison ever runs, including for a database swapped in by hand outside
+the app.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ from wxverify.settings.keys import get_number_setting
 logger = logging.getLogger(__name__)
 
 #: The wind lane's hold on today's 5-minute download, written before 0.16.13.
-#: That download is now held under the ``five_minute`` refused-access kind, so
-#: nothing reads or writes this key any more and a leftover row is deleted.
+#: That download is held under the ``five_minute`` refused-access kind, so
+#: nothing reads or writes this key and a leftover row is deleted.
 _RETIRED_WIND_HOLD_KEY: Final = "wind_history_auth_hold:all_1day"
 
 # Mirrors worker.current_obs.MIN_INTERVAL_SECONDS / _MIN_INTERVAL_FLOOR. Not
@@ -57,9 +57,7 @@ def table_exists(conn: sqlite3.Connection, name: str) -> bool:
 def sanitize_wedge_prone_timestamps(conn: sqlite3.Connection) -> None:
     """Rewrite unparseable ``next_attempt_at`` / ``next_poll_at`` values.
 
-    A minimal hand-built upload may lack either table (only ``sites``,
-    ``stations``, and ``station_observations`` are required at import), so
-    each pass is skipped rather than failing when its table is absent. Then
+    Each pass is skipped rather than failing when its table is absent. Then
     ``release_key_refused_polls`` runs, with its own table guards.
     """
     if table_exists(conn, "jobs"):
@@ -80,8 +78,8 @@ def release_key_refused_polls(conn: sqlite3.Connection) -> None:
     replace. Then the retired ``all_1day`` wind lane hold row is deleted.
 
     The release is skipped when ``station_poll_state`` or one of the three
-    columns it reads is absent (a minimal hand-built upload), and the delete
-    when ``runtime_state`` is absent; each runs without the other.
+    columns it reads is absent, and the delete when ``runtime_state`` is
+    absent; each runs without the other.
     Idempotent: nothing from 0.16.13 on writes such a poll or such a row, so
     after the first run neither matches.
     """

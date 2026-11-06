@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import seed_pair_max_wind
+from tests.helpers import close_off, seed_pair_max_wind
 from wxverify import config
 from wxverify.db.connection import close_db, init_db
 from wxverify.scoring.consensus import (
@@ -316,6 +316,7 @@ def test_materialize_consensus_wind_p90_through_real_write_path(
     tmp_path: Path,
 ) -> None:
     conn = _init_tmp_db(tmp_path)
+    close_off(conn)
     site_id = int(
         conn.execute(
             """

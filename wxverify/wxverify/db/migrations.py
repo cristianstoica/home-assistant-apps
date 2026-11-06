@@ -1,28 +1,28 @@
-"""SQLite schema and insert-only boot seeds."""
+"""SQLite schema, insert-only boot seeds, and the one upgrade to version 17."""
 
 from __future__ import annotations
 
-import functools
 import logging
 import sqlite3
 import time
-from datetime import date, timedelta
+from dataclasses import dataclass
 from typing import Final
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify import config
 from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
 from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
-from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro, utc_now
+from wxverify.core import stop
+from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
-from wxverify.db.switch import migrate_v15_switch
+from wxverify.db.site_days import DAILY_CLOSE_ON_KEY
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 16
+TARGET_USER_VERSION = 17
 
-# Seed offset applied per station when migrate_v3 backfills station_poll_state,
-# so cold-start polls fan out instead of bursting all at once.
-POLL_SEED_STAGGER_SECONDS = 10
+# The one version run_migrations upgrades from; 1 to 15 are refused.
+UPGRADE_FROM_USER_VERSION: Final = 16
 
 
 def _executescript(conn: sqlite3.Connection, script: str) -> None:
@@ -30,12 +30,12 @@ def _executescript(conn: sqlite3.Connection, script: str) -> None:
 
 
 def create_tables(conn: sqlite3.Connection) -> None:
-    """Every CREATE TABLE IF NOT EXISTS of the current schema, verbatim.
+    """Every CREATE TABLE IF NOT EXISTS of the current schema, verbatim, and
+    the three ``sites`` triggers on ``backfill_status``.
 
-    Runs before the version migrations in `run_migrations`: `migrate_v3` and
-    `migrate_v4` seed tables a pre-v4 file does not have. No index lives here
-    -- an index may name a column that only a version migration adds (see
-    `create_indexes`).
+    Runs first in `run_migrations`, before the version 17 upgrade, which
+    writes into ``forecast_history``. No index lives here: `run_migrations`
+    makes them in `create_indexes`, after the upgrade.
     """
     _executescript(
         conn,
@@ -56,6 +56,32 @@ def create_tables(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             last_obs_cycle_at TEXT
         );
+
+        CREATE TRIGGER IF NOT EXISTS trg_sites_backfill_status_insert_default
+        AFTER INSERT ON sites
+        FOR EACH ROW
+        WHEN NEW.backfill_status IS NULL
+        BEGIN
+            UPDATE sites SET backfill_status='pending' WHERE id=NEW.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_sites_backfill_status_insert_check
+        BEFORE INSERT ON sites
+        FOR EACH ROW
+        WHEN NEW.backfill_status IS NOT NULL
+         AND NEW.backfill_status NOT IN ('pending','in_progress','complete')
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid backfill_status');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_sites_backfill_status_update_check
+        BEFORE UPDATE OF backfill_status ON sites
+        FOR EACH ROW
+        WHEN NEW.backfill_status IS NULL
+          OR NEW.backfill_status NOT IN ('pending','in_progress','complete')
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid backfill_status');
+        END;
 
         CREATE TABLE IF NOT EXISTS stations (
             id INTEGER PRIMARY KEY,
@@ -214,34 +240,6 @@ def create_tables(conn: sqlite3.Connection) -> None:
             provenance TEXT
         );
 
-        CREATE TABLE IF NOT EXISTS forecast_pairs (
-            id INTEGER PRIMARY KEY,
-            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
-            variable TEXT NOT NULL,
-            issued_at TEXT NOT NULL,
-            valid_at TEXT NOT NULL,
-            lead_hours INTEGER NOT NULL CHECK(lead_hours >= 1),
-            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
-            forecast REAL NOT NULL,
-            observed REAL NOT NULL,
-            error REAL,
-            abs_error REAL,
-            sq_error REAL,
-            cat_hit INTEGER,
-            cat_false INTEGER,
-            cat_miss INTEGER,
-            cat_correct_neg INTEGER,
-            rain_threshold_mm REAL,
-            contributors INTEGER,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            first_known_at TEXT,
-            tz_generation_id INTEGER NOT NULL
-                REFERENCES timezone_generations(id),
-            UNIQUE(site_id, feed_id, variable, issued_at, valid_at,
-                   tz_generation_id)
-        );
-
         CREATE TABLE IF NOT EXISTS daily_truth (
             id INTEGER PRIMARY KEY,
             site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
@@ -368,142 +366,6 @@ def create_tables(conn: sqlite3.Connection) -> None:
                     AND site_id IS NOT NULL
                 )
             )
-        );
-
-        CREATE TABLE IF NOT EXISTS verification_runs (
-            id INTEGER PRIMARY KEY,
-            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-            tz_generation_id INTEGER NOT NULL
-                REFERENCES timezone_generations(id),
-            methodology_version INTEGER NOT NULL,
-            app_version TEXT NOT NULL,
-            state TEXT NOT NULL
-                CHECK(state IN ('running','published','failed')),
-            attempt INTEGER NOT NULL,
-            config_snapshot TEXT NOT NULL,
-            period_start TEXT,
-            period_end TEXT,
-            settled_through TEXT,
-            bootstrap_seed INTEGER NOT NULL,
-            bootstrap_resamples INTEGER NOT NULL,
-            input_fingerprint TEXT NOT NULL,
-            aggregate_state TEXT,
-            error TEXT,
-            created_at TEXT NOT NULL
-                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            published_at TEXT,
-            result_basis_fingerprint TEXT,
-            worksheet_kept INTEGER NOT NULL DEFAULT 1
-        );
-
-        CREATE TABLE IF NOT EXISTS verification_evidence (
-            id INTEGER PRIMARY KEY,
-            run_id INTEGER NOT NULL
-                REFERENCES verification_runs(id) ON DELETE CASCADE,
-            snapshot_local_date TEXT NOT NULL,
-            target_local_date TEXT NOT NULL,
-            lead INTEGER NOT NULL CHECK(lead BETWEEN 0 AND 7),
-            variable TEXT NOT NULL
-                CHECK(variable IN ('temperature','wind','precip')),
-            quantity TEXT NOT NULL CHECK(quantity IN
-                ('temperature_high','temperature_low','wind_max',
-                 'precip_total','precip_occurrence')),
-            entity_type TEXT NOT NULL CHECK(entity_type IN
-                ('depth','feed','baseline_persistence',
-                 'baseline_all_feed_mean','baseline_always_dry',
-                 'daily_rank_depth')),
-            entity_key TEXT NOT NULL,
-            predicted REAL,
-            forecast_eligible INTEGER NOT NULL
-                CHECK(forecast_eligible IN (0,1)),
-            forecast_exclusion_reason TEXT,
-            covered_hours INTEGER,
-            realized_contributors INTEGER,
-            truth_value REAL,
-            truth_eligible INTEGER NOT NULL CHECK(truth_eligible IN (0,1)),
-            truth_exclusion_reason TEXT,
-            truth_covered_hours INTEGER,
-            truth_wet_hours INTEGER,
-            truth_dry_hours INTEGER,
-            abs_error REAL,
-            occurrence_outcome TEXT
-                CHECK(occurrence_outcome IS NULL OR occurrence_outcome IN
-                    ('hit','miss','false_alarm','correct_negative')),
-            UNIQUE(run_id, snapshot_local_date, lead, variable, quantity,
-                   entity_type, entity_key)
-        );
-
-        CREATE TABLE IF NOT EXISTS verification_day_context (
-            id INTEGER PRIMARY KEY,
-            run_id INTEGER NOT NULL
-                REFERENCES verification_runs(id) ON DELETE CASCADE,
-            snapshot_local_date TEXT NOT NULL,
-            snapshot_utc TEXT NOT NULL,
-            knowability_exclusions TEXT NOT NULL,
-            null_availability_samples INTEGER NOT NULL,
-            UNIQUE(run_id, snapshot_local_date)
-        );
-
-        CREATE TABLE IF NOT EXISTS verification_results (
-            id INTEGER PRIMARY KEY,
-            run_id INTEGER NOT NULL
-                REFERENCES verification_runs(id) ON DELETE CASCADE,
-            variable TEXT NOT NULL,
-            lead INTEGER NOT NULL,
-            quantity TEXT NOT NULL,
-            entity_type TEXT NOT NULL,
-            entity_key TEXT NOT NULL,
-            headline INTEGER NOT NULL CHECK(headline IN (0,1)),
-            common_days INTEGER NOT NULL,
-            mae REAL,
-            bias REAL,
-            rmse REAL,
-            hits INTEGER,
-            misses INTEGER,
-            false_alarms INTEGER,
-            correct_negatives INTEGER,
-            ets REAL,
-            availability_rate REAL,
-            delta_vs_incumbent REAL,
-            detail TEXT,
-            UNIQUE(run_id, variable, lead, quantity, entity_type, entity_key)
-        );
-
-        CREATE TABLE IF NOT EXISTS verification_verdicts (
-            id INTEGER PRIMARY KEY,
-            run_id INTEGER NOT NULL
-                REFERENCES verification_runs(id) ON DELETE CASCADE,
-            variable TEXT NOT NULL,
-            outcome TEXT NOT NULL CHECK(outcome IN
-                ('recommend','retain_incumbent','mixed_by_lead',
-                 'mixed_by_quantity','insufficient_evidence','skipped')),
-            recommended_depth INTEGER,
-            incumbent_depth INTEGER NOT NULL,
-            tested_family TEXT NOT NULL,
-            UNIQUE(run_id, variable)
-        );
-
-        CREATE TABLE IF NOT EXISTS verification_run_inputs (
-            run_id INTEGER NOT NULL
-                REFERENCES verification_runs(id) ON DELETE CASCADE,
-            component TEXT NOT NULL,
-            value TEXT NOT NULL,
-            scope TEXT NOT NULL,
-            PRIMARY KEY (run_id, component)
-        );
-
-        CREATE TABLE IF NOT EXISTS verification_trigger_decisions (
-            id INTEGER PRIMARY KEY,
-            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-            trigger_date TEXT NOT NULL,
-            decided_at TEXT NOT NULL
-                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            decision TEXT NOT NULL CHECK(decision IN
-                ('run_started','no_change_skip','suppressed_because_active',
-                 'skipped')),
-            reason TEXT,
-            input_fingerprint TEXT,
-            run_id INTEGER REFERENCES verification_runs(id)
         );
 
         CREATE TABLE IF NOT EXISTS station_poll_state (
@@ -779,32 +641,22 @@ def create_tables(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (site_id, feed_id, variable, valid_at, day_ahead)
         ) WITHOUT ROWID;
 
-        CREATE TABLE IF NOT EXISTS close_pairs (
+        -- The scored forecasts of closed days (storage release, 3.1). Stage 5
+        -- writes the hours it scored, real feeds and the multi-model mean,
+        -- never persistence. The truth stays in observations. The version 17
+        -- upgrade also writes the days before each site's first record.
+        CREATE TABLE IF NOT EXISTS forecast_history (
             site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-            local_date TEXT NOT NULL,
             feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
             variable TEXT NOT NULL,
             day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
-            valid_at TEXT NOT NULL,
+            valid_at TEXT NOT NULL,      -- the observations stamp, same text
+            local_date TEXT NOT NULL,    -- the day the hour belongs to
+            value REAL NOT NULL,         -- the forecast; for the mean, the mean
             lead_hours INTEGER NOT NULL,
-            forecast REAL NOT NULL,
-            observed REAL NOT NULL,
-            error REAL,
-            abs_error REAL,
-            sq_error REAL,
-            cat_hit INTEGER,
-            cat_false INTEGER,
-            cat_miss INTEGER,
-            cat_correct_neg INTEGER,
-            rain_threshold_mm REAL,
-            ref_sq_error REAL,
-            download_id INTEGER,
-            download_date TEXT,
-            issued_at TEXT,
-            fetched_at TEXT,
-            contributors INTEGER,
-            PRIMARY KEY (site_id, local_date, feed_id, variable, day_ahead,
-                         valid_at, lead_hours)
+            issued_at TEXT,              -- NULL only for a closed day's mean
+            contributors INTEGER,        -- the mean only
+            PRIMARY KEY (site_id, feed_id, variable, day_ahead, valid_at)
         ) WITHOUT ROWID;
 
         CREATE TABLE IF NOT EXISTS day_scores (
@@ -1001,37 +853,12 @@ def create_tables(conn: sqlite3.Connection) -> None:
     )
 
 
-@functools.cache
-def schema_table_names() -> tuple[str, ...]:
-    """Names of every table `create_tables` makes, sorted, read back from SQLite.
-
-    Built on first use against a private in-memory database, so the list
-    cannot drift from the DDL, and importing this module runs no SQL.
-    """
-    conn = sqlite3.connect(":memory:")
-    try:
-        create_tables(conn)
-        return tuple(
-            sorted(
-                str(name_row[0])
-                for name_row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                )
-            )
-        )
-    finally:
-        conn.close()
-
-
 def create_indexes(conn: sqlite3.Connection) -> None:
     """Every CREATE INDEX IF NOT EXISTS of the current schema, verbatim, plus
     the two code-generated forecast_samples indexes and idx_samples_slot.
 
-    Runs after the version migrations in `run_migrations`: by then every
-    column an index names exists on any supported input (idx_pairs_winrate
-    names tz_generation_id, which `migrate_v4` adds by rebuilding
-    forecast_pairs), and an index a migration already recreated is skipped by
-    name. On a fresh file the order is immaterial.
+    Runs after the version 17 upgrade in `run_migrations`; an index already
+    there is skipped by name.
     """
     _executescript(
         conn,
@@ -1044,15 +871,6 @@ def create_indexes(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_tz_generations_site
             ON timezone_generations(site_id, state);
 
-        CREATE INDEX IF NOT EXISTS idx_pairs_leaderboard
-            ON forecast_pairs(site_id, variable, day_ahead, valid_at);
-        CREATE INDEX IF NOT EXISTS idx_pairs_cell
-            ON forecast_pairs(site_id, feed_id, variable, day_ahead, valid_at);
-        CREATE INDEX IF NOT EXISTS idx_pairs_winrate
-            ON forecast_pairs(site_id, variable, day_ahead, feed_id,
-                              valid_at, issued_at DESC, abs_error,
-                              tz_generation_id);
-
         CREATE INDEX IF NOT EXISTS idx_daily_truth_stale
             ON daily_truth(site_id, local_date, tz_generation_id)
             WHERE stale = 1;
@@ -1062,16 +880,6 @@ def create_indexes(conn: sqlite3.Connection) -> None:
             WHERE status IN ('pending','running') AND job_key IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_jobs_type_key_site
             ON jobs(type, job_key, site_id, id);
-
-        CREATE INDEX IF NOT EXISTS idx_verification_runs_site
-            ON verification_runs(site_id, state, id);
-
-        CREATE INDEX IF NOT EXISTS idx_verification_evidence_cell
-            ON verification_evidence(run_id, entity_type, quantity, lead,
-                                     target_local_date);
-
-        CREATE INDEX IF NOT EXISTS idx_verification_trigger_site_date
-            ON verification_trigger_decisions(site_id, trigger_date, id);
 
         CREATE INDEX IF NOT EXISTS idx_site_days_state
             ON site_days(site_id, state, local_date);
@@ -1104,9 +912,8 @@ def create_indexes(conn: sqlite3.Connection) -> None:
 def create_schema(conn: sqlite3.Connection) -> None:
     """Fresh-database convenience: tables, then indexes, in one call.
 
-    Not used by `run_migrations`, which runs the version migrations between
-    the two halves. On a file whose tables predate a column an index names,
-    this raises `sqlite3.OperationalError` exactly as the pre-split runner did.
+    Not used by `run_migrations`, which runs the version 17 upgrade between
+    the two halves.
     """
     create_tables(conn)
     create_indexes(conn)
@@ -1117,8 +924,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
 # (valid_at, variable, model_run_id) columns make both windowed statements
 # index-only over it -- measured 22.6% faster than the three-column form on a
 # production-sized copy, at ~135 MB of index for a ~1 GB database. Same idiom
-# as idx_samples_runs (shaped to cover the model-run count) and
-# idx_pairs_winrate (shaped to the win-rate query).
+# as idx_samples_runs (shaped to cover the model-run count).
 SAMPLES_RECENT_INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS idx_samples_recent "
     "ON forecast_samples(site_id, feed_id, issued_at, valid_at, "
@@ -1127,34 +933,10 @@ SAMPLES_RECENT_INDEX_DDL = (
 
 # One forecast_samples row per hour: the newest value (rain release, Part B).
 # The forecast_samples upsert names these four columns as its conflict
-# target. A file below version 16 can hold several rows per hour, so
-# migrate_v16_rain_release makes the index after it deletes the extra rows.
+# target.
 SAMPLES_SLOT_INDEX_DDL: Final = (
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_samples_slot"
     " ON forecast_samples(site_id, feed_id, variable, valid_at)"
-)
-
-# migrate_v16_rain_release's own index, made before its carry-over and
-# dropped right after the rain history fill, inside the migration's
-# SAVEPOINT, so no file ever keeps it. It serves the inferred-download reads
-# of scoring/downloads.py (_inferred_download), which no other index does:
-# each fixes site_id and feed_id, then a fetched_at range or value, then
-# reads issued_at and tests source_raw, so with all five columns each reads
-# only this index.
-V16_FETCHED_INDEX: Final = "tmp_v16_samples_fetched"
-V16_FETCHED_INDEX_DDL: Final = (
-    f"CREATE INDEX {V16_FETCHED_INDEX}"
-    " ON forecast_samples(site_id, feed_id, fetched_at, issued_at, source_raw)"
-)
-# The forecast_samples indexes migrate_v16_rain_release drops before
-# keep_newest_samples' delete, which would otherwise update each of them for
-# every row it deletes. create_indexes, which run_migrations calls after the
-# version migrations, makes all four again.
-V16_DROPPED_SAMPLE_INDEXES: Final = (
-    "idx_samples_site_var_valid",
-    "idx_samples_runs",
-    "idx_samples_recent",
-    "idx_samples_invalid",
 )
 
 
@@ -1282,71 +1064,6 @@ def seed_default_feeds(conn: sqlite3.Connection) -> None:
     )
 
 
-#: One-time bootstrap decision marker (D2). Written exactly once per
-#: database, in either branch, on the first boot that reaches
-#: `run_migrations`. Its presence -- not its value -- is the gate: once
-#: written it is never rewritten or deleted by this release.
-PUBLISH_HOLD_BOOTSTRAP_KEY = "verification_publish_hold_bootstrap"
-
-
-def bootstrap_publish_hold(
-    conn: sqlite3.Connection, *, pre_migration_user_version: int
-) -> None:
-    """Arm the operator kill switch on upgrade; never on a fresh install (D1-D3).
-
-    ``pre_migration_user_version`` is required and keyword-only so a future
-    caller cannot silently pass the post-migration value and turn every
-    boot into "fresh". Runs as the last step of `run_migrations`, before the
-    `PRAGMA user_version` write, so a failure here aborts the migration
-    without bumping user_version and the next boot retries the decision.
-
-    The SAVEPOINT buys bootstrap-write atomicity -- the hold setting row,
-    its two last-transition metadata rows and the one-time marker land
-    together or not at all -- NOT atomicity of the whole migration:
-    `create_tables` and `create_indexes` have already COMMITTED by the time
-    we get here, because executescript implicitly commits the pending
-    transaction before running its script, so the outer BEGIN IMMEDIATE from
-    Database._run_immediate is long gone and each statement below would
-    otherwise land individually.
-    That commit boundary is pre-existing -- these bootstrap writes expose
-    it, they do not introduce it. Unprotected, a failure after the hold
-    write but before the marker write would leave the database HELD with no
-    marker, and since marker PRESENCE (not value) is the anti-rearm gate, a
-    later operator release would then be silently re-armed on the next boot
-    -- the exact hazard this bootstrap exists to prevent. The savepoint
-    opens before the marker read so the already-bootstrapped path closes it
-    too, and execute() (unlike executescript) never forces an implicit
-    commit.
-    """
-    from wxverify.verification.publish_hold import set_publish_hold
-
-    conn.execute("SAVEPOINT bootstrap_publish_hold")
-    try:
-        # Phrased as "not yet bootstrapped" rather than an early return so
-        # there is exactly one exit and one RELEASE: an early return inside
-        # the savepoint would have to release on its own path too.
-        if get_runtime_state(conn, PUBLISH_HOLD_BOOTSTRAP_KEY) is None:
-            site_count_row = conn.execute(
-                "SELECT COUNT(*) AS n FROM sites WHERE enabled = 1"
-            ).fetchone()
-            enabled_site_count = int(site_count_row["n"])
-            existing_installation = (
-                pre_migration_user_version > 0 or enabled_site_count > 0
-            )
-            if existing_installation:
-                set_publish_hold(conn, held=True, source="bootstrap")
-                set_runtime_state(conn, PUBLISH_HOLD_BOOTSTRAP_KEY, "armed")
-            else:
-                set_runtime_state(
-                    conn, PUBLISH_HOLD_BOOTSTRAP_KEY, "skipped_fresh_install"
-                )
-    except BaseException:
-        conn.execute("ROLLBACK TO bootstrap_publish_hold")
-        conn.execute("RELEASE bootstrap_publish_hold")
-        raise
-    conn.execute("RELEASE bootstrap_publish_hold")
-
-
 def seed_default_settings(conn: sqlite3.Connection) -> None:
     conn.executemany(
         "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -1360,7 +1077,7 @@ def seed_default_settings(conn: sqlite3.Connection) -> None:
 
 
 #: One-shot marker for the 0.12.0 Google horizon correction. Presence --
-#: not value -- is the gate, matching PUBLISH_HOLD_BOOTSTRAP_KEY.
+#: not value -- is the gate.
 GOOGLE_HORIZON_CORRECTION_KEY = "google_horizon_correction_applied"
 
 
@@ -1419,9 +1136,7 @@ def correct_open_meteo_horizons(conn: sqlite3.Connection) -> None:
 
     Not a `user_version` migration: no schema shape changes, and older
     code reads a corrected row correctly, so bumping the version would
-    assert an incompatibility that does not exist. The v7 obs-cycle
-    migration bumps the version for its own reasons; this correction
-    rides alongside it and leaves the version alone.
+    assert an incompatibility that does not exist.
 
     The `runtime_state` marker -- not the `WHERE` clause -- is what
     makes this one-shot. The `max_lead_hours = 168` predicate is
@@ -1517,8 +1232,7 @@ def correct_open_meteo_fetch_intervals(conn: sqlite3.Connection) -> None:
 
 
 #: One-shot marker for the meteoblue member drop. Presence -- not value -- is
-#: the gate, matching GOOGLE_HORIZON_CORRECTION_KEY. The key holds no colon, so
-#: the v9 step's first-segment key match can never delete it.
+#: the gate, matching GOOGLE_HORIZON_CORRECTION_KEY.
 METEOBLUE_MEMBER_DROP_KEY = "meteoblue_member_drop_applied"
 
 
@@ -1623,1031 +1337,495 @@ def record_precip_hour_start_boundary(conn: sqlite3.Connection) -> None:
     logger.info("precip hour-start boundary recorded at %s", boundary)
 
 
+# Value: when the download record (``forecast_downloads``) starts, a
+# canonical whole-second UTC ``...Z`` stamp. A fresh file gets its build time.
+DOWNLOAD_RECORD_SINCE_KEY: Final = "download_record_since"
+# Value: when the file was last compacted, a canonical UTC ``...Z`` stamp. A
+# fresh file gets its build time: it has nothing to compact.
+STORAGE_COMPACTED_KEY: Final = "storage_compacted_at"
+
+_CLOSE_OFF_REFUSAL: Final = (
+    f"database schema {UPGRADE_FROM_USER_VERSION} has no {DAILY_CLOSE_ON_KEY}"
+    " key; this release needs the daily close on"
+)
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
+    """Bring the file to version 17, or refuse it.
+
+    Refused with ``RuntimeError`` before anything is written: a file above
+    17; a file at 1 to 15 (or below 0); a file at 16 whose daily close is
+    off (no ``DAILY_CLOSE_ON_KEY``). Then, in order: `create_tables`; at 16
+    only, `migrate_v17_storage`; `create_indexes`; the four one-shot
+    corrections, the three seeds and the rain-label boundary; at 0 only, the
+    fresh file's three keys (`_record_fresh_build_keys`); last,
+    ``user_version`` 17. A file already at 17 runs the same steps less the
+    upgrade and the fresh keys.
+
+    A stop is checked before each step (``core.stop.begin_step``), which
+    also names the step for ``Database._open``'s log line. A step that does
+    not run leaves ``user_version`` unchanged, and each step finds its own
+    work done on a repeat, so the next start reruns from it.
+    """
     row = conn.execute("PRAGMA user_version").fetchone()
     current = int(row[0]) if row is not None else 0
     if current > TARGET_USER_VERSION:
         raise RuntimeError(f"database user_version {current} is newer than this app")
+    if current != 0 and current < UPGRADE_FROM_USER_VERSION:
+        raise RuntimeError(
+            f"database schema {current} is too old for this release;"
+            " install 0.16.15 first"
+        )
+    if current == UPGRADE_FROM_USER_VERSION and not _close_on_recorded(conn):
+        raise RuntimeError(_CLOSE_OFF_REFUSAL)
     logger.debug(
         "migrations begin user_version=%s target=%s", current, TARGET_USER_VERSION
     )
-    # Tables first, indexes last: a version migration may add a column an
-    # index names (migrate_v4 -> idx_pairs_winrate), and the migrations seed
-    # tables a pre-v4 file lacks. Both halves are IF NOT EXISTS throughout,
-    # so re-entry after a partial run converges.
+    stop.begin_step("create_tables")
     create_tables(conn)
     logger.debug("migrations tables ensured")
-    if current < 2:
-        logger.debug("migrations applying v2 backfill_status")
-        migrate_v2_backfill_status(conn)
-    if current < 3:
-        logger.debug("migrations applying v3 station poll-state")
-        migrate_v3(conn)
-    if current < 4:
-        logger.debug("migrations applying v4 timezone generations")
-        migrate_v4(conn)
-    if current < 5:
-        logger.debug("migrations applying v5 result-basis fingerprint")
-        migrate_v5_result_basis_fingerprint(conn)
-    if current < 6:
-        logger.debug("migrations applying v6 daily-truth admission basis")
-        migrate_v6_daily_truth_admission_basis(conn)
-    if current < 7:
-        logger.debug("migrations applying v7 obs cycle clock + station history")
-        migrate_v7_obs_cycle_and_station_history(conn)
-    if current < 8:
-        logger.debug("migrations applying v8 last usable fetch stamp")
-        migrate_v8_last_usable_fetch_at(conn)
-    if current < 9:
-        logger.debug("migrations applying v9 old wind state removal")
-        migrate_v9_drop_old_wind_state(conn)
-    if current < 11:
-        logger.debug("migrations applying v11 daily-close days")
-        migrate_v11_daily_close_days(conn)
-    if current < 12:
-        logger.debug("migrations applying v12 widened raw readings")
-        migrate_v12_widen_raw_readings(conn)
-    if current < 13:
-        logger.debug("migrations applying v13 daily-close job kinds")
-        migrate_v13_close_jobs(conn)
-    if current < 14:
-        logger.debug("migrations applying v14 daily-close scores")
-        migrate_v14_daily_close_scores(conn)
-    if current < 15:
-        logger.debug("migrations applying v15 switch to the daily close")
-        migrate_v15_switch(conn)
-    if current < 16:
-        logger.debug("migrations applying v16 rain release")
-        migrate_v16_rain_release(conn)
+    if current == UPGRADE_FROM_USER_VERSION:
+        migrate_v17_storage(conn)
+    stop.begin_step("create_indexes")
     create_indexes(conn)
     logger.debug("migrations indexes ensured")
+    stop.begin_step("correct_google_horizon")
     correct_google_horizon(conn)
+    stop.begin_step("correct_open_meteo_horizons")
     correct_open_meteo_horizons(conn)
+    stop.begin_step("correct_open_meteo_fetch_intervals")
     correct_open_meteo_fetch_intervals(conn)
+    stop.begin_step("pause_dropped_meteoblue_members")
     pause_dropped_meteoblue_members(conn)
+    stop.begin_step("seed_default_sources")
     seed_default_sources(conn)
+    stop.begin_step("seed_default_feeds")
     seed_default_feeds(conn)
+    stop.begin_step("seed_default_settings")
     seed_default_settings(conn)
     logger.debug("migrations seeded sources+feeds+settings")
+    stop.begin_step("record_precip_hour_start_boundary")
     record_precip_hour_start_boundary(conn)
-    bootstrap_publish_hold(conn, pre_migration_user_version=current)
+    if current == 0:
+        stop.begin_step("record_fresh_build_keys")
+        _record_fresh_build_keys(conn)
     conn.execute(f"PRAGMA user_version = {TARGET_USER_VERSION}")
     logger.debug("migrations done user_version=%s", TARGET_USER_VERSION)
 
 
-def migrate_v2_backfill_status(conn: sqlite3.Connection) -> None:
-    columns = _table_columns(conn, "sites")
-    if "backfill_status" not in columns:
-        conn.execute(
-            """
-            ALTER TABLE sites
-            ADD COLUMN backfill_status TEXT NOT NULL DEFAULT 'pending'
-                CHECK(backfill_status IN ('pending','in_progress','complete'))
-            """
-        )
-    if "backfill_through" not in columns:
-        conn.execute("ALTER TABLE sites ADD COLUMN backfill_through TEXT")
-    conn.execute(
-        """
-        UPDATE sites
-        SET backfill_status = 'pending'
-        WHERE backfill_status IS NULL
-           OR backfill_status NOT IN ('pending','in_progress','complete')
-        """
-    )
-    _executescript(
-        conn,
-        """
-        CREATE TRIGGER IF NOT EXISTS trg_sites_backfill_status_insert_default
-        AFTER INSERT ON sites
-        FOR EACH ROW
-        WHEN NEW.backfill_status IS NULL
-        BEGIN
-            UPDATE sites SET backfill_status='pending' WHERE id=NEW.id;
-        END;
+def _record_fresh_build_keys(conn: sqlite3.Connection) -> None:
+    """A fresh file's three ``runtime_state`` keys, each written only when absent.
 
-        CREATE TRIGGER IF NOT EXISTS trg_sites_backfill_status_insert_check
-        BEFORE INSERT ON sites
-        FOR EACH ROW
-        WHEN NEW.backfill_status IS NOT NULL
-         AND NEW.backfill_status NOT IN ('pending','in_progress','complete')
-        BEGIN
-            SELECT RAISE(ABORT, 'invalid backfill_status');
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_sites_backfill_status_update_check
-        BEFORE UPDATE OF backfill_status ON sites
-        FOR EACH ROW
-        WHEN NEW.backfill_status IS NULL
-          OR NEW.backfill_status NOT IN ('pending','in_progress','complete')
-        BEGIN
-            SELECT RAISE(ABORT, 'invalid backfill_status');
-        END;
-        """,
-    )
-
-
-def migrate_v3(conn: sqlite3.Connection) -> None:
-    """Widen the jobs CHECK for fetch_current_obs and seed station poll-state.
-
-    Runs only under the ``current < 3`` gate in :func:`run_migrations`, so the
-    live ``jobs`` table still carries the pre-v3 CHECK and the rebuild always
-    applies cleanly. The two new tables (``station_poll_state``,
-    ``station_current_obs``) are created by :func:`create_tables`; this function
-    rebuilds ``jobs`` to admit ``fetch_current_obs`` and backfills a staggered
-    poll-state row per existing station.
+    ``DAILY_CLOSE_ON_KEY``: the daily close is on from the build.
+    ``DOWNLOAD_RECORD_SINCE_KEY``: the download record starts at the build,
+    in whole seconds. ``STORAGE_COMPACTED_KEY``: the file has nothing to
+    compact. All three come from one read of this module's ``utc_now``.
     """
-    # The whole v3 step (jobs rebuild + poll-state seed) must be all-or-nothing.
-    # The outer BEGIN IMMEDIATE in Database._run_immediate does NOT protect us:
-    # create_tables' executescript issues an implicit COMMIT before migrate_v3
-    # runs, so by here the connection is effectively back in autocommit and each
-    # statement would land individually. An explicit SAVEPOINT opens (nests) a
-    # transaction regardless of autocommit state, and execute/executemany (unlike
-    # executescript) never force an implicit commit, so the rebuild becomes
-    # atomic on its own terms. On failure we ROLL BACK TO the savepoint (removing
-    # any orphan jobs_new, leaving jobs intact) and re-raise so run_migrations
-    # aborts WITHOUT bumping user_version, leaving a clean v2 DB the next boot
-    # retries.
-    conn.execute("SAVEPOINT migrate_v3")
-    try:
-        # Rebuild jobs to carry the widened CHECK (SQLite cannot ALTER a CHECK,
-        # and CREATE TABLE IF NOT EXISTS is a no-op on the existing table). The
-        # jobs_new CHECK and column list must stay identical to create_tables'
-        # fresh DDL. The unconditional CREATE TABLE jobs_new is safe: the
-        # savepoint rollback guarantees no orphan survives an aborted run.
-        conn.execute(
-            """
-            CREATE TABLE jobs_new (
-                id INTEGER PRIMARY KEY,
-                type TEXT NOT NULL,
-                site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
-                job_key TEXT,
-                payload TEXT NOT NULL DEFAULT '{}',
-                status TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(status IN ('pending','running','completed','failed')),
-                next_attempt_at TEXT,
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                max_retries INTEGER NOT NULL DEFAULT 5,
-                last_error TEXT,
-                result TEXT,
-                created_at TEXT NOT NULL
-                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                updated_at TEXT NOT NULL
-                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                CHECK (
-                    (type = 'catchup' AND site_id IS NULL)
-                    OR (
-                        type IN ('fetch_feed','fetch_obs','fetch_current_obs',
-                                 'pair_and_score','backfill_site',
-                                 'forecast_record','record_gap_scan',
-                                 'verification_run','timezone_correction',
-                                 'day_close','day_publish')
-                        AND site_id IS NOT NULL
-                    )
-                )
-            )
-            """
-        )
-        conn.execute("INSERT INTO jobs_new SELECT * FROM jobs")
-        conn.execute("DROP TABLE jobs")
-        conn.execute("ALTER TABLE jobs_new RENAME TO jobs")
-        conn.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedupe
-                ON jobs(type, COALESCE(site_id, -1), job_key)
-                WHERE status IN ('pending','running') AND job_key IS NOT NULL
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_jobs_type_key_site
-                ON jobs(type, job_key, site_id, id)
-            """
-        )
-        # Seed a poll-state row per existing station with a staggered
-        # next_poll_at so cold-start polls fan out; the leftmost seeds at ~now.
-        # INSERT OR IGNORE keeps this idempotent (re-run is a no-op) and never
-        # disturbs live poll state.
-        now = utc_now()
-        rows = [
-            (
-                int(row["id"]),
-                isoformat_utc(
-                    now + timedelta(seconds=index * POLL_SEED_STAGGER_SECONDS)
-                ),
-            )
-            for index, row in enumerate(
-                conn.execute("SELECT id FROM stations ORDER BY id")
-            )
-        ]
-        conn.executemany(
-            "INSERT OR IGNORE INTO station_poll_state (station_id, next_poll_at) "
-            "VALUES (?, ?)",
-            rows,
-        )
-    except BaseException:
-        conn.execute("ROLLBACK TO migrate_v3")
-        conn.execute("RELEASE migrate_v3")
-        raise
-    conn.execute("RELEASE migrate_v3")
+    now = utc_now()
+    for key, value in (
+        (DAILY_CLOSE_ON_KEY, isoformat_utc(now)),
+        (DOWNLOAD_RECORD_SINCE_KEY, isoformat_utc(now.replace(microsecond=0))),
+        (STORAGE_COMPACTED_KEY, isoformat_utc(now)),
+    ):
+        if get_runtime_state(conn, key) is None:
+            set_runtime_state(conn, key, value)
 
 
-def migrate_v4(conn: sqlite3.Connection) -> None:
-    """Timezone generations: widen the jobs CHECK, generation-tag pairs.
+# ---------------------------------------------------------------------------
+# The version 17 upgrade: one forecast history
+# ---------------------------------------------------------------------------
 
-    Mirrors :func:`migrate_v3`'s SAVEPOINT-wrapped rebuild pattern (same
-    atomicity rationale — see that function's comment). Steps, all inside one
-    savepoint:
+#: The tables `migrate_v17_storage` drops, in its order: every child before
+#: its parent. With foreign keys on, dropping a parent first runs an implicit
+#: DELETE of its rows, which cascades row by row, or fails on a plain
+#: REFERENCES with no ON DELETE action.
+V17_DROP_ORDER: Final[tuple[str, ...]] = (
+    "verification_evidence",
+    "verification_day_context",
+    "verification_results",
+    "verification_verdicts",
+    "verification_run_inputs",
+    "verification_trigger_decisions",
+    "verification_runs",
+    "close_pairs",
+    "forecast_pairs",
+)
 
-    1. rebuild ``jobs`` with the CHECK widened for the 0.11.0 job types
-       (``forecast_record``, ``record_gap_scan``, ``verification_run``,
-       ``timezone_correction`` — all per-site) and recreate its two indexes;
-    2. seed one ``initial`` timezone generation per existing site (state
-       ``published``, NULL-bounded effective interval — covers the whole
-       history) plus the per-site published-pointer ``runtime_state`` row
-       (``tz_generation_published:<site_id>``);
-    3. rebuild ``forecast_pairs`` with ``first_known_at`` (left NULL for
-       pre-existing rows — availability is defined by the pair producers
-       going forward, never invented retroactively) and
-       ``tz_generation_id NOT NULL`` inside the widened unique key,
-       backfilling every existing row to its site's seeded ``initial``
-       generation, then recreate the three pairs indexes.
-
-    ``timezone_generations`` itself comes from :func:`create_tables`, as in
-    v3. On a fresh database (user_version 0) both rebuilds copy zero rows
-    from the already-new-shape tables created by :func:`create_tables`, so
-    running the whole chain is harmless.
-    """
-    # Re-run guard: run_migrations writes PRAGMA user_version only AFTER the
-    # RELEASE below commits, so a crash between the two leaves the v4 body
-    # committed with user_version still 3. The SAVEPOINT makes the body
-    # all-or-nothing, so this column's presence <=> the whole body (jobs
-    # rebuild + seed + backfill) already committed; without the guard a
-    # re-entry would seed duplicate initial generations and the pairs rebuild
-    # would crash-loop on its UNIQUE(id). Precedent:
-    # :func:`migrate_v2_backfill_status`'s column-probed idempotence.
-    if "tz_generation_id" in _table_columns(conn, "forecast_pairs"):
-        return
-    conn.execute("SAVEPOINT migrate_v4")
-    try:
-        conn.execute(
-            """
-            CREATE TABLE jobs_new (
-                id INTEGER PRIMARY KEY,
-                type TEXT NOT NULL,
-                site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
-                job_key TEXT,
-                payload TEXT NOT NULL DEFAULT '{}',
-                status TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(status IN ('pending','running','completed','failed')),
-                next_attempt_at TEXT,
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                max_retries INTEGER NOT NULL DEFAULT 5,
-                last_error TEXT,
-                result TEXT,
-                created_at TEXT NOT NULL
-                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                updated_at TEXT NOT NULL
-                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                CHECK (
-                    (type = 'catchup' AND site_id IS NULL)
-                    OR (
-                        type IN ('fetch_feed','fetch_obs','fetch_current_obs',
-                                 'pair_and_score','backfill_site',
-                                 'forecast_record','record_gap_scan',
-                                 'verification_run','timezone_correction',
-                                 'day_close','day_publish')
-                        AND site_id IS NOT NULL
-                    )
-                )
-            )
-            """
-        )
-        conn.execute("INSERT INTO jobs_new SELECT * FROM jobs")
-        conn.execute("DROP TABLE jobs")
-        conn.execute("ALTER TABLE jobs_new RENAME TO jobs")
-        conn.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedupe
-                ON jobs(type, COALESCE(site_id, -1), job_key)
-                WHERE status IN ('pending','running') AND job_key IS NOT NULL
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_jobs_type_key_site
-                ON jobs(type, job_key, site_id, id)
-            """
-        )
-        # Seed the initial published generation per existing site (the row
-        # `wxverify.db.switch.ensure_site_generation` makes), then the
-        # published-pointer runtime_state row, which A1 of `migrate_v15_switch` reads
-        # and A4 deletes. Kept in SQL here so the whole step stays inside this
-        # savepoint.
-        now = isoformat_utc(utc_now())
-        conn.execute(
-            """
-            INSERT INTO timezone_generations
-                (site_id, timezone, mode, state, published_at)
-            SELECT id, timezone, 'initial', 'published', ?
-            FROM sites
-            ORDER BY id
-            """,
-            (now,),
-        )
-        conn.execute(
-            """
-            INSERT INTO runtime_state (key, value)
-            SELECT 'tz_generation_published:' || tg.site_id,
-                   CAST(tg.id AS TEXT)
-            FROM timezone_generations tg
-            WHERE tg.mode = 'initial' AND tg.state = 'published'
-            ON CONFLICT(key) DO UPDATE SET
-                value=excluded.value,
-                updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE forecast_pairs_new (
-                id INTEGER PRIMARY KEY,
-                site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-                feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
-                variable TEXT NOT NULL,
-                issued_at TEXT NOT NULL,
-                valid_at TEXT NOT NULL,
-                lead_hours INTEGER NOT NULL CHECK(lead_hours >= 1),
-                day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
-                forecast REAL NOT NULL,
-                observed REAL NOT NULL,
-                error REAL,
-                abs_error REAL,
-                sq_error REAL,
-                cat_hit INTEGER,
-                cat_false INTEGER,
-                cat_miss INTEGER,
-                cat_correct_neg INTEGER,
-                rain_threshold_mm REAL,
-                contributors INTEGER,
-                created_at TEXT NOT NULL
-                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                first_known_at TEXT,
-                tz_generation_id INTEGER NOT NULL
-                    REFERENCES timezone_generations(id),
-                UNIQUE(site_id, feed_id, variable, issued_at, valid_at,
-                       tz_generation_id)
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs_new
-                (id, site_id, feed_id, variable, issued_at, valid_at,
-                 lead_hours, day_ahead, forecast, observed, error, abs_error,
-                 sq_error, cat_hit, cat_false, cat_miss, cat_correct_neg,
-                 rain_threshold_mm, contributors, created_at, first_known_at,
-                 tz_generation_id)
-            SELECT fp.id, fp.site_id, fp.feed_id, fp.variable, fp.issued_at,
-                   fp.valid_at, fp.lead_hours, fp.day_ahead, fp.forecast,
-                   fp.observed, fp.error, fp.abs_error, fp.sq_error,
-                   fp.cat_hit, fp.cat_false, fp.cat_miss, fp.cat_correct_neg,
-                   fp.rain_threshold_mm, fp.contributors, fp.created_at,
-                   NULL, tg.id
-            FROM forecast_pairs fp
-            JOIN timezone_generations tg
-              ON tg.site_id = fp.site_id
-             AND tg.mode = 'initial' AND tg.state = 'published'
-            """
-        )
-        conn.execute("DROP TABLE forecast_pairs")
-        conn.execute("ALTER TABLE forecast_pairs_new RENAME TO forecast_pairs")
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_pairs_leaderboard
-                ON forecast_pairs(site_id, variable, day_ahead, valid_at)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_pairs_cell
-                ON forecast_pairs(site_id, feed_id, variable, day_ahead,
-                                  valid_at)
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_pairs_winrate
-                ON forecast_pairs(site_id, variable, day_ahead, feed_id,
-                                  valid_at, issued_at DESC, abs_error,
-                                  tz_generation_id)
-            """
-        )
-    except BaseException:
-        conn.execute("ROLLBACK TO migrate_v4")
-        conn.execute("RELEASE migrate_v4")
-        raise
-    conn.execute("RELEASE migrate_v4")
-
-
-def migrate_v5_result_basis_fingerprint(conn: sqlite3.Connection) -> None:
-    """Add ``verification_runs.result_basis_fingerprint`` (nullable).
-
-    One additive ``ALTER TABLE``; nothing is backfilled. A run published
-    before this column existed reads NULL, which the freshness derivation
-    reports as *unknown* rather than fabricating a baseline.
-
-    Column-probed idempotence, following
-    :func:`migrate_v2_backfill_status`: ``run_migrations`` writes
-    ``PRAGMA user_version`` only after this returns, so a crash in between
-    leaves the column present at user_version 4 and the next boot re-enters
-    the ``current < 5`` gate. :func:`create_tables` already creates the
-    column on a fresh database, where this is likewise a no-op -- which is
-    why the DDL appends it after ``published_at``, so a fresh and a migrated
-    database agree on column order, not just membership.
-    """
-    if "result_basis_fingerprint" not in _table_columns(conn, "verification_runs"):
-        conn.execute(
-            "ALTER TABLE verification_runs ADD COLUMN result_basis_fingerprint TEXT"
-        )
-
-
-def migrate_v6_daily_truth_admission_basis(conn: sqlite3.Connection) -> None:
-    """Add ``daily_truth.admission_basis`` (nullable, CHECK-constrained).
-
-    One additive ``ALTER TABLE``; nothing is backfilled. A row created
-    before this column existed reads NULL, and NULL is the exact,
-    by-construction marker of a pre-gate row -- a row whose creation was
-    never subject to an admission decision. Backfilling any value would
-    fabricate a decision that was never made, so nothing is backfilled.
-
-    Column-probed idempotence, following
-    :func:`migrate_v5_result_basis_fingerprint`: ``run_migrations`` writes
-    ``PRAGMA user_version`` only after this returns, so a crash in between
-    leaves the column present at user_version 5 and the next boot re-enters
-    the ``current < 6`` gate. :func:`create_tables` already creates the
-    column on a fresh database, where this is likewise a no-op -- which is
-    why the DDL appends it after ``tz_generation_id``, so a fresh and a
-    migrated database agree on column order, not just membership.
-
-    The ``CHECK`` predicate is repeated here, matching the one in the
-    ``create_tables`` DDL: ``ALTER TABLE ... ADD COLUMN`` accepts a bare
-    ``TEXT`` happily, so dropping it would leave migrated installs
-    accepting values a fresh install rejects.
-    """
-    if "admission_basis" not in _table_columns(conn, "daily_truth"):
-        conn.execute(
-            "ALTER TABLE daily_truth ADD COLUMN admission_basis TEXT "
-            "CHECK(admission_basis IS NULL "
-            "OR admission_basis IN ('complete','deadline'))"
-        )
-
-
-def migrate_v7_obs_cycle_and_station_history(conn: sqlite3.Connection) -> None:
-    """Split the obs cycle clock from obs freshness; add the station history trio.
-
-    ``sites.last_obs_cycle_at`` is the cycle-attempt clock the scheduler
-    reads, leaving ``sites.last_obs_at`` to mean data freshness alone.
-    ``stations.history_next_attempt_at`` / ``history_last_error`` /
-    ``history_error_count`` carry the per-station history-recovery state so
-    one station's empty hourly history can no longer abort its site's whole
-    observation cycle.
-
-    Column-probed idempotence, following
-    :func:`migrate_v6_daily_truth_admission_basis`: ``run_migrations`` writes
-    ``PRAGMA user_version`` only after this returns, so a crash in between
-    leaves the columns present at user_version 6 and the next boot re-enters
-    the ``current < 7`` gate. :func:`create_tables` already creates them on a
-    fresh database, where the probes are a no-op -- which is why the DDL
-    appends each one last in its table, so a fresh and a migrated database
-    agree on column order, not just membership.
-
-    ``history_error_count`` repeats its full ``NOT NULL DEFAULT 0``
-    definition, matching the ``create_tables`` DDL: ``ALTER TABLE ... ADD
-    COLUMN history_error_count INTEGER`` is accepted happily and would leave
-    every pre-existing station row holding NULL, which reads as neither
-    ``> 0`` nor ``<= 0`` in the monitor's condition. The other three are
-    nullable ``TEXT`` on both paths, so a bare type is their full definition.
-
-    The backfill runs outside the probe guards and is self-idempotent via its
-    own ``WHERE``, so a crash between the ``ALTER`` and the ``UPDATE``
-    converges on the next boot. It exists so an upgraded instance does not
-    become due for every site at once, and so no reader needs a permanent
-    ``COALESCE`` fallback.
-    """
-    if "last_obs_cycle_at" not in _table_columns(conn, "sites"):
-        conn.execute("ALTER TABLE sites ADD COLUMN last_obs_cycle_at TEXT")
-    station_columns = _table_columns(conn, "stations")
-    if "history_next_attempt_at" not in station_columns:
-        conn.execute("ALTER TABLE stations ADD COLUMN history_next_attempt_at TEXT")
-    if "history_last_error" not in station_columns:
-        conn.execute("ALTER TABLE stations ADD COLUMN history_last_error TEXT")
-    if "history_error_count" not in station_columns:
-        conn.execute(
-            "ALTER TABLE stations ADD COLUMN "
-            "history_error_count INTEGER NOT NULL DEFAULT 0"
-        )
-    conn.execute(
-        "UPDATE sites SET last_obs_cycle_at = last_obs_at "
-        "WHERE last_obs_cycle_at IS NULL"
-    )
-
-
-# Seeds ``site_feed_state.last_usable_fetch_at`` from ``last_run_at`` when a
-# stored sample proves that fetch returned something usable: a valid sample
-# whose ``fetched_at`` is exactly that stamp. Both columns are written from
-# the same ``fetched_at`` value by one ``persist_fetch_result`` call, so exact
-# string equality is sound. A meteoblue package row also accepts samples of
-# its member feeds, which is where that fetch stores them. The member branch
-# is an ``IN (... UNION ALL ...)``, not an ``OR``: the ``OR`` form degrades
-# the probe to a ``site_id``-only seek of idx_samples_recent, while this form
-# seeks ``(site_id, feed_id, issued_at)``. The ``issued_at`` floor is that
-# seek's range. Idempotent through ``IS NULL``; every case it cannot prove
-# (a no-op fetch, a duplicates-only fetch, runs older than 2 days) is left
-# NULL, which the Forecast page reads as "fetch time unknown".
-SEED_LAST_USABLE_FETCH_SQL: Final[str] = f"""
-    UPDATE site_feed_state AS sfs
-    SET last_usable_fetch_at = sfs.last_run_at
-    WHERE sfs.last_usable_fetch_at IS NULL
-      AND sfs.last_run_at IS NOT NULL
-      AND EXISTS (
-          SELECT 1 FROM forecast_samples fs
-          WHERE fs.site_id = sfs.site_id
-            AND fs.feed_id IN (
-                SELECT sfs.feed_id
-                UNION ALL
-                SELECT m.id FROM feeds m, feeds p
-                WHERE p.id = sfs.feed_id
-                  AND p.source = 'meteoblue' AND p.model = 'multimodel'
-                  AND m.source = 'meteoblue' AND m.model != 'multimodel')
-            AND fs.issued_at
-                >= strftime('%Y-%m-%dT%H:%M:%SZ', sfs.last_run_at, '-2 days')
-            AND fs.fetched_at = sfs.last_run_at
-            AND NOT {invalid_forecast_sample_sql("fs")}
-      )
-    """
-
-
-def migrate_v8_last_usable_fetch_at(conn: sqlite3.Connection) -> None:
-    """Add ``site_feed_state.last_usable_fetch_at`` and seed it.
-
-    The column records when the app last completed a forward fetch for the
-    site and feed that returned at least one usable sample; the Forecast
-    page's ``stale`` badge reads it. ``persist_fetch_result`` writes it from
-    now on; :data:`SEED_LAST_USABLE_FETCH_SQL` recovers what the stored
-    samples can prove for fetches made before the column existed.
-
-    Column-probed idempotence, following
-    :func:`migrate_v7_obs_cycle_and_station_history`: ``run_migrations``
-    writes ``PRAGMA user_version`` only after this returns, so a crash in
-    between leaves the column present at user_version 7 and the next boot
-    re-enters the ``current < 8`` gate. :func:`create_tables` already creates
-    the column on a fresh database, where the probe is a no-op -- which is
-    why the DDL appends it last in its table, so a fresh and a migrated
-    database agree on column order, not just membership. The seed runs
-    outside the probe guard and is self-idempotent through its ``IS NULL``,
-    so a crash between the ``ALTER`` and the ``UPDATE`` converges on the next
-    boot.
-    """
-    if "last_usable_fetch_at" not in _table_columns(conn, "site_feed_state"):
-        conn.execute("ALTER TABLE site_feed_state ADD COLUMN last_usable_fetch_at TEXT")
-    conn.execute(SEED_LAST_USABLE_FETCH_SQL)
-
-
-def migrate_v9_drop_old_wind_state(conn: sqlite3.Connection) -> None:
-    """Delete the six per-site wind key kinds and drop ``legacy_hours``.
-
-    Both are left over from the 0.16.6 wind switch and nothing reads them any
-    more: the ``runtime_state`` keys ``wind_basis:``,
-    ``wind_basis_progress_at:``, ``wind_basis_cursor:``,
-    ``wind_basis_blocked:``, ``wind_rebuild_report:`` and
-    ``wind_rebuild_done_at:`` of every site, and the column
-    ``station_wind_days.legacy_hours``. Forward-only: nothing puts them back,
-    and once ``run_migrations`` has written ``user_version`` 9 an older
-    release refuses the database.
-
-    The six prefixes are written out here, so the step keeps meaning the same
-    keys whatever later code does. A key matches only when its whole first
-    segment, up to and including its first colon, is one of the six; ``IN``
-    compares case-sensitively. ``LIKE`` is not used: its ``_`` matches any one
-    character and it ignores ASCII case. The weather.com auth holds
-    (``wind_history_auth_hold:<endpoint>``) and the call counters stay.
-
-    Re-entry, following :func:`migrate_v8_last_usable_fetch_at`:
-    ``run_migrations`` writes ``PRAGMA user_version`` only after this
-    returns, so a stop after the ``DELETE`` or after the ``ALTER`` leaves
-    user_version 8 and the next boot re-enters the ``current < 9`` gate. Each
-    part is safe to run again: the ``DELETE`` then matches nothing and the
-    column probe skips a column already gone. :func:`create_tables` no longer
-    creates the column, so on a fresh database the step deletes nothing,
-    drops nothing and logs nothing. ``DROP COLUMN`` keeps the order of the
-    columns it leaves, so a fresh and a migrated database agree on column
-    order, not just membership. One INFO line is logged only when the step
-    removed something.
-    """
-    started = time.perf_counter()
-    deleted = conn.execute(
-        "DELETE FROM runtime_state"
-        " WHERE substr(key, 1, instr(key, ':')) IN ("
-        "'wind_basis:', 'wind_basis_progress_at:', 'wind_basis_cursor:',"
-        " 'wind_basis_blocked:', 'wind_rebuild_report:', 'wind_rebuild_done_at:')"
-    ).rowcount
-    dropped = "legacy_hours" in _table_columns(conn, "station_wind_days")
-    if dropped:
-        conn.execute("ALTER TABLE station_wind_days DROP COLUMN legacy_hours")
-    if deleted or dropped:
-        logger.info(
-            "old wind state removed: %d keys deleted, legacy_hours column %s, %d ms",
-            deleted,
-            "dropped" if dropped else "already gone",
-            int((time.perf_counter() - started) * 1000),
-        )
-
-
-# Starts ``station_changes`` in step with today's ``stations.enabled`` flags:
-# one row per station that has no change yet, ``added`` when enabled and
-# ``turned_off`` otherwise. ``:effective_date`` is ``date.min``, earlier than
-# any record's date, so the seed row decides a station's list membership
-# until a route records a change. ``:changed_at`` is one fixed-width stamp
-# for the whole seed. Idempotent through ``NOT EXISTS``; on a fresh database
-# there are no stations and it writes nothing.
-SEED_STATION_CHANGES_SQL: Final[str] = """
-    INSERT INTO station_changes
-        (site_id, station_id, change, effective_date, reason, changed_at)
-    SELECT s.site_id, s.id,
-           CASE WHEN s.enabled = 1 THEN 'added' ELSE 'turned_off' END,
-           :effective_date, 'switch_seed', :changed_at
-    FROM stations AS s
-    WHERE NOT EXISTS (
-        SELECT 1 FROM station_changes AS c WHERE c.station_id = s.id
-    )
-    ORDER BY s.id
+# The jobs the upgrade keeps, in any status: the kinds dispatch still runs,
+# and fetch_obs only under the key wind-days. IS, not =, so a NULL job_key
+# compares as a value.
+_V17_KEPT_JOBS_SQL: Final = """
+    type IN ('fetch_current_obs', 'fetch_feed', 'forecast_record',
+             'record_gap_scan', 'day_close', 'day_publish')
+    OR (type = 'fetch_obs' AND job_key IS 'wind-days')
 """
+# The persistence yardstick's feed id, left out of the forecast history.
+_V17_PERSISTENCE_FEEDS_SQL: Final = (
+    "SELECT id FROM feeds WHERE source = 'virtual' AND model = '_persistence'"
+)
+# The runtime_state keys of the removed code: a prefix, and one key.
+_V17_REMOVED_KEY_PREFIX: Final = "verification_"
+_V17_REMOVED_KEY: Final = "import_rebuild_state"
+_V17_REMOVED_SETTING: Final = "verification_publish_hold"
+# The day_publish stage whose jobs the upgrade deletes; the close chain's
+# stages end at 7.
+_V17_REMOVED_PUBLISH_STAGE: Final = 8
 
 
-def migrate_v11_daily_close_days(conn: sqlite3.Connection) -> None:
-    """Add ``stations.retired_at`` and seed ``station_changes``.
+@dataclass(frozen=True, slots=True)
+class _V17Site:
+    """One site's source for the pre-close conversion: its ``published`` time
+    zone generation, and the ``valid_at`` text its rows lie below (its first
+    record's ``day_start_utc``; None while it has no record: every row)."""
 
-    :func:`create_tables` makes the four daily-close tables (``site_days``,
-    ``station_changes``, ``site_day_stations``, ``site_zone_changes``) before
-    the gates and :func:`create_indexes` their indexes after them, so this
-    step only adds the column and runs :data:`SEED_STATION_CHANGES_SQL`. It
-    creates no ``site_days`` row and seeds no zone change, and it changes no
-    existing row beyond the new NULL column.
+    site_id: int
+    generation_id: int
+    bound: str | None
 
-    Re-entry, following :func:`migrate_v8_last_usable_fetch_at`:
-    ``run_migrations`` writes ``PRAGMA user_version`` only after this
-    returns, so a crash in between leaves user_version below 11 and the next
-    boot re-enters the ``current < 11`` gate. The column probe skips a column
-    already there -- on a fresh database :func:`create_tables` made it, last
-    in its table, so a fresh and a migrated database agree on column order --
-    and the seed's ``NOT EXISTS`` skips every station already seeded.
-    ``changed_at`` reads the clock through this module's ``utc_now``.
+
+def migrate_v17_storage(conn: sqlite3.Connection) -> None:
+    """Upgrade a version 16 file to one forecast history.
+
+    `run_migrations` calls it at version 16 only, after `create_tables` made
+    ``forecast_history``, and writes ``user_version`` 17 after it.
+
+    Raises ``RuntimeError``, writing nothing, when ``DAILY_CLOSE_ON_KEY`` is
+    absent. Logs ``PRAGMA secure_delete`` and sets it to 0 on this
+    connection, so the drops do not overwrite each freed page; it is put
+    back on the way out. With ``forecast_pairs`` gone, an earlier run
+    committed every step: one INFO line "already converted", and it returns.
+
+    Otherwise one SAVEPOINT holds five steps, each named for a stop check
+    (``core.stop.begin_step``) and logged at INFO with its rows and
+    milliseconds:
+
+    1. ``v17_date_map``: the TEMP table ``v17_dates``, the local date of
+       each hour the conversion reads (`_v17_date_map`);
+    2. ``v17_convert_pre_close``: each site's ``forecast_pairs`` rows from
+       before its first record (`_v17_convert_pre_close`);
+    3. ``v17_copy_close_pairs``: the ``close_pairs`` rows
+       (`_v17_copy_close_pairs`);
+    4. ``v17_delete_removed_jobs_keys``: the jobs, keys and setting of
+       removed code (`_v17_delete_removed_jobs_keys`);
+    5. ``v17_drop_tables``: ``V17_DROP_ORDER``, then ``v17_dates``
+       (`_v17_drop_tables`).
+
+    Any error rolls the savepoint back and is re-raised, so the file stays
+    at version 16 as it was and the next open runs the upgrade again; the
+    in_transaction check covers an error that has already ended the
+    transaction. The RELEASE commits the five steps; a stop after it and
+    before the version write leaves a converted version 16 file, on which
+    the next open returns at the guard.
     """
-    if "retired_at" not in _table_columns(conn, "stations"):
-        conn.execute("ALTER TABLE stations ADD COLUMN retired_at TEXT")
-    conn.execute(
-        SEED_STATION_CHANGES_SQL,
-        {
-            "effective_date": date.min.isoformat(),
-            "changed_at": isoformat_utc_micro(utc_now()),
-        },
+    stop.begin_step("migrate_v17_storage")
+    if not _close_on_recorded(conn):
+        raise RuntimeError(_CLOSE_OFF_REFUSAL)
+    secure_delete = int(conn.execute("PRAGMA secure_delete").fetchone()[0])
+    logger.info(
+        "v17 upgrade: secure_delete is %d; set to 0 for the drops", secure_delete
     )
+    conn.execute("PRAGMA secure_delete = 0")
+    try:
+        if not _table_exists(conn, "forecast_pairs"):
+            logger.info("v17 upgrade: already converted")
+            return
+        conn.execute("SAVEPOINT migrate_v17")
+        try:
+            stop.begin_step("v17_date_map")
+            sites = _v17_date_map(conn)
+            stop.begin_step("v17_convert_pre_close")
+            _v17_convert_pre_close(conn, sites)
+            stop.begin_step("v17_copy_close_pairs")
+            _v17_copy_close_pairs(conn)
+            stop.begin_step("v17_delete_removed_jobs_keys")
+            _v17_delete_removed_jobs_keys(conn)
+            stop.begin_step("v17_drop_tables")
+            _v17_drop_tables(conn)
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK TO migrate_v17")
+                conn.execute("RELEASE migrate_v17")
+            raise
+        conn.execute("RELEASE migrate_v17")
+    finally:
+        restored = "FAST" if secure_delete == 2 else str(secure_delete)
+        conn.execute(f"PRAGMA secure_delete = {restored}")
 
 
-def migrate_v12_widen_raw_readings(conn: sqlite3.Connection) -> None:
-    """Widen ``station_wind_records`` and add ``station_wind_days.refused_at``.
+def _v17_date_map(conn: sqlite3.Connection) -> list[_V17Site]:
+    """Step 1: fill the TEMP table ``v17_dates``; return each site's source.
 
-    ``station_wind_records`` becomes the one table of raw station readings:
-    wind, temperature and the rain running total, from the 5-minute
-    download, the current-conditions poll and the hourly download. SQLite
-    cannot drop ``speed_kmh``'s ``NOT NULL`` with ``ALTER TABLE``, and
-    ``source`` joins the ``WITHOUT ROWID`` primary key, so the table is
-    rebuilt in :func:`create_tables`' shape. Every existing row is copied
-    with ``source`` ``'five_minute'`` and its speed, the new columns NULL;
-    nothing is backfilled. ``refused_at`` (NULL) is the latest time a
-    5-minute try for the station-day was held or refused.
+    For each site, in id order, with ``core.stop.check`` once per site: its
+    ``published`` time zone generation (the highest id, should it have
+    several) and its bound, its first record's ``day_start_utc`` as
+    ``isoformat_utc`` text. Each distinct ``valid_at`` of the site's
+    ``forecast_pairs`` rows of that generation below the bound, compared as
+    text, gets its local date in the generation's zone. A site with no
+    ``published`` generation has no source.
 
-    Steps, all inside one savepoint, following :func:`migrate_v4`:
-
-    1. the re-run guard: the rebuild is skipped when ``station_wind_records``
-       already has ``source`` -- a fresh file :func:`create_tables` made, or
-       a rebuild already committed. ``run_migrations`` writes ``PRAGMA
-       user_version`` only after this returns, so a crash in between leaves
-       user_version below 12 and the next boot re-enters the ``current < 12``
-       gate;
-    2. the rebuild (:func:`_rebuild_station_wind_records`);
-    3. ``ALTER TABLE station_wind_days ADD COLUMN refused_at TEXT`` when the
-       column is absent. On a fresh file :func:`create_tables` made it, last
-       among the columns, so a fresh and a migrated database agree on column
-       order.
-
-    As in :func:`record_precip_hour_start_boundary`, the savepoint is the
-    whole transaction on the writer, and the in_transaction check covers an
-    error that has already ended it. Any failure, a failed foreign key check
-    included, rolls every step back and is re-raised, so the open fails
-    before the ``user_version`` write and the next open retries. One INFO
-    line is logged only when the table was rebuilt.
+    Raises ``RuntimeError`` at the first site, in id order, whose zone does
+    not load (the message names the site and the zone), or any of whose
+    ``valid_at`` stamps do not parse (the message names the site, how many
+    do not parse, and the lowest of them as text). Every hour is mapped or
+    the upgrade is refused: `migrate_v17_storage` rolls the savepoint back,
+    so the file stays at version 16.
     """
     started = time.perf_counter()
-    copied: int | None = None
-    conn.execute("SAVEPOINT migrate_v12")
-    try:
-        if "source" not in _table_columns(conn, "station_wind_records"):
-            copied = _rebuild_station_wind_records(conn)
-        if "refused_at" not in _table_columns(conn, "station_wind_days"):
-            conn.execute("ALTER TABLE station_wind_days ADD COLUMN refused_at TEXT")
-    except BaseException:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK TO migrate_v12")
-            conn.execute("RELEASE migrate_v12")
-        raise
-    conn.execute("RELEASE migrate_v12")
-    if copied is not None:
-        logger.info(
-            "station_wind_records rebuilt for version 12: %d rows copied, %d ms",
-            copied,
-            int((time.perf_counter() - started) * 1000),
-        )
-
-
-def _rebuild_station_wind_records(conn: sqlite3.Connection) -> int:
-    """Rebuild ``station_wind_records`` in the widened shape.
-
-    Step 2 of :func:`migrate_v12_widen_raw_readings`, run inside its
-    savepoint. The new table's statement must stay identical to the one in
-    :func:`create_tables` but for the name and ``IF NOT EXISTS``, indentation
-    included, so a rebuilt and a fresh table agree column for column. No
-    table references ``station_wind_records``, so the drop and the rename
-    touch no other table's keys. Raises ``RuntimeError`` when ``PRAGMA
-    foreign_key_check`` then reports any row. Returns the rows copied.
-    """
     conn.execute(
-        """
-        CREATE TABLE station_wind_records_v12 (
-            station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
-            obs_at TEXT NOT NULL,            -- canonical YYYY-MM-DDTHH:MM:SSZ
-            source TEXT NOT NULL
-                CHECK (source IN ('five_minute','current_obs','hourly')),
-            -- the reading's own local date, YYYY-MM-DD
-            local_date TEXT,
-            speed_kmh REAL CHECK (speed_kmh IS NULL OR speed_kmh >= 0),
-            temp_c REAL,
-            precip_total_mm REAL
-                CHECK (precip_total_mm IS NULL OR precip_total_mm >= 0),
-            -- canonical; NULL for rows from before 0.16.14
-            fetched_at TEXT,
-            CHECK (speed_kmh IS NOT NULL OR temp_c IS NOT NULL
-                   OR precip_total_mm IS NOT NULL),
-            PRIMARY KEY (station_id, obs_at, source)
-        ) WITHOUT ROWID
-        """
+        "CREATE TEMP TABLE v17_dates ("
+        " site_id INTEGER NOT NULL, valid_at TEXT NOT NULL,"
+        " local_date TEXT NOT NULL, PRIMARY KEY (site_id, valid_at))"
     )
+    site_ids = [
+        int(row[0])
+        for row in conn.execute("SELECT id FROM sites ORDER BY id").fetchall()
+    ]
+    sites: list[_V17Site] = []
+    hours = 0
+    for site_id in site_ids:
+        stop.check()
+        generation = conn.execute(
+            "SELECT id, timezone FROM timezone_generations"
+            " WHERE site_id = ? AND state = 'published'"
+            " ORDER BY id DESC LIMIT 1",
+            (site_id,),
+        ).fetchone()
+        if generation is None:
+            continue
+        first = conn.execute(
+            "SELECT day_start_utc FROM site_days WHERE site_id = ?"
+            " ORDER BY local_date LIMIT 1",
+            (site_id,),
+        ).fetchone()
+        site = _V17Site(
+            site_id=site_id,
+            generation_id=int(generation[0]),
+            bound=None if first is None else isoformat_utc(parse_utc(str(first[0]))),
+        )
+        sites.append(site)
+        zone_name = str(generation[1])
+        try:
+            zone = ZoneInfo(zone_name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise RuntimeError(
+                f"v17 upgrade: site {site_id}: zone {zone_name!r} does not load;"
+                " the upgrade is refused and the file stays at version 16"
+            ) from exc
+        dates: list[tuple[int, str, str]] = []
+        unparsed: list[str] = []
+        for row in conn.execute(
+            "SELECT DISTINCT valid_at FROM forecast_pairs"
+            " WHERE site_id = :site_id AND tz_generation_id = :generation_id"
+            " AND (:bound IS NULL OR valid_at < :bound)",
+            _v17_site_binds(site),
+        ).fetchall():
+            valid_at = str(row[0])
+            try:
+                local = parse_utc(valid_at).astimezone(zone).date()
+            except ValueError:
+                unparsed.append(valid_at)
+                continue
+            dates.append((site_id, valid_at, local.isoformat()))
+        if unparsed:
+            raise RuntimeError(
+                f"v17 upgrade: site {site_id}: {len(unparsed)} valid_at"
+                f" stamp(s) do not parse, for example {min(unparsed)!r}; the"
+                " upgrade is refused and the file stays at version 16"
+            )
+        conn.executemany(
+            "INSERT INTO v17_dates (site_id, valid_at, local_date) VALUES (?, ?, ?)",
+            dates,
+        )
+        hours += len(dates)
+    logger.info(
+        "v17 upgrade: v17_date_map: %d hour(s) of %d site(s), %d ms",
+        hours,
+        len(sites),
+        _elapsed_ms(started),
+    )
+    return sites
+
+
+def _v17_convert_pre_close(conn: sqlite3.Connection, sites: list[_V17Site]) -> None:
+    """Step 2: each site's pre-close forecasts into ``forecast_history``.
+
+    The source of a site (`_v17_date_map`): its ``forecast_pairs`` rows of
+    its ``published`` generation with ``valid_at`` below its bound as text,
+    persistence left out, joined to ``v17_dates`` for ``local_date``. Per key
+    (site, feed, variable, day ahead, ``valid_at``) one row: the earliest
+    run, ordered by ``julianday(issued_at)``, then ``issued_at``, then
+    ``id``, so two text forms of one instant tie on the instant. ``value`` is
+    the stored forecast; ``day_ahead``, ``lead_hours``, ``issued_at`` and
+    ``contributors`` (the mean's) are copied as stored.
+    """
+    started = time.perf_counter()
+    written = 0
+    for site in sites:
+        written += conn.execute(
+            f"""
+            INSERT INTO forecast_history
+                (site_id, feed_id, variable, day_ahead, valid_at, local_date,
+                 value, lead_hours, issued_at, contributors)
+            SELECT site_id, feed_id, variable, day_ahead, valid_at, local_date,
+                   forecast, lead_hours, issued_at, contributors
+            FROM (
+                SELECT fp.site_id, fp.feed_id, fp.variable, fp.day_ahead,
+                       fp.valid_at, d.local_date, fp.forecast, fp.lead_hours,
+                       fp.issued_at, fp.contributors,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY fp.site_id, fp.feed_id, fp.variable,
+                                        fp.day_ahead, fp.valid_at
+                           ORDER BY julianday(fp.issued_at), fp.issued_at, fp.id
+                       ) AS pick
+                FROM forecast_pairs fp
+                JOIN v17_dates d
+                  ON d.site_id = fp.site_id AND d.valid_at = fp.valid_at
+                WHERE fp.site_id = :site_id
+                  AND fp.tz_generation_id = :generation_id
+                  AND (:bound IS NULL OR fp.valid_at < :bound)
+                  AND fp.feed_id NOT IN ({_V17_PERSISTENCE_FEEDS_SQL})
+            )
+            WHERE pick = 1
+            """,
+            _v17_site_binds(site),
+        ).rowcount
+    logger.info(
+        "v17 upgrade: v17_convert_pre_close: %d row(s) written, %d ms",
+        written,
+        _elapsed_ms(started),
+    )
+
+
+def _v17_site_binds(site: _V17Site) -> dict[str, object]:
+    """The named binds of one site's source reads."""
+    return {
+        "site_id": site.site_id,
+        "generation_id": site.generation_id,
+        "bound": site.bound,
+    }
+
+
+def _v17_copy_close_pairs(conn: sqlite3.Connection) -> None:
+    """Step 3: copy the ``close_pairs`` rows into ``forecast_history``.
+
+    Every row as it is, persistence left out: ``value`` is the stored
+    forecast, the other columns of the history are copied. A plain INSERT,
+    so a key clash fails the upgrade rather than being skipped.
+    """
+    started = time.perf_counter()
     copied = conn.execute(
-        "INSERT INTO station_wind_records_v12 (station_id, obs_at, source, speed_kmh)"
-        " SELECT station_id, obs_at, 'five_minute', speed_kmh"
-        " FROM station_wind_records"
+        f"""
+        INSERT INTO forecast_history
+            (site_id, feed_id, variable, day_ahead, valid_at, local_date,
+             value, lead_hours, issued_at, contributors)
+        SELECT site_id, feed_id, variable, day_ahead, valid_at, local_date,
+               forecast, lead_hours, issued_at, contributors
+        FROM close_pairs
+        WHERE feed_id NOT IN ({_V17_PERSISTENCE_FEEDS_SQL})
+        """
     ).rowcount
-    conn.execute("DROP TABLE station_wind_records")
-    conn.execute("ALTER TABLE station_wind_records_v12 RENAME TO station_wind_records")
-    violation = conn.execute(
-        "PRAGMA foreign_key_check(station_wind_records)"
-    ).fetchone()
-    if violation is not None:
-        raise RuntimeError("station_wind_records rebuild failed its foreign key check")
-    return copied
-
-
-def migrate_v13_close_jobs(conn: sqlite3.Connection) -> None:
-    """Widen the ``jobs`` type CHECK for ``day_close`` and ``day_publish``.
-
-    The daily close's two job kinds must pass the CHECK, and
-    :func:`create_tables` leaves an existing ``jobs`` table as it is, so a
-    file at version 12 keeps the narrow CHECK until this rebuild widens it.
-    The new table's column list and CHECK must stay identical to
-    :func:`create_tables`' and to the ``jobs_new`` of :func:`migrate_v3` and
-    :func:`migrate_v4`. The rebuild copies :func:`migrate_v4`'s: every row is
-    copied as it is, retired kinds included, and the two ``jobs`` indexes
-    are made again here; every other index comes back from
-    :func:`create_indexes`. The five daily-close tables come from
-    :func:`create_tables`, so this step does not name them.
-
-    The re-run guard returns at once when the ``jobs`` statement already
-    holds ``'day_publish'``: a fresh file, whose ``jobs`` :func:`migrate_v3`
-    rebuilt from its own widened text, or a rebuild already committed.
-    ``run_migrations`` writes ``PRAGMA user_version`` only after this
-    returns, so a stop in between leaves user_version below 13 and the next
-    open re-enters the ``current < 13`` gate and returns here.
-
-    As in :func:`migrate_v12_widen_raw_readings`, one savepoint holds the
-    rebuild, and the in_transaction check covers an error that has already
-    ended it. Any failure rolls the rebuild back, leaving the old ``jobs``
-    and no ``jobs_new``, and is re-raised, so the open fails before the
-    ``user_version`` write and the next open runs the step again.
-    """
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'"
-    ).fetchone()
-    if row is not None and "'day_publish'" in str(row[0]):
-        return
-    conn.execute("SAVEPOINT migrate_v13")
-    try:
-        conn.execute(
-            """
-            CREATE TABLE jobs_new (
-                id INTEGER PRIMARY KEY,
-                type TEXT NOT NULL,
-                site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
-                job_key TEXT,
-                payload TEXT NOT NULL DEFAULT '{}',
-                status TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(status IN ('pending','running','completed','failed')),
-                next_attempt_at TEXT,
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                max_retries INTEGER NOT NULL DEFAULT 5,
-                last_error TEXT,
-                result TEXT,
-                created_at TEXT NOT NULL
-                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                updated_at TEXT NOT NULL
-                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                CHECK (
-                    (type = 'catchup' AND site_id IS NULL)
-                    OR (
-                        type IN ('fetch_feed','fetch_obs','fetch_current_obs',
-                                 'pair_and_score','backfill_site',
-                                 'forecast_record','record_gap_scan',
-                                 'verification_run','timezone_correction',
-                                 'day_close','day_publish')
-                        AND site_id IS NOT NULL
-                    )
-                )
-            )
-            """
-        )
-        conn.execute("INSERT INTO jobs_new SELECT * FROM jobs")
-        conn.execute("DROP TABLE jobs")
-        conn.execute("ALTER TABLE jobs_new RENAME TO jobs")
-        conn.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedupe
-                ON jobs(type, COALESCE(site_id, -1), job_key)
-                WHERE status IN ('pending','running') AND job_key IS NOT NULL
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_jobs_type_key_site
-                ON jobs(type, job_key, site_id, id)
-            """
-        )
-    except BaseException:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK TO migrate_v13")
-            conn.execute("RELEASE migrate_v13")
-        raise
-    conn.execute("RELEASE migrate_v13")
-
-
-# Value: when the download record (``forecast_downloads``) starts, a
-# canonical whole-second UTC ``...Z`` stamp. Downloads before it are
-# inferred from ``forecast_samples`` and the job rows instead.
-DOWNLOAD_RECORD_SINCE_KEY: Final = "download_record_since"
-
-
-def migrate_v14_daily_close_scores(conn: sqlite3.Connection) -> None:
-    """Add the four P4 columns and start the download record.
-
-    :func:`create_tables` makes P4's twelve tables before the gates and
-    :func:`create_indexes` the ``forecast_downloads`` index after them, so
-    this step only adds ``verification_runs.worksheet_kept`` (1 for every
-    existing run) and ``forecast_of_record``'s ``publication_id``,
-    ``publication_cutoff`` and ``publication_age_days`` (NULL for every
-    existing record), then writes :data:`DOWNLOAD_RECORD_SINCE_KEY` with
-    the migration's time when the key is absent. It changes no existing row
-    beyond the new columns.
-
-    Re-entry, following :func:`migrate_v8_last_usable_fetch_at`:
-    ``run_migrations`` writes ``PRAGMA user_version`` only after this
-    returns, so a stop in between leaves user_version below 14 and the next
-    open re-enters the ``current < 14`` gate. Each column probe skips a
-    column already there -- on a fresh database :func:`create_tables` made
-    it, last in its table, so a fresh and a migrated database agree on
-    column order -- and the key is written only when absent, so a re-entry
-    keeps the first time. The clock is read through this module's
-    ``utc_now``, truncated to whole seconds.
-    """
-    if "worksheet_kept" not in _table_columns(conn, "verification_runs"):
-        conn.execute(
-            "ALTER TABLE verification_runs"
-            " ADD COLUMN worksheet_kept INTEGER NOT NULL DEFAULT 1"
-        )
-    record_columns = _table_columns(conn, "forecast_of_record")
-    if "publication_id" not in record_columns:
-        conn.execute("ALTER TABLE forecast_of_record ADD COLUMN publication_id INTEGER")
-    if "publication_cutoff" not in record_columns:
-        conn.execute(
-            "ALTER TABLE forecast_of_record ADD COLUMN publication_cutoff TEXT"
-        )
-    if "publication_age_days" not in record_columns:
-        conn.execute(
-            "ALTER TABLE forecast_of_record ADD COLUMN publication_age_days INTEGER"
-        )
-    if get_runtime_state(conn, DOWNLOAD_RECORD_SINCE_KEY) is None:
-        set_runtime_state(
-            conn,
-            DOWNLOAD_RECORD_SINCE_KEY,
-            isoformat_utc(utc_now().replace(microsecond=0)),
-        )
-
-
-def migrate_v16_rain_release(conn: sqlite3.Connection) -> None:
-    """The rain release's one migration (``plans/2026-11-01-rain-release.md``).
-
-    :func:`create_tables` makes ``station_rain_checks``, ``forecast_scored``
-    and Part C's four rain tables before the gates. Part A adds
-    ``site_day_stations.rain_counted`` when the table lacks it, 1 for every
-    existing list row: nothing else is carried over, and the first close
-    after the upgrade judges its day. Part B's carry-over then runs in the
-    plan's order: step 1 writes the scored
-    values of the open days and the coming days into ``forecast_scored``
-    (``carry_over_scored_values``); Part C's C6 fills ``rain_days`` and
-    ``rain_forecast_days`` for the 60 days before the oldest open day
-    (``fill_rain_history``); step 2 keeps one ``forecast_samples``
-    row per hour, the row the Forecast page showed
-    (``keep_newest_samples``), and step 3 makes ``idx_samples_slot``, which
-    the extra rows of step 2 would have refused. The clock is read through
-    this module's ``utc_now``.
-
-    The carry-over lives in ``collection/forecast_store.py`` and is
-    imported here: ``scoring/downloads.py``, which it calls, imports this
-    module.
-
-    Two index steps make the upgrade faster and change no row. Step 1 and
-    the fill run with ``V16_FETCHED_INDEX``, dropped right after the fill.
-    Before step 2 the four ``V16_DROPPED_SAMPLE_INDEXES`` are dropped (IF
-    EXISTS), so the delete updates only the table and its ``UNIQUE`` index;
-    :func:`create_indexes` makes all four again once the version
-    migrations are done, before ``user_version`` is written. Its
-    ``executescript`` commits first, so a stop before it ends leaves a
-    version-15 file without them; the next open runs this migration again
-    and then makes them.
-
-    One SAVEPOINT holds every step, following :func:`migrate_v4`: any error
-    rolls them all back and is re-raised, so the open fails before the
-    ``user_version`` write and the next open runs the migration again. As
-    in :func:`migrate_v12_widen_raw_readings`, the in_transaction check
-    covers an error that has already ended the transaction. Each step finds
-    its work done on a repeat (the column is added only when missing, the
-    scored and rain history rows are written only where none is stored, and
-    the index is IF NOT EXISTS), so a stop between this step and the version write
-    converges on the next open.
-    """
-    from wxverify.collection.forecast_store import (
-        carry_over_scored_values,
-        fill_rain_history,
-        keep_newest_samples,
+    logger.info(
+        "v17 upgrade: v17_copy_close_pairs: %d row(s), %d ms",
+        copied,
+        _elapsed_ms(started),
     )
 
-    conn.execute("SAVEPOINT migrate_v16")
+
+def _v17_delete_removed_jobs_keys(conn: sqlite3.Connection) -> None:
+    """Step 4: delete the jobs, keys and setting of removed code.
+
+    ``jobs`` keeps only ``_V17_KEPT_JOBS_SQL``'s rows, in any status, less
+    the ``day_publish`` rows of stage 8 (`_publish_stage`). ``runtime_state``
+    loses every key beginning ``verification_`` (compared case-sensitively,
+    no LIKE) and ``import_rebuild_state``; ``settings`` loses
+    ``verification_publish_hold``.
+    """
+    started = time.perf_counter()
+    jobs = conn.execute(f"DELETE FROM jobs WHERE NOT ({_V17_KEPT_JOBS_SQL})").rowcount
+    stage_jobs = [
+        (int(row[0]),)
+        for row in conn.execute(
+            "SELECT id, job_key FROM jobs WHERE type = 'day_publish'"
+        ).fetchall()
+        if _publish_stage(row[1]) == _V17_REMOVED_PUBLISH_STAGE
+    ]
+    conn.executemany("DELETE FROM jobs WHERE id = ?", stage_jobs)
+    keys = conn.execute(
+        "DELETE FROM runtime_state WHERE substr(key, 1, ?) = ? OR key = ?",
+        (len(_V17_REMOVED_KEY_PREFIX), _V17_REMOVED_KEY_PREFIX, _V17_REMOVED_KEY),
+    ).rowcount
+    settings = conn.execute(
+        "DELETE FROM settings WHERE key = ?", (_V17_REMOVED_SETTING,)
+    ).rowcount
+    logger.info(
+        "v17 upgrade: v17_delete_removed_jobs_keys: %d job(s), %d stage-%d"
+        " publish job(s), %d key(s), %d setting(s), %d ms",
+        jobs,
+        len(stage_jobs),
+        _V17_REMOVED_PUBLISH_STAGE,
+        keys,
+        settings,
+        _elapsed_ms(started),
+    )
+
+
+def _publish_stage(job_key: object) -> int | None:
+    """The stage of a ``day_publish`` key ``publish:<site>:<stage>``, read as
+    the close chain reads it (both numbers through ``int``); None when the
+    key does not read."""
+    if not isinstance(job_key, str):
+        return None
+    parts = job_key.split(":")
+    if len(parts) != 3 or parts[0] != "publish":
+        return None
     try:
-        # Part A: the list rows' rain flag; every existing row is counted.
-        if "rain_counted" not in _table_columns(conn, "site_day_stations"):
-            conn.execute(
-                "ALTER TABLE site_day_stations ADD COLUMN rain_counted"
-                " INTEGER NOT NULL DEFAULT 1 CHECK(rain_counted IN (0,1))"
-            )
-        # The carry-over's and the fill's own index, gone again before the
-        # delete: see V16_FETCHED_INDEX.
-        started = time.perf_counter()
-        conn.execute(f"DROP INDEX IF EXISTS {V16_FETCHED_INDEX}")
-        conn.execute(V16_FETCHED_INDEX_DDL)
-        logger.info(
-            "index %s built in %d ms",
-            V16_FETCHED_INDEX,
-            int((time.perf_counter() - started) * 1000),
-        )
-        # Part B, step 1: the scored values of the open days.
-        carry_over_scored_values(conn, now_utc=utc_now())
-        # Part C, C6: the rain history of the 60 days before the oldest open
-        # day, before Part B's step 2, which deletes the older labels the
-        # fill's scored_version reads.
-        fill_rain_history(conn)
-        conn.execute(f"DROP INDEX {V16_FETCHED_INDEX}")
-        # The delete need not keep these up to date; create_indexes makes
-        # them again after the version migrations.
-        for name in V16_DROPPED_SAMPLE_INDEXES:
-            conn.execute(f"DROP INDEX IF EXISTS {name}")
-        # Part B, step 2: one forecast_samples row per hour.
-        keep_newest_samples(conn)
-        # Part B, step 3: the index, after step 2's delete.
-        conn.execute(SAMPLES_SLOT_INDEX_DDL)
-    except BaseException:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK TO migrate_v16")
-            conn.execute("RELEASE migrate_v16")
-        raise
-    conn.execute("RELEASE migrate_v16")
+        _site, stage = int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+    return stage
 
 
-def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+def _v17_drop_tables(conn: sqlite3.Connection) -> None:
+    """Step 5: ``DROP TABLE IF EXISTS`` each table of ``V17_DROP_ORDER``, in
+    that order, then the TEMP table ``v17_dates``. The INFO line gives each
+    drop's milliseconds."""
+    started = time.perf_counter()
+    timings: list[str] = []
+    dropped = 0
+    for table in V17_DROP_ORDER:
+        if _table_exists(conn, table):
+            dropped += 1
+        table_started = time.perf_counter()
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+        timings.append(f"{table} {_elapsed_ms(table_started)} ms")
+    conn.execute("DROP TABLE IF EXISTS temp.v17_dates")
+    logger.info(
+        "v17 upgrade: v17_drop_tables: %d table(s) dropped (%s), %d ms",
+        dropped,
+        ", ".join(timings),
+        _elapsed_ms(started),
+    )
+
+
+def _close_on_recorded(conn: sqlite3.Connection) -> bool:
+    """Whether ``runtime_state`` holds ``DAILY_CLOSE_ON_KEY``. Read-only; a
+    file with no ``runtime_state`` table holds no key."""
+    if not _table_exists(conn, "runtime_state"):
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM runtime_state WHERE key = ?", (DAILY_CLOSE_ON_KEY,)
+    ).fetchone()
+    return row is not None
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    """Whether the main schema has a table named ``table``. Read-only."""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    return row is not None
+
+
+def _elapsed_ms(started: float) -> int:
+    """Whole milliseconds since ``started``, a ``time.perf_counter`` value."""
+    return int((time.perf_counter() - started) * 1000)

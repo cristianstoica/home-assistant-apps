@@ -300,9 +300,7 @@ def test_k2_lock_held_at_current_obs_call_site_and_outcome_writes(
             monkeypatch.setattr(
                 "wxverify.worker.processor.persist_poll_result", spy_persist
             )
-            await _fetch_current_obs(
-                db, FencedWriter(db, db.generation), site_a, station_a
-            )
+            await _fetch_current_obs(db, FencedWriter(db), site_a, station_a)
 
             monkeypatch.setattr(
                 "wxverify.worker.processor.fetch_current_observation",
@@ -312,9 +310,7 @@ def test_k2_lock_held_at_current_obs_call_site_and_outcome_writes(
                 "wxverify.worker.processor._record_current_obs_backoff", spy_backoff
             )
             with pytest.raises(JobDeferred):
-                await _fetch_current_obs(
-                    db, FencedWriter(db, db.generation), site_b, station_b
-                )
+                await _fetch_current_obs(db, FencedWriter(db), site_b, station_b)
 
             assert locked_at == {
                 "fetch_200": True,

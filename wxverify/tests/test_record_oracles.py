@@ -27,17 +27,20 @@ import pytest
 
 from tests.helpers import (
     asof_conn,
-    asof_insert_pair,
     asof_make_real_feed,
     asof_make_site,
+    seed_active_publication,
+    seed_forecast_history,
+    seed_publication_ranking,
     seed_rain_ranks,
 )
-from tests.test_forecast_service import _hours
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.core.units import ms_to_kmh
+from wxverify.db.runtime_state import set_runtime_state
 from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.service import build_forecast, build_hourly
 from wxverify.forecast.wind_blend import FALLBACK_NOT_ENOUGH_FEEDS
+from wxverify.scoring.metrics import MetricResult
 from wxverify.settings.keys import set_setting
 from wxverify.verification.methodology import LATE_WRITE_WINDOW_HOURS
 from wxverify.verification.record import (
@@ -191,27 +194,39 @@ def _seed_base_fixture(conn: sqlite3.Connection) -> tuple[int, int, int]:
                 value=value_b,
                 variable=variable,
             )
-    # Knowable-at-T pairs: A has 2, B has 1 -> scored rung ranks A first.
+    # A's 2 history rows and B's 1 (below) are the fixture's literal
+    # evidence, read back by name in the oracle that pins the record's
+    # "scored" rung (``test_first_write_cutoff_late_build_bit_identical_
+    # to_at_t``, via a published ranking carrying the same counts):
+    # ``_record_ranking`` reads a feed's pair count from its
+    # ``publication_rankings`` row, not from these ``forecast_history``
+    # rows directly.
     for hour in (10, 11):
-        asof_insert_pair(
+        seed_forecast_history(
             conn,
             site_id=site_id,
+            local_date=date(2035, 6, 12),
             feed_id=feed_a,
+            variable="temperature",
+            day_ahead=1,
             valid_at=f"2035-06-12T{hour:02d}:00:00Z",
-            issued_at="2035-06-11T10:00:00Z",
+            lead_hours=6,
             forecast=10.0,
             observed=10.5,
-            first_known_at="2035-06-12T12:00:00Z",
+            issued_at="2035-06-11T10:00:00Z",
         )
-    asof_insert_pair(
+    seed_forecast_history(
         conn,
         site_id=site_id,
+        local_date=date(2035, 6, 12),
         feed_id=feed_b,
+        variable="temperature",
+        day_ahead=1,
         valid_at="2035-06-12T10:00:00Z",
-        issued_at="2035-06-11T10:00:00Z",
+        lead_hours=6,
         forecast=12.0,
         observed=10.5,
-        first_known_at="2035-06-12T12:00:00Z",
+        issued_at="2035-06-11T10:00:00Z",
     )
     return site_id, feed_a, feed_b
 
@@ -220,10 +235,9 @@ def _poison_post_t(
     conn: sqlite3.Connection, *, site_id: int, feed_b: int, snapshot_utc: datetime
 ) -> int:
     """Inject data knowable only AFTER T (the §18.5 adversary): a brand-new
-    feed fetched post-T, five post-T pairs flipping the pair-count ranking
-    to feed B, and a ``score_cache`` row that would make B the confident
-    live-path winner. A leak through ANY of the three as-of seams changes
-    the record's candidates, ranking, or selection.
+    feed fetched post-T and five post-T pairs flipping the pair-count
+    ranking to feed B. A leak through either as-of seam changes the
+    record's candidates or ranking.
     """
     row = conn.execute("SELECT id FROM feeds WHERE model = 'model-c'").fetchone()
     assert row is not None
@@ -240,15 +254,18 @@ def _poison_post_t(
             value=50.0,
         )
     for hour in range(5):
-        asof_insert_pair(
+        seed_forecast_history(
             conn,
             site_id=site_id,
+            local_date=date(2035, 6, 13),
             feed_id=feed_b,
+            variable="temperature",
+            day_ahead=1,
             valid_at=f"2035-06-13T{10 + hour:02d}:00:00Z",
-            issued_at="2035-06-12T10:00:00Z",
+            lead_hours=6,
             forecast=12.0,
             observed=12.1,
-            first_known_at=post,
+            issued_at="2035-06-12T10:00:00Z",
         )
     conn.execute(
         """
@@ -310,6 +327,34 @@ def _cell(
 # ---------------------------------------------------------------------------
 
 
+def _seed_base_fixture_ranking(
+    conn: sqlite3.Connection, *, site_id: int, feed_a: int, feed_b: int, t: datetime
+) -> None:
+    """Publish feed A/B's pair counts (2/1) at (temperature, day_ahead=1)
+    in a publication active at T, neither confident (``min_n`` above
+    both), so the record's selection falls to the "scored" rung and ranks
+    by ``pair_n`` -- the published counts matching the knowable-at-T
+    ``forecast_history`` rows ``_seed_base_fixture`` seeds for A and B.
+    """
+    pub_id = seed_active_publication(
+        conn,
+        site_id=site_id,
+        cutoff=_DAY - timedelta(days=1),
+        published_at=t - timedelta(hours=1),
+        min_n=5,
+    )
+    for feed_id, n in ((feed_a, 2), (feed_b, 1)):
+        seed_publication_ranking(
+            conn,
+            publication_id=pub_id,
+            feed_id=feed_id,
+            variable="temperature",
+            day_ahead=1,
+            window_key="w:7",
+            result=MetricResult(n=n, confident=False),
+        )
+
+
 def test_first_write_cutoff_late_build_bit_identical_to_at_t() -> None:
     """§18.5 first-write cutoff / §7 Construction (as-of parameterization).
 
@@ -318,16 +363,19 @@ def test_first_write_cutoff_late_build_bit_identical_to_at_t() -> None:
       ``build_forecast_record`` (post-T feed C leaks into candidates);
     - ``as_of = isoformat_utc(at)`` instead of ``snapshot_utc`` (post-T
       pairs/samples become "knowable" on the late build);
-    - dropping ``as_of=as_of`` from the ``forecast_ranking`` call (the
-      ranking falls back to the live cache-backed path; the incomplete
-      poisoned ``score_cache`` snapshot reads ``rebuilding`` -> EMPTY rows,
-      so every candidate's pair evidence collapses to zero — caught by the
-      absolute hand-derived pair-count assertions below, NOT by the dump
-      comparison, which a both-sides-equally-degraded mutant slips past).
+    - dropping ``at_utc=as_of`` from the ``active_publication`` call that
+      resolves the record's publication (the call falls back to the
+      latest-cutoff publication regardless of ``published_at``, so a
+      publication published AFTER T -- none exists in this fixture, but a
+      mutant that drops the filter would still read whatever the latest
+      cutoff is -- could leak a post-T ranking into the record).
     """
     t = _t()
     conn_at_t = asof_conn()
-    site_at_t, feed_a, _ = _seed_base_fixture(conn_at_t)
+    site_at_t, feed_a, feed_b_at_t = _seed_base_fixture(conn_at_t)
+    _seed_base_fixture_ranking(
+        conn_at_t, site_id=site_at_t, feed_a=feed_a, feed_b=feed_b_at_t, t=t
+    )
     build_forecast_record(conn_at_t, site_at_t, _DAY.isoformat(), now=t)
     # ``write_path`` records WHICH path wrote the row, not the product it
     # wrote; it is derived from the build clock and so differs by construction
@@ -339,6 +387,9 @@ def test_first_write_cutoff_late_build_bit_identical_to_at_t() -> None:
     conn_late = asof_conn()
     site_late, feed_a_late, feed_b_late = _seed_base_fixture(conn_late)
     assert feed_a_late == feed_a  # identical construction order by design
+    _seed_base_fixture_ranking(
+        conn_late, site_id=site_late, feed_a=feed_a_late, feed_b=feed_b_late, t=t
+    )
     _poison_post_t(conn_late, site_id=site_late, feed_b=feed_b_late, snapshot_utc=t)
     build_forecast_record(
         conn_late, site_late, _DAY.isoformat(), now=t + timedelta(hours=6)
@@ -918,88 +969,36 @@ def test_record_outcomes_score_clearing_subset_hourly_follows_drill_down() -> No
 # ---------------------------------------------------------------------------
 
 
-def _insert_wind_training_pair(
+def _seed_wind_publication(
     conn: sqlite3.Connection,
     *,
     site_id: int,
-    feed_id: int,
-    valid_at: str,
-    issued_at: str,
-    forecast: float,
-    observed: float,
-) -> None:
-    """A wind training pair known as of its own ``valid_at`` (as-of-safe).
-
-    ``tests.helpers.asof_insert_pair`` is hardcoded to ``variable=
-    'temperature'`` (see its SQL literal), so wind training needs its own
-    insert here. ``first_known_at=valid_at`` makes every pair knowable to
-    the as-of training query the record build runs (``asof.py``'s
-    ``first_known_at IS NOT NULL AND first_known_at <= T``); the shared
-    ``tests/test_forecast_service.py`` wind helpers leave it NULL, which
-    hides every pair from this query even though the live Forecast page
-    (``as_of=None``) still renders fine off the same rows.
+    weights_by_feed: dict[int, float],
+    day_ahead: int = 1,
+    cutoff: date,
+    published_at: datetime,
+) -> int:
+    """Turn the daily close on and publish each feed's raw wind weight
+    (``publication_wind_weights``) -- serving (and the record build) now
+    reads only the active publication, never a live recompute from
+    training pairs. ``day_ahead`` must match the representative lead
+    ``record.py`` computes for the seeded samples (1, for the usual
+    "issued the evening before, 24h today" shape these fixtures use).
     """
-    error = forecast - observed
-    generation_id = ensure_site_generation(conn, site_id)
-    conn.execute(
-        """
-        INSERT INTO forecast_pairs
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error,
-             first_known_at, tz_generation_id)
-        VALUES (?, ?, 'wind', ?, ?, 4, 1, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            site_id,
-            feed_id,
-            issued_at,
-            valid_at,
-            forecast,
-            observed,
-            error,
-            abs(error),
-            error**2,
-            valid_at,
-            generation_id,
-        ),
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(published_at))
+    publication_id = seed_active_publication(
+        conn, site_id=site_id, cutoff=cutoff, published_at=published_at
     )
-
-
-def _seed_wind_training_asof(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    forecast_by_feed: dict[int, float],
-    observed: float,
-    upto: date,
-) -> None:
-    """30 days of trained, as-of-knowable wind pairs ending just before
-    ``upto``, plus the matching ``observations`` rows ``load_wind_training``
-    reads for the observed side."""
-    for offset in range(1, 31):
-        target = upto - timedelta(days=offset)
-        issued_at = f"{target - timedelta(days=1)}T20:00:00Z"
-        valid_ats = _hours(target.isoformat(), 0, 24)
-        for feed_id, forecast in forecast_by_feed.items():
-            for valid_at in valid_ats:
-                _insert_wind_training_pair(
-                    conn,
-                    site_id=site_id,
-                    feed_id=feed_id,
-                    valid_at=valid_at,
-                    issued_at=issued_at,
-                    forecast=forecast,
-                    observed=observed,
-                )
-        for valid_at in valid_ats:
-            conn.execute(
-                """
-                INSERT INTO observations
-                    (site_id, variable, valid_at, value, n_stations, computed_at)
-                VALUES (?, 'wind', ?, ?, 1, ?)
-                """,
-                (site_id, valid_at, observed, valid_at),
-            )
+    for feed_id, weight in weights_by_feed.items():
+        conn.execute(
+            "INSERT INTO publication_wind_weights"
+            " (publication_id, feed_id, day_ahead, mae_ms, days, weight)"
+            " VALUES (?, ?, ?, 1.0, 30, ?)",
+            (publication_id, feed_id, day_ahead, weight),
+        )
+    return publication_id
 
 
 def test_t61_pair_max_wind_tile_parity_and_legacy_hourly_uses_clearing_subset() -> None:
@@ -1008,10 +1007,11 @@ def test_t61_pair_max_wind_tile_parity_and_legacy_hourly_uses_clearing_subset() 
     ``_blend_hourly(agg_ids, ...)`` -- the clearing subset -- not the
     general ladder's full ``selected_ids``.
 
-    Fixture: three feeds trained identically well enough to be weighted-
-    eligible (A and B cover 24h today and clear coverage; C covers only 15h
-    today, below ``MIN_COVERAGE_HOURS=18``, so it clears neither coverage
-    nor the clearing subset). ``forecast_blend_depth_wind`` is overridden to
+    Fixture: three feeds with published weights (A and B cover 24h today
+    and clear coverage; C covers only 15h today, below
+    ``MIN_COVERAGE_HOURS=18``, so it clears neither coverage nor the
+    clearing subset, regardless of its weight). ``forecast_blend_depth_wind``
+    is overridden to
     3 so the general ladder's ``selected_ids`` includes all three feeds,
     deliberately diverging from ``agg_ids`` (the clearing subset, A and B
     only) -- the divergence T61 requires to distinguish the two.
@@ -1033,12 +1033,12 @@ def test_t61_pair_max_wind_tile_parity_and_legacy_hourly_uses_clearing_subset() 
     set_setting(conn, "forecast_blend_depth_wind", "3")
     conn.commit()
 
-    _seed_wind_training_asof(
+    _seed_wind_publication(
         conn,
         site_id=site_id,
-        forecast_by_feed={feed_a: 5.0, feed_b: 6.0, feed_c: 5.5},
-        observed=4.0,
-        upto=_DAY,
+        weights_by_feed={feed_a: 1.0, feed_b: 0.5, feed_c: 1 / 1.5},
+        cutoff=_DAY - timedelta(days=1),
+        published_at=datetime(2035, 6, 14, 21, 0, tzinfo=UTC),
     )
     _insert_var_day(
         conn,
@@ -1129,15 +1129,16 @@ def test_t63_weighted_served_feed_weights_sum_to_one() -> None:
     feed_b = asof_make_real_feed(conn, "model-b")
     conn.commit()
 
-    # A forecasts dead-on (MAE -> floor 0.1, weight 10); B is off by 1.0
-    # m/s every day (MAE 1.0, weight 1) -- an asymmetric fixture so a
-    # dropped normalization is visibly not 1.0, not coincidentally 1.0.
-    _seed_wind_training_asof(
+    # A's published weight stands in for a dead-on forecast (MAE -> floor
+    # 0.1, weight 10); B's for one off by 1.0 m/s every day (MAE 1.0,
+    # weight 1) -- an asymmetric fixture so a dropped normalization is
+    # visibly not 1.0, not coincidentally 1.0.
+    _seed_wind_publication(
         conn,
         site_id=site_id,
-        forecast_by_feed={feed_a: 4.0, feed_b: 5.0},
-        observed=4.0,
-        upto=_DAY,
+        weights_by_feed={feed_a: 10.0, feed_b: 1.0},
+        cutoff=_DAY - timedelta(days=1),
+        published_at=datetime(2035, 6, 14, 21, 0, tzinfo=UTC),
     )
     _insert_var_day(
         conn,
@@ -1165,8 +1166,14 @@ def test_t63_weighted_served_feed_weights_sum_to_one() -> None:
 
     row = _cell(conn, site_id, _DAY.isoformat(), "wind", 0)
     for column in _RECORD_WIND_COLUMNS:
+        if column == "leaderboard_status":
+            continue
         assert row[column] is not None
         json.loads(str(row[column]))  # every wind column is well-formed JSON
+    # NULL with the close on: the live leaderboard status is not read
+    # (record.py, "NULL with the close on" comment) -- this test's
+    # ``_seed_wind_publication`` turns the close on.
+    assert row["leaderboard_status"] is None
 
     weights = json.loads(str(row["feed_weights"]))
     assert set(weights) == {str(feed_a), str(feed_b)}
@@ -1194,13 +1201,11 @@ def test_t63_pair_max_one_feed_has_not_enough_feeds() -> None:
     feed_a = asof_make_real_feed(conn, "model-a")
     conn.commit()
 
-    _seed_wind_training_asof(
-        conn,
-        site_id=site_id,
-        forecast_by_feed={feed_a: 4.0},
-        observed=4.0,
-        upto=_DAY,
-    )
+    # No weight source seeded: with only one feed site-wide, `choose_wind_
+    # feeds` is unavailable below MIN_FEEDS=2 regardless of any weight data
+    # (serving and the record build read only the active publication for
+    # weights, never a live recompute -- `_seed_wind_publication`'s
+    # docstring above).
     _insert_var_day(
         conn,
         site_id=site_id,
@@ -1218,8 +1223,14 @@ def test_t63_pair_max_one_feed_has_not_enough_feeds() -> None:
 
     row = _cell(conn, site_id, _DAY.isoformat(), "wind", 0)
     for column in _RECORD_WIND_COLUMNS:
+        if column == "leaderboard_status":
+            # Always NULL: the record never reads the live leaderboard
+            # status (record.py, "the live leaderboard status is not
+            # read" comment).
+            continue
         assert row[column] is not None
         json.loads(str(row[column]))
+    assert row["leaderboard_status"] is None
 
     assert json.loads(str(row["feed_weights"])) == {}
     assert json.loads(str(row["selected_feed_ids"])) == []

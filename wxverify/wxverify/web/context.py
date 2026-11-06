@@ -579,8 +579,7 @@ def _load_dashboard(
         )
     )
     verdict = compute_verdict(leaderboard)
-    # Pure read: the status is surfaced for the route to act on AFTER the read
-    # connection closes (dashboard_page enqueues the rescore); never write here.
+    # Pure read; never write here.
     composite_result = composite_in_snapshot(conn, site_id=site.id, window=window)
     return {
         "sites": sites,
@@ -709,8 +708,6 @@ def load_ops(conn: sqlite3.Connection) -> dict[str, object]:
     mixes them. With the close on, ``close_panel`` holds the close status
     panel; with it off the panels are today's and ``close_panel`` is None.
     """
-    from wxverify.verification.publish_hold import read_publish_hold
-
     now = utc_now()
     close_on = daily_close_on(conn)
     sites = load_sites(conn)
@@ -727,7 +724,6 @@ def load_ops(conn: sqlite3.Connection) -> dict[str, object]:
         "observation_health": load_observation_health(conn, close_on=close_on),
         "station_trust": load_station_trust(conn),
         "wind_history": load_wind_history(conn),
-        "publish_hold": read_publish_hold(conn),
         "close_on": close_on,
         "close_panel": load_close_status(conn, now, close_on=close_on),
     }
@@ -754,11 +750,9 @@ def load_overlay(
         if site_id is not None
         else (sites[0] if sites else None)
     )
-    # One switch per read (9.2): it picks the feed list and the chart hint.
+    # One switch per read (9.2): it picks the chart hint.
     close_on = daily_close_on(conn)
-    feeds = _scoring_feeds(
-        conn, site.id if site is not None else None, variable, close_on=close_on
-    )
+    feeds = _scoring_feeds(conn, site.id if site is not None else None)
     selected_feed_id = (
         feed_id if feed_id is not None else (feeds[0].id if feeds else None)
     )
@@ -1828,47 +1822,25 @@ def _fetch_unit_feeds(
     return out
 
 
-def _scoring_feeds(
-    conn: sqlite3.Connection, site_id: int | None, variable: str, *, close_on: bool
-) -> list[FeedToggle]:
+def _scoring_feeds(conn: sqlite3.Connection, site_id: int | None) -> list[FeedToggle]:
     """The Overlay's feed list for a site, ordered by source and model.
 
-    With the daily close off, the site's active feeds that have a stored
-    pair of ``variable``. With it on (9.2), every active feed: closed days'
-    pairs are P4's, so ``forecast_pairs`` no longer says which feed has data.
+    Every active feed of the site (9.2).
     """
     if site_id is None:
         return []
-    if close_on:
-        rows = conn.execute(
-            f"""
-            WITH {active_feed_cte()}
-            SELECT f.*, sfs.enabled AS override_enabled
-            FROM active_feeds a
-            JOIN feeds f ON f.id = a.feed_id
-            LEFT JOIN site_feed_state sfs
-              ON sfs.site_id = ? AND sfs.feed_id = f.id
-            ORDER BY f.source, f.model
-            """,
-            (site_id, site_id, site_id),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            f"""
-            WITH {active_feed_cte()}
-            SELECT f.*, sfs.enabled AS override_enabled
-            FROM active_feeds a
-            JOIN feeds f ON f.id = a.feed_id
-            LEFT JOIN site_feed_state sfs
-              ON sfs.site_id = ? AND sfs.feed_id = f.id
-            WHERE EXISTS (
-                SELECT 1 FROM forecast_pairs fp
-                WHERE fp.site_id = ? AND fp.feed_id = a.feed_id AND fp.variable = ?
-            )
-            ORDER BY f.source, f.model
-            """,
-            (site_id, site_id, site_id, site_id, variable),
-        ).fetchall()
+    rows = conn.execute(
+        f"""
+        WITH {active_feed_cte()}
+        SELECT f.*, sfs.enabled AS override_enabled
+        FROM active_feeds a
+        JOIN feeds f ON f.id = a.feed_id
+        LEFT JOIN site_feed_state sfs
+          ON sfs.site_id = ? AND sfs.feed_id = f.id
+        ORDER BY f.source, f.model
+        """,
+        (site_id, site_id, site_id),
+    ).fetchall()
     out: list[FeedToggle] = []
     for row in rows:
         override = (

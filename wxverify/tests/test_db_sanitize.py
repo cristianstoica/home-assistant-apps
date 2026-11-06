@@ -12,10 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from wxverify import config
-from wxverify.api.routes import db_transfer
 from wxverify.core.timeutil import isoformat_utc, parse_utc
-from wxverify.db.connection import Database, close_db
+from wxverify.db.connection import Database
 from wxverify.db.sanitize import sanitize_wedge_prone_timestamps
 
 
@@ -184,9 +182,10 @@ def test_malformed_settings_table_falls_back_to_default_interval(
 
 
 # ---------------------------------------------------------------------------
-# Entry-point wiring: Database._open() (every open) and db_transfer's staged
-# upload pass. These pin that the wedge fix actually runs from each real
-# caller, not just that the underlying function works in isolation.
+# Entry-point wiring: Database._open() (every open). This pins that the
+# wedge fix actually runs from the real caller, not just that the
+# underlying function works in isolation. (The database import's own
+# staged-upload pass was removed in the storage-release plan, 5.5.)
 # ---------------------------------------------------------------------------
 
 
@@ -286,43 +285,9 @@ def test_boot_guard_clears_open_transaction_after_failed_rollback(
         db.close()
 
 
-def test_stage_pending_rebuild_state_sanitizes_the_staged_upload(
-    tmp_path: Path,
-) -> None:
-    """``_stage_pending_rebuild_state`` runs on the staged upload file before
-    promotion, so a wedged row in an imported database is fixed by
-    construction -- the promoted file never carries it, regardless of what
-    runs (or crashes) after the rename.
-    """
-    close_db()
-    config.db_path = str(tmp_path / "unused.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-
-    staged_path = tmp_path / "staged.db"
-    staged = Database(str(staged_path))
-    try:
-        staged._conn.execute(  # noqa: SLF001
-            "INSERT INTO jobs (type, job_key, status, next_attempt_at)"
-            " VALUES ('catchup', 'k', 'pending', 'zzzz-not-a-timestamp')"
-        )
-        staged._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
-        staged._conn.commit()  # noqa: SLF001
-    finally:
-        staged.close()
-
-    db_transfer._stage_pending_rebuild_state(staged_path)  # noqa: SLF001
-
-    direct = sqlite3.connect(str(staged_path))
-    try:
-        row = direct.execute(
-            "SELECT next_attempt_at FROM jobs WHERE job_key = 'k'"
-        ).fetchone()
-    finally:
-        direct.close()
-    assert row[0] is None, (
-        "the staged file must be sanitized before promotion, so the wedge "
-        "never survives into the live database"
-    )
+# `test_stage_pending_rebuild_state_sanitizes_the_staged_upload` (the staged
+# import's own sanitize-before-promotion call) was removed with the database
+# import (storage-release plan 5.5).
 
 
 # ---------------------------------------------------------------------------
@@ -387,8 +352,7 @@ def test_sanitize_finds_mixed_case_jobs_and_station_poll_state() -> None:
 # unmodified, now with the release simply skipped. UP1-UP4 need the real
 # columns (health_state, last_error, error_count), so they build a
 # real-schema database via `Database(...)`, exactly like
-# `test_database_open_sanitizes_a_wedged_jobs_row_on_every_open` and
-# `test_stage_pending_rebuild_state_sanitizes_the_staged_upload` above.
+# `test_database_open_sanitizes_a_wedged_jobs_row_on_every_open` above.
 #
 # Synthetic data only (public repo): station ids "KTEST001".."KTEST005".
 # ---------------------------------------------------------------------------
@@ -637,55 +601,6 @@ def test_up3_second_call_changes_nothing_and_logs_no_info(
         db.close()
 
 
-def test_up4_staged_upload_is_released_before_promotion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Mirrors `test_stage_pending_rebuild_state_sanitizes_the_staged_upload`
-    above: `_stage_pending_rebuild_state` runs `sanitize_wedge_prone_timestamps`
-    (which calls `release_key_refused_polls`) on the staged file BEFORE the
-    atomic rename promotes it, so a station parked by a now-expired key
-    refusal is released by construction -- never only by the open-path boot
-    guard running later against the live database.
-
-    Kills: a release wired only into the open path (`Database.__init__`'s
-    own sanitize call), never into the staging path.
-    """
-    close_db()
-    config.db_path = str(tmp_path / "unused.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-    monkeypatch.setattr("wxverify.db.sanitize.utc_now", lambda: _UP_NOW)
-
-    staged_path = tmp_path / "staged.db"
-    staged = Database(str(staged_path))
-    station_id: int
-    try:
-        site_id = _up_site(staged._conn)  # noqa: SLF001
-        station_id = _up_station(staged._conn, site_id, "KTEST001")  # noqa: SLF001
-        future = isoformat_utc(_UP_NOW + timedelta(hours=20))
-        _up_poll_state(  # noqa: SLF001
-            staged._conn,
-            station_id,
-            health_state="terminal",
-            last_error="http 401",
-            next_poll_at=future,
-        )
-        staged._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
-        staged._conn.commit()  # noqa: SLF001
-    finally:
-        staged.close()
-
-    db_transfer._stage_pending_rebuild_state(staged_path)  # noqa: SLF001
-
-    direct = sqlite3.connect(str(staged_path))
-    direct.row_factory = sqlite3.Row
-    try:
-        row = direct.execute(
-            "SELECT next_poll_at FROM station_poll_state WHERE station_id = ?",
-            (station_id,),
-        ).fetchone()
-    finally:
-        direct.close()
-    assert row["next_poll_at"] == isoformat_utc(_UP_NOW), (
-        "the staged file's refused-key poll must already be released at the "
-        "point of promotion, not only once the live database next opens"
-    )
+# UP4 (`test_up4_staged_upload_is_released_before_promotion`: the staged
+# import's own release-before-promotion call) was removed with the database
+# import (storage-release plan 5.5).

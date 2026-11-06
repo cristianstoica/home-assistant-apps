@@ -21,11 +21,10 @@ from tests.test_forecast_service import (
     _insert_sample,
     _make_db,
     _seed_hourly,
-    _seed_wind_training,
+    _seed_wind_publication,
 )
 from wxverify.core.units import ms_to_kmh
 from wxverify.db.runtime_state import set_runtime_state
-from wxverify.forecast import wind_blend
 from wxverify.forecast.service import build_forecast, build_hourly
 from wxverify.forecast.wind_blend import NOT_ENOUGH_FEEDS_NOTE
 
@@ -33,9 +32,9 @@ from wxverify.forecast.wind_blend import NOT_ENOUGH_FEEDS_NOTE
 
 
 def test_t59_one_eligible_feed_is_not_enough() -> None:
-    """``pair_max`` with exactly one trained, sufficiently-covered feed:
-    still below ``MIN_FEEDS=2``, so wind is withheld with the
-    not-enough-feeds note -- distinct from
+    """One published, sufficiently-covered wind feed: still below
+    ``MIN_FEEDS=2``, so wind is withheld with the not-enough-feeds note --
+    distinct from
     ``test_build_hourly_wind_untrained_feed_is_not_served`` (ZERO eligible
     feeds), which a ``len(eligible) == 0`` mutant of the ``MIN_FEEDS``
     check would still pass.
@@ -51,7 +50,7 @@ def test_t59_one_eligible_feed_is_not_enough() -> None:
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_wind_training(conn, forecast_by_feed={feed_id: 5.0}, observed=4.0)
+    _seed_wind_publication(conn, weights_by_feed={feed_id: 1.0})
     _seed_hourly(
         conn,
         feed_id=feed_id,
@@ -71,10 +70,10 @@ def test_t59_one_eligible_feed_is_not_enough() -> None:
 
 def test_t59_one_eligible_feed_tile_is_not_available() -> None:
     """Tile side of T59, same fixture as
-    ``test_t59_one_eligible_feed_is_not_enough``: one trained,
-    sufficiently-covered feed in ``pair_max`` is still below
-    ``MIN_FEEDS=2``, so the tile itself (not just the hourly payload) must
-    read not-available with the not-enough-feeds note and no value.
+    ``test_t59_one_eligible_feed_is_not_enough``: one published,
+    sufficiently-covered wind feed is still below ``MIN_FEEDS=2``, so the
+    tile itself (not just the hourly payload) must read not-available with
+    the not-enough-feeds note and no value.
 
     mutant_min_feeds_off_by_one -> at ``assert tile.wind.meta.state ==
     "not_available"``: correct = ``"not_available"`` (one eligible feed is
@@ -88,7 +87,7 @@ def test_t59_one_eligible_feed_tile_is_not_available() -> None:
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_wind_training(conn, forecast_by_feed={feed_id: 5.0}, observed=4.0)
+    _seed_wind_publication(conn, weights_by_feed={feed_id: 1.0})
     _seed_hourly(
         conn,
         feed_id=feed_id,
@@ -118,9 +117,10 @@ def test_t60_stored_switching_or_rescoring_key_serves_weighted_wind(
     nothing reads it, so the tile and the hourly line serve the weighted
     blend, with no progress note.
 
-    Two trained feeds, A (MAE 1.0) and B (MAE 2.0), take weights 2/3 and
-    1/3; A forecasts 4.0 m/s and B 7.0 m/s all day, so the daily high and
-    every hour read 2/3 * 4.0 + 1/3 * 7.0 = 5.0 m/s, 18.0 km/h.
+    Two published feeds, A (weight 1.0, standing in for MAE 1.0) and B
+    (weight 0.5, MAE 2.0), normalize to 2/3 and 1/3; A forecasts 4.0 m/s
+    and B 7.0 m/s all day, so the daily high and every hour read
+    2/3 * 4.0 + 1/3 * 7.0 = 5.0 m/s, 18.0 km/h.
 
     mutant_wind_line_plain_mean -> at
     ``assert payload["blend"]["wind_kmh"] == pytest.approx([18.0] * 24)``:
@@ -132,7 +132,7 @@ def test_t60_stored_switching_or_rescoring_key_serves_weighted_wind(
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_wind_training(conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0}, observed=4.0)
+    _seed_wind_publication(conn, weights_by_feed={feed_a: 1.0, feed_b: 0.5})
     hours = _hours("2026-07-20", 0, 24)
     for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0)):
         _seed_hourly(
@@ -184,7 +184,7 @@ def test_t66_weighted_widens_axis_temperature_unchanged_none_at_new_hours() -> N
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_wind_training(conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0}, observed=4.0)
+    _seed_wind_publication(conn, weights_by_feed={feed_a: 1.0, feed_b: 0.5})
     wind_hours = _hours("2026-07-20", 0, 24)
     for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0)):
         _seed_hourly(
@@ -245,9 +245,7 @@ def test_t66_weighted_widens_axis_precip_unchanged_none_at_new_hour() -> None:
     off_hour = "2026-07-20T03:30:00Z"
 
     def _seed_common(c: sqlite3.Connection, *, widen: bool) -> None:
-        _seed_wind_training(
-            c, forecast_by_feed={feed_a: 5.0, feed_b: 6.0}, observed=4.0
-        )
+        _seed_wind_publication(c, weights_by_feed={feed_a: 1.0, feed_b: 0.5})
         for fid, value in ((feed_a, 4.0), (feed_b, 7.0)):
             _seed_hourly(
                 c,
@@ -316,7 +314,7 @@ def test_t66_weighted_renormalizes_missing_feed_hour() -> None:
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_wind_training(conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0}, observed=4.0)
+    _seed_wind_publication(conn, weights_by_feed={feed_a: 1.0, feed_b: 0.5})
     hours = _hours("2026-07-20", 0, 24)
     _seed_hourly(
         conn,
@@ -365,7 +363,7 @@ def test_t66_weighted_hour_with_no_wind_contributor_is_none() -> None:
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_wind_training(conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0}, observed=4.0)
+    _seed_wind_publication(conn, weights_by_feed={feed_a: 1.0, feed_b: 0.5})
     wind_hours = _hours("2026-07-20", 0, 20)
     for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0)):
         _seed_hourly(
@@ -413,7 +411,7 @@ def test_t66_weighted_states_wind_ignores_rebuilding() -> None:
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_wind_training(conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0}, observed=4.0)
+    _seed_wind_publication(conn, weights_by_feed={feed_a: 1.0, feed_b: 0.5})
     hours = _hours("2026-07-20", 0, 24)
     for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0)):
         _seed_hourly(
@@ -432,21 +430,16 @@ def test_t66_weighted_states_wind_ignores_rebuilding() -> None:
 def test_t66_stored_switching_key_still_serves_the_weighted_line() -> None:
     """A stored ``switching`` key no longer closes the hourly wind line: it
     is the weighted blend (18.0 km/h at every hour, as in the T60 rewrite),
-    ``notes["wind"]`` is None, and temperature is unaffected. The live
-    weights come through the cache, which counts the call.
+    ``notes["wind"]`` is None, and temperature is unaffected.
 
-    mutant_live_and_as_of_swapped -> at the ``calls`` assertion: correct =
-    one call more (``load_wind_serving`` with ``as_of`` None reads the live
-    weights through ``live_wind_weights``, which counts every call), mutant
-    (``load_wind_serving``'s two branches swapped, so a live request
-    computes its weights uncached) = no call counted, while the weights,
-    and so the line, stay the same.
+    ``load_wind_serving`` only reads the active publication's weights, with
+    no live recompute, so this test checks only the serving-side output.
     """
     conn = _make_db()
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_wind_training(conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0}, observed=4.0)
+    _seed_wind_publication(conn, weights_by_feed={feed_a: 1.0, feed_b: 0.5})
     hours = _hours("2026-07-20", 0, 24)
     for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0)):
         _seed_hourly(
@@ -467,13 +460,7 @@ def test_t66_stored_switching_key_still_serves_the_weighted_line() -> None:
     )
     set_runtime_state(conn, "wind_basis:1", "switching")
     conn.commit()
-    before = wind_blend.wind_weights_cache_stats()
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
-    after = wind_blend.wind_weights_cache_stats()
     assert payload["blend"]["wind_kmh"] == pytest.approx([18.0] * 24)
     assert payload["notes"] == {"wind": None}
     assert payload["blend"]["temp_c"] == pytest.approx([15.0] * 24)
-    assert (
-        sum(after["calls"].values())  # type: ignore[union-attr]
-        == sum(before["calls"].values()) + 1  # type: ignore[union-attr]
-    )

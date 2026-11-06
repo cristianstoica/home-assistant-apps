@@ -1,24 +1,24 @@
 """The offline close CLI (plan 2026-10-21-daily-close-close-job.md section
 15.12): CL1 to CL5.
 
-Written before ``close-day`` exists as a subcommand and fails first for
-that reason: ``main([...,"close-day",...])`` today raises ``SystemExit(2)``
-from argparse's own "invalid choice" refusal, before any of the command's
-own checks run -- exactly plan 8.8's "close-day not yet a command" failure.
-Each test calls ``main()`` the way it will once piece 8 lands (expecting an
-``int`` return, never wrapped in ``pytest.raises(SystemExit)``), so the
-SAME test body goes green once the command exists, rather than needing a
-rewrite.
+Each test calls ``main()`` expecting an ``int`` return, never wrapped in
+``pytest.raises(SystemExit)``.
 
-Each source file is a version-12 file (today's narrow ``jobs`` CHECK, the
-five ``close_*`` tables absent), built the way
-``tests/test_close_schema.py``'s own ``_build_v12_file`` does -- migrating a
-fresh on-disk file up and then undoing piece 1's additions -- copied locally
-per this file's own-helpers rule, plus a site and two synthetic stations
-(A, B). Unlike that helper, the file built here is never opened through
-``init_db`` afterward: 15.12 says "the source file unchanged" means its
-bytes and ``user_version``, read through a ``mode=ro`` connection, are
-equal before and after the command runs.
+Each source file is a real database pinned at user_version 16 rather
+than fully fresh, built the way
+``tests/test_close_schema.py``'s own (now-retired) ``_build_v12_file``
+did -- migrating a fresh on-disk file up, then forcing ``PRAGMA
+user_version`` back down -- plus a site and two synthetic stations
+(A, B). The five ``close_*`` tables and the widened ``jobs`` CHECK this
+fixture used to undo by hand are unconditional parts of ``create_tables``
+now (storage release 4.1), so there is nothing left to undo onto a
+reachable schema; pinning at 16 instead of 17 still exercises a real
+``run_migrations`` call on open (migrate_v17_storage's own "already
+converted" guard makes it a fast no-op here). Unlike the retired helper,
+the file built here is never opened through ``init_db`` afterward: 15.12
+says "the source file unchanged" means its bytes and ``user_version``,
+read through a ``mode=ro`` connection, are equal before and after the
+command runs.
 
 Section 16.2 names the mutant each test ID kills; the mapping is given
 inline on the exact assertion it kills at.
@@ -43,81 +43,32 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
 from wxverify.db.switch import ensure_site_generation
 
-_CLOSE_TABLES = (
-    "close_attempts",
-    "close_station_days",
-    "close_publications",
-    "close_stage_log",
-    "close_try_log",
-)
 
-_V12_JOBS_DDL = """
-    CREATE TABLE jobs_v12 (
-        id INTEGER PRIMARY KEY,
-        type TEXT NOT NULL,
-        site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
-        job_key TEXT,
-        payload TEXT NOT NULL DEFAULT '{}',
-        status TEXT NOT NULL DEFAULT 'pending'
-            CHECK(status IN ('pending','running','completed','failed')),
-        next_attempt_at TEXT,
-        retry_count INTEGER NOT NULL DEFAULT 0,
-        max_retries INTEGER NOT NULL DEFAULT 5,
-        last_error TEXT,
-        result TEXT,
-        created_at TEXT NOT NULL
-            DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-        updated_at TEXT NOT NULL
-            DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-        CHECK (
-            (type = 'catchup' AND site_id IS NULL)
-            OR (
-                type IN ('fetch_feed','fetch_obs','fetch_current_obs',
-                         'pair_and_score','backfill_site',
-                         'forecast_record','record_gap_scan',
-                         'verification_run','timezone_correction')
-                AND site_id IS NOT NULL
-            )
-        )
-    );
-"""
-
-
-def _build_v12_file(
+def _build_v16_file(
     path: Path, *, site_name: str = "Testsite"
 ) -> tuple[int, dict[str, int]]:
-    """Write a version-12 database to ``path`` with one site and stations A
-    and B (``ISTATION01``/``ISTATION02``), returning ``(site_id,
-    {pws_id: station_id})``. Copied locally from
-    ``tests/test_close_schema.py``'s own ``_build_v12_file`` (15.3) per this
-    file's own-helpers rule.
+    """Write a database to ``path`` with one site and stations A and B
+    (``ISTATION01``/``ISTATION02``), returning ``(site_id, {pws_id:
+    station_id})``, pinned at user_version 16 rather than fully fresh.
+
+    The five ``close_*`` tables and the widened ``jobs`` CHECK this
+    fixture used to undo (to stand in for a pre-piece-1 file) are now
+    unconditional parts of ``create_tables`` -- migrate_v13_close_jobs,
+    the migration that used to add them, is deleted along with every
+    other migrate_v2 ... migrate_v16 function, and user_version 1-15 is
+    refused outright (storage release 4.1) -- so there is no longer a
+    reachable schema to undo them onto. Pinning at 16 instead of a fully
+    fresh 17 keeps these tests exercising a REAL migration on open
+    (migrate_v17_storage's own "forecast_pairs absent -> already
+    converted" guard makes this a fast no-op, but run_migrations still
+    has to carry the file's own user_version write up to
+    TARGET_USER_VERSION, which a CLI that forgot to migrate the copy at
+    all would miss).
     """
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     run_migrations(conn)
-    for table in _CLOSE_TABLES:
-        conn.execute(f"DROP TABLE {table}")
-    conn.execute("SAVEPOINT narrow_jobs")
-    try:
-        conn.execute(_V12_JOBS_DDL)
-        conn.execute("INSERT INTO jobs_v12 SELECT * FROM jobs")
-        conn.execute("DROP TABLE jobs")
-        conn.execute("ALTER TABLE jobs_v12 RENAME TO jobs")
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedupe"
-            " ON jobs(type, COALESCE(site_id, -1), job_key)"
-            " WHERE status IN ('pending','running') AND job_key IS NOT NULL"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_jobs_type_key_site"
-            " ON jobs(type, job_key, site_id, id)"
-        )
-    except BaseException:
-        conn.execute("ROLLBACK TO narrow_jobs")
-        conn.execute("RELEASE narrow_jobs")
-        raise
-    conn.execute("RELEASE narrow_jobs")
 
     site_id = conn.execute(
         "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
@@ -141,7 +92,7 @@ def _build_v12_file(
         ).lastrowid
         assert station_id is not None
         stations[pws_id] = int(station_id)
-    conn.execute("PRAGMA user_version = 12")
+    conn.execute("PRAGMA user_version = 16")
     conn.commit()
     conn.close()
     return int(site_id), stations
@@ -323,7 +274,7 @@ def test_cl1_refuses_the_add_ons_own_database(
     with the live database written to.
     """
     path = tmp_path / "wxverify.db"
-    site_id, _stations = _build_v12_file(path)
+    site_id, _stations = _build_v16_file(path)
     monkeypatch.setattr(config, "db_path", str(path))
     before_names = sorted(p.name for p in tmp_path.iterdir())
     before_bytes, before_version = _file_bytes_and_version(path)
@@ -376,7 +327,7 @@ def test_cl2_refuses_beside_a_recently_running_worker(
     database a real add-on process may still be writing.
     """
     path = tmp_path / "wxverify.db"
-    site_id, _stations = _build_v12_file(path)
+    site_id, _stations = _build_v16_file(path)
     monkeypatch.setattr(config, "db_path", str(tmp_path / "other.db"))
 
     conn = sqlite3.connect(str(path))
@@ -456,7 +407,7 @@ def test_cl3_closes_a_past_day_offline_from_stored_hours(
     from tests.helpers import install_p4_standins, patch_weathercom_transport
 
     path = tmp_path / "wxverify.db"
-    site_id, _stations = _build_v12_file(path)
+    site_id, _stations = _build_v16_file(path)
     _seed_observations_full_day(path, site_id, D)
     monkeypatch.setattr(config, "db_path", str(tmp_path / "other.db"))
 
@@ -602,7 +553,7 @@ def test_cl4_refuses_raw_rebuild_with_no_temperature_and_an_existing_record(
 
     # Case (i): no raw readings of any kind.
     path_i = tmp_path / "no_raw.db"
-    site_i, _stations_i = _build_v12_file(path_i, site_name="TestsiteNoRaw")
+    site_i, _stations_i = _build_v16_file(path_i, site_name="TestsiteNoRaw")
     _seed_observations_full_day(path_i, site_i, D)
     monkeypatch.setattr(config, "db_path", str(tmp_path / "other.db"))
     patch_weathercom_transport(monkeypatch, _handler)  # type: ignore[arg-type]
@@ -634,7 +585,7 @@ def test_cl4_refuses_raw_rebuild_with_no_temperature_and_an_existing_record(
     # would itself pass if it were ever reached -- only the DayStateError
     # path can produce this case's exit 1.
     path_ii = tmp_path / "already_has_record.db"
-    site_ii, stations_ii = _build_v12_file(path_ii, site_name="TestsiteAlready")
+    site_ii, stations_ii = _build_v16_file(path_ii, site_name="TestsiteAlready")
     _seed_existing_site_day(path_ii, site_ii, D - timedelta(days=5))
     _seed_raw_temperature_day(path_ii, stations_ii["ISTATION01"], D)
     before_bytes_ii, before_version_ii = _file_bytes_and_version(path_ii)
@@ -707,7 +658,7 @@ def test_cl5_refuses_a_raw_rebuild_from_copied_wind_history_alone(
         raise AssertionError("no gap-fill request may be made by the offline close")
 
     path = tmp_path / "wxverify.db"
-    site_id, stations = _build_v12_file(path)
+    site_id, stations = _build_v16_file(path)
     _seed_observations_full_day(path, site_id, D)
     _seed_wind_only_raw_rows(path, stations["ISTATION01"], D)
     _seed_wind_only_raw_rows(path, stations["ISTATION02"], D)

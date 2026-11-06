@@ -98,9 +98,9 @@ def test_the_scan_finds_a_real_consumer_and_a_real_orphan() -> None:
     declared = _declared_constants()
     referenced = _referenced_names()
 
-    assert "ROSTER_AVAILABILITY_FLOOR" in declared
-    assert "ROSTER_AVAILABILITY_FLOOR" in referenced
+    assert "TEMP_TRUTH_MIN_HOURS" in declared
+    assert "TEMP_TRUTH_MIN_HOURS" in referenced
     # A name that has never existed in the package is genuinely absent, so
     # the reference set is a filter and not a catch-all.
-    assert "ROSTER_AVAILABILITY_FLOOR_SENSITIVITY" not in referenced
-    assert "ROSTER_AVAILABILITY_FLOOR_SENSITIVITY" not in declared
+    assert "TEMP_TRUTH_MIN_HOURS_SENSITIVITY" not in referenced
+    assert "TEMP_TRUTH_MIN_HOURS_SENSITIVITY" not in declared

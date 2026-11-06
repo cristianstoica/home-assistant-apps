@@ -1,22 +1,16 @@
 """Shared pytest fixtures.
 
-The verification read cache (``wxverify.verification.read_cache``) is
-process-global in-memory state, and the test suite re-initialises the process
-database many times over -- every fresh database starts at generation 0 and
-run ids repeat across tests. Resetting in an autouse fixture, rather than
-opting in per test, is what keeps that state from leaking between unrelated
-test modules as an intermittent failure nobody can attribute.
-
-The wind weights cache (``wxverify.forecast.wind_blend``) is process-global
-for the same reason and is reset the same way, so that its counters start at
-zero in every test and no entry outlives the test that stored it.
-
 The export sweeper's death latch
-(``wxverify.api.routes.db_transfer._sweeper_death``) is process-global for the
-same reason and needs the same treatment: ``test_graceful_shutdown.py`` crashes
+(``wxverify.api.routes.db_transfer._sweeper_death``) is process-global, so it
+is reset before each test: ``test_graceful_shutdown.py`` crashes
 a REAL lifespan's sweeper twice, which latches a death that is deliberately
 terminal for the process. Left standing, it would surface in ``test_monitor.py``
 as an ``overall == "critical"`` with no test to attribute it to.
+
+The process-wide stop flag (``wxverify.core.stop.STOP``) is process-global for
+the same reason and needs the same treatment: ``lifespan``'s ``finally`` now
+calls ``request_stop()`` on every shutdown, so a test that drives a real
+lifespan leaves ``STOP`` set for every test that runs after it.
 
 Real network access is denied for every test by ``_deny_network``; the
 mechanism, its ledger and its allowlist live in ``tests/network_guard.py`` so
@@ -64,28 +58,21 @@ import pytest
 
 from tests.network_guard import deny_network_scope
 from wxverify.api.routes.db_transfer import reset_export_sweeper_death
-from wxverify.forecast.wind_blend import reset_wind_weights_cache
-from wxverify.verification.read_cache import reset_read_cache
+from wxverify.core.stop import reset_stop
 
 pytest_plugins = ["pytester"]
-
-
-@pytest.fixture(autouse=True)
-def _reset_verification_read_cache() -> None:
-    """Empty the verification read cache before each test."""
-    reset_read_cache()
-
-
-@pytest.fixture(autouse=True)
-def _reset_wind_weights_cache() -> None:
-    """Empty the wind weights cache and zero its counters before each test."""
-    reset_wind_weights_cache()
 
 
 @pytest.fixture(autouse=True)
 def _reset_export_sweeper_death() -> None:
     """Un-latch the export sweeper's death before each test."""
     reset_export_sweeper_death()
+
+
+@pytest.fixture(autouse=True)
+def _reset_core_stop() -> None:
+    """Clear the process-wide stop flag before each test."""
+    reset_stop()
 
 
 @pytest.fixture(autouse=True)

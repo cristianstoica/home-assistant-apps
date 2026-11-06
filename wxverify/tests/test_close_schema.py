@@ -1,13 +1,13 @@
-"""Schema and migration for daily-close piece 1 (plan
-2026-10-21-daily-close-close-job.md, section 12, test IDs SC1-SC5).
-
-Every test here is written before ``migrate_v13_close_jobs`` and the five
-``close_*`` tables exist and fails first for that reason: the inline import
-of ``wxverify.db.migrations.migrate_v13_close_jobs`` below raises
-``ImportError``, and the five tables are absent from a freshly migrated
-database until piece 1 lands. Section 16.2 of the plan names the mutant
-each test ID must kill; that mapping is also given inline on each
-assertion, in the file's own style.
+"""Schema for daily-close piece 1 (plan 2026-10-21-daily-close-close-job.md,
+section 12, test IDs SC3-SC5): the five ``close_*`` tables and the widened
+``jobs`` CHECK, both now unconditional parts of ``create_tables``.
+``migrate_v13_close_jobs``, the migration that originally added them to an
+existing file, is deleted along with every other ``migrate_v2`` ...
+``migrate_v16`` function (storage release 4.1) -- SC1 and SC2's migration-
+mechanics tests retired with it; what remains (SC3-SC5) exercises the
+tables' own CHECK/foreign-key rules directly. Section 16.2 of the plan
+names the mutant each surviving test ID kills; that mapping is also given
+inline on each assertion, in the file's own style.
 
 Real SQLite and real migrations throughout; nothing in the code under test
 is mocked. Synthetic data only: station ids ``ISTATION01``/``ISTATION02``
@@ -18,209 +18,32 @@ is mocked. Synthetic data only: station ids ``ISTATION01``/``ISTATION02``
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 
 import pytest
 
 from tests.helpers import D, asof_conn, day_close_site
 from tests.test_migration_runner_pre_v4 import _connect  # noqa: PLC2701
-from wxverify.db.migrations import (
-    TARGET_USER_VERSION,
-    create_tables,
-    run_migrations,
-)
-
-# ---------------------------------------------------------------------------
-# A version-12 file: today's narrow jobs CHECK (no 'day_close'/'day_publish'),
-# the five close_* tables absent, one seeded pending fetch_feed job (15.3
-# preamble). Built by migrating a fresh on-disk file all the way up (harmless
-# before piece 1 lands, since TARGET_USER_VERSION is still 12 then) and then
-# undoing piece 1's additions, rather than hand-copying every historical
-# migration -- mirrors tests/test_raw_table_schema.py's _v11_fixture_conn,
-# which forces PRAGMA user_version back down the same way.
-# ---------------------------------------------------------------------------
-
-_V12_JOBS_DDL = """
-    CREATE TABLE jobs_v12 (
-        id INTEGER PRIMARY KEY,
-        type TEXT NOT NULL,
-        site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
-        job_key TEXT,
-        payload TEXT NOT NULL DEFAULT '{}',
-        status TEXT NOT NULL DEFAULT 'pending'
-            CHECK(status IN ('pending','running','completed','failed')),
-        next_attempt_at TEXT,
-        retry_count INTEGER NOT NULL DEFAULT 0,
-        max_retries INTEGER NOT NULL DEFAULT 5,
-        last_error TEXT,
-        result TEXT,
-        created_at TEXT NOT NULL
-            DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-        updated_at TEXT NOT NULL
-            DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-        CHECK (
-            (type = 'catchup' AND site_id IS NULL)
-            OR (
-                type IN ('fetch_feed','fetch_obs','fetch_current_obs',
-                         'pair_and_score','backfill_site',
-                         'forecast_record','record_gap_scan',
-                         'verification_run','timezone_correction')
-                AND site_id IS NOT NULL
-            )
-        )
-    );
-"""
-
-_CLOSE_TABLES = (
-    "close_attempts",
-    "close_station_days",
-    "close_publications",
-    "close_stage_log",
-    "close_try_log",
-)
-
-
-def _build_v12_file(path: Path) -> Path:
-    """Write a version-12 database to ``path`` (15.3 preamble)."""
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(conn)
-    for table in _CLOSE_TABLES:
-        conn.execute(f"DROP TABLE {table}")
-    conn.execute("SAVEPOINT narrow_jobs")
-    try:
-        conn.execute(_V12_JOBS_DDL)
-        conn.execute("INSERT INTO jobs_v12 SELECT * FROM jobs")
-        conn.execute("DROP TABLE jobs")
-        conn.execute("ALTER TABLE jobs_v12 RENAME TO jobs")
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedupe"
-            " ON jobs(type, COALESCE(site_id, -1), job_key)"
-            " WHERE status IN ('pending','running') AND job_key IS NOT NULL"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_jobs_type_key_site"
-            " ON jobs(type, job_key, site_id, id)"
-        )
-    except BaseException:
-        conn.execute("ROLLBACK TO narrow_jobs")
-        conn.execute("RELEASE narrow_jobs")
-        raise
-    conn.execute("RELEASE narrow_jobs")
-    site_id = conn.execute(
-        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-        " timezone) VALUES ('Testsite', 0.0, 0.0, 0.0, 'UTC')"
-    ).lastrowid
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, status)"
-        " VALUES ('fetch_feed', ?, 'seed-fetch-feed', 'pending')",
-        (site_id,),
-    )
-    conn.execute("PRAGMA user_version = 12")
-    conn.commit()
-    conn.close()
-    return path
-
-
-def _table_shape(conn: sqlite3.Connection, table: str) -> list[dict[str, object]]:
-    return [dict(r) for r in conn.execute(f"PRAGMA table_xinfo({table})")]
-
-
-def _table_indexes(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {
-        str(r["name"])
-        for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=?",
-            (table,),
-        )
-    }
-
+from wxverify.db.migrations import create_tables
 
 # --- SC1 ------------------------------------------------------------------
+#
+# A hand-crafted version-12 file (today's narrow jobs CHECK, the five
+# close_* tables absent) used to stand in for a pre-piece-1 database here,
+# built by migrating a fresh file up and then undoing piece 1's additions.
+# That technique no longer has anything to undo onto a reachable schema:
+# migrate_v13_close_jobs (and every other migrate_v2 ... migrate_v16
+# function) is deleted, create_tables carries the widened jobs CHECK and
+# the five close_* tables unconditionally, and user_version 1-15 is
+# refused outright rather than migrated (storage release 4.1) -- so no
+# test below builds one any more.
 
 
-def test_sc1_fresh_and_migrated_files_agree_and_the_check_admits_both_kinds(
-    tmp_path: Path,
-) -> None:
-    """SC1: a fresh file and a migrated version-12 file land on the same
-    ``user_version``, the same ``jobs``/five-table shapes and indexes, admit
-    both new job kinds and refuse a bogus one, and keep the seeded job.
-    """
-    fresh_conn = sqlite3.connect(":memory:")
-    fresh_conn.row_factory = sqlite3.Row
-    fresh_conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(fresh_conn)
-
-    v12_path = _build_v12_file(tmp_path / "v12.db")
-    migrated_conn = sqlite3.connect(str(v12_path))
-    migrated_conn.row_factory = sqlite3.Row
-    migrated_conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(migrated_conn)
-
-    for conn in (fresh_conn, migrated_conn):
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
-        assert version == TARGET_USER_VERSION, (
-            "mutant -> at this assertion: correct = user_version read from"
-            " TARGET_USER_VERSION, never a literal, since P4 and P6 raise"
-            " it further; mutant (M9, the early-return tests for"
-            " 'day_close' only, one kind added without the other) ="
-            " the narrow CHECK partially widened and TARGET_USER_VERSION"
-            " never reached on the migrated file"
-        )
-
-    for table in ("jobs", *_CLOSE_TABLES):
-        fresh_shape = _table_shape(fresh_conn, table)
-        migrated_shape = _table_shape(migrated_conn, table)
-        assert fresh_shape == migrated_shape, (
-            f"mutant -> at the {table} table_xinfo comparison: correct ="
-            " identical column lists on both paths, mutant (M7, "
-            "'day_publish' left out of migrate_v3's jobs_new) = the two"
-            " jobs shapes agree but one path's CHECK text differs"
-        )
-        fresh_idx = _table_indexes(fresh_conn, table)
-        migrated_idx = _table_indexes(migrated_conn, table)
-        assert fresh_idx == migrated_idx, (
-            f"mutant -> at the {table} index-name comparison: correct ="
-            " the same index names on both paths, mutant (an index lost"
-            " in the rebuild) = the migrated file missing one"
-        )
-
-    for conn in (fresh_conn, migrated_conn):
-        site_id = conn.execute(
-            "INSERT INTO sites (name, forecast_lat, forecast_lon,"
-            " elevation_m, timezone) VALUES ('Testsite', 0.0, 0.0, 0.0,"
-            " 'UTC')"
-        ).lastrowid
-        conn.execute(
-            "INSERT INTO jobs (type, site_id, job_key, status)"
-            " VALUES ('day_close', ?, 'close:1:2026-07-06:2', 'pending')",
-            (site_id,),
-        )
-        conn.execute(
-            "INSERT INTO jobs (type, site_id, job_key, status)"
-            " VALUES ('day_publish', ?, 'publish:1:7', 'pending')",
-            (site_id,),
-        )
-        conn.commit()
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO jobs (type, site_id, status)"
-                " VALUES ('bogus_type', ?, 'pending')",
-                (site_id,),
-            )
-        conn.rollback()
-
-    seeded = migrated_conn.execute(
-        "SELECT type, status FROM jobs WHERE job_key = 'seed-fetch-feed'"
-    ).fetchone()
-    assert seeded is not None and seeded["type"] == "fetch_feed", (
-        "mutant -> at this assertion: correct = the pre-existing fetch_feed"
-        " job survives the jobs rebuild, mutant (INSERT INTO jobs_new"
-        " SELECT * FROM jobs dropped from migrate_v13_close_jobs) = the"
-        " seeded row lost"
-    )
-    assert seeded["status"] == "pending"
+# test_sc1_fresh_and_migrated_files_agree_and_the_check_admits_both_kinds
+# is retired: it proved a migrated version-12 file lands on the same shape
+# as a fresh one, but migrate_v13_close_jobs (like every other migrate_v2
+# ... migrate_v16 function) is deleted, and user_version 1-15 is now
+# refused outright rather than migrated (storage release 4.1) -- there is
+# no migrated-from-v12 path left to compare against a fresh file.
 
 
 # --- SC1 (extension): the CHECK copy in isolation ---------------------------
@@ -285,184 +108,13 @@ def test_sc1_create_tables_copy_of_the_check_admits_both_kinds_alone() -> None:
     _assert_jobs_check_admits_both_close_kinds_refuses_bogus(conn, mutant="M7c")
 
 
-# --- SC1 (extension): the re-run guard checks 'day_publish', not 'day_close' -
-#
-# The three call points that ever write this CHECK (create_tables,
-# migrate_v3, migrate_v4) always add 'day_close' and 'day_publish' together,
-# so on every reachable real-world schema the two literals co-occur and
-# migrate_v13_close_jobs's own re-run guard cannot be told, by any test that
-# only drives those three functions, whether it tests for 'day_close' or for
-# 'day_publish' (M9: the guard tests for 'day_close' only). This test builds
-# the one state no production code path can reach but a future historical
-# migration could -- a jobs CHECK naming 'day_close' alone -- so the two
-# literals finally diverge.
-
-
-def test_sc1_the_rebuild_guard_checks_for_day_publish_not_day_close(
-    tmp_path: Path,
-) -> None:
-    """SC1 extension: a ``jobs`` CHECK naming ``'day_close'`` but not
-    ``'day_publish'`` (a state no real migration leaves behind today, but
-    the guard must still tell the two literals apart rather than relying
-    on them always co-occurring).
-
-    M9 -> at the day_publish-insert assertion below: correct = the insert
-    is accepted (``'day_publish'`` is absent, so the real guard's
-    ``"'day_publish'" in str(row[0])`` is False and the rebuild runs,
-    widening the CHECK for both kinds), mutant M9 (the guard reads
-    ``"'day_close'" in str(row[0])`` instead, ``db/migrations.py:2220``)
-    = ``sqlite3.IntegrityError`` (``'day_close'`` is present, so the
-    mutant's guard returns at once and the CHECK is never widened for
-    ``day_publish``).
-    """
-    from wxverify.db.migrations import migrate_v13_close_jobs
-
-    _ASYMMETRIC_JOBS_DDL = """
-        CREATE TABLE jobs_asym (
-            id INTEGER PRIMARY KEY,
-            type TEXT NOT NULL,
-            site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
-            job_key TEXT,
-            payload TEXT NOT NULL DEFAULT '{}',
-            status TEXT NOT NULL DEFAULT 'pending'
-                CHECK(status IN ('pending','running','completed','failed')),
-            next_attempt_at TEXT,
-            retry_count INTEGER NOT NULL DEFAULT 0,
-            max_retries INTEGER NOT NULL DEFAULT 5,
-            last_error TEXT,
-            result TEXT,
-            created_at TEXT NOT NULL
-                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            updated_at TEXT NOT NULL
-                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            CHECK (
-                (type = 'catchup' AND site_id IS NULL)
-                OR (
-                    type IN ('fetch_feed','fetch_obs','fetch_current_obs',
-                             'pair_and_score','backfill_site',
-                             'forecast_record','record_gap_scan',
-                             'verification_run','timezone_correction',
-                             'day_close')
-                    AND site_id IS NOT NULL
-                )
-            )
-        );
-    """
-
-    v12_path = _build_v12_file(tmp_path / "v12.db")
-    conn = sqlite3.connect(str(v12_path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("SAVEPOINT make_asymmetric")
-    conn.execute(_ASYMMETRIC_JOBS_DDL)
-    conn.execute("INSERT INTO jobs_asym SELECT * FROM jobs")
-    conn.execute("DROP TABLE jobs")
-    conn.execute("ALTER TABLE jobs_asym RENAME TO jobs")
-    conn.execute("RELEASE make_asymmetric")
-    site_id = conn.execute(
-        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-        " timezone) VALUES ('Testsite', 0.0, 0.0, 0.0, 'UTC')"
-    ).lastrowid
-    before = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'"
-    ).fetchone()[0]
-    assert "'day_close'" in before and "'day_publish'" not in before, (
-        "fixture bug: the asymmetric jobs table must name day_close without"
-        " day_publish before the guard runs"
-    )
-    conn.commit()
-
-    migrate_v13_close_jobs(conn)
-
-    # M9 -> at this insert: correct = accepted, no exception ('day_publish'
-    # was absent before the call, so the real guard ran the rebuild and
-    # widened the CHECK for both kinds), mutant M9 (the guard checks
-    # "'day_close'" instead, which was already present) = sqlite3.
-    # IntegrityError (the rebuild never ran; day_publish is still refused).
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, status)"
-        " VALUES ('day_publish', ?, 'publish:1:7', 'pending')",
-        (site_id,),
-    )
-    conn.commit()
-
-
-# --- SC2 --------------------------------------------------------------------
-
-
-def test_sc2_a_fault_on_rename_leaves_v12_intact_and_the_rerun_converges(
-    tmp_path: Path,
-) -> None:
-    """SC2: a fault on the rebuild's final ``RENAME TO jobs`` leaves version
-    12, the old ``jobs`` and its seeded job, with no orphan ``jobs_new``; the
-    rerun then reaches ``TARGET_USER_VERSION``, and an extra direct call
-    changes nothing.
-    """
-    from wxverify.db.migrations import migrate_v13_close_jobs
-
-    v12_path = _build_v12_file(tmp_path / "v12.db")
-    conn = sqlite3.connect(str(v12_path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-
-    def _authorizer(
-        action: int,
-        arg1: str | None,
-        arg2: str | None,
-        db: str | None,
-        trigger: str | None,
-    ) -> int:
-        if action == sqlite3.SQLITE_ALTER_TABLE and arg2 == "jobs_new":
-            return sqlite3.SQLITE_DENY
-        return sqlite3.SQLITE_OK
-
-    conn.set_authorizer(_authorizer)
-    with pytest.raises(sqlite3.DatabaseError):
-        run_migrations(conn)
-    conn.set_authorizer(None)
-
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 12, (
-        "mutant -> at this assertion: correct = 12 (the fault leaves the"
-        " fixture's own version; run_migrations writes user_version only"
-        " at its last line), mutant (M8, migrate_v13_close_jobs's rebuild"
-        " run outside its savepoint) = the version advances to 13 even"
-        " though the RENAME never completed"
-    )
-    seeded = conn.execute(
-        "SELECT type FROM jobs WHERE job_key = 'seed-fetch-feed'"
-    ).fetchone()
-    assert seeded is not None and seeded["type"] == "fetch_feed"
-    orphan = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs_new'"
-    ).fetchone()
-    assert orphan is None, (
-        "mutant -> at this assertion: correct = no orphan jobs_new survives"
-        " the rollback (M8), mutant (ROLLBACK TO the savepoint dropped from"
-        " the except clause) = jobs_new left behind"
-    )
-
-    run_migrations(conn)
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == TARGET_USER_VERSION, (
-        "mutant -> at this assertion: correct = the rerun reaches"
-        " TARGET_USER_VERSION (M8, a step not safe to repeat would stop"
-        " short here instead)"
-    )
-
-    before_shape = _table_shape(conn, "jobs")
-    before_count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-    migrate_v13_close_jobs(conn)
-    after_shape = _table_shape(conn, "jobs")
-    after_count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-    assert after_shape == before_shape
-    assert after_count == before_count, (
-        "mutant -> at this assertion: correct = a direct extra call to"
-        " migrate_v13_close_jobs changes nothing (its own"
-        " already-contains-'day_publish' re-run guard), mutant (the"
-        " early-return guard dropped) = the jobs table is rebuilt again,"
-        " changing row count or shape"
-    )
+# test_sc1_the_rebuild_guard_checks_for_day_publish_not_day_close and
+# test_sc2_a_fault_on_rename_leaves_v12_intact_and_the_rerun_converges are
+# both retired: both call migrate_v13_close_jobs directly, and it is
+# deleted along with every other migrate_v2 ... migrate_v16 function
+# (storage release 4.1) -- create_tables carries the widened jobs CHECK
+# and the five close_* tables unconditionally now, with no rebuild step
+# left to guard or fault-inject.
 
 
 # --- SC3 --------------------------------------------------------------------
@@ -895,210 +547,13 @@ def test_sc4_station_delete_scopes_to_its_rows_site_delete_clears_all_five() -> 
 
 
 # --- SC5 --------------------------------------------------------------------
-
-
-_SC5_STAMP = "2026-07-06T00:00:00.000000Z"
-
-# The two close_* columns P1's per-column date list actually covers
-# (close_stage_log.local_date, close_try_log.local_date): the row values
-# besides the date column itself, keyed by table (12.6 bullet 2; the three
-# record tables -- close_attempts, close_station_days, close_publications --
-# are covered by their foreign key to site_days instead, never by this list,
-# and are not parametrised here).
-_SC5_LOG_ROW: dict[str, dict[str, object]] = {
-    "close_stage_log": {
-        "local_date": None,  # filled in per case
-        "attempt": 1,
-        "stage": 1,
-        "job_id": None,
-        "enqueued_at": _SC5_STAMP,
-        "started_at": _SC5_STAMP,
-        "ended_at": _SC5_STAMP,
-        "queue_wait_s": 0.0,
-        "duration_s": 0.0,
-        "outcome": "completed",
-        "detail": "{}",
-    },
-    "close_try_log": {
-        "local_date": None,  # filled in per case
-        "station_id": 1,
-        "kind": "five_minute",
-        "slot": "daytime",
-        "close_attempt": None,
-        "tried_at": _SC5_STAMP,
-        "outcome": "stored",
-        "readings_kept": 0,
-        "readings_refused": 0,
-    },
-}
-
-
-def _upload_db_with_close_log_date(path: Path, *, table: str, date_value: str) -> None:
-    """A migrated file with a real ``sites`` row and one row in ``table``
-    (``close_stage_log`` or ``close_try_log``) whose ``local_date`` is
-    ``date_value``, ``site_id`` pointing at that real row; every other
-    column holds a valid, CHECK-satisfying value.
-
-    Both log tables carry ``site_id REFERENCES sites(id)``, and
-    ``_validate_upload`` runs ``PRAGMA foreign_key_check`` -- which checks
-    every foreign key whatever the connection's own ``foreign_keys``
-    setting -- before its date loop (12.6). A fixture with no matching
-    ``sites`` row would therefore be refused by the foreign-key message
-    before the date check under test here ever ran; the real row here
-    breaks nothing except the one date value.
-    """
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    run_migrations(conn)
-    site_id = conn.execute(
-        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-        " timezone) VALUES ('Testsite', 0.0, 0.0, 0.0, 'UTC')"
-    ).lastrowid
-    row = dict(_SC5_LOG_ROW[table])
-    row["site_id"] = site_id
-    row["local_date"] = date_value
-    columns = list(row)
-    placeholders = ", ".join("?" for _ in columns)
-    conn.execute(
-        f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
-        [row[c] for c in columns],
-    )
-    conn.commit()
-    conn.close()
-
-
-@pytest.mark.parametrize("table", ["close_stage_log", "close_try_log"])
-def test_sc5_the_two_log_tables_date_column_is_checked_at_import(
-    tmp_path: Path, table: str
-) -> None:
-    """SC5: a bad ``local_date`` in each of the two log tables P1's
-    per-column date list actually covers is refused with P1's date message
-    at 422 (12.6); a real matching ``sites`` row keeps the foreign-key
-    check out of the way, so only the date value is under test.
-
-    For ``close_try_log`` -> at the ``excinfo`` assertions below: correct =
-    ApiError(422) with "invalid date in close_try_log.local_date: expected
-    YYYY-MM-DD", mutant (M12, the date check skipped for
-    close_try_log.local_date) = ``_validate_upload`` does not raise.
-    """
-    from wxverify.api.errors import ApiError
-    from wxverify.api.routes.db_transfer import _validate_upload  # noqa: PLC2701
-
-    bad_path = tmp_path / "bad.db"
-    _upload_db_with_close_log_date(bad_path, table=table, date_value="2026/07/06")
-
-    with pytest.raises(ApiError) as excinfo:
-        _validate_upload(bad_path)
-    assert excinfo.value.status_code == 422
-    assert (
-        f"invalid date in {table}.local_date: expected YYYY-MM-DD"
-        in excinfo.value.message
-    )
-
-
-@pytest.mark.parametrize("table", ["close_stage_log", "close_try_log"])
-def test_sc5_the_two_log_tables_good_date_twin_is_accepted(
-    tmp_path: Path, table: str
-) -> None:
-    """SC5 twin of the test above: the identical fixture with a
-    canonical-form date passes ``_validate_upload`` -- proving the refusal
-    above comes from the date value itself, not from anything else the
-    fixture sets up (the real ``sites`` row, the FK check, or the row's
-    other columns).
-    """
-    from wxverify.api.routes.db_transfer import _validate_upload  # noqa: PLC2701
-
-    good_path = tmp_path / "good.db"
-    _upload_db_with_close_log_date(good_path, table=table, date_value="2026-07-06")
-
-    _validate_upload(good_path)  # must not raise
-
-
-def test_sc5_close_publications_cutoff_is_covered_by_the_site_days_fk_not_the_date_list(
-    tmp_path: Path,
-) -> None:
-    """SC5: a bad date in ``close_publications.cutoff``, with no
-    ``site_days`` row whose ``(site_id, local_date)`` matches it, is
-    refused by the foreign-key check, never by a per-column date check --
-    12.6 bullet 2: the three record tables (``close_attempts``,
-    ``close_station_days``, ``close_publications``) are covered by their
-    foreign key to ``site_days``, not by the date list, and
-    ``_validate_upload`` runs ``PRAGMA foreign_key_check`` (:988-992)
-    before the date loop (:1082).
-    """
-    from wxverify.api.errors import ApiError
-    from wxverify.api.routes.db_transfer import _validate_upload  # noqa: PLC2701
-
-    path = tmp_path / "bad-cutoff.db"
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    run_migrations(conn)
-    site_id = conn.execute(
-        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-        " timezone) VALUES ('Testsite', 0.0, 0.0, 0.0, 'UTC')"
-    ).lastrowid
-    # No site_days row is inserted at all, so no (site_id, local_date) pair
-    # can match this cutoff, bad-looking or not.
-    conn.execute(
-        "INSERT INTO close_publications (site_id, cutoff, attempt, state,"
-        " opened_at) VALUES (?, ?, 1, 'pending', ?)",
-        (site_id, "2026/07/06", _SC5_STAMP),
-    )
-    conn.commit()
-    conn.close()
-
-    with pytest.raises(ApiError) as excinfo:
-        _validate_upload(path)
-    assert excinfo.value.status_code == 422
-    assert excinfo.value.message == "database failed foreign key check", (
-        "mutant -> at this assertion: correct = 'database failed foreign"
-        " key check' (close_publications.cutoff has no per-column date"
-        " check of its own -- only the composite foreign key to"
-        " site_days(site_id, local_date) catches a bad value here), mutant"
-        " (a per-column date check added for close_publications.cutoff) ="
-        " excinfo.value.message reads the date message"
-        " 'invalid date in close_publications.cutoff: expected YYYY-MM-DD'"
-        " instead"
-    )
-
-
-def test_sc5_a_version_12_file_without_the_five_tables_is_accepted(
-    tmp_path: Path,
-) -> None:
-    """SC5: a real version-12 file -- narrow ``jobs`` CHECK, the five
-    close_* tables absent, the pre-existing ``fetch_feed`` job seeded (the
-    15.3 preamble fixture, built by ``_build_v12_file``) -- is accepted by
-    ``_validate_upload`` and then migrates the rest of the way on open
-    (12.6).
-    """
-    from wxverify.api.routes.db_transfer import _validate_upload  # noqa: PLC2701
-
-    path = tmp_path / "older.db"
-    _build_v12_file(path)
-
-    _validate_upload(path)  # must not raise
-
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(conn)
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == TARGET_USER_VERSION, (
-        "mutant -> at this assertion: correct = TARGET_USER_VERSION (the"
-        " older, pre-this-release file migrates the rest of the way on"
-        " open), mutant (an upload-time version check that refuses a"
-        " version-12 file outright) = this file never reaches"
-        " TARGET_USER_VERSION here"
-    )
-    names = {
-        str(row["name"])
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    }
-    for table in _CLOSE_TABLES:
-        assert table in names, (
-            f"mutant -> at this assertion: correct = {table} present after"
-            " migrating the older file (migrate_v13_close_jobs's"
-            " create_tables call in run_migrations creates it), mutant (a"
-            " close_* table not created for a pre-this-release upload) ="
-            f" {table} missing from names"
-        )
+#
+# SC5's db-transfer-import tests (the two log tables' local_date check, and
+# close_publications.cutoff's foreign-key coverage) tested only
+# ``_validate_upload``, removed with the database import (storage-release
+# plan 5.5). The one SC5 test that also checked a live migration path (an
+# older version-12 file migrating the rest of the way on open) is retired
+# too: a version-12 file is now refused outright rather than migrated
+# (storage release 4.1), and a fresh or v16 file already carries the five
+# close_* tables unconditionally via create_tables -- nothing migrated-
+# from-v12-specific survives to test.

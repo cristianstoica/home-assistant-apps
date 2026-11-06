@@ -11,7 +11,7 @@ runs ``run_migrations`` (mirrors ``tests/test_scoring_equivalence.py``'s
 guaranteed per-test isolation (no teardown needed for an in-process
 ``:memory:`` handle — it is discarded with the connection object).
 
-Dates: forecast_pairs valid_at/issued_at fixtures use the year 2035 (matching
+Dates: publication cutoff/published_at fixtures use the year 2035 (matching
 ``tests/test_web_ui.py``'s convention) because ``forecast_ranking``'s default
 ``window="rolling"`` computes its cutoff from the REAL wall clock
 (``window_cutoff`` -> ``utc_now()``), not an injectable "now" — a same-year
@@ -25,29 +25,19 @@ Synthetic data only (public repo): no real site/station identifiers.
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
+from tests.helpers import seed_active_publication, seed_publication_ranking
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
-from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.data import (
-    forecast_ranking,
     forecast_ranking_with_status,
     load_feed_freshness,
     load_future_samples,
     samples_fingerprint,
 )
-from wxverify.scoring.cache import upsert_score_cache
-from wxverify.scoring.leaderboard import resolve_window
-from wxverify.scoring.metrics import strategy_for
+from wxverify.scoring.metrics import MetricSums, metrics_from_sums
 from wxverify.settings.keys import get_number_setting, set_setting
-
-_FAR_FUTURE_VALID_ATS = (
-    "2035-07-01T00:00:00Z",
-    "2035-07-01T01:00:00Z",
-    "2035-07-01T02:00:00Z",
-)
-_FAR_FUTURE_LEAD_HOURS = (1, 2, 3)
 
 
 def _make_db() -> sqlite3.Connection:
@@ -111,71 +101,22 @@ def _stamp_usable_fetch(
     )
 
 
-def _insert_pair(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int = 1,
-    feed_id: int,
-    variable: str,
-    issued_at: str,
-    valid_at: str,
-    lead_hours: int,
-    day_ahead: int,
-    forecast: float,
-    observed: float = 10.0,
-) -> None:
-    error = forecast - observed
-    conn.execute(
-        """
-        INSERT INTO forecast_pairs
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error,
-             tz_generation_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            site_id,
-            feed_id,
-            variable,
-            issued_at,
-            valid_at,
-            lead_hours,
-            day_ahead,
-            forecast,
-            observed,
-            error,
-            abs(error),
-            error * error,
-            ensure_site_generation(conn, site_id),
-        ),
-    )
-
-
 def _seed_cell_pairs(
-    conn: sqlite3.Connection,
+    forecasts: dict[int, float],
     *,
     feed_id: int,
-    variable: str,
-    day_ahead: int,
     forecast: float,
 ) -> None:
-    """Insert 3 forecast_pairs rows for one feed at one (variable, day_ahead)
-    cell, on the canonical far-future valid_at/lead_hours trio shared by
-    every feed in the ranking-exclusion fixture (so `_paired_skill`'s join
-    against the persistence feed's OWN rows at the same trio lines up)."""
-    for valid_at, lead_hours in zip(
-        _FAR_FUTURE_VALID_ATS, _FAR_FUTURE_LEAD_HOURS, strict=True
-    ):
-        _insert_pair(
-            conn,
-            feed_id=feed_id,
-            variable=variable,
-            issued_at="2035-06-30T00:00:00Z",
-            valid_at=valid_at,
-            lead_hours=lead_hours,
-            day_ahead=day_ahead,
-            forecast=forecast,
-        )
+    """Record one feed's forecast at one (variable, day_ahead) cell, into
+    the caller's OWN local ``forecasts`` dict, for
+    ``_seed_complete_score_cache`` to hand-derive ``MetricSums`` from
+    (the canonical far-future valid_at/lead_hours trio this fixture always
+    uses, so persistence's own error over the same 3 valid_ats stays the
+    skill baseline). No row is written: nothing reads a pair table for
+    scoring any more (W6b, storage release 3.1). ``forecasts`` is local to
+    the caller, never module-level state, so no connection's values can
+    ever leak into another's."""
+    forecasts[feed_id] = forecast
 
 
 # ---------------------------------------------------------------------------
@@ -772,7 +713,13 @@ def test_fingerprint_advances_on_new_sample_stable_otherwise() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _seed_ranking_exclusion_fixture(conn: sqlite3.Connection) -> dict[str, int]:
+def _seed_ranking_exclusion_fixture(
+    conn: sqlite3.Connection,
+) -> tuple[dict[str, int], dict[int, float]]:
+    """Returns ``(ids, forecasts)``: ``forecasts`` is local to this call,
+    for the caller to pass straight into ``_seed_complete_score_cache`` --
+    never module-level state, so no connection's values can leak into
+    another's."""
     set_setting(conn, "min_n", "3")
     persistence_id = _feed_id(conn, "virtual", "_persistence")
     multimodel_mean_id = _feed_id(conn, "virtual", "_multimodel_mean")
@@ -802,73 +749,123 @@ def _seed_ranking_exclusion_fixture(conn: sqlite3.Connection) -> dict[str, int]:
     # Persistence gets a deliberately bad forecast so every other feed's
     # skill (computed against persistence as baseline) is a real, positive
     # number rather than a degenerate 0/0.
-    _seed_cell_pairs(
-        conn, feed_id=persistence_id, variable="temperature", day_ahead=0, forecast=8.0
-    )
+    forecasts: dict[int, float] = {}
+    _seed_cell_pairs(forecasts, feed_id=persistence_id, forecast=8.0)
     for feed_id in (multimodel_mean_id, package_id, member_id, meteoblue_member_id):
-        _seed_cell_pairs(
-            conn, feed_id=feed_id, variable="temperature", day_ahead=0, forecast=10.5
-        )
+        _seed_cell_pairs(forecasts, feed_id=feed_id, forecast=10.5)
 
-    return {
-        "persistence": persistence_id,
-        "multimodel_mean": multimodel_mean_id,
-        "package": package_id,
-        "member": member_id,
-        "meteoblue_member": meteoblue_member_id,
-    }
+    return (
+        {
+            "persistence": persistence_id,
+            "multimodel_mean": multimodel_mean_id,
+            "package": package_id,
+            "member": member_id,
+            "meteoblue_member": meteoblue_member_id,
+        },
+        forecasts,
+    )
+
+
+_TEST_PUBLICATION_WINDOW_DAYS = 30
+_TEST_PUBLICATION_WINDOW_KEY = f"w:{_TEST_PUBLICATION_WINDOW_DAYS}"
+
+
+def _ensure_test_publication(conn: sqlite3.Connection, *, min_n: int) -> int:
+    """This connection's one site-1 publication, created on first use.
+
+    ``forecast_ranking``'s ``rolling`` window now always reads the active
+    publication (9.2), never a live recompute, so every ranking this file
+    seeds must land in ONE publication -- its ``min_n`` is baked in at
+    creation, matching the runtime ``min_n`` setting at that point, so the
+    read-time confidence check agrees with what
+    :func:`_seed_complete_score_cache` computed.
+    """
+    row = conn.execute(
+        "SELECT id FROM publications WHERE site_id = 1 ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row is not None:
+        return int(row["id"])
+    return seed_active_publication(
+        conn,
+        site_id=1,
+        cutoff=date(2035, 6, 30),
+        published_at=datetime(2035, 6, 30, tzinfo=UTC),
+        window_days=_TEST_PUBLICATION_WINDOW_DAYS,
+        min_n=min_n,
+    )
 
 
 def _seed_complete_score_cache(
-    conn: sqlite3.Connection, *, feed_ids: list[int], variable: str, day_ahead: int
+    conn: sqlite3.Connection,
+    *,
+    forecasts: dict[int, float],
+    variable: str,
+    day_ahead: int,
 ) -> None:
-    """Seed a fresh, complete score_cache snapshot for exactly `feed_ids` at
-    one (variable, day_ahead) cell on the default rolling window.
+    """Seed a fresh, complete published-ranking snapshot for exactly the
+    feeds in `forecasts` at one (variable, day_ahead) cell.
 
-    forecast_ranking's cache-backed leaderboard lookup requires a snapshot
-    whose feed set equals the query's expected-active-feed set exactly (a
-    partial snapshot is treated as absent) or it degrades to a 'rebuilding'
-    empty ranking rather than the live-recomputed values these tests assert
-    on. Seeding via the same strategy_for(...).aggregate call the live path
-    used reproduces identical numbers. `computed_at` is
-    the REAL current UTC time (not a fixture-injected `now`) because
-    `is_cache_fresh` buckets against the actual wall-clock UTC day.
+    `forecast_ranking_with_status`'s `rolling` window now always reads the
+    active publication (9.2): a feed set that does not match the query's
+    expected-active-feed set exactly degrades to a 'rebuilding' empty
+    ranking rather than the live-recomputed values these tests assert on.
+    The pair-aggregate SQL that used to compute these (`strategy_for(
+    ...).aggregate`) is gone (W6b); the sums below are hand-derived exactly
+    from the 3 identical far-future pairs `_seed_cell_pairs` wrote into
+    `forecasts` for each feed (a fixed observed=10.0 baseline) through the
+    surviving pure `metrics_from_sums`, skill-paired 1:1 against
+    persistence's own (also constant) error over the same 3 valid_ats --
+    reproducing the same numbers, just not via the removed reader.
+    `forecasts` is local to the caller: no module-level state survives this
+    call, so a stale `id(conn)` reuse across tests can never leak one
+    test's values into another's.
     """
     min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-    resolved = resolve_window(conn, "rolling")
-    for feed_id in feed_ids:
-        result = strategy_for(variable).aggregate(
+    pub_id = _ensure_test_publication(conn, min_n=min_n)
+    persistence_id = _feed_id(conn, "virtual", "_persistence")
+    persistence_forecast = forecasts.get(persistence_id)
+    persistence_sq = (
+        None if persistence_forecast is None else (persistence_forecast - 10.0) ** 2
+    )
+    for feed_id, forecast in forecasts.items():
+        error = forecast - 10.0
+        sums: MetricSums = {
+            "n": 3,
+            "err_n": 3,
+            "err_sum": error * 3,
+            "abs_sum": abs(error) * 3,
+            "sq_sum": error * error * 3,
+        }
+        if persistence_sq is not None:
+            sums = {
+                **sums,
+                "skill_n": 3,
+                "skill_sq_sum": error * error * 3,
+                "skill_ref_sq_sum": persistence_sq * 3,
+            }
+        result = metrics_from_sums(sums, variable=variable, min_n=min_n)
+        seed_publication_ranking(
             conn,
-            site_id=1,
+            publication_id=pub_id,
             feed_id=feed_id,
             variable=variable,
             day_ahead=day_ahead,
-            window_cutoff=resolved.cutoff,
-            min_n=min_n,
-        )
-        upsert_score_cache(
-            conn,
-            site_id=1,
-            feed_id=feed_id,
-            variable=variable,
-            day_ahead=day_ahead,
-            window_key=resolved.window_key,
+            window_key=_TEST_PUBLICATION_WINDOW_KEY,
             result=result,
-            computed_at=isoformat_utc(),
         )
 
 
 def test_forecast_ranking_excludes_virtual_and_meteoblue_package_feeds() -> None:
     conn = _make_db()
-    ids = _seed_ranking_exclusion_fixture(conn)
+    ids, forecasts = _seed_ranking_exclusion_fixture(conn)
     _seed_complete_score_cache(
-        conn, feed_ids=list(ids.values()), variable="temperature", day_ahead=0
+        conn, forecasts=forecasts, variable="temperature", day_ahead=0
     )
 
     conn.commit()
-    ranking = forecast_ranking(
+    ranking = forecast_ranking_with_status(
         conn, site_id=1, variable="temperature", day_ahead=0, window="rolling"
-    )
+    ).rows
 
     # Negative: the three excluded categories never appear, even though each
     # is genuinely eligible and confidently scored.
@@ -888,32 +885,22 @@ def test_forecast_ranking_excludes_virtual_and_meteoblue_package_feeds() -> None
 
 def test_forecast_ranking_is_keyed_per_day_ahead_cell() -> None:
     conn = _make_db()
-    ids = _seed_ranking_exclusion_fixture(conn)
-    # Pairs were seeded only at day_ahead=0; the neighboring cell must be
-    # empty -- ranking is not accidentally shared across day_ahead cells.
-    conn.commit()
-    ranking_day1 = forecast_ranking(
-        conn, site_id=1, variable="temperature", day_ahead=1, window="rolling"
+    ids, forecasts = _seed_ranking_exclusion_fixture(conn)
+    _seed_complete_score_cache(
+        conn, forecasts=forecasts, variable="temperature", day_ahead=0
     )
+    # Pairs (and the published ranking) were seeded only at day_ahead=0; the
+    # neighboring cell must be empty -- ranking is not accidentally shared
+    # across day_ahead cells.
+    conn.commit()
+    ranking_day0 = forecast_ranking_with_status(
+        conn, site_id=1, variable="temperature", day_ahead=0, window="rolling"
+    ).rows
+    ranking_day1 = forecast_ranking_with_status(
+        conn, site_id=1, variable="temperature", day_ahead=1, window="rolling"
+    ).rows
+    # Paired positive: cell 0, under the SAME publication, is non-empty --
+    # the cell-1 emptiness above isn't a vacuous "nothing is ever seeded".
+    assert ids["member"] in ranking_day0
     assert ids["member"] not in ranking_day1
     assert ranking_day1 == {}
-
-
-def test_forecast_ranking_with_status_as_of_branch_reports_live() -> None:
-    """The as-of branch (plan §6) recomputes live from pairs and never reads
-    score_cache, so it always reports the ``live`` status --
-    ``leaderboard_with_status``'s status for a non-cache-backed window --
-    never the cache-backed branch's ``rebuilding``."""
-    conn = _make_db()
-    assert (
-        forecast_ranking_with_status(
-            conn,
-            site_id=1,
-            variable="temperature",
-            day_ahead=0,
-            as_of="2035-07-01T00:00:00Z",
-            declared_min_n=1,
-            declared_window_days=None,
-        ).status
-        == "live"
-    )

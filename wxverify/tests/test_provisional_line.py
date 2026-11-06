@@ -620,7 +620,7 @@ def test_pl10_latest_reading_at_is_the_latest(monkeypatch: pytest.MonkeyPatch) -
 
 def test_pl11_writes_no_scoring_or_truth_row(monkeypatch: pytest.MonkeyPatch) -> None:
     """PL11 (plan §13.8, §8.3, §8.5): the line writes no
-    ``station_observations``, ``observations``, ``forecast_pairs`` or
+    ``station_observations``, ``observations``, ``forecast_history`` or
     ``daily_truth`` row (M85: ``write_station_observation`` called for the
     jump check)."""
     from wxverify.provisional_line import provisional_site_hours
@@ -630,7 +630,7 @@ def test_pl11_writes_no_scoring_or_truth_row(monkeypatch: pytest.MonkeyPatch) ->
     _seed_pl1(conn, site_id)
     now = datetime(D.year, D.month, D.day, 12, 20, tzinfo=UTC)
 
-    tables = ("station_observations", "observations", "forecast_pairs", "daily_truth")
+    tables = ("station_observations", "observations", "forecast_history", "daily_truth")
     before = {t: conn.execute(f"SELECT * FROM {t}").fetchall() for t in tables}  # noqa: S608
 
     provisional_site_hours(conn, site_id=site_id, variable="temperature", now_utc=now)

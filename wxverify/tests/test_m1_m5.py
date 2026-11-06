@@ -5,12 +5,10 @@ import contextlib
 import errno
 import json
 import logging
-import math
 import re
 import sqlite3
 import threading
 import time
-from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -18,12 +16,11 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.helpers import close_off
 from wxverify import __version__, config
 from wxverify.api.app import _default_stop_process, _stop_on_worker_done, create_app
-from wxverify.api.routes.feeds import _rebuild_mean_for_site
 from wxverify.collection.budget import current_billing_day
 from wxverify.collection.forecast_fetcher import persist_fetch_result
-from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import TARGET_USER_VERSION
 from wxverify.db.queue import (
@@ -33,7 +30,6 @@ from wxverify.db.queue import (
     enqueue_if_absent,
     reclaim_all_stale,
 )
-from wxverify.db.switch import ensure_site_generation
 from wxverify.feeds.meteoblue import MeteoblueAdapter
 from wxverify.feeds.open_meteo import (
     _samples_from_hourly as open_meteo_samples_from_hourly,
@@ -42,33 +38,17 @@ from wxverify.feeds.seam import (
     CostEstimate,
     FetchResult,
     ForecastRequest,
-    NormalizedSample,
 )
 from wxverify.obs.pws_adapter import (
     PwsStation,
     observations_from_payload,
 )
-from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh, upsert_score_cache
-from wxverify.scoring.composite import composite
 from wxverify.scoring.consensus import (
     StationReading,
     compute_consensus,
     insert_station_observation,
-    write_station_observation,
 )
-from wxverify.scoring.engine import pair_and_score
-from wxverify.scoring.leaderboard import (
-    below_baseline,
-    leaderboard,
-    leaderboard_with_status,
-    resolve_window,
-    score_badge,
-)
-from wxverify.scoring.metrics import strategy_for
-from wxverify.scoring.rescore import drain_pending_rescores
-from wxverify.scoring.winrate import winrate
-from wxverify.settings.keys import get_number_setting, set_setting
-from wxverify.settings.service import set_rolling_window_days_sync
+from wxverify.settings.keys import set_setting
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.domain_backoff import (
     check_domain_backoff,
@@ -215,16 +195,15 @@ def test_migrations_seed_fk_and_not_null_census(tmp_path: Path) -> None:
             "model_run_id",
             "source_raw",
         },
-        "forecast_pairs": {
+        "forecast_history": {
             "site_id",
             "feed_id",
             "variable",
-            "issued_at",
-            "valid_at",
             "day_ahead",
+            "valid_at",
+            "local_date",
+            "value",
             "lead_hours",
-            "forecast",
-            "observed",
         },
         "station_observations": {
             "station_id",
@@ -301,17 +280,16 @@ def test_migrations_seed_fk_and_not_null_census(tmp_path: Path) -> None:
     feed_id = conn.execute(
         "SELECT id FROM feeds WHERE source='open-meteo' LIMIT 1"
     ).fetchone()["id"]
-    generation_id = ensure_site_generation(conn, site_id)
     try:
         conn.execute(
             """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, tz_generation_id)
-            VALUES (?, ?, 'temperature', '2026-01-01T00:00:00Z',
-                    '2026-01-01T01:00:00Z', 1, 8, 7.0, 6.0, ?)
+            INSERT INTO forecast_history
+                (site_id, feed_id, variable, day_ahead, valid_at, local_date,
+                 value, lead_hours, issued_at, contributors)
+            VALUES (?, ?, 'temperature', 8, '2026-01-01T01:00:00Z',
+                    '2026-01-01', 7.0, 1, '2026-01-01T00:00:00Z', NULL)
             """,
-            (site_id, feed_id, generation_id),
+            (site_id, feed_id),
         )
     except sqlite3.IntegrityError:
         pass
@@ -329,6 +307,12 @@ def test_worker_status_exposes_runtime_and_completed_job_fields(
     app = create_app(root_path="")
     with TestClient(app) as client:
         db = get_db()
+        # This test's subject is close-OFF behaviour: with the close off,
+        # last_completed_pair_and_score_at is always null, regardless of
+        # any completed pair_and_score job. The close is permanently on
+        # from the build (storage release 3.2), so force it off before
+        # anything reads the key.
+        db.write_sync(close_off)
 
         def _seed_completed_jobs(conn: sqlite3.Connection) -> None:
             site_id = int(
@@ -363,7 +347,7 @@ def test_worker_status_exposes_runtime_and_completed_job_fields(
     assert payload["scheduler_last_tick_at"] is None
     assert payload["last_completed_fetch_feed_at"] == "2035-01-01T01:00:00.000Z"
     assert payload["last_completed_fetch_obs_at"] == "2035-01-01T02:00:00.000Z"
-    assert payload["last_completed_pair_and_score_at"] == "2035-01-01T03:00:00.000Z"
+    assert payload["last_completed_pair_and_score_at"] is None
 
 
 def test_idle_worker_stamps_runtime_heartbeats(tmp_path: Path) -> None:
@@ -461,17 +445,10 @@ def test_worker_permission_error_is_process_fatal(
     failed_jobs: list[int] = []
 
     class FakeDb:
-        generation = 0
-
         async def read(self, fn):  # type: ignore[no-untyped-def]
             return fn(None)
 
         async def write(self, fn, *, epoch_exempt: bool = False):  # type: ignore[no-untyped-def]
-            return fn(None)
-
-        async def write_fenced(  # type: ignore[no-untyped-def]
-            self, fn, *, generation, epoch_exempt=False
-        ):
             return fn(None)
 
     def claim_once(conn: object) -> Job:
@@ -649,46 +626,14 @@ def test_s6_finish_halts_on_worker_crash_exit_but_not_signal_shutdown() -> None:
     assert "exec /run/s6/basedir/bin/halt" in finish
 
 
-def test_v1_migration_adds_backfill_columns(tmp_path: Path) -> None:
-    close_db()
-    db_path = tmp_path / "wxverify-v1.db"
-    raw = sqlite3.connect(db_path)
-    raw.execute(
-        """
-        CREATE TABLE sites (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            forecast_lat REAL NOT NULL,
-            forecast_lon REAL NOT NULL,
-            elevation_m REAL NOT NULL,
-            timezone TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
-            rain_threshold_mm REAL NOT NULL DEFAULT 0.2 CHECK(rain_threshold_mm >= 0),
-            last_obs_at TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        )
-        """
-    )
-    raw.execute(
-        """
-        INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES ('Old', 40, -105, 900, 'UTC')
-        """
-    )
-    raw.execute("PRAGMA user_version = 1")
-    raw.commit()
-    raw.close()
-
-    config.db_path = str(db_path)
-    config.options_path = str(tmp_path / "missing-options.json")
-    db = init_db(str(db_path))
-    conn = db._conn  # noqa: SLF001 - tests inspect the real writer connection
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(sites)")}
-    assert {"backfill_status", "backfill_through"} <= columns
-    row = conn.execute("SELECT backfill_status, backfill_through FROM sites").fetchone()
-    assert row["backfill_status"] == "pending"
-    assert row["backfill_through"] is None
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == TARGET_USER_VERSION
+# test_v1_migration_adds_backfill_columns (a hand-crafted v1 sites table
+# gaining backfill_status/backfill_through on open) is retired:
+# migrate_v1 and every other migrate_v2 ... migrate_v16 function are
+# deleted (storage release 4.1), and user_version 1 is refused outright
+# now rather than upgraded. A fresh build's sites table carries both
+# columns from create_tables directly -- test_migrations_seed_fk_and_
+# not_null_census above already pins backfill_status there; nothing
+# migrate_v1-specific survives to test.
 
 
 def test_database_rejects_sqlite_without_returning(
@@ -884,129 +829,6 @@ def test_station_call_pacing_delay_is_seeded_bounded_and_rate_limits_calls(
     assert sleeps == [station_call_delay_seconds(7, 11, 1)]
 
 
-def test_consensus_pairing_settings_and_cache_freshness(tmp_path: Path) -> None:
-    conn = _init_tmp_db(tmp_path)
-    site_id = int(
-        conn.execute(
-            """
-            INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Score', 40, -105, 900, 'UTC')
-            """
-        ).lastrowid
-    )
-    station_id = int(
-        conn.execute(
-            """
-            INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m)
-            VALUES (?, 'S1', 40, -105, 900)
-            """,
-            (site_id,),
-        ).lastrowid
-    )
-    insert_station_observation(
-        conn,
-        station_id=station_id,
-        variable="temperature",
-        valid_at="2026-01-01T01:00:00Z",
-        value=6.85,
-        source_raw="6.85C",
-    )
-    obs = conn.execute(
-        "SELECT * FROM observations WHERE site_id=?", (site_id,)
-    ).fetchone()
-    assert obs["n_stations"] == 1
-    assert obs["value"] == pytest.approx(6.85)
-    for name, value in (("S2", 7.05), ("S3", 8.65)):
-        sibling_id = int(
-            conn.execute(
-                """
-                INSERT INTO stations
-                    (site_id, pws_station_id, lat, lon, dem_elevation_m)
-                VALUES (?, ?, 40, -105, 900)
-                """,
-                (site_id, name),
-            ).lastrowid
-        )
-        insert_station_observation(
-            conn,
-            station_id=sibling_id,
-            variable="temperature",
-            valid_at="2026-01-01T01:00:00Z",
-            value=value,
-            source_raw=f"{value}C",
-        )
-    obs = conn.execute(
-        "SELECT * FROM observations WHERE site_id=?", (site_id,)
-    ).fetchone()
-    assert obs["n_stations"] == 3
-    assert obs["rejected_stations"] == 0
-    try:
-        write_station_observation(
-            conn,
-            station_id=station_id,
-            variable="wind",
-            valid_at="2026-01-01T01:00:00Z",
-            value=3.0,
-            source_raw=None,
-        )
-    except ValueError:
-        pass
-    else:  # pragma: no cover
-        raise AssertionError("target obs write without source_raw was accepted")
-
-    feed_id = int(
-        conn.execute(
-            "SELECT id FROM feeds WHERE source='open-meteo' LIMIT 1"
-        ).fetchone()["id"]
-    )
-    persist_fetch_result(
-        conn,
-        site_id=site_id,
-        source="open-meteo",
-        fetch_feed_id=feed_id,
-        result=FetchResult(
-            samples=[
-                NormalizedSample(
-                    model="ecmwf_ifs",
-                    variable="temperature",
-                    issued_at="2026-01-01T00:00:00Z",
-                    valid_at="2026-01-01T01:00:00Z",
-                    lead_hours=1,
-                    value=7.85,
-                    source_raw="7.85C",
-                    model_run_id="run-1",
-                )
-            ]
-        ),
-    )
-    pair_and_score(conn, site_id)
-    assert conn.execute("SELECT COUNT(*) AS n FROM forecast_pairs").fetchone()["n"] >= 1
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO score_cache
-            (site_id, feed_id, variable, day_ahead, window_key, n, computed_at)
-        VALUES (?, ?, 'temperature', 0, 'w:30', 1, '2026-01-01T00:00:00Z')
-        """,
-        (site_id, feed_id),
-    )
-    set_rolling_window_days_sync(conn, 14)
-    assert (
-        conn.execute(
-            "SELECT COUNT(*) AS n FROM score_cache WHERE window_key='w:30'"
-        ).fetchone()["n"]
-        == 0
-    )
-    assert is_cache_fresh(ScoreCacheRow(computed_at="not-a-date"), "w:all") is False
-    assert (
-        is_cache_fresh(ScoreCacheRow(computed_at="2026-01-01T00:00:00Z"), "w:all")
-        is True
-    )
-    assert score_badge(0.734) == 73
-    assert score_badge(-0.2) == 0
-    assert below_baseline(-0.2) is True
-    assert score_badge(None) is None
-
-
 def test_consensus_outlier_rejection_oracle() -> None:
     """Numeric oracle: temperature outlier MUST be rejected and excluded from median.
 
@@ -1124,1085 +946,13 @@ def test_consensus_lapse_normalization_oracle() -> None:
     assert result.value == pytest.approx(20.05)
 
 
-def test_corrected_observation_rebuilds_future_persistence(tmp_path: Path) -> None:
-    conn = _init_tmp_db(tmp_path)
-    site_id = int(
-        conn.execute(
-            """
-            INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Persistence', 40, -105, 900, 'UTC')
-            """
-        ).lastrowid
-    )
-    station_id = int(
-        conn.execute(
-            """
-            INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m)
-            VALUES (?, 'P1', 40, -105, 900)
-            """,
-            (site_id,),
-        ).lastrowid
-    )
-    for valid_at, value in (
-        ("2035-01-01T00:00:00Z", 10.0),
-        ("2035-01-01T02:00:00Z", 13.0),
-    ):
-        insert_station_observation(
-            conn,
-            station_id=station_id,
-            variable="temperature",
-            valid_at=valid_at,
-            value=value,
-            source_raw=f"{value} C",
-        )
-    pair_and_score(conn, site_id)
-    persistence_feed_id = int(
-        conn.execute(
-            "SELECT id FROM feeds WHERE source='virtual' AND model='_persistence'"
-        ).fetchone()["id"]
-    )
-    stale = conn.execute(
-        """
-        SELECT forecast, observed
-        FROM forecast_pairs
-        WHERE site_id=?
-          AND feed_id=?
-          AND variable='temperature'
-          AND issued_at='2035-01-01T00:00:00Z'
-          AND valid_at='2035-01-01T02:00:00Z'
-          AND lead_hours=2
-        """,
-        (site_id, persistence_feed_id),
-    ).fetchone()
-    assert stale["forecast"] == pytest.approx(10.0)
-    assert stale["observed"] == pytest.approx(13.0)
-
-    insert_station_observation(
-        conn,
-        station_id=station_id,
-        variable="temperature",
-        valid_at="2035-01-01T00:00:00Z",
-        value=11.0,
-        source_raw="11.0 C",
-    )
-    assert (
-        conn.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM forecast_pairs
-            WHERE site_id=?
-              AND feed_id=?
-              AND variable='temperature'
-              AND issued_at='2035-01-01T00:00:00Z'
-              AND valid_at='2035-01-01T02:00:00Z'
-              AND lead_hours=2
-            """,
-            (site_id, persistence_feed_id),
-        ).fetchone()["n"]
-        == 0
-    )
-    pair_and_score(conn, site_id)
-    rebuilt = conn.execute(
-        """
-        SELECT forecast, observed
-        FROM forecast_pairs
-        WHERE site_id=?
-          AND feed_id=?
-          AND variable='temperature'
-          AND issued_at='2035-01-01T00:00:00Z'
-          AND valid_at='2035-01-01T02:00:00Z'
-          AND lead_hours=2
-        """,
-        (site_id, persistence_feed_id),
-    ).fetchone()
-    assert rebuilt["forecast"] == pytest.approx(11.0)
-    assert rebuilt["observed"] == pytest.approx(13.0)
+# test_corrected_observation_rebuilds_future_persistence was removed with
+# storage-release plan B6: materialize_consensus no longer deletes or
+# rebuilds pairs/score_cache rows when an observation is written or
+# corrected, so the delete-then-rebuild it pinned no longer happens.
 
 
-def test_skill_uses_shared_persistence_cells_and_virtual_precip_flags(
-    tmp_path: Path,
-) -> None:
-    conn = _init_tmp_db(tmp_path)
-    set_setting(conn, "min_n", "1")
-    site_id = int(
-        conn.execute(
-            """
-            INSERT INTO sites
-                (name, forecast_lat, forecast_lon, elevation_m, timezone,
-                 rain_threshold_mm)
-            VALUES ('Shared Skill', 40, -105, 900, 'UTC', 0.2)
-            """
-        ).lastrowid
-    )
-    real_feed_ids = [
-        int(row["id"])
-        for row in conn.execute(
-            "SELECT id FROM feeds WHERE source='open-meteo' ORDER BY id LIMIT 2"
-        )
-    ]
-    persistence_feed_id = int(
-        conn.execute(
-            "SELECT id FROM feeds WHERE source='virtual' AND model='_persistence'"
-        ).fetchone()["id"]
-    )
-    mean_feed_id = int(
-        conn.execute(
-            "SELECT id FROM feeds WHERE source='virtual' AND model='_multimodel_mean'"
-        ).fetchone()["id"]
-    )
-
-    def add_pair(
-        feed_id: int,
-        *,
-        variable: str,
-        issued_at: str,
-        valid_at: str,
-        forecast: float,
-        observed: float,
-        day_ahead: int = 1,
-        lead_hours: int = 24,
-        cat_hit: int | None = None,
-        cat_false: int | None = None,
-        cat_miss: int | None = None,
-        cat_correct_neg: int | None = None,
-        rain_threshold_mm: float | None = None,
-    ) -> None:
-        error = forecast - observed
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 cat_hit, cat_false, cat_miss, cat_correct_neg, rain_threshold_mm,
-                 tz_generation_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                site_id,
-                feed_id,
-                variable,
-                issued_at,
-                valid_at,
-                lead_hours,
-                day_ahead,
-                forecast,
-                observed,
-                error,
-                abs(error),
-                error * error,
-                cat_hit,
-                cat_false,
-                cat_miss,
-                cat_correct_neg,
-                rain_threshold_mm,
-                ensure_site_generation(conn, site_id),
-            ),
-        )
-
-    add_pair(
-        real_feed_ids[0],
-        variable="temperature",
-        issued_at="2035-01-01T00:00:00Z",
-        valid_at="2035-01-02T00:00:00Z",
-        forecast=11.0,
-        observed=10.0,
-    )
-    add_pair(
-        real_feed_ids[0],
-        variable="temperature",
-        issued_at="2035-01-01T01:00:00Z",
-        valid_at="2035-01-02T01:00:00Z",
-        forecast=13.0,
-        observed=10.0,
-    )
-    add_pair(
-        persistence_feed_id,
-        variable="temperature",
-        issued_at="2035-01-01T00:00:00Z",
-        valid_at="2035-01-02T00:00:00Z",
-        forecast=12.0,
-        observed=10.0,
-    )
-
-    # window="all" is cache-backed (w:all): leaderboard_with_status now serves
-    # exclusively from score_cache for cache-backed windows, so the expected
-    # active feed universe -- real_feed_ids[0] AND virtual/_persistence, both
-    # of which have pairs in this window -- needs a complete seeded snapshot
-    # or the read degrades to a 'rebuilding' empty ranking instead of the
-    # skill_score assertion below.
-    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-    resolved = resolve_window(conn, "all")
-    for feed_id in (real_feed_ids[0], persistence_feed_id):
-        result = strategy_for("temperature").aggregate(
-            conn,
-            site_id=site_id,
-            feed_id=feed_id,
-            variable="temperature",
-            day_ahead=1,
-            window_cutoff=resolved.cutoff,
-            min_n=min_n,
-        )
-        upsert_score_cache(
-            conn,
-            site_id=site_id,
-            feed_id=feed_id,
-            variable="temperature",
-            day_ahead=1,
-            window_key=resolved.window_key,
-            result=result,
-            computed_at=isoformat_utc(),
-        )
-
-    skill_rows = leaderboard(
-        conn,
-        site_id=site_id,
-        variable="temperature",
-        day_ahead=1,
-        window="all",
-    )
-    skill_by_feed = {row.feed_id: row for row in skill_rows}
-    skill_row = skill_by_feed[real_feed_ids[0]]
-    assert skill_row.feed_id == real_feed_ids[0]
-    assert skill_row.skill_score == pytest.approx(0.75)
-
-    conn.execute(
-        """
-        INSERT INTO observations
-            (site_id, variable, valid_at, value, n_stations)
-        VALUES
-            (?, 'precip', '2035-01-01T00:00:00Z', 0.0, 1),
-            (?, 'precip', '2035-01-02T00:00:00Z', 0.3, 1)
-        """,
-        (site_id, site_id),
-    )
-    add_pair(
-        real_feed_ids[0],
-        variable="precip",
-        issued_at="2035-01-01T00:00:00Z",
-        valid_at="2035-01-02T00:00:00Z",
-        forecast=0.4,
-        observed=0.3,
-        cat_hit=1,
-        cat_false=0,
-        cat_miss=0,
-        cat_correct_neg=0,
-        rain_threshold_mm=0.2,
-    )
-    add_pair(
-        real_feed_ids[1],
-        variable="precip",
-        issued_at="2035-01-01T00:00:00Z",
-        valid_at="2035-01-02T00:00:00Z",
-        forecast=0.0,
-        observed=0.3,
-        cat_hit=0,
-        cat_false=0,
-        cat_miss=1,
-        cat_correct_neg=0,
-        rain_threshold_mm=0.2,
-    )
-    pair_and_score(conn, site_id)
-    persistence_precip = conn.execute(
-        """
-        SELECT cat_hit, cat_false, cat_miss, cat_correct_neg, rain_threshold_mm
-        FROM forecast_pairs
-        WHERE site_id=? AND feed_id=? AND variable='precip'
-          AND issued_at='2035-01-01T00:00:00Z'
-          AND valid_at='2035-01-02T00:00:00Z'
-        """,
-        (site_id, persistence_feed_id),
-    ).fetchone()
-    assert persistence_precip["cat_hit"] == 0
-    assert persistence_precip["cat_false"] == 0
-    assert persistence_precip["cat_miss"] == 1
-    assert persistence_precip["cat_correct_neg"] == 0
-    assert persistence_precip["rain_threshold_mm"] == pytest.approx(0.2)
-    mean_precip = conn.execute(
-        """
-        SELECT forecast, cat_hit, cat_false, cat_miss, cat_correct_neg,
-               rain_threshold_mm
-        FROM forecast_pairs
-        WHERE site_id=? AND feed_id=? AND variable='precip'
-        """,
-        (site_id, mean_feed_id),
-    ).fetchone()
-    assert mean_precip["forecast"] == pytest.approx(0.2)
-    assert mean_precip["cat_hit"] == 1
-    assert mean_precip["cat_false"] == 0
-    assert mean_precip["cat_miss"] == 0
-    assert mean_precip["cat_correct_neg"] == 0
-    assert mean_precip["rain_threshold_mm"] == pytest.approx(0.2)
-
-
-def test_winrate_uses_latest_issued_ties_and_sparse_denominator(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Pin "now" near the fixture dates so the default rolling window
-    # (30 days) is stable forever; otherwise these June-2026 pairs age out
-    # of the wall-clock-relative window and covered drops from 2 to 1.
-    fixed_now = datetime(2026, 6, 24, 0, 0, 0, tzinfo=UTC)
-    monkeypatch.setattr("wxverify.core.timeutil.utc_now", lambda: fixed_now)
-    conn = _init_tmp_db(tmp_path)
-    site_id = int(
-        conn.execute(
-            """
-            INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Winrate', 40, -105, 900, 'UTC')
-            """
-        ).lastrowid
-    )
-    feed_ids = [
-        int(row["id"])
-        for row in conn.execute(
-            "SELECT id FROM feeds WHERE source='open-meteo' ORDER BY id LIMIT 4"
-        )
-    ]
-
-    def add_pair(
-        feed_id: int, issued_at: str, valid_at: str, forecast: float, observed: float
-    ) -> None:
-        error = forecast - observed
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 tz_generation_id)
-            VALUES (?, ?, 'temperature', ?, ?, 24, 1, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                site_id,
-                feed_id,
-                issued_at,
-                valid_at,
-                forecast,
-                observed,
-                error,
-                abs(error),
-                error * error,
-                ensure_site_generation(conn, site_id),
-            ),
-        )
-
-    add_pair(
-        feed_ids[0],
-        "2026-06-21T00:00:00Z",
-        "2026-06-23T00:00:00Z",
-        10.0,
-        10.0,
-    )
-    add_pair(
-        feed_ids[0],
-        "2026-06-22T00:00:00Z",
-        "2026-06-23T00:00:00Z",
-        13.0,
-        10.0,
-    )
-    add_pair(
-        feed_ids[1],
-        "2026-06-22T00:00:00Z",
-        "2026-06-23T00:00:00Z",
-        11.0,
-        10.0,
-    )
-    add_pair(
-        feed_ids[0],
-        "2026-06-23T00:00:00Z",
-        "2026-06-24T00:00:00Z",
-        9.0,
-        10.0,
-    )
-    add_pair(
-        feed_ids[1],
-        "2026-06-23T00:00:00Z",
-        "2026-06-24T00:00:00Z",
-        11.0,
-        10.0,
-    )
-    add_pair(
-        feed_ids[2],
-        "2026-06-23T00:00:00Z",
-        "2026-06-24T00:00:00Z",
-        14.0,
-        10.0,
-    )
-    conn.execute(
-        """
-        INSERT INTO site_feed_state (site_id, feed_id, enabled)
-        VALUES (?, ?, 0)
-        """,
-        (site_id, feed_ids[3]),
-    )
-    add_pair(
-        feed_ids[3],
-        "2026-06-23T00:00:00Z",
-        "2026-06-24T00:00:00Z",
-        10.0,
-        10.0,
-    )
-
-    rows = {
-        int(row["feed_id"]): row
-        for row in winrate(conn, site_id=site_id, variable="temperature", day_ahead=1)
-    }
-    assert set(rows) == set(feed_ids[:3])
-    assert rows[feed_ids[0]]["covered"] == 2
-    assert rows[feed_ids[0]]["comparable"] == 2
-    assert rows[feed_ids[0]]["wins"] == pytest.approx(0.5)
-    assert rows[feed_ids[0]]["win_rate"] == pytest.approx(0.25)
-    assert rows[feed_ids[1]]["wins"] == pytest.approx(1.5)
-    assert rows[feed_ids[1]]["win_rate"] == pytest.approx(0.75)
-    assert rows[feed_ids[2]]["covered"] == 1
-    assert rows[feed_ids[2]]["comparable"] == 1
-    assert rows[feed_ids[2]]["win_rate"] == 0.0
-
-
-def test_winrate_applies_window_to_canonical_cells(tmp_path: Path) -> None:
-    conn = _init_tmp_db(tmp_path)
-    site_id = int(
-        conn.execute(
-            """
-            INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Winrate Window', 40, -105, 900, 'UTC')
-            """
-        ).lastrowid
-    )
-    feed_ids = [
-        int(row["id"])
-        for row in conn.execute(
-            "SELECT id FROM feeds WHERE source='open-meteo' ORDER BY id LIMIT 3"
-        )
-    ]
-
-    def add_pair(
-        feed_id: int, issued_at: str, valid_at: str, forecast: float, observed: float
-    ) -> None:
-        error = forecast - observed
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 tz_generation_id)
-            VALUES (?, ?, 'temperature', ?, ?, 24, 1, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                site_id,
-                feed_id,
-                issued_at,
-                valid_at,
-                forecast,
-                observed,
-                error,
-                abs(error),
-                error * error,
-                ensure_site_generation(conn, site_id),
-            ),
-        )
-
-    add_pair(
-        feed_ids[0],
-        "2035-01-01T00:00:00Z",
-        "2035-01-02T00:00:00Z",
-        10.0,
-        10.0,
-    )
-    add_pair(
-        feed_ids[1],
-        "2035-01-01T00:00:00Z",
-        "2035-01-02T00:00:00Z",
-        12.0,
-        10.0,
-    )
-    add_pair(
-        feed_ids[1],
-        "2020-01-01T00:00:00Z",
-        "2020-01-02T00:00:00Z",
-        20.0,
-        10.0,
-    )
-    add_pair(
-        feed_ids[2],
-        "2020-01-01T00:00:00Z",
-        "2020-01-02T00:00:00Z",
-        10.0,
-        10.0,
-    )
-
-    recent = {
-        int(row["feed_id"]): row
-        for row in winrate(
-            conn,
-            site_id=site_id,
-            variable="temperature",
-            day_ahead=1,
-            window="1d",
-        )
-    }
-    assert set(recent) == {feed_ids[0], feed_ids[1]}
-    assert recent[feed_ids[0]]["win_rate"] == 1.0
-    assert recent[feed_ids[1]]["win_rate"] == 0.0
-
-    all_rows = {
-        int(row["feed_id"]): row
-        for row in winrate(
-            conn,
-            site_id=site_id,
-            variable="temperature",
-            day_ahead=1,
-            window="all",
-        )
-    }
-    assert set(all_rows) == set(feed_ids)
-
-
-def test_composite_averages_live_components_and_filters_feeds(tmp_path: Path) -> None:
-    conn = _init_tmp_db(tmp_path)
-    set_setting(conn, "min_n", "1")
-    site_id = int(
-        conn.execute(
-            """
-            INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Composite', 40, -105, 900, 'UTC')
-            """
-        ).lastrowid
-    )
-    feed_ids = [
-        int(row["id"])
-        for row in conn.execute(
-            "SELECT id FROM feeds WHERE source='open-meteo' ORDER BY id LIMIT 4"
-        )
-    ]
-    persistence_feed_id = int(
-        conn.execute(
-            "SELECT id FROM feeds WHERE source='virtual' AND model='_persistence'"
-        ).fetchone()["id"]
-    )
-
-    def add_pair(
-        feed_id: int,
-        variable: str,
-        skill_score: float,
-        *,
-        day_ahead: int = 1,
-        valid_hour: int,
-    ) -> None:
-        observed = 10.0
-        persistence_sq_error = 4.0
-        feed_sq_error = (1.0 - skill_score) * persistence_sq_error
-        feed_error = math.sqrt(feed_sq_error)
-        valid_at = f"2035-01-02T{valid_hour:02d}:00:00Z"
-        issued_at = f"2035-01-01T{valid_hour:02d}:00:00Z"
-        persistence_error = math.sqrt(persistence_sq_error)
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 tz_generation_id)
-            VALUES (?, ?, ?, ?, ?, 24, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                site_id,
-                persistence_feed_id,
-                variable,
-                issued_at,
-                valid_at,
-                day_ahead,
-                observed + persistence_error,
-                observed,
-                persistence_error,
-                abs(persistence_error),
-                persistence_sq_error,
-                ensure_site_generation(conn, site_id),
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 tz_generation_id)
-            VALUES (?, ?, ?, ?, ?, 24, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                site_id,
-                feed_id,
-                variable,
-                issued_at,
-                valid_at,
-                day_ahead,
-                observed + feed_error,
-                observed,
-                feed_error,
-                abs(feed_error),
-                feed_sq_error,
-                ensure_site_generation(conn, site_id),
-            ),
-        )
-
-    add_pair(feed_ids[0], "temperature", 0.5, valid_hour=0)
-    add_pair(feed_ids[0], "wind", -0.2, valid_hour=1)
-    add_pair(feed_ids[1], "temperature", 0.8, valid_hour=2)
-    add_pair(feed_ids[1], "wind", 0.4, valid_hour=3)
-    conn.execute(
-        """
-        INSERT INTO site_feed_state (site_id, feed_id, enabled)
-        VALUES (?, ?, 0)
-        """,
-        (site_id, feed_ids[3]),
-    )
-    add_pair(feed_ids[3], "temperature", 1.0, valid_hour=4)
-
-    # Custom `Nd` window: the live compute path. The `rolling` window is
-    # cache-backed since 0.4.2 and would return `rebuilding` (empty) with no
-    # seeded score_cache; the live aggregation/filter math under test here is
-    # unchanged and identical across window cutoffs.
-    rows = {
-        int(row["feed_id"]): row
-        for row in composite(conn, site_id=site_id, window="30d")
-    }
-    assert feed_ids[0] in rows
-    assert feed_ids[1] in rows
-    assert feed_ids[3] not in rows
-    assert rows[feed_ids[0]]["component_count"] == 2
-    assert rows[feed_ids[0]]["components"] == {"temperature": 0.5, "wind": 0.0}
-    assert rows[feed_ids[0]]["raw_components"] == pytest.approx(
-        {
-            "temperature": 0.5,
-            "wind": -0.2,
-        }
-    )
-    assert rows[feed_ids[0]]["score"] == pytest.approx(0.25)
-    assert rows[feed_ids[0]]["raw_score"] == pytest.approx(0.15)
-    assert rows[feed_ids[0]]["badge"] == 25
-    assert rows[feed_ids[1]]["score"] == pytest.approx(0.6)
-    assert rows[feed_ids[1]]["badge"] == 60
-
-
-def test_composite_custom_window_computes_live_without_cache(tmp_path: Path) -> None:
-    conn = _init_tmp_db(tmp_path)
-    set_setting(conn, "min_n", "1")
-    site_id = int(
-        conn.execute(
-            """
-            INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Composite Live', 40, -105, 900, 'UTC')
-            """
-        ).lastrowid
-    )
-    real_feed_id = int(
-        conn.execute(
-            "SELECT id FROM feeds WHERE source='open-meteo' ORDER BY id LIMIT 1"
-        ).fetchone()["id"]
-    )
-    persistence_feed_id = int(
-        conn.execute(
-            "SELECT id FROM feeds WHERE source='virtual' AND model='_persistence'"
-        ).fetchone()["id"]
-    )
-
-    def add_pair(feed_id: int, forecast: float) -> None:
-        observed = 10.0
-        error = forecast - observed
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 tz_generation_id)
-            VALUES (?, ?, 'temperature', '2035-01-01T00:00:00Z',
-                    '2035-01-02T00:00:00Z', 24, 1, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                site_id,
-                feed_id,
-                forecast,
-                observed,
-                error,
-                abs(error),
-                error * error,
-                ensure_site_generation(conn, site_id),
-            ),
-        )
-
-    add_pair(real_feed_id, 11.0)
-    add_pair(persistence_feed_id, 12.0)
-
-    rows = {
-        int(row["feed_id"]): row
-        for row in composite(conn, site_id=site_id, window="1d")
-    }
-    assert rows[real_feed_id]["window_key"] == "live:1d"
-    assert rows[real_feed_id]["components"] == {"temperature": 0.75}
-    assert rows[real_feed_id]["raw_score"] == pytest.approx(0.75)
-    assert rows[real_feed_id]["badge"] == 75
-    assert conn.execute("SELECT COUNT(*) AS n FROM score_cache").fetchone()["n"] == 0
-
-
-def test_subscription_rebuilds_multimodel_mean(tmp_path: Path) -> None:
-    conn = _init_tmp_db(tmp_path)
-    site_id = int(
-        conn.execute(
-            """
-            INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Mean Rebuild', 40, -105, 900, 'UTC')
-            """
-        ).lastrowid
-    )
-    feed_ids = [
-        int(row["id"])
-        for row in conn.execute(
-            "SELECT id FROM feeds WHERE source='open-meteo' ORDER BY id LIMIT 2"
-        )
-    ]
-    mean_feed_id = int(
-        conn.execute(
-            "SELECT id FROM feeds WHERE source='virtual' AND model='_multimodel_mean'"
-        ).fetchone()["id"]
-    )
-
-    def add_pair(feed_id: int, forecast: float) -> None:
-        observed = 10.0
-        error = forecast - observed
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 tz_generation_id)
-            VALUES (?, ?, 'temperature', '2035-01-01T00:00:00Z',
-                    '2035-01-02T00:00:00Z', 24, 1, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                site_id,
-                feed_id,
-                forecast,
-                observed,
-                error,
-                abs(error),
-                error * error,
-                ensure_site_generation(conn, site_id),
-            ),
-        )
-
-    add_pair(feed_ids[0], 8.0)
-    add_pair(feed_ids[1], 12.0)
-    _rebuild_mean_for_site(conn, site_id)
-    row = conn.execute(
-        """
-        SELECT forecast, contributors FROM forecast_pairs
-        WHERE site_id=? AND feed_id=?
-        """,
-        (site_id, mean_feed_id),
-    ).fetchone()
-    assert row["forecast"] == pytest.approx(10.0)
-    assert row["contributors"] == 2
-
-    conn.execute(
-        """
-        INSERT INTO site_feed_state (site_id, feed_id, enabled)
-        VALUES (?, ?, 0)
-        """,
-        (site_id, feed_ids[1]),
-    )
-    _rebuild_mean_for_site(conn, site_id)
-    assert (
-        conn.execute(
-            """
-            SELECT COUNT(*) AS n FROM forecast_pairs
-            WHERE site_id=? AND feed_id=?
-            """,
-            (site_id, mean_feed_id),
-        ).fetchone()["n"]
-        == 0
-    )
-
-    conn.execute(
-        "UPDATE site_feed_state SET enabled=1 WHERE site_id=? AND feed_id=?",
-        (site_id, feed_ids[1]),
-    )
-    _rebuild_mean_for_site(conn, site_id)
-    assert (
-        conn.execute(
-            """
-            SELECT COUNT(*) AS n FROM forecast_pairs
-            WHERE site_id=? AND feed_id=?
-            """,
-            (site_id, mean_feed_id),
-        ).fetchone()["n"]
-        == 1
-    )
-
-
-def test_meteoblue_package_gates_members_for_leaderboard_and_mean(
-    tmp_path: Path,
-) -> None:
-    conn = _init_tmp_db(tmp_path)
-    set_setting(conn, "min_n", "1")
-    site_id = int(
-        conn.execute(
-            """
-            INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Meteoblue Gate', 40, -105, 900, 'UTC')
-            """
-        ).lastrowid
-    )
-    package_feed_id = int(
-        conn.execute(
-            """
-            SELECT id FROM feeds
-            WHERE source='meteoblue' AND model='multimodel'
-            """
-        ).fetchone()["id"]
-    )
-    member_ids: list[int] = []
-    for model in ("gfs", "icon"):
-        member_ids.append(
-            int(
-                conn.execute(
-                    """
-                    INSERT INTO feeds
-                        (source, model, enabled, default_subscribed,
-                         fetch_interval_minutes, max_lead_hours, is_virtual)
-                    VALUES ('meteoblue', ?, 1, 0, 1440, 168, 0)
-                    """,
-                    (model,),
-                ).lastrowid
-            )
-        )
-    mean_feed_id = int(
-        conn.execute(
-            "SELECT id FROM feeds WHERE source='virtual' AND model='_multimodel_mean'"
-        ).fetchone()["id"]
-    )
-
-    for feed_id, forecast in zip(member_ids, (8.0, 12.0), strict=True):
-        observed = 10.0
-        error = forecast - observed
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 tz_generation_id)
-            VALUES (?, ?, 'temperature', '2035-01-01T00:00:00Z',
-                    '2035-01-02T00:00:00Z', 24, 1, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                site_id,
-                feed_id,
-                forecast,
-                observed,
-                error,
-                abs(error),
-                error * error,
-                ensure_site_generation(conn, site_id),
-            ),
-        )
-
-    conn.execute(
-        """
-        INSERT INTO site_feed_state (site_id, feed_id, enabled)
-        VALUES (?, ?, 1)
-        """,
-        (site_id, package_feed_id),
-    )
-    _rebuild_mean_for_site(conn, site_id)
-    mean = conn.execute(
-        """
-        SELECT forecast, contributors
-        FROM forecast_pairs
-        WHERE site_id=? AND feed_id=?
-        """,
-        (site_id, mean_feed_id),
-    ).fetchone()
-    assert mean["forecast"] == pytest.approx(10.0)
-    assert mean["contributors"] == 2
-    listed = {
-        row.feed_id
-        for row in leaderboard(
-            conn, site_id=site_id, variable="temperature", day_ahead=1, window="1d"
-        )
-    }
-    assert set(member_ids).issubset(listed)
-
-    conn.execute(
-        "UPDATE site_feed_state SET enabled=0 WHERE site_id=? AND feed_id=?",
-        (site_id, package_feed_id),
-    )
-    _rebuild_mean_for_site(conn, site_id)
-    assert (
-        conn.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM forecast_pairs
-            WHERE site_id=? AND feed_id=?
-            """,
-            (site_id, mean_feed_id),
-        ).fetchone()["n"]
-        == 0
-    )
-    listed_after_unsubscribe = {
-        row.feed_id
-        for row in leaderboard(
-            conn, site_id=site_id, variable="temperature", day_ahead=1, window="1d"
-        )
-    }
-    assert set(member_ids).isdisjoint(listed_after_unsubscribe)
-
-
-def test_dashboard_rolling_readthrough_rebuilding_enqueues_and_returns_empty(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    close_db()
-    config.db_path = str(tmp_path / "dashboard-cache.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
-    app = create_app(root_path="")
-    with TestClient(app) as client:
-        db = get_db()
-
-        def _seed(conn: sqlite3.Connection) -> int:
-            set_setting(conn, "min_n", "1")
-            set_setting(conn, "rolling_window_days", "14")
-            site_id = int(
-                conn.execute(
-                    """
-                    INSERT INTO sites
-                        (name, forecast_lat, forecast_lon, elevation_m, timezone)
-                    VALUES ('Readthrough', 40, -105, 900, 'UTC')
-                    """
-                ).lastrowid
-            )
-            feed_id = int(
-                conn.execute(
-                    "SELECT id FROM feeds WHERE source='open-meteo' ORDER BY id LIMIT 1"
-                ).fetchone()["id"]
-            )
-            observed = 10.0
-            forecast = 11.0
-            error = forecast - observed
-            conn.execute(
-                """
-                INSERT INTO forecast_pairs
-                    (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                     day_ahead, forecast, observed, error, abs_error, sq_error,
-                     tz_generation_id)
-                VALUES (?, ?, 'temperature', '2035-01-01T00:00:00Z',
-                        '2035-01-02T00:00:00Z', 24, 1, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    site_id,
-                    feed_id,
-                    forecast,
-                    observed,
-                    error,
-                    abs(error),
-                    error * error,
-                    ensure_site_generation(conn, site_id),
-                ),
-            )
-            return site_id
-
-        site_id = db.write_sync(_seed)
-        response = client.get(
-            "/api/leaderboard",
-            params={"site": site_id, "variable": "temperature", "lead": "D+1"},
-        )
-        assert response.status_code == 200
-        rows = response.json()
-        # Applicable input exists (a forecast_pairs row for the one active
-        # feed), but score_cache is absent -- cache-backed windows never
-        # live-recompute, so the read degrades to 'rebuilding': empty rows,
-        # not a live fallback that fills in a row straight from
-        # forecast_pairs. Exactly one job is enqueued for the miss (not zero,
-        # not duplicated across the single read).
-        assert rows == []
-        # The rescore enqueue is fire-and-forget (schedule_score_rescore);
-        # TestClient.get() does not wait for it, so drain the scheduled task
-        # via the running TestClient's portal before checking the jobs table.
-        client.portal.call(drain_pending_rescores)
-        assert (
-            db.read_sync(
-                lambda conn: conn.execute(
-                    """
-                    SELECT COUNT(*) AS n
-                    FROM jobs
-                    WHERE type='pair_and_score' AND site_id=?
-                    """,
-                    (site_id,),
-                ).fetchone()["n"]
-            )
-            == 1
-        )
-
-
-def test_cached_leaderboard_misses_when_active_feed_cache_is_incomplete(
-    tmp_path: Path,
-) -> None:
-    conn = _init_tmp_db(tmp_path)
-    site_id = int(
-        conn.execute(
-            """
-            INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Partial Cache', 40, -105, 900, 'UTC')
-            """
-        ).lastrowid
-    )
-    feed_ids = [
-        int(row["id"])
-        for row in conn.execute(
-            "SELECT id FROM feeds WHERE source='open-meteo' ORDER BY id LIMIT 2"
-        )
-    ]
-    for feed_id, forecast in zip(feed_ids, (11.0, 12.0), strict=True):
-        error = forecast - 10.0
-        conn.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 tz_generation_id)
-            VALUES (?, ?, 'temperature', '2035-01-01T00:00:00Z',
-                    '2035-01-02T00:00:00Z', 24, 1, ?, 10.0, ?, ?, ?, ?)
-            """,
-            (
-                site_id,
-                feed_id,
-                forecast,
-                error,
-                abs(error),
-                error * error,
-                ensure_site_generation(conn, site_id),
-            ),
-        )
-    conn.execute(
-        """
-        INSERT INTO score_cache
-            (site_id, feed_id, variable, day_ahead, window_key, n, skill_score,
-             computed_at)
-        VALUES (?, ?, 'temperature', 1, 'w:all', 1, 0.5, '2035-01-02T00:00:00Z')
-        """,
-        (site_id, feed_ids[0]),
-    )
-    result = leaderboard_with_status(
-        conn,
-        site_id=site_id,
-        variable="temperature",
-        day_ahead=1,
-        window="all",
-    )
-    # A partial snapshot (one of the two expected active feeds cached) is
-    # treated as absent -- cache-backed windows never live-recompute, so an
-    # incomplete cache degrades to a 'rebuilding' empty ranking rather than
-    # a live fallback that fills in the missing feed's row.
-    assert result.status == "rebuilding"
-    assert result.rows == []
-
-
-def test_station_toggle_and_rain_threshold_restore_pairs(
+def test_station_toggle_leaves_forecast_history_alone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     close_db()
@@ -2278,7 +1028,22 @@ def test_station_toggle_and_rain_threshold_restore_pairs(
                     """,
                     (site_id, feed_id, variable, forecast, f"{variable}-run"),
                 )
-            pair_and_score(conn, site_id)
+            # Fixture only: `pair_and_score` (the old inline pairing/scoring
+            # pass) is gone (storage-release plan 2026-11-02, table 1.B).
+            # Plant the one forecast_history row the assertion below reads
+            # directly, with the same forecast value that call used to
+            # produce -- 11.0, from the sample above -- rather than pin
+            # anything about how the row is built.
+            conn.execute(
+                """
+                INSERT INTO forecast_history
+                    (site_id, feed_id, variable, day_ahead, valid_at, local_date,
+                     value, lead_hours, issued_at, contributors)
+                VALUES (?, ?, 'temperature', 1, '2035-01-02T00:00:00Z',
+                        '2035-01-02', 11.0, 24, '2035-01-01T00:00:00Z', NULL)
+                """,
+                (site_id, feed_id),
+            )
             return site_id, station_b, feed_id
 
         site_id, station_b, feed_id = db.write_sync(_seed)
@@ -2290,19 +1055,19 @@ def test_station_toggle_and_rain_threshold_restore_pairs(
             headers=headers,
         )
         assert station_response.status_code == 200
-        temperature_pair = db.read_sync(
+        temperature_history = db.read_sync(
             lambda conn: conn.execute(
                 """
-                SELECT observed
-                FROM forecast_pairs
+                SELECT value
+                FROM forecast_history
                 WHERE site_id=? AND feed_id=? AND variable='temperature'
                 """,
                 (site_id, feed_id),
             ).fetchone()
         )
         # The toggle no longer re-materializes or inline-scores (8.3 removes
-        # it), so the pair keeps its pre-toggle consensus value.
-        assert temperature_pair["observed"] == pytest.approx(11.0)
+        # it), so the history row keeps its pre-toggle forecast value.
+        assert temperature_history["value"] == pytest.approx(11.0)
         station_row = db.read_sync(
             lambda conn: conn.execute(
                 "SELECT enabled FROM stations WHERE id=?", (station_b,)
@@ -2310,23 +1075,11 @@ def test_station_toggle_and_rain_threshold_restore_pairs(
         )
         assert station_row["enabled"] == 0
 
-        rain_response = client.put(
-            f"/api/sites/{site_id}",
-            json={"rain_threshold_mm": 1.0},
-            headers=headers,
-        )
-        assert rain_response.status_code == 200
-        precip_pair = db.read_sync(
-            lambda conn: conn.execute(
-                """
-                SELECT rain_threshold_mm
-                FROM forecast_pairs
-                WHERE site_id=? AND feed_id=? AND variable='precip'
-                """,
-                (site_id, feed_id),
-            ).fetchone()
-        )
-        assert precip_pair["rain_threshold_mm"] == pytest.approx(1.0)
+
+# The rain-threshold half of this test (PUT /api/sites/{id} deleting and
+# rebuilding the precip pair with the new threshold) was removed with
+# storage-release plan B14: update_site only stores the rain threshold now,
+# it no longer deletes, re-pairs or re-scores anything.
 
 
 def test_domain_backoff_records_defers_and_clears(tmp_path: Path) -> None:
@@ -2384,7 +1137,7 @@ def test_provider_http_errors_are_redacted_before_persisting(
         asyncio.run(
             dispatch(
                 dispatch_db,
-                FencedWriter(dispatch_db, dispatch_db.generation),
+                FencedWriter(dispatch_db),
                 Job(
                     id=41,
                     type="fetch_feed",
@@ -3076,28 +1829,12 @@ def test_options_boot_apply_bad_options_and_packaging_files(
     config.db_path = str(db_path)
     config.options_path = str(options_path)
     conn = init_db(str(db_path))._conn  # noqa: SLF001 - tests seed boot state
-    site_id = int(
-        conn.execute(
-            """
-            INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Boot', 40, -105, 900, 'UTC')
-            """
-        ).lastrowid
-    )
-    feed_id = int(
-        conn.execute(
-            "SELECT id FROM feeds WHERE source='open-meteo' LIMIT 1"
-        ).fetchone()["id"]
-    )
     conn.execute(
         """
-        INSERT OR REPLACE INTO score_cache
-            (site_id, feed_id, variable, day_ahead, window_key, n, computed_at)
-        VALUES (?, ?, 'temperature', 0, 'w:30', 1, '2026-01-01T00:00:00Z')
-        """,
-        (site_id, feed_id),
+        INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
+        VALUES ('Boot', 40, -105, 900, 'UTC')
+        """
     )
-
     # network guard: idle the worker so the lifespan never reaches a provider
     monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
     with TestClient(create_app(root_path="")) as client:
@@ -3114,14 +1851,6 @@ def test_options_boot_apply_bad_options_and_packaging_files(
         assert rows["min_n"] == "50"
         assert rows["obs_interval_minutes"] == "240"
         assert rows["obs_jitter_minutes"] == "35"
-        assert (
-            get_db().read_sync(
-                lambda db_conn: db_conn.execute(
-                    "SELECT COUNT(*) AS n FROM score_cache WHERE window_key='w:30'"
-                ).fetchone()["n"]
-            )
-            == 0
-        )
 
     malformed = tmp_path / "bad-options.json"
     malformed.write_text('{"min_n": 50,', encoding="utf-8")
@@ -3263,7 +1992,7 @@ def test_worker_status_pins_api_prefix_empty_queue_and_null_pair_score(
     """Worker-status regression pins (S03):
     - /worker/status (no /api prefix) → 404
     - empty jobs table → {"jobs": {}} (keys absent, not 0)
-    - no completed pair_and_score → last_completed_pair_and_score_at is null
+    - no active publication → last_completed_pair_and_score_at is null
     """
     close_db()
     config.db_path = str(tmp_path / "ws-pins.db")
@@ -3276,84 +2005,6 @@ def test_worker_status_pins_api_prefix_empty_queue_and_null_pair_score(
         payload = client.get("/api/worker/status").json()
         assert payload["jobs"] == {}
         assert payload["last_completed_pair_and_score_at"] is None
-
-
-def test_button_typed_job_oracle_and_leaderboard_negative(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Leaderboard negative (S02): GET /api/leaderboard (rebuilding:
-    applicable input, absent cache) creates no catchup/backfill_site row
-    (both retired RE1 routes) -- only a pair_and_score run.
-    """
-    close_db()
-    config.db_path = str(tmp_path / "oracle.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-    config.standalone_origin = None
-    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
-    app = create_app(root_path="")
-    with TestClient(app) as client:
-        db = get_db()
-
-        def _seed(conn: sqlite3.Connection) -> int:
-            site_id = int(
-                conn.execute(
-                    """
-                    INSERT INTO sites
-                        (name, forecast_lat, forecast_lon, elevation_m, timezone)
-                    VALUES ('Oracle', 40.0, -105.0, 900.0, 'UTC')
-                    """
-                ).lastrowid
-            )
-            feed_id = int(
-                conn.execute(
-                    "SELECT id FROM feeds WHERE source='open-meteo' ORDER BY id LIMIT 1"
-                ).fetchone()["id"]
-            )
-            error = 1.0
-            conn.execute(
-                """
-                INSERT INTO forecast_pairs
-                    (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                     day_ahead, forecast, observed, error, abs_error, sq_error,
-                     tz_generation_id)
-                VALUES (?, ?, 'temperature', '2035-01-01T00:00:00Z',
-                        '2035-01-02T00:00:00Z', 24, 1, 11.0, 10.0, ?, ?, ?, ?)
-                """,
-                (
-                    site_id,
-                    feed_id,
-                    error,
-                    abs(error),
-                    error * error,
-                    ensure_site_generation(conn, site_id),
-                ),
-            )
-            return site_id
-
-        site_id = db.write_sync(_seed)
-
-        db.write_sync(lambda conn: conn.execute("DELETE FROM jobs"))
-
-        assert (
-            client.get(
-                "/api/leaderboard",
-                params={"site": site_id, "variable": "temperature", "lead": "D+1"},
-            ).status_code
-            == 200
-        )
-        # The rescore enqueue is fire-and-forget (schedule_score_rescore);
-        # TestClient.get() does not wait for it, so drain the scheduled task
-        # via the running TestClient's portal before checking the jobs table.
-        client.portal.call(drain_pending_rescores)
-        job_types = db.read_sync(
-            lambda conn: {
-                str(row["type"])
-                for row in conn.execute("SELECT DISTINCT type FROM jobs").fetchall()
-            }
-        )
-        assert "catchup" not in job_types
-        assert "backfill_site" not in job_types
-        assert "pair_and_score" in job_types
 
 
 def test_csrf_garbage_token_rejects(

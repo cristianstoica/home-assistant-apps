@@ -35,6 +35,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+from tests.helpers import close_off
 from wxverify import config
 from wxverify.collection.budget import Reservation
 from wxverify.collection.wind_quota import (
@@ -173,7 +174,7 @@ def _run_wind_days(
     monkeypatch.setenv("WXV_WEATHERCOM_KEY", _API_KEY)
     real_client = httpx.AsyncClient
     db = get_db()
-    writer = FencedWriter(db, db.generation)
+    writer = FencedWriter(db)
     with patch(
         "wxverify.worker.wind_days.httpx.AsyncClient",
         lambda *a, **kw: real_client(transport=httpx.MockTransport(handler)),  # type: ignore[arg-type]
@@ -485,6 +486,7 @@ def test_t96_a_simulated_day_makes_54_all_1day_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     conn = _init_tmp_db(tmp_path)
+    close_off(conn)
     site_id = _make_site(conn)
     station_ids = [_make_station(conn, site_id, f"KTEST{i:03d}") for i in range(1, 7)]
     start = datetime(2026, 3, 10, 0, 0, 0, tzinfo=UTC)

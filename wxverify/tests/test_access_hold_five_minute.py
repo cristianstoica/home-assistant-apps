@@ -40,6 +40,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
+from tests.helpers import close_off
 from wxverify import config
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database, FencedWriter, close_db, init_db
@@ -165,7 +166,7 @@ def _run_wind_days_chunk(
 ) -> None:
     monkeypatch.setenv("WXV_WEATHERCOM_KEY", _API_KEY)
     real_client = httpx.AsyncClient
-    writer = FencedWriter(db, db.generation)
+    writer = FencedWriter(db)
     with patch(
         "wxverify.worker.wind_days.httpx.AsyncClient",
         lambda *a, **kw: real_client(  # type: ignore[arg-type]
@@ -251,6 +252,7 @@ def test_ah1_a_held_try_sends_nothing_and_moves_to_its_next_slot(
 
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
+    close_off(conn)
     site_id = _seed_site(conn)
     station_a = _seed_station(conn, site_id, pws_id="ISTATION01")
     station_b = _seed_station(conn, site_id, pws_id="ISTATION02")
@@ -332,6 +334,7 @@ def test_ah2_collection_resumes_at_the_rows_own_next_slot_not_the_holds_end(
 
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
+    close_off(conn)
     site_id = _seed_site(conn)
     station_a = _seed_station(conn, site_id, pws_id="ISTATION01")
     station_b = _seed_station(conn, site_id, pws_id="ISTATION02")
@@ -427,6 +430,7 @@ def test_ah3_a_401_for_the_first_station_holds_the_others_in_the_same_run(
 
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
+    close_off(conn)
     site_id = _seed_site(conn)
     station_1 = _seed_station(conn, site_id, pws_id="ISTATION01")
     station_2 = _seed_station(conn, site_id, pws_id="ISTATION02")
@@ -512,6 +516,7 @@ def test_ah4_a_2xx_clears_only_five_minute_not_current_obs_or_hourly(
 
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
+    close_off(conn)
     site_id = _seed_site(conn)
     station_id = _seed_station(conn, site_id, pws_id="ISTATION01")
 
@@ -589,6 +594,7 @@ def test_fm4_each_kinds_hold_leaves_the_other_two_lanes_running(
     _freeze(monkeypatch, now)
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
+    close_off(conn)
 
     site_id = _seed_site(conn)
     station_id = _seed_station(conn, site_id, pws_id="KTEST001")
@@ -652,7 +658,7 @@ def test_fm4_each_kinds_hold_leaves_the_other_two_lanes_running(
         # current-obs call below running after it only matches how the real
         # worker orders its lanes.
         real_client = httpx.AsyncClient
-        writer = FencedWriter(db, db.generation)
+        writer = FencedWriter(db)
         with patch(
             "wxverify.worker.wind_days.httpx.AsyncClient",
             lambda *a, **kw: real_client(  # type: ignore[arg-type]

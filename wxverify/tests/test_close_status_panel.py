@@ -32,6 +32,7 @@ from tests.helpers import (
     NOW,
     D,
     asof_conn,
+    close_off,
     day_close_site,
     seed_active_publication,
     seed_attempt,
@@ -123,6 +124,7 @@ def test_op1_close_off_shows_todays_panels(
     "Backfill Progress", "Last obs" (M98). PASSES today: with the close
     off P5 changes nothing on this page."""
     conn = _init_tmp_db(tmp_path)
+    close_off(conn)
     day_close_site(conn, close_on=False)
 
     app = _make_app(monkeypatch)

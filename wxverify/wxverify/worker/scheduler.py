@@ -13,7 +13,6 @@ from wxverify.db.queue import (
     enqueue_if_absent_with_cooldown,
 )
 from wxverify.db.site_days import daily_close_on
-from wxverify.settings.keys import get_setting
 from wxverify.worker.close_chain import enqueue_due_close_work
 from wxverify.worker.round import (
     enqueue_due_daytime_downloads,
@@ -71,9 +70,8 @@ def record_window_open(now: datetime, snapshot_utc: datetime) -> bool:
 
 def scheduler_tick(conn: sqlite3.Connection) -> None:
     logger.debug("scheduler tick")
-    # While the daily close is off the main lane runs only the cutover
-    # (switch-over plan 6.2). The key is read in the tick's own transaction,
-    # so a file an import swapped in after the lane's gate read is seen.
+    # While the daily close is off the tick enqueues nothing. The key is read
+    # in the tick's own transaction.
     if not daily_close_on(conn):
         return
     # The forward downloads: the scored round and the fixed daytime slots
@@ -85,32 +83,6 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
     _enqueue_due_forecast_records(conn)
     # The close's chain: scores are written only by its stage 5.
     enqueue_due_close_work(conn, now_utc=utc_now())
-
-
-# Site-local wall-clock time at/after which the nightly verification trigger
-# fires (§14). A scheduling default, not §17 methodology — it cannot change
-# any score. It has to fall after `day_end_utc + CONSENSUS_LAG_HOURS` for the
-# PREVIOUS local day, or that day is still unsettled when the run starts and
-# the newest scorable day stays D-2 instead of D-1. Worst case is the
-# spring-forward day: only 4 real hours elapse from local midnight, leaving a
-# margin of 1 hour.
-VERIFICATION_TRIGGER_LOCAL_TIME = "05:00"
-
-# Operator kill-switch for the nightly verification chain (0.11.1 §3.1), set
-# through the Ops publish-hold control (`PUT /api/verification/publish-hold`),
-# or `python3 -m wxverify --db /data/wxverify.db settings set
-# verification_publish_hold 1` as an emergency fallback. Truthy is exactly
-# "1"; ABSENT OR ANY OTHER VALUE MEANS NOT HELD, so a fresh install is never
-# silently non-verifying. The gate is scheduler-side rather than
-# publish-side deliberately: suppressing the enqueue leaves no partial run
-# whose evidence the non-published purge is entitled to delete, and no phase
-# the chain re-enters nightly with no clearing path.
-VERIFICATION_PUBLISH_HOLD_KEY = "verification_publish_hold"
-
-
-def verification_publish_held(conn: sqlite3.Connection) -> bool:
-    """Whether the operator has held the nightly verification trigger."""
-    return get_setting(conn, VERIFICATION_PUBLISH_HOLD_KEY) == "1"
 
 
 def _enqueue_due_forecast_records(conn: sqlite3.Connection) -> None:

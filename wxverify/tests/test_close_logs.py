@@ -276,7 +276,6 @@ def test_lg1_the_stage_log_rows_match_the_jobs_that_ran(
             "day_close",
             "day_close",
             "day_publish",
-            "day_publish",
         ], "HO1's own claim-order precondition must hold before this test's own checks"
 
         conn = db._conn  # noqa: SLF001
@@ -327,12 +326,11 @@ def test_lg1_the_stage_log_rows_match_the_jobs_that_ran(
             )
             assert row["outcome"] == "completed"
 
-        for stage, key_suffix in ((7, ":7"), (8, ":8")):
-            job_id = _job_id_for_key(conn, "day_publish", key_suffix)
-            row = _stage_log_row(conn, site_id, D, stage)
-            assert row is not None, f"stage {stage}'s stage-log row must exist"
-            assert row["job_id"] == job_id
-            assert row["outcome"] == "completed"
+        job_id7 = _job_id_for_key(conn, "day_publish", ":7")
+        row7 = _stage_log_row(conn, site_id, D, 7)
+        assert row7 is not None, "stage 7's stage-log row must exist"
+        assert row7["job_id"] == job_id7
+        assert row7["outcome"] == "completed"
 
         assert len(captured_summary) == 1, "score_day must have run exactly once"
         real_summary = captured_summary[0]
@@ -587,86 +585,28 @@ def _truth_version_from_rows(conn, site_id: int, local_date) -> str:  # type: ig
     return hashlib.sha256(blob).hexdigest()
 
 
-#: Copied locally from ``tests/test_close_day_cli.py``'s own
-#: ``_CLOSE_TABLES`` (CL3) per this file's own-helpers rule.
-_LG4_CLOSE_TABLES = (
-    "close_attempts",
-    "close_station_days",
-    "close_publications",
-    "close_stage_log",
-    "close_try_log",
-)
-
-#: Copied locally from ``tests/test_close_day_cli.py``'s own
-#: ``_V12_JOBS_DDL`` (CL3) per this file's own-helpers rule.
-_LG4_V12_JOBS_DDL = """
-    CREATE TABLE jobs_v12 (
-        id INTEGER PRIMARY KEY,
-        type TEXT NOT NULL,
-        site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
-        job_key TEXT,
-        payload TEXT NOT NULL DEFAULT '{}',
-        status TEXT NOT NULL DEFAULT 'pending'
-            CHECK(status IN ('pending','running','completed','failed')),
-        next_attempt_at TEXT,
-        retry_count INTEGER NOT NULL DEFAULT 0,
-        max_retries INTEGER NOT NULL DEFAULT 5,
-        last_error TEXT,
-        result TEXT,
-        created_at TEXT NOT NULL
-            DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-        updated_at TEXT NOT NULL
-            DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-        CHECK (
-            (type = 'catchup' AND site_id IS NULL)
-            OR (
-                type IN ('fetch_feed','fetch_obs','fetch_current_obs',
-                         'pair_and_score','backfill_site',
-                         'forecast_record','record_gap_scan',
-                         'verification_run','timezone_correction')
-                AND site_id IS NOT NULL
-            )
-        )
-    );
-"""
-
-
 def _build_v12_file(
     path: Path, *, site_name: str = "Testsite"
 ) -> tuple[int, dict[str, int]]:
-    """Write a version-12 database to ``path`` with one site and stations A
-    and B (``ISTATION01``/``ISTATION02``), returning ``(site_id,
-    {pws_id: station_id})``. Copied locally from
-    ``tests/test_close_day_cli.py``'s own ``_build_v12_file`` (CL3, itself
-    copied from ``tests/test_close_schema.py``'s 15.3) per this file's
-    own-helpers rule.
+    """Write a database to ``path`` with one site and stations A and B
+    (``ISTATION01``/``ISTATION02``), returning ``(site_id, {pws_id:
+    station_id})``, pinned at user_version 16 rather than fully fresh.
+
+    The five ``close_*`` tables and the widened ``jobs`` CHECK this
+    fixture used to undo by hand (copied locally from
+    ``tests/test_close_day_cli.py``'s own, now-retired ``_build_v12_file``)
+    are unconditional parts of ``create_tables`` now -- migrate_v13_
+    close_jobs is deleted along with every other migrate_v2 ...
+    migrate_v16 function, and user_version 1-15 is refused outright
+    (storage release 4.1) -- so there is nothing left to undo onto a
+    reachable schema. Pinning at 16 instead of 17 still exercises a real
+    ``run_migrations`` call on open (migrate_v17_storage's own "already
+    converted" guard makes it a fast no-op here).
     """
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     run_migrations(conn)
-    for table in _LG4_CLOSE_TABLES:
-        conn.execute(f"DROP TABLE {table}")
-    conn.execute("SAVEPOINT narrow_jobs")
-    try:
-        conn.execute(_LG4_V12_JOBS_DDL)
-        conn.execute("INSERT INTO jobs_v12 SELECT * FROM jobs")
-        conn.execute("DROP TABLE jobs")
-        conn.execute("ALTER TABLE jobs_v12 RENAME TO jobs")
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedupe"
-            " ON jobs(type, COALESCE(site_id, -1), job_key)"
-            " WHERE status IN ('pending','running') AND job_key IS NOT NULL"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_jobs_type_key_site"
-            " ON jobs(type, job_key, site_id, id)"
-        )
-    except BaseException:
-        conn.execute("ROLLBACK TO narrow_jobs")
-        conn.execute("RELEASE narrow_jobs")
-        raise
-    conn.execute("RELEASE narrow_jobs")
 
     site_id = conn.execute(
         "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
@@ -690,7 +630,7 @@ def _build_v12_file(
         ).lastrowid
         assert station_id is not None
         stations[pws_id] = int(station_id)
-    conn.execute("PRAGMA user_version = 12")
+    conn.execute("PRAGMA user_version = 16")
     conn.commit()
     conn.close()
     return int(site_id), stations
@@ -730,9 +670,10 @@ def test_lg4_the_truth_version_is_a_pure_function_of_the_truth_rows(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """LG4: three source files as CL3's -- a version-12 file (15.12's
-    preamble, built with CL3's own ``_build_v12_file``/
-    ``_seed_observations_full_day``, copied locally above) holding D's
+    """LG4: three source files as CL3's -- a database pinned at
+    user_version 16 (15.12's preamble, built with CL3's own
+    ``_build_v12_file``/``_seed_observations_full_day``, copied locally
+    above) holding D's
     ``observations`` (temperature, rain and wind), no raw readings, no
     site-day record -- in their own folders: the first and second
     identical, the third with D's highest hourly ``temperature`` value in

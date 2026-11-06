@@ -1,16 +1,12 @@
 """Downstream consequences of the obs-204 Open-Meteo horizon change.
 
 Covers the request-shape side (``OpenMeteoAdapter.fetch_forecast`` in
-``wxverify/feeds/open_meteo.py``) and the pairing/display side
-(``wxverify.scoring.pairing.pair_real_models`` and
-``wxverify.core.timeutil.day_ahead`` vs. ``wxverify.forecast.aggregate.
+``wxverify/feeds/open_meteo.py``) and the display side
+(``wxverify.core.timeutil.day_ahead`` vs. ``wxverify.forecast.aggregate.
 display_day_index``) of raising each feed's ``max_lead_hours``.
 
-Isolation: ``tests.helpers.asof_conn`` (fresh fully-migrated in-memory
-database, real seeded feeds), mirroring ``tests/test_roster_horizon_
-provenance.py``; the request-shape tests use ``httpx.MockTransport``, the
-same driver ``tests/test_open_meteo_metering.py`` uses -- no network call
-is ever made.
+The request-shape tests use ``httpx.MockTransport``, the same driver
+``tests/test_open_meteo_metering.py`` uses -- no network call is ever made.
 
 Synthetic data only: a ``site-alpha`` site at generic coordinates in
 ``Europe/Berlin``/UTC, and the product's own public Open-Meteo model
@@ -20,17 +16,12 @@ identifiers.
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 
 import httpx
 
-from tests.helpers import asof_conn, asof_make_site
 from wxverify.core.timeutil import day_ahead
 from wxverify.feeds.open_meteo import OpenMeteoAdapter
 from wxverify.feeds.seam import ForecastRequest
-from wxverify.scoring.pairing import pair_real_models
-
-_UTC = "UTC"
 
 
 def _req(*, model: str, max_lead_hours: int) -> ForecastRequest:
@@ -87,168 +78,6 @@ def test_fetch_forecast_sends_forecast_hours_equal_to_max_lead_hours() -> None:
 # ---------------------------------------------------------------------------
 # 9. Pairing window discriminates
 # ---------------------------------------------------------------------------
-
-
-def _feed_id(conn: sqlite3.Connection, *, source: str, model: str) -> int:
-    row = conn.execute(
-        "SELECT id FROM feeds WHERE source = ? AND model = ?", (source, model)
-    ).fetchone()
-    assert row is not None
-    return int(row["id"])
-
-
-def _insert_sample_and_observation(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    feed_id: int,
-    issued_at: str,
-    valid_at: str,
-    lead_hours: int,
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO forecast_samples
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             value, source_raw, model_run_id, fetched_at)
-        VALUES (?, ?, 'temperature', ?, ?, ?, 10.0, '{}', 'run-x', ?)
-        """,
-        (site_id, feed_id, issued_at, valid_at, lead_hours, issued_at),
-    )
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO observations
-            (site_id, variable, valid_at, value, n_stations, computed_at)
-        VALUES (?, 'temperature', ?, 9.5, 3, ?)
-        """,
-        (site_id, valid_at, valid_at),
-    )
-
-
-def test_pair_real_models_window_boundary_at_raised_and_unraised_horizons() -> None:
-    """The bucket ``compute_real_model_pairs`` admits is ``0 <= day_ahead <= 7``,
-    measured from ISSUANCE (its ``day_ahead`` bucket filter). Any lead of ~192h or
-    more lands outside that bucket on every date this suite exercises
-    (ordinary and DST, see the companion test below), regardless of
-    ``max_lead_hours`` -- so it cannot discriminate the horizon change and
-    is not used as evidence of it here. The discriminating case has to
-    sit inside the bucket:
-
-    - lead 180h issued 00:30 local: ``day_ahead`` == 7 (inside the
-      window) -- admitted for ``ecmwf_ifs`` (raised to 217) but excluded
-      for ``ukmo_global_deterministic_10km`` (left at 168), because the
-      ``max_lead_hours`` bound is what decides here, not the bucket. This
-      is the pair the raised horizon exists to unlock.
-    - lead 204h, same issuance (24h later, ``day_ahead`` == 8): excluded
-      for BOTH feeds by the bucket rule alone -- justified by the bucket
-      computed for this exact date, not a general hour threshold (see the
-      companion DST test for why that distinction matters).
-    - lead 168h/169h issued at local midnight, ordinary date, both at
-      ``day_ahead`` == 7: admitted / excluded for BOTH feeds still left at
-      168h (``ukmo_global_deterministic_10km`` and
-      ``meteofrance_arpege_world``) -- the exact ``max_lead_hours`` SQL
-      boundary for the unchanged feeds, isolated from the bucket guard
-      since both leads land in the same bucket.
-
-    The raised feeds' OWN new boundary (217h/218h) cannot be exercised
-    through this bucket-gated path at all: at any local issuance hour --
-    even crossing a fall-back day, which gives back at most one hour --
-    217h lands at ``day_ahead`` >= 8, past the pairing window, so the row
-    is dropped by the bucket guard before ``max_lead_hours`` is ever
-    compared. That boundary is exercised instead by the request-shape
-    test above (``forecast_hours`` == 217) and is not re-asserted here.
-    """
-    conn = asof_conn()
-    site_id = asof_make_site(conn, "site-alpha")
-    ecmwf_id = _feed_id(conn, source="open-meteo", model="ecmwf_ifs")
-    ukmo_id = _feed_id(
-        conn, source="open-meteo", model="ukmo_global_deterministic_10km"
-    )
-    arpege_id = _feed_id(conn, source="open-meteo", model="meteofrance_arpege_world")
-
-    # -- discriminator: lead 180h @ 00:30 local, day_ahead == 7 -----------
-    issued_at = "2026-01-01T00:30:00Z"
-    valid_at_180 = "2026-01-08T12:30:00Z"  # issued_at + 180h
-    assert day_ahead(issued_at, valid_at_180, _UTC) == 7
-    _insert_sample_and_observation(
-        conn,
-        site_id=site_id,
-        feed_id=ecmwf_id,
-        issued_at=issued_at,
-        valid_at=valid_at_180,
-        lead_hours=180,
-    )
-    _insert_sample_and_observation(
-        conn,
-        site_id=site_id,
-        feed_id=ukmo_id,
-        issued_at=issued_at,
-        valid_at=valid_at_180,
-        lead_hours=180,
-    )
-
-    # -- bucket-rule control: lead 204h @ 00:30 local, day_ahead == 8,
-    # excluded for BOTH feeds regardless of max_lead_hours.
-    valid_at_204 = "2026-01-09T12:30:00Z"  # issued_at + 204h
-    assert day_ahead(issued_at, valid_at_204, _UTC) == 8
-    _insert_sample_and_observation(
-        conn,
-        site_id=site_id,
-        feed_id=ecmwf_id,
-        issued_at=issued_at,
-        valid_at=valid_at_204,
-        lead_hours=204,
-    )
-    _insert_sample_and_observation(
-        conn,
-        site_id=site_id,
-        feed_id=ukmo_id,
-        issued_at=issued_at,
-        valid_at=valid_at_204,
-        lead_hours=204,
-    )
-
-    # -- unchanged-feed SQL boundary: lead 168h/169h @ local midnight,
-    # both at day_ahead == 7.
-    midnight_issued = "2026-01-01T00:00:00Z"
-    valid_168 = "2026-01-08T00:00:00Z"
-    valid_169 = "2026-01-08T01:00:00Z"
-    assert day_ahead(midnight_issued, valid_168, _UTC) == 7
-    assert day_ahead(midnight_issued, valid_169, _UTC) == 7
-    for feed_id in (ukmo_id, arpege_id):
-        _insert_sample_and_observation(
-            conn,
-            site_id=site_id,
-            feed_id=feed_id,
-            issued_at=midnight_issued,
-            valid_at=valid_168,
-            lead_hours=168,
-        )
-        _insert_sample_and_observation(
-            conn,
-            site_id=site_id,
-            feed_id=feed_id,
-            issued_at=midnight_issued,
-            valid_at=valid_169,
-            lead_hours=169,
-        )
-
-    written = pair_real_models(conn, site_id=site_id)
-    # anti-vacuity: exactly the admitted set below, nothing more or less
-    assert written == 3
-
-    paired = {
-        (int(row["feed_id"]), int(row["lead_hours"]))
-        for row in conn.execute(
-            "SELECT feed_id, lead_hours FROM forecast_pairs WHERE site_id = ?",
-            (site_id,),
-        ).fetchall()
-    }
-    assert paired == {
-        (ecmwf_id, 180),
-        (ukmo_id, 168),
-        (arpege_id, 168),
-    }
 
 
 def test_day_ahead_bucket_rule_holds_across_dst_transitions() -> None:

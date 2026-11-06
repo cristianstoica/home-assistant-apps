@@ -37,6 +37,7 @@ write without needing a real feed or any scored forecasts.
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
@@ -108,7 +109,7 @@ def _make_night_db(tmp_path: Path) -> tuple[Database, FencedWriter, sqlite3.Conn
     config.db_path = str(db_path)
     db = init_db(str(db_path))
     conn = db._conn  # noqa: SLF001 -- tests build the fixture on the real writer conn
-    return db, FencedWriter(db, db.generation), conn
+    return db, FencedWriter(db), conn
 
 
 def _seed_two_point_lead(
@@ -477,6 +478,153 @@ def test_member_with_no_full_day_forecast_counts_in_neither_k_nor_q() -> None:
     # Effective denominator 2 (F, G), 1 wet (F): 50%, never 33% (H wrongly
     # in q) or 67% (H wrongly counted as wet in k).
     assert precip.agreement_pct == 50
+
+
+def _rain_row_html(response_text: str) -> str:
+    """Pull just the rendered content of the Rain row's ``<strong>`` out of
+    a ``/forecast`` page's HTML -- scoped to day_ahead 0's tile (the first
+    "Rain" row in document order), so assertions never pick up another
+    tile's or row's markup.
+    """
+    match = re.search(
+        r"<span>Rain</span>\s*<strong[^>]*>(.*?)</strong>", response_text, re.DOTALL
+    )
+    assert match is not None, "no rendered Rain row found in the response"
+    return match.group(1)
+
+
+def test_forecast_page_rain_tile_hides_the_word_agreement_but_shows_the_tooltip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The template half of C4: the rendered ``/forecast`` page's Rain row
+    must show the agreement percentage without the visible word
+    "Agreement" -- the percentage sits inside an element whose ``title``
+    attribute is exactly "Agreement".
+    """
+    close_db()
+    db_path = tmp_path / "wxverify.db"
+    config.db_path = str(db_path)
+    options_path = tmp_path / "options.json"
+    options_path.write_text("{}", encoding="utf-8")
+    config.options_path = str(options_path)
+    db = init_db(str(db_path))
+    conn = db._conn  # noqa: SLF001
+    site_id = int(
+        conn.execute(
+            "INSERT INTO sites"
+            " (name, forecast_lat, forecast_lon, elevation_m, timezone)"
+            " VALUES ('Rain Tooltip Site', 40.0, -105.0, 900.0, 'UTC')"
+        ).lastrowid
+    )
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(_FIXED_NOW))
+    f = _insert_feed(conn, "F")
+    g = _insert_feed(conn, "G")
+    h = _insert_feed(conn, "H")
+    pub_id = _seed_publication(conn, site_id=site_id, cutoff=_DAY0)
+    _seed_rain_rank(conn, pub_id, day_ahead=0, rank=1, feed_id=f, selected=True)
+    _seed_rain_rank(conn, pub_id, day_ahead=0, rank=2, feed_id=g)
+    _seed_rain_rank(conn, pub_id, day_ahead=0, rank=3, feed_id=h)
+    for day in (_DAY0, _DAY1):
+        _insert_hourly(
+            conn,
+            site_id=site_id,
+            feed_id=f,
+            variable="temperature",
+            day=day,
+            hourly=[10.0] * 24,
+        )
+        _insert_hourly(
+            conn,
+            site_id=site_id,
+            feed_id=f,
+            variable="wind",
+            day=day,
+            hourly=[5.0] * 24,
+        )
+    f_hourly = [0.0] * 24
+    f_hourly[0] = 1.0  # wet
+    g_hourly = [0.0] * 24
+    g_hourly[0] = 1.0  # wet
+    h_hourly = [0.0] * 24  # dry
+    _full_precip_day(conn, site_id=site_id, feed_id=f, day=_DAY0, hourly=f_hourly)
+    _full_precip_day(conn, site_id=site_id, feed_id=g, day=_DAY0, hourly=g_hourly)
+    _full_precip_day(conn, site_id=site_id, feed_id=h, day=_DAY0, hourly=h_hourly)
+    conn.commit()
+
+    monkeypatch.setattr("wxverify.forecast.service.utc_now", lambda: _FIXED_NOW)
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        response = client.get(f"/forecast?site={site_id}")
+    assert response.status_code == 200
+
+    row_html = _rain_row_html(response.text)
+    visible_row_text = re.sub(r"<[^>]+>", " ", row_html)
+    assert "67%" in visible_row_text
+    assert "Agreement" not in visible_row_text
+    assert re.search(r'title="Agreement"[^>]*>\s*67%\s*<', row_html) is not None
+
+
+def test_forecast_page_rain_tile_with_no_agreement_has_no_tooltip_or_percent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Paired negative: with only one ranked feed, ``agreement_pct`` is
+    ``None`` (C4's ``test_single_ranked_feed_shows_no_agreement_pct``), so
+    the rendered Rain row must carry neither the "Agreement" tooltip nor
+    any agreement percentage -- today and after the change alike.
+    """
+    close_db()
+    db_path = tmp_path / "wxverify.db"
+    config.db_path = str(db_path)
+    options_path = tmp_path / "options.json"
+    options_path.write_text("{}", encoding="utf-8")
+    config.options_path = str(options_path)
+    db = init_db(str(db_path))
+    conn = db._conn  # noqa: SLF001
+    site_id = int(
+        conn.execute(
+            "INSERT INTO sites"
+            " (name, forecast_lat, forecast_lon, elevation_m, timezone)"
+            " VALUES ('Rain No Agreement Site', 40.0, -105.0, 900.0, 'UTC')"
+        ).lastrowid
+    )
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(_FIXED_NOW))
+    f = _insert_feed(conn, "F")
+    pub_id = _seed_publication(conn, site_id=site_id, cutoff=_DAY0)
+    _seed_rain_rank(conn, pub_id, day_ahead=0, rank=1, feed_id=f, selected=True)
+    for day in (_DAY0, _DAY1):
+        _insert_hourly(
+            conn,
+            site_id=site_id,
+            feed_id=f,
+            variable="temperature",
+            day=day,
+            hourly=[10.0] * 24,
+        )
+        _insert_hourly(
+            conn,
+            site_id=site_id,
+            feed_id=f,
+            variable="wind",
+            day=day,
+            hourly=[5.0] * 24,
+        )
+    hourly = [0.0] * 24
+    hourly[0] = 1.0
+    _full_precip_day(conn, site_id=site_id, feed_id=f, day=_DAY0, hourly=hourly)
+    conn.commit()
+
+    monkeypatch.setattr("wxverify.forecast.service.utc_now", lambda: _FIXED_NOW)
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        response = client.get(f"/forecast?site={site_id}")
+    assert response.status_code == 200
+
+    row_html = _rain_row_html(response.text)
+    assert 'title="Agreement"' not in row_html
+    visible_row_text = re.sub(r"<[^>]+>", " ", row_html)
+    assert "%" not in visible_row_text
 
 
 # --- C5: a missing forecast never shows as dry ------------------------------

@@ -1,39 +1,24 @@
-"""Read-side composite score query: cache-backed windows plus a live path."""
+"""Read-side composite score query, from the active publication."""
 
 from __future__ import annotations
 
-import logging
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date
 from typing import Literal
 
 from wxverify.collection.forecast_validation import FORECAST_VARIABLES
-from wxverify.db.queue import enqueue_if_absent_with_cooldown
-from wxverify.db.site_days import daily_close_on
 from wxverify.db.snapshot import read_snapshot
-from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh
-from wxverify.scoring.effective import (
-    MAX_DAY_AHEAD,
-    active_competitor_clause,
-    active_feed_cte,
-    cell_grid_cte,
-)
-from wxverify.scoring.leaderboard import WindowResolution, resolve_window, score_badge
-from wxverify.scoring.metrics import strategy_for
+from wxverify.scoring.effective import MAX_DAY_AHEAD
+from wxverify.scoring.leaderboard import score_badge
 from wxverify.scoring.publication import (
     ScoredCell,
     active_publication,
     live_cells,
     published_cells,
 )
-from wxverify.settings.keys import get_number_setting
-
-logger = logging.getLogger(__name__)
 
 CompositeStatus = Literal["hit", "stale", "rebuilding", "empty", "live"]
-
-_RESCORE_FAILURE_COOLDOWN = timedelta(minutes=15)
 
 
 @dataclass
@@ -52,46 +37,28 @@ class CompositeParts:
 class CompositeResult:
     rows: list[dict[str, object]]
     status: CompositeStatus
-    #: With the close on, the cutoff of the publication read (9.6); None
-    #: with the close off or with no publication.
+    #: The cutoff of the publication read (9.6); None with no publication.
     evidence_through: date | None = None
 
 
 def composite(
     conn: sqlite3.Connection, *, site_id: int, window: str = "rolling"
 ) -> list[dict[str, object]]:
-    """Return composite rows for a window; cache-backed windows read the cache."""
+    """Return composite rows for a window."""
     return composite_with_status(conn, site_id=site_id, window=window).rows
 
 
 def composite_with_status(
     conn: sqlite3.Connection, *, site_id: int, window: str = "rolling"
 ) -> CompositeResult:
-    """Return composite rows plus a cache status for the resolved window.
+    """Return composite rows plus a status for the resolved window.
 
-    Cache-backed windows (``rolling`` / ``all``) are served from ``score_cache``:
-    a fresh full snapshot is a ``hit``, a same-window full-but-stale snapshot is
-    served as ``stale`` (never recomputed live), and an absent/partial snapshot
-    is ``rebuilding`` (empty rows). The no-input gate runs before any cache
-    branch: a missing/disabled site or no active-competitor pairs within the
-    window cutoff is genuinely ``empty`` regardless of cache contents. Custom
-    ``Nd`` windows always compute live and return ``live`` — the engine never
-    writes ``w:{N}d`` cache keys, so they must not look like cache misses.
-    Callers enqueue a rescore (after the read closes) only for ``stale`` and
-    ``rebuilding``.
-
-    Every read the verdict depends on — the window setting, the site row,
-    ``_expected_active_cells`` and the ``score_cache`` rows — runs inside one
-    WAL read snapshot (``read_snapshot``), so ``rebuilding`` is only ever
-    reported for a mismatch that existed in one state of the database, never
-    for two reads that straddled a rescore commit. The block is read-only.
-
-    With the daily close on (9.2) the verdict comes from the active
-    publication, decided once from ``daily_close_on`` in the same snapshot:
-    no publication, or the site disabled, is ``empty``; ``rolling`` and
-    ``all`` group the publication's ``w:{N}`` and ``w:all`` rows on
-    ``_cached_composite``'s grid, ``hit``; an ``Nd`` window groups the live
-    day sums ending at the publication's cutoff, ``live``.
+    The verdict comes from the active publication (9.2), read inside one
+    WAL read snapshot (``read_snapshot``): no publication, or the site
+    disabled, is ``empty``; ``rolling`` and ``all`` group the publication's
+    ``w:{N}`` and ``w:all`` rows on the canonical (variable, day ahead)
+    grid, ``hit``; an ``Nd`` window groups the live day sums ending at the
+    publication's cutoff, ``live``. The block is read-only.
     """
     with read_snapshot(conn, label="composite"):
         return _composite_in_transaction(conn, site_id=site_id, window=window)
@@ -114,33 +81,13 @@ def _composite_in_transaction(
     conn: sqlite3.Connection, *, site_id: int, window: str
 ) -> CompositeResult:
     """The verdict of ``composite_with_status``, inside the caller's snapshot."""
-    if daily_close_on(conn):
-        return _published_composite(conn, site_id=site_id, window=window)
-    resolved = resolve_window(conn, window)
-    if not resolved.cache_backed:
-        rows = _live_composite(
-            conn,
-            site_id=site_id,
-            window_key=resolved.window_key,
-            cutoff=resolved.cutoff,
-        )
-        return CompositeResult(rows=rows, status="live")
-    expected_cells = _expected_active_cells(conn, site_id=site_id, resolved=resolved)
-    if not expected_cells or not _site_enabled(conn, site_id):
-        return CompositeResult(rows=[], status="empty")
-    cached = _cached_composite(
-        conn, site_id=site_id, resolved=resolved, expected_cells=expected_cells
-    )
-    if cached is None:
-        return CompositeResult(rows=[], status="rebuilding")
-    rows, fresh = cached
-    return CompositeResult(rows=rows, status="hit" if fresh else "stale")
+    return _published_composite(conn, site_id=site_id, window=window)
 
 
 def _published_composite(
     conn: sqlite3.Connection, *, site_id: int, window: str
 ) -> CompositeResult:
-    """The close-on verdict of ``composite_with_status`` (9.2)."""
+    """The verdict of ``composite_with_status`` (9.2)."""
     pub = (
         active_publication(conn, site_id=site_id, at_utc=None)
         if _site_enabled(conn, site_id)
@@ -168,9 +115,9 @@ def _published_composite(
 def _grouped_composite(
     cells: list[ScoredCell], *, min_n: int, window_key: str
 ) -> list[dict[str, object]]:
-    """``_cached_composite``'s grid and grouping over a window's cells, in
-    their (source, model, variable, day ahead) order: a cell off the
-    canonical grid, with no skill score or below ``min_n`` is left out."""
+    """The canonical grid and grouping over a window's cells, in their
+    (source, model, variable, day ahead) order: a cell off the canonical
+    grid, with no skill score or below ``min_n`` is left out."""
     canonical_variables = set(FORECAST_VARIABLES)
     grouped: dict[int, CompositeParts] = {}
     by_variable: dict[int, dict[str, list[float]]] = {}
@@ -198,229 +145,9 @@ def _grouped_composite(
     return _format_composite(grouped, window_key)
 
 
-def enqueue_score_rescore(conn: sqlite3.Connection, site_id: int) -> None:
-    """Enqueue a ``pair_and_score`` rescore with terminal-failure cooldown.
-
-    Shared guard for every post-read rescore enqueue (composite, leaderboard,
-    and curve routes plus the dashboard page — they all enqueue the identical
-    generic scoring job): if the latest ``pair_and_score`` job for this site
-    is terminally ``failed`` and was updated within the last 15 minutes,
-    suppress the enqueue so per-request stale/rebuilding reads cannot
-    re-enqueue a persistently failing scoring job on every poll. The latest
-    outcome (not "any recent failed row") decides, so a later ``completed``
-    job supersedes an older failure.
-
-    With the daily close on it returns without enqueuing: the publication
-    replaces the post-read rescore (daily-close P4 plan, section 10).
-    """
-    if daily_close_on(conn):
-        return
-    enqueue_if_absent_with_cooldown(
-        conn,
-        "pair_and_score",
-        site_id,
-        "score",
-        {"site_id": site_id},
-        cooldown=_RESCORE_FAILURE_COOLDOWN,
-    )
-
-
 def _site_enabled(conn: sqlite3.Connection, site_id: int) -> bool:
     row = conn.execute("SELECT enabled FROM sites WHERE id=?", (site_id,)).fetchone()
     return row is not None and bool(row["enabled"])
-
-
-def _expected_active_cells(
-    conn: sqlite3.Connection, *, site_id: int, resolved: WindowResolution
-) -> set[tuple[int, str, int]]:
-    """Whole-window active cell universe: (feed_id, variable, day_ahead).
-
-    Enumerates the closed candidate grid (active feeds x FORECAST_VARIABLES x
-    day_ahead 0..MAX_DAY_AHEAD) and probes idx_pairs_cell once per candidate,
-    rather than rebuilding the universe with a DISTINCT over every pair row for
-    the site. Set-identical to the DISTINCT form by construction: a candidate is
-    admitted iff at least one in-window pair exists for it, which is exactly the
-    DISTINCT's membership test. Cost is O(candidates) and independent of how
-    much history the table holds.
-    """
-    window_clause = "" if resolved.cutoff is None else "AND fp.valid_at >= ?"
-    params: tuple[object, ...] = (site_id, site_id, site_id)
-    if resolved.cutoff is not None:
-        params = (*params, resolved.cutoff)
-    rows = conn.execute(
-        f"""
-        WITH {active_feed_cte()},{cell_grid_cte()}
-        SELECT a.feed_id, v.variable, l.day_ahead
-        FROM active_feeds a, grid_variables v, grid_leads l
-        WHERE EXISTS (
-            SELECT 1
-            FROM forecast_pairs fp
-            WHERE fp.site_id = ?
-              AND fp.feed_id = a.feed_id
-              AND fp.variable = v.variable
-              AND fp.day_ahead = l.day_ahead
-              {window_clause}
-        )
-        """,
-        params,
-    ).fetchall()
-    return {
-        (int(row["feed_id"]), str(row["variable"]), int(row["day_ahead"]))
-        for row in rows
-    }
-
-
-def _cached_composite(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    resolved: WindowResolution,
-    expected_cells: set[tuple[int, str, int]],
-) -> tuple[list[dict[str, object]], bool] | None:
-    """Serve composite from ``score_cache``; None only on absent/mismatch.
-
-    Returns ``(rows, fresh)``: a full same-window snapshot is served even when
-    stale (``fresh=False``) — the stale path must never fall through to the
-    live recompute. The cell-set match is whole-window and cross-variable: any
-    expected cell missing from the cache makes the entire window a miss.
-    """
-    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-    rows = conn.execute(
-        f"""
-        SELECT sc.feed_id, sc.variable, sc.day_ahead, sc.n, sc.skill_score,
-               sc.computed_at, f.source, f.model
-        FROM score_cache sc
-        JOIN feeds f ON f.id = sc.feed_id
-        LEFT JOIN site_feed_state sfs
-          ON sfs.site_id = sc.site_id AND sfs.feed_id = sc.feed_id
-        WHERE sc.site_id = ?
-          AND sc.window_key = ?
-          AND {active_competitor_clause(site_expr="sc.site_id")}
-        ORDER BY f.source, f.model, sc.variable, sc.day_ahead
-        """,
-        (site_id, resolved.window_key),
-    ).fetchall()
-    if not rows:
-        return None
-    canonical_variables = set(FORECAST_VARIABLES)
-    kept: list[sqlite3.Row] = []
-    dropped: set[tuple[str, int]] = set()
-    for row in rows:
-        cell = (str(row["variable"]), int(row["day_ahead"]))
-        if cell[0] in canonical_variables and 0 <= cell[1] <= MAX_DAY_AHEAD:
-            kept.append(row)
-        else:
-            dropped.add(cell)
-    if dropped:
-        logger.warning(
-            "score_cache rows outside the canonical (variable, day_ahead)"
-            " grid ignored site=%s window=%s cells=%s",
-            site_id,
-            resolved.window_key,
-            sorted(dropped),
-        )
-        rows = kept
-        if not rows:
-            return None
-    cached_cells = {
-        (int(row["feed_id"]), str(row["variable"]), int(row["day_ahead"]))
-        for row in rows
-    }
-    if cached_cells != expected_cells:
-        return None
-    fresh = True
-    grouped: dict[int, CompositeParts] = {}
-    by_variable: dict[int, dict[str, list[float]]] = {}
-    for row in rows:
-        cache_row = ScoreCacheRow(
-            n=int(row["n"]),
-            skill_score=_optional_float(row["skill_score"]),
-            computed_at=None if row["computed_at"] is None else str(row["computed_at"]),
-        )
-        if not is_cache_fresh(cache_row, resolved.window_key):
-            fresh = False
-        skill = cache_row.skill_score
-        if skill is None or cache_row.n < min_n:
-            continue
-        feed_id = int(row["feed_id"])
-        grouped.setdefault(
-            feed_id,
-            CompositeParts(source=str(row["source"]), model=str(row["model"])),
-        )
-        by_variable.setdefault(feed_id, {}).setdefault(str(row["variable"]), []).append(
-            skill
-        )
-    for feed_id, variables in by_variable.items():
-        parts = grouped[feed_id]
-        for variable, scores in variables.items():
-            raw = sum(scores) / len(scores)
-            parts.raw_components[variable] = raw
-            parts.components[variable] = max(0.0, raw)
-            parts.lead_counts[variable] = len(scores)
-    return _format_composite(grouped, resolved.window_key), fresh
-
-
-def _optional_float(value: object) -> float | None:
-    if value is None:
-        return None
-    if not isinstance(value, int | float | str):
-        raise TypeError("invalid numeric cache value")
-    return float(value)
-
-
-def _live_composite(
-    conn: sqlite3.Connection, *, site_id: int, window_key: str, cutoff: str | None
-) -> list[dict[str, object]]:
-    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-    window_clause = "" if cutoff is None else "AND fp.valid_at >= ?"
-    params: tuple[object, ...] = (site_id,) if cutoff is None else (site_id, cutoff)
-    rows = conn.execute(
-        f"""
-        SELECT DISTINCT fp.feed_id, f.source, f.model, fp.variable, fp.day_ahead
-        FROM forecast_pairs fp
-        JOIN feeds f ON f.id = fp.feed_id
-        LEFT JOIN site_feed_state sfs
-          ON sfs.site_id = fp.site_id AND sfs.feed_id = fp.feed_id
-        WHERE fp.site_id = ?
-          {window_clause}
-          AND {active_competitor_clause(site_expr="fp.site_id")}
-        ORDER BY f.source, f.model, fp.variable, fp.day_ahead
-        """,
-        params,
-    ).fetchall()
-    grouped: dict[int, CompositeParts] = {}
-    by_variable: dict[int, dict[str, list[float]]] = {}
-    for row in rows:
-        variable = str(row["variable"])
-        result = strategy_for(variable).aggregate(
-            conn,
-            site_id=site_id,
-            feed_id=int(row["feed_id"]),
-            variable=variable,
-            day_ahead=int(row["day_ahead"]),
-            window_cutoff=cutoff,
-            min_n=min_n,
-        )
-        if result.skill_score is None or result.n < min_n:
-            continue
-        feed_id = int(row["feed_id"])
-        grouped.setdefault(
-            feed_id,
-            CompositeParts(source=str(row["source"]), model=str(row["model"])),
-        )
-        by_variable.setdefault(feed_id, {}).setdefault(variable, []).append(
-            result.skill_score
-        )
-
-    for feed_id, variables in by_variable.items():
-        parts = grouped[feed_id]
-        for variable, scores in variables.items():
-            raw = sum(scores) / len(scores)
-            parts.raw_components[variable] = raw
-            parts.components[variable] = max(0.0, raw)
-            parts.lead_counts[variable] = len(scores)
-
-    return _format_composite(grouped, window_key)
 
 
 def _format_composite(

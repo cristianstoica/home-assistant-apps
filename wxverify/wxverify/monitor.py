@@ -49,7 +49,6 @@ FEED_STALE_HOURS = 12
 OBS_STALE_HOURS = 12
 FETCH_OBS_LIVE_HOURS = 8
 FETCH_FEED_LIVE_HOURS = 12
-PAIR_SCORE_LIVE_HOURS = 12
 FAILED_JOB_AGE_HOURS = 48
 STUCK_RUNNING_MINUTES = 20
 PENDING_OVERDUE_MINUTES = 15
@@ -152,23 +151,19 @@ _ELIGIBLE_OBS_WHERE = """
 # be built, or an hourly cycle stopped by a refused-access hold) completes
 # with result NULL, as did every completion before the marker existed, and
 # none of those rows resolves anything.
-# The chain types (record_gap_scan, and the retired verification_run,
-# backfill_site, timezone_correction and catchup, whose failed rows a file
-# can still hold) are deliberately absent: _complete_and_continue
-# completes every finished chunk under the chain's own key, so a later
-# completed row there is a chunk, not a resolution, and those scopes count by
-# age alone.
+# The chain type record_gap_scan is deliberately absent:
+# _complete_and_continue completes every finished chunk under the chain's own
+# key, so a later completed row there is a chunk, not a resolution, and its
+# scopes count by age alone. The v17 upgrade deletes the rows of every job
+# type dispatch does not run, so no other type is left to classify.
 # The daily close's two kinds are classified apart (daily-close P3 9.6). A
 # failed day_close stage is left out of the arm: the day's state and attempt
 # record report it, and its scope (close:{site_id}:{local_date}:{stage}) is
 # the same for both attempts, so a later completion says nothing about the
-# day. A failed day_publish stage 7 (key publish:{site_id}:7) is left out
-# too: a failure fail_publication records moves the publication record,
-# whose state reports it, and a stale job's failure has its WARNING line.
-# day_publish is on the allowlist for its stage 8 (publish:{site_id}:8),
-# reported here alone: the site's next stage 8 that completes with
-# result='ok' deletes what the failed one left, a real recovery (stage 8's
-# early return ends with JobCancelled, so it clears nothing).
+# day. A failed day_publish job, the chain's last stage 7 (key
+# publish:{site_id}:7), is left out too: a failure fail_publication records
+# moves the publication record, whose state reports it, and a stale job's
+# failure has its WARNING line.
 # A feed's two download keys are one scope (daily-close P4 4.4). A round try
 # (key round:{feed_id}) has max_retries 0, so a try that raises ends failed,
 # while the feed's daytime downloads complete under fetch:{feed_id}; resolved
@@ -188,11 +183,10 @@ FAILED_SCOPES_SQL = """
     SELECT COUNT(*) FROM (
         SELECT 1 FROM jobs AS j
         WHERE j.status = 'failed' AND j.updated_at <= ?
-          AND NOT (j.type = 'day_publish'
-                   AND j.job_key IS ('publish:' || j.site_id || ':7'))
+          AND j.type != 'day_publish'
           AND j.type != 'day_close'
           AND (j.type NOT IN ('fetch_feed', 'fetch_obs', 'fetch_current_obs',
-                              'pair_and_score', 'forecast_record', 'day_publish')
+                              'forecast_record')
                OR NOT EXISTS (
                    SELECT 1 FROM jobs AS k
                    WHERE k.type = j.type
@@ -359,7 +353,7 @@ def _obs_collection_delays(
 # read.
 _LIVENESS_EVIDENCE_SQL: Final = f"""
     SELECT 'state', key, value, updated_at FROM runtime_state
-     WHERE key IN ('worker_started_at', 'worker_last_loop_at', 'import_rebuild_state')
+     WHERE key IN ('worker_started_at', 'worker_last_loop_at')
     UNION ALL
     SELECT 'job', NULL, NULL, updated_at FROM jobs
      WHERE status = 'running' AND {MAIN_LANE_TYPE_SQL}
@@ -369,7 +363,6 @@ _LIVENESS_EVIDENCE_SQL: Final = f"""
 @dataclass(frozen=True)
 class _LivenessEvidence:
     started: datetime | None  # W: worker_started_at's value
-    import_changed: datetime | None  # I: import_rebuild_state's updated_at
     last_loop: datetime | None  # S: worker_last_loop_at's value
     running_claims: tuple[datetime, ...]  # C: running main-lane rows' updated_at
 
@@ -385,7 +378,6 @@ def _main_liveness_evidence(conn: sqlite3.Connection) -> _LivenessEvidence:
     ``db_readable`` false.
     """
     started: datetime | None = None
-    import_changed: datetime | None = None
     last_loop: datetime | None = None
     running_claims: list[datetime] = []
     for row in conn.execute(_LIVENESS_EVIDENCE_SQL):
@@ -397,11 +389,8 @@ def _main_liveness_evidence(conn: sqlite3.Connection) -> _LivenessEvidence:
             started = _parse_or_none(row[2])
         elif row[1] == "worker_last_loop_at":
             last_loop = _parse_or_none(row[2])
-        elif row[1] == "import_rebuild_state":
-            import_changed = _parse_or_none(row[3])
     return _LivenessEvidence(
         started=started,
-        import_changed=import_changed,
         last_loop=last_loop,
         running_claims=tuple(running_claims),
     )
@@ -412,21 +401,18 @@ def _main_liveness_check(
 ) -> tuple[bool, str]:
     """``(tripped, detail)`` for ``main_worker_liveness``; pure, no I/O.
 
-    F is the later parseable of the worker start and the last import state
-    change. S* is the loop stamp if it parses and is not older than F, and
-    the basis B is S*, else F. A running main-lane row is current if it was
-    claimed at or after B, with no upper cap: how long a job may run is for
-    the running arm of ``problem_jobs`` to judge. Tripped when B is missing,
+    F is the worker start, if it parses. S* is the loop stamp if it parses
+    and is not older than F, and the basis B is S*, else F. A running
+    main-lane row is current if it was claimed at or after B, with no upper
+    cap: how long a job may run is for the running arm of ``problem_jobs``
+    to judge. Tripped when B is missing,
     or when B is at least ``MAIN_WORKER_LIVENESS_MINUTES`` old and no
     running row is current. Evidence in the future is not clamped, so it
     reads ok. The detail says which evidence is stale or missing; it never
     says the worker is hung, since a lane whose stamp write fails may still
     be running jobs.
     """
-    floor = max(
-        (t for t in (evidence.started, evidence.import_changed) if t is not None),
-        default=None,
-    )
+    floor = evidence.started
     last_loop = evidence.last_loop
     if last_loop is not None and (floor is None or last_loop >= floor):
         basis = last_loop
@@ -439,14 +425,13 @@ def _main_liveness_check(
         basis = floor
         detail = (
             "main-worker liveness evidence missing: no loop stamp since worker"
-            f" start or import at {isoformat_utc(floor)};"
+            f" start at {isoformat_utc(floor)};"
             " no main-lane job claimed since then is running"
         )
     else:
         return (
             True,
-            "main-worker liveness evidence missing:"
-            " no loop stamp, worker start or import time",
+            "main-worker liveness evidence missing: no loop stamp or worker start time",
         )
     current = any(claimed >= basis for claimed in evidence.running_claims)
     stale = now - basis >= timedelta(minutes=MAIN_WORKER_LIVENESS_MINUTES)
@@ -601,9 +586,9 @@ def _wind_stale_station_reasons(
 
 
 def _retired_check_results(
-    conn: sqlite3.Connection, now: datetime, *, eligible_feeds: int
+    conn: sqlite3.Connection, now: datetime
 ) -> dict[str, tuple[bool, int | None, str]]:
-    """The five pipeline checks the daily close retires, by id.
+    """The four pipeline checks the daily close retires, by id.
 
     Each as ``(tripped, count, detail)`` for ``_cond``. Called only while the
     close is off (daily-close plan P5 §4.1): with it on, none of these
@@ -611,7 +596,6 @@ def _retired_check_results(
     """
     obs_cutoff = isoformat_utc(now - timedelta(hours=OBS_STALE_HOURS))
     fetch_obs_cutoff = isoformat_utc(now - timedelta(hours=FETCH_OBS_LIVE_HOURS))
-    pair_cutoff = isoformat_utc(now - timedelta(hours=PAIR_SCORE_LIVE_HOURS))
 
     # obs_stale: enabled site with >=1 enabled station and last_obs_at >12h/NULL.
     obs_stale_n = _count(
@@ -633,9 +617,6 @@ def _retired_check_results(
     # so a completing wind-days lane cannot mask a dead live stream.
     fetch_obs_live_tripped = eligible_obs > 0 and not _has_completed_within(
         conn, "fetch_obs", fetch_obs_cutoff, job_key="obs"
-    )
-    pair_score_live_tripped = eligible_feeds > 0 and not _has_completed_within(
-        conn, "pair_and_score", pair_cutoff, job_key=None
     )
 
     # obs_station_history_failing (Item B.7): enabled stations of enabled sites
@@ -664,11 +645,6 @@ def _retired_check_results(
             None,
             "no completed fetch_obs in 8h",
         ),
-        "pair_score_live": (
-            pair_score_live_tripped,
-            None,
-            "no completed pair_and_score in 12h",
-        ),
         "obs_station_history_failing": (
             history_failing_n > 0,
             history_failing_n,
@@ -688,7 +664,7 @@ def _pipeline_conditions(
     conn: sqlite3.Connection, now: datetime, *, grace_active: bool
 ) -> list[Condition]:
     # The daily close's switch (daily-close plan P5 §4.1, §5.1). With it on,
-    # the five checks it retires are not built and close_alerts adds its
+    # the four checks it retires are not built and close_alerts adds its
     # rows; with it off, every row is built as before.
     close_on = daily_close_on(conn)
 
@@ -724,9 +700,7 @@ def _pipeline_conditions(
         conn, "fetch_feed", fetch_feed_cutoff, job_key=None
     )
     retired: dict[str, tuple[bool, int | None, str]] = (
-        {}
-        if close_on
-        else _retired_check_results(conn, now, eligible_feeds=eligible_feeds)
+        {} if close_on else _retired_check_results(conn, now)
     )
 
     # problem_jobs = failed scopes + in-flight problems. The failed arm counts
@@ -736,19 +710,17 @@ def _pipeline_conditions(
     # types listed in FAILED_SCOPES_SQL a later completed row in the same scope
     # that carries the success marker (result='ok', written only by
     # _complete_and_continue on a normal dispatch return) supersedes the
-    # failure -- the rule the rescore cooldown already applies, narrowed to
-    # genuine successes: a cancelled or unavailable completion, and every row
-    # written before the marker existed, has result NULL and resolves nothing.
+    # failure, but only a genuine success: a cancelled or unavailable
+    # completion, and every row written before the marker existed, has result
+    # NULL and resolves nothing.
     # For the chain types every finished chunk leaves a marked completed row
     # under the chain's key (_complete_and_continue), so a chunk's completion
     # proves nothing about the chain and those types count by age alone. The
-    # daily close's failed day_close stages and failed day_publish stage 7
-    # (key publish:{site_id}:7) are left out of the arm: the day's state and
-    # attempt record, or the publication record's state, report them, and a
-    # stale job's failure its WARNING line. Its stage 8 (publish:{site_id}:8)
-    # is a single-row scope: a later stage 8 of the site that completes with
-    # result='ok' has deleted what the failed one left. The
-    # failed rows themselves stay until purge_failed_jobs_older_than removes
+    # daily close's failed day_close stages and failed day_publish jobs (its
+    # last stage 7, key publish:{site_id}:7) are left out of the arm: the
+    # day's state and attempt record, or the publication record's state,
+    # report them, and a stale job's failure its WARNING line. The failed
+    # rows themselves stay until purge_failed_jobs_older_than removes
     # them, so retention is unchanged and the count cannot be cleared by
     # anything but a real success. "Later" is id order, matched NULL-safely
     # with IS because job_key and site_id are nullable. The in-flight arm
@@ -763,7 +735,7 @@ def _pipeline_conditions(
     # folds in the sibling blind spot: a non-ISO next_attempt_at (e.g. 'zzzz')
     # sorts AFTER every cutoff string, so a plain `<=` comparison would never
     # flag it either -- this surfaces that row as overdue instead of letting
-    # it go uncounted forever. db.sanitize's boot/import passes fix such rows
+    # it go uncounted forever. db.sanitize's boot pass fixes such rows
     # going forward; this is the operator-visible net for one that slips in
     # between those passes (a live write racing the pass, or a value crafted
     # to sort before "now" and pass the pass's own `parse_utc` check trivially
@@ -917,7 +889,6 @@ def _pipeline_conditions(
             None,
             "no completed fetch_feed in 12h",
         ),
-        *_retired("pair_score_live"),
         _cond(
             "problem_jobs",
             problem_jobs_n > 0,
@@ -1243,15 +1214,14 @@ def _grace_active(conn: sqlite3.Connection, now: datetime) -> bool:
 
 
 # The pipeline group's skipped list while monitor_pipeline is off (daily-close
-# plan P5 §5.1). With the close off: today's twelve ids plus
+# plan P5 §5.1). With the close off: today's eleven ids plus
 # station_silent_today. With it on: the seven kept pipeline ids,
-# station_silent_today and close_alerts' seven ids, none of the five retired.
+# station_silent_today and close_alerts' seven ids, none of the four retired.
 _PIPELINE_SKIPPED_CLOSE_OFF: Final[tuple[str, ...]] = (
     "feed_stale",
     "obs_stale",
     "fetch_obs_live",
     "fetch_feed_live",
-    "pair_score_live",
     "problem_jobs",
     "forecast_record_gap",
     "record_gap_scan_degraded",

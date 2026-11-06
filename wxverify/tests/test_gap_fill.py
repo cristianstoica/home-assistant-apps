@@ -343,7 +343,7 @@ def _minimal_site(
     _seed_full_day(conn, stations[STATION_PWS_IDS[1]])
     if close:
         begin_close(conn, site_id, GAP_DAY, now_utc=NOW)
-    return db, FencedWriter(db, db.generation), site_id, stations[STATION_PWS_IDS[0]]
+    return db, FencedWriter(db), site_id, stations[STATION_PWS_IDS[0]]
 
 
 @pytest.fixture
@@ -351,7 +351,7 @@ def site(tmp_path: Path) -> tuple[Database, FencedWriter, int, dict[str, int]]:
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001 -- tests inspect the real writer connection
     site_id, stations = _build_base_site(conn)
-    return db, FencedWriter(db, db.generation), site_id, stations
+    return db, FencedWriter(db), site_id, stations
 
 
 def _budget_calls(conn) -> int:  # type: ignore[no-untyped-def]
@@ -758,7 +758,7 @@ def test_gf7_a_closed_or_missed_day_refuses_every_gap_fill_write(
             requested.append(str(request.url.params["stationId"]))
             return httpx.Response(200, content=json.dumps(_hourly_week_body()).encode())
 
-        writer = FencedWriter(db, db.generation)
+        writer = FencedWriter(db)
         with _patched_client(handler):
             result = asyncio.run(
                 fill_gaps(db, writer, site_id=site_id, local_date=GAP_DAY, now_utc=NOW)

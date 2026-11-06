@@ -7,14 +7,9 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Literal
 
-from wxverify.core.timeutil import parse_utc, window_cutoff
-from wxverify.db.site_days import daily_close_on
+from wxverify.core.timeutil import window_cutoff
 from wxverify.db.snapshot import read_snapshot
-from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh
-from wxverify.scoring.effective import active_competitor_clause, active_feed_cte
-from wxverify.scoring.metrics import strategy_for
 from wxverify.settings.keys import get_number_setting
-from wxverify.verification.asof import knowable_pair_predicate
 
 LeaderboardStatus = Literal["hit", "stale", "rebuilding", "empty", "live"]
 
@@ -50,8 +45,8 @@ class LeaderboardResult:
     status: LeaderboardStatus
     window_key: str
     window_days: int | None
-    #: With the close on, the cutoff and id of the publication read (9.6);
-    #: None with the close off or with no publication.
+    #: The cutoff and id of the publication read (9.6); None with no
+    #: publication.
     evidence_through: date | None = None
     publication_id: int | None = None
 
@@ -81,32 +76,15 @@ def leaderboard_with_status(
     day_ahead: int,
     window: str,
 ) -> LeaderboardResult:
-    """Return leaderboard rows plus a cache status for the resolved window.
+    """Return leaderboard rows plus a status for the resolved window.
 
-    Mirrors ``composite_with_status``'s state model: cache-backed windows
-    (``rolling`` / ``all``) are served exclusively from ``score_cache`` — a
-    fresh complete snapshot is a ``hit``, a complete-but-stale snapshot is
-    served as ``stale`` (never recomputed live), and an absent/mismatched
-    snapshot with applicable input is ``rebuilding`` (empty rows). The
-    no-input gate runs before any cache branch: a missing/disabled site or an
-    empty expected feed universe is genuinely ``empty`` regardless of cache
-    contents, and callers MUST NOT enqueue for it. Custom ``Nd`` windows
-    always compute live and return ``live`` — the engine never writes
-    ``live:{N}d`` cache keys, so they must not look like cache misses.
-    Callers enqueue a rescore (after the read closes) only for ``stale`` and
-    ``rebuilding``.
-
-    Every read the verdict depends on — the window setting, the site row, the
-    expected active feed set and the ``score_cache`` rows — runs inside one WAL
-    read snapshot (``read_snapshot``), so ``rebuilding`` is only ever reported
-    for a mismatch that existed in one state of the database, never for two
-    reads that straddled a rescore commit. The block is read-only. A caller
-    that already holds a transaction on ``conn`` must call
+    The verdict of ``leaderboard_with_status_in_transaction``. Every read it
+    depends on runs inside one WAL read snapshot (``read_snapshot``), so the
+    rows describe one state of the database. The block is read-only. A
+    caller that already holds a transaction on ``conn`` must call
     ``leaderboard_with_status_in_transaction`` instead, because the snapshot
-    refuses to nest: the forecast-record builder, inside a caller-held snapshot
-    (the record job's ``read_snapshot``, or a writer's ``BEGIN IMMEDIATE`` on
-    the synchronous path), and ``forecast_ranking_with_status`` when a forecast
-    route's read snapshot is open.
+    refuses to nest: ``forecast_ranking_with_status`` when a forecast route's
+    read snapshot is open.
     """
     with read_snapshot(conn, label="leaderboard"):
         return leaderboard_with_status_in_transaction(
@@ -129,86 +107,23 @@ def leaderboard_with_status_in_transaction(
     """``leaderboard_with_status`` for a caller that already holds the snapshot.
 
     Identical verdict logic; issues no transaction of its own and requires
-    none. Two production callers hold a snapshot already, where the facade's
-    ``read_snapshot`` would refuse to nest: the forecast-record builder, inside
-    a caller-held snapshot (the record job's ``read_snapshot``, or a writer's
-    ``BEGIN IMMEDIATE`` on the synchronous path), and
-    ``forecast_ranking_with_status`` when a forecast route's read snapshot is
-    open on ``conn``. Other read paths call the facade.
+    none. ``forecast_ranking_with_status`` calls it when a forecast route's
+    read snapshot is open on ``conn``, where the facade's ``read_snapshot``
+    would refuse to nest, and ``leaderboard_in_snapshot`` wraps it. Other
+    read paths call the facade.
 
-    With the daily close on (9.2) the verdict comes from the active
-    publication instead, decided once from ``daily_close_on`` in the same
-    snapshot: no publication, or the site disabled, is ``empty``;
-    ``rolling`` and ``all`` are the publication's ``w:{N}`` and ``w:all``
-    rows, ``hit``; an ``Nd`` window is summed live over the N closed dates
-    ending at the publication's cutoff, ``live``. No ``score_cache`` read, so
-    never ``stale`` or ``rebuilding``.
+    The verdict comes from the active publication (9.2): no publication, or
+    the site disabled, is ``empty``; ``rolling`` and ``all`` are the
+    publication's ``w:{N}`` and ``w:all`` rows, ``hit``; an ``Nd`` window is
+    summed live over the N closed dates ending at the publication's cutoff,
+    ``live``.
     """
-    if daily_close_on(conn):
-        return _published_leaderboard(
-            conn,
-            site_id=site_id,
-            variable=variable,
-            day_ahead=day_ahead,
-            window=window,
-        )
-    resolved = resolve_window(conn, window)
-    if not resolved.cache_backed:
-        rows = _live_leaderboard(
-            conn,
-            site_id=site_id,
-            variable=variable,
-            day_ahead=day_ahead,
-            resolved=resolved,
-        )
-        return LeaderboardResult(
-            rows=rows,
-            status="live",
-            window_key=resolved.window_key,
-            window_days=resolved.window_days,
-        )
-    if not _site_enabled(conn, site_id):
-        return LeaderboardResult(
-            rows=[],
-            status="empty",
-            window_key=resolved.window_key,
-            window_days=resolved.window_days,
-        )
-    expected_feed_ids = _expected_active_feed_ids(
+    return _published_leaderboard(
         conn,
         site_id=site_id,
         variable=variable,
         day_ahead=day_ahead,
-        resolved=resolved,
-    )
-    if not expected_feed_ids:
-        return LeaderboardResult(
-            rows=[],
-            status="empty",
-            window_key=resolved.window_key,
-            window_days=resolved.window_days,
-        )
-    cached = _cached_leaderboard(
-        conn,
-        site_id=site_id,
-        variable=variable,
-        day_ahead=day_ahead,
-        resolved=resolved,
-        expected_feed_ids=expected_feed_ids,
-    )
-    if cached is None:
-        return LeaderboardResult(
-            rows=[],
-            status="rebuilding",
-            window_key=resolved.window_key,
-            window_days=resolved.window_days,
-        )
-    rows, fresh = cached
-    return LeaderboardResult(
-        rows=rows,
-        status="hit" if fresh else "stale",
-        window_key=resolved.window_key,
-        window_days=resolved.window_days,
+        window=window,
     )
 
 
@@ -246,7 +161,7 @@ def _published_leaderboard(
     day_ahead: int,
     window: str,
 ) -> LeaderboardResult:
-    """The close-on verdict of ``leaderboard_with_status_in_transaction``."""
+    """The verdict of ``leaderboard_with_status_in_transaction``."""
     # Deferred: the publication module imports this one (its rows are
     # ``LeaderboardRow``s) through ``forecast/data.py``.
     from wxverify.scoring.publication import (
@@ -319,195 +234,6 @@ def _site_enabled(conn: sqlite3.Connection, site_id: int) -> bool:
     return row is not None and bool(row["enabled"])
 
 
-def _live_leaderboard(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    variable: str,
-    day_ahead: int,
-    resolved: WindowResolution,
-    as_of: str | None = None,
-    min_n_override: int | None = None,
-) -> list[LeaderboardRow]:
-    """Compute the leaderboard live from pairs (no ``score_cache`` read).
-
-    With ``as_of`` set this is the §6 as-of parameterization of the SAME
-    query shapes: feed discovery and metric aggregation see only pairs
-    knowable at T, and ``min_n_override`` MUST carry the run's declared
-    value — the as-of path never reads live mutable settings.
-    """
-    if as_of is not None and min_n_override is None:
-        raise ValueError("as-of leaderboard requires a declared min_n")
-    min_n = (
-        min_n_override
-        if min_n_override is not None
-        else get_number_setting(conn, "min_n", 30, minimum=0)
-    )
-    asof_clause = ""
-    asof_params: tuple[object, ...] = ()
-    if as_of is not None:
-        predicate, params = knowable_pair_predicate("fp", as_of=as_of)
-        asof_clause = f"AND {predicate}"
-        asof_params = params
-    feeds = conn.execute(
-        f"""
-        SELECT DISTINCT fp.feed_id, f.source, f.model
-        FROM forecast_pairs fp
-        JOIN feeds f ON f.id = fp.feed_id
-        LEFT JOIN site_feed_state sfs
-          ON sfs.site_id = fp.site_id AND sfs.feed_id = fp.feed_id
-        WHERE fp.site_id = ?
-          AND fp.variable = ?
-          AND fp.day_ahead = ?
-          AND {active_competitor_clause(site_expr="fp.site_id")}
-          {asof_clause}
-        ORDER BY f.source, f.model
-        """,
-        (site_id, variable, day_ahead, *asof_params),
-    ).fetchall()
-    rows: list[LeaderboardRow] = []
-    for feed in feeds:
-        result = strategy_for(variable).aggregate(
-            conn,
-            site_id=site_id,
-            feed_id=int(feed["feed_id"]),
-            variable=variable,
-            day_ahead=day_ahead,
-            window_cutoff=resolved.cutoff,
-            min_n=min_n,
-            as_of=as_of,
-        )
-        rows.append(
-            LeaderboardRow(
-                feed_id=int(feed["feed_id"]),
-                source=str(feed["source"]),
-                model=str(feed["model"]),
-                n=result.n,
-                skill_score=result.skill_score,
-                badge=score_badge(result.skill_score),
-                below_baseline=below_baseline(result.skill_score),
-                confident=result.confident,
-                bias=result.bias,
-                mae=result.mae,
-                rmse=result.rmse,
-                window_key=resolved.window_key,
-                window_days=resolved.window_days,
-            )
-        )
-    return rows
-
-
-def _cached_leaderboard(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    variable: str,
-    day_ahead: int,
-    resolved: WindowResolution,
-    expected_feed_ids: set[int],
-) -> tuple[list[LeaderboardRow], bool] | None:
-    """Serve the leaderboard from ``score_cache``; None only on absent/mismatch.
-
-    Returns ``(rows, fresh)``: a complete same-window feed-set snapshot is
-    served even when stale (``fresh=False``) — the stale path must never fall
-    through to the live recompute. ``expected_feed_ids`` is computed by the
-    caller so the hot-path DISTINCT query runs only once per read.
-    """
-    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-    rows = conn.execute(
-        f"""
-        SELECT sc.site_id, sc.feed_id, sc.variable, sc.day_ahead, sc.window_key,
-               sc.n, sc.bias, sc.mae, sc.rmse, sc.skill_score, sc.computed_at,
-               f.source, f.model
-        FROM score_cache sc
-        JOIN feeds f ON f.id = sc.feed_id
-        LEFT JOIN site_feed_state sfs
-          ON sfs.site_id = sc.site_id AND sfs.feed_id = sc.feed_id
-        WHERE sc.site_id = ?
-          AND sc.variable = ?
-          AND sc.day_ahead = ?
-          AND sc.window_key = ?
-          AND {active_competitor_clause(site_expr="sc.site_id")}
-        ORDER BY f.source, f.model
-        """,
-        (site_id, variable, day_ahead, resolved.window_key),
-    ).fetchall()
-    if not rows:
-        return None
-    cached_feed_ids = {int(row["feed_id"]) for row in rows}
-    if cached_feed_ids != expected_feed_ids:
-        return None
-    fresh = True
-    out: list[LeaderboardRow] = []
-    for row in rows:
-        cache_row = ScoreCacheRow(
-            site_id=int(row["site_id"]),
-            feed_id=int(row["feed_id"]),
-            variable=str(row["variable"]),
-            day_ahead=int(row["day_ahead"]),
-            window_key=str(row["window_key"]),
-            n=int(row["n"]),
-            bias=_optional_float(row["bias"]),
-            mae=_optional_float(row["mae"]),
-            rmse=_optional_float(row["rmse"]),
-            skill_score=_optional_float(row["skill_score"]),
-            computed_at=None if row["computed_at"] is None else str(row["computed_at"]),
-        )
-        if not is_cache_fresh(cache_row, resolved.window_key):
-            fresh = False
-        raw = cache_row.skill_score
-        out.append(
-            LeaderboardRow(
-                feed_id=cache_row.feed_id,
-                source=str(row["source"]),
-                model=str(row["model"]),
-                n=cache_row.n,
-                skill_score=raw,
-                badge=score_badge(raw),
-                below_baseline=below_baseline(raw),
-                confident=cache_row.n >= min_n and raw is not None,
-                bias=cache_row.bias,
-                mae=cache_row.mae,
-                rmse=cache_row.rmse,
-                window_key=resolved.window_key,
-                window_days=resolved.window_days,
-            )
-        )
-    return out, fresh
-
-
-def _expected_active_feed_ids(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    variable: str,
-    day_ahead: int,
-    resolved: WindowResolution,
-) -> set[int]:
-    window_clause = "" if resolved.cutoff is None else "AND fp.valid_at >= ?"
-    params: tuple[object, ...] = (site_id, site_id, site_id, variable, day_ahead)
-    if resolved.cutoff is not None:
-        params = (*params, resolved.cutoff)
-    rows = conn.execute(
-        f"""
-        WITH {active_feed_cte()}
-        SELECT a.feed_id
-        FROM active_feeds a
-        WHERE EXISTS (
-            SELECT 1
-            FROM forecast_pairs fp
-            WHERE fp.site_id = ?
-              AND fp.feed_id = a.feed_id
-              AND fp.variable = ?
-              AND fp.day_ahead = ?
-              {window_clause}
-        )
-        """,
-        params,
-    ).fetchall()
-    return {int(row["feed_id"]) for row in rows}
-
-
 def score_badge(raw: float | None) -> int | None:
     if raw is None:
         return None
@@ -518,58 +244,10 @@ def below_baseline(raw: float | None) -> bool:
     return raw is not None and raw < 0
 
 
-def asof_leaderboard(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    variable: str,
-    day_ahead: int,
-    as_of: str,
-    min_n: int,
-    window_days: int | None,
-) -> list[LeaderboardRow]:
-    """Incumbent-ranking reconstruction as of T (plan §6).
-
-    A declared-configuration counterfactual: ``min_n`` and ``window_days``
-    are the run's pinned configuration snapshot, passed in explicitly — this
-    path never reads live mutable settings and never touches the mutable
-    ``score_cache``. The rolling cutoff is anchored at T (``window_cutoff``
-    with ``now=T``), and only pairs knowable at T participate; today's
-    leaderboard or the rebuilt all-history cache is never applied
-    retrospectively. ``window_days=None`` means all history up to T.
-    """
-    cutoff = (
-        None if window_days is None else window_cutoff(window_days, parse_utc(as_of))
-    )
-    resolved = WindowResolution(
-        window_key=("asof:all" if window_days is None else f"asof:{window_days}d"),
-        window_days=window_days,
-        cutoff=cutoff,
-        cache_backed=False,
-    )
-    return _live_leaderboard(
-        conn,
-        site_id=site_id,
-        variable=variable,
-        day_ahead=day_ahead,
-        resolved=resolved,
-        as_of=as_of,
-        min_n_override=min_n,
-    )
-
-
-def cutoff_for_window(conn: sqlite3.Connection, window: str) -> str | None:
-    return resolve_window(conn, window).cutoff
-
-
 def resolve_window(
     conn: sqlite3.Connection, window: str, *, now: datetime | None = None
 ) -> WindowResolution:
-    """Resolve a window token; ``now`` anchors relative cutoffs (default: now).
-
-    The backtest threads ``now=T`` so every relative window is computed
-    against the canonical decision time, never wall-clock time (plan §6).
-    """
+    """Resolve a window token; ``now`` anchors relative cutoffs (default: now)."""
     if window == "all":
         return WindowResolution(
             window_key="w:all", window_days=None, cutoff=None, cache_backed=True
@@ -597,11 +275,3 @@ def resolve_window(
         cutoff=window_cutoff(days, now),
         cache_backed=True,
     )
-
-
-def _optional_float(value: object) -> float | None:
-    if value is None:
-        return None
-    if not isinstance(value, int | float | str):
-        raise TypeError("invalid numeric cache value")
-    return float(value)

@@ -9,30 +9,10 @@ RUNTIME_STATE_KEYS = (
     "worker_started_at",
     "worker_last_loop_at",
     "scheduler_last_tick_at",
-    "import_rebuild_done_at",
-    "import_rebuild_state",
-    "import_rebuild_error",
     "current_obs_poller_last_loop_at",
 )
 
 RUNTIME_HEARTBEAT_INTERVAL_SECONDS = 60.0
-
-# Mirrors create_schema()'s runtime_state DDL in db/migrations.py -- update
-# both if this table's shape ever changes. Needed here because a caller may
-# write to this table before migrations have run against it (import
-# staging, ahead of promotion); once migrations have run, create_schema has
-# always already ensured it.
-_RUNTIME_STATE_DDL = """
-CREATE TABLE IF NOT EXISTS runtime_state (
-    key TEXT PRIMARY KEY NOT NULL,
-    value TEXT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-)
-"""
-
-
-def ensure_runtime_state_table(conn: sqlite3.Connection) -> None:
-    conn.execute(_RUNTIME_STATE_DDL)
 
 
 def set_runtime_state(conn: sqlite3.Connection, key: str, value: str) -> None:

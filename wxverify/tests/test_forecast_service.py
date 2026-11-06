@@ -14,43 +14,38 @@ elsewhere and the risk here is in how the service layer WIRES them together.
 
 Isolation: fresh ``sqlite3.connect(":memory:")`` + ``run_migrations`` per
 test (mirrors test_forecast_data.py / test_scoring_equivalence.py).
-Far-future (2035) dates are used for forecast_pairs fixtures for the same
-reason as test_forecast_data.py: ``forecast_ranking``'s default rolling
-window cutoff is computed from the REAL wall clock, not an injectable "now".
+Far-future (2035) dates are used for the seeded test publication, so its
+cutoff always precedes any ``now`` this file's live (`build_forecast`)
+fixtures use.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 
 import pytest
 
-from tests.helpers import seed_rain_ranks
+from tests.helpers import (
+    seed_active_publication,
+    seed_publication_ranking,
+    seed_rain_ranks,
+)
 from wxverify.collection.forecast_fetcher import register_feed_if_needed
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.core.units import ms_to_kmh
 from wxverify.db.migrations import pause_dropped_meteoblue_members, run_migrations
-from wxverify.db.switch import ensure_site_generation
-from wxverify.forecast import wind_blend
+from wxverify.db.runtime_state import set_runtime_state
 from wxverify.forecast.service import (
     build_forecast,
     build_hourly,
     relative_ago,
 )
 from wxverify.forecast.wind_blend import NOT_ENOUGH_FEEDS_NOTE
-from wxverify.scoring.cache import upsert_score_cache
-from wxverify.scoring.leaderboard import leaderboard_with_status, resolve_window
-from wxverify.scoring.metrics import strategy_for
+from wxverify.scoring.leaderboard import leaderboard_with_status
+from wxverify.scoring.metrics import MetricSums, metrics_from_sums
 from wxverify.settings.keys import get_number_setting, set_setting
 from wxverify.web.context import feed_label
-
-_FAR_FUTURE_VALID_ATS = (
-    "2035-07-01T00:00:00Z",
-    "2035-07-01T01:00:00Z",
-    "2035-07-01T02:00:00Z",
-)
-_FAR_FUTURE_LEAD_HOURS = (1, 2, 3)
 
 
 def _make_db() -> sqlite3.Connection:
@@ -115,67 +110,21 @@ def _stamp_usable_fetch(
     )
 
 
-def _insert_pair(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int = 1,
-    feed_id: int,
-    variable: str,
-    issued_at: str,
-    valid_at: str,
-    lead_hours: int,
-    day_ahead: int,
-    forecast: float,
-    observed: float = 10.0,
-) -> None:
-    error = forecast - observed
-    conn.execute(
-        """
-        INSERT INTO forecast_pairs
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error,
-             tz_generation_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            site_id,
-            feed_id,
-            variable,
-            issued_at,
-            valid_at,
-            lead_hours,
-            day_ahead,
-            forecast,
-            observed,
-            error,
-            abs(error),
-            error * error,
-            ensure_site_generation(conn, site_id),
-        ),
-    )
-
-
 def _make_confident(
     conn: sqlite3.Connection, *, feed_id: int, variable: str, day_ahead: int
 ) -> None:
-    """Give `feed_id` a real, positive skill score at (variable, day_ahead)
-    against the seeded `virtual/_persistence` baseline, on far-future dates
-    so the rolling-window cutoff (real wall clock) never excludes them."""
+    """Give `feed_id` a real, positive skill ranking at (variable,
+    day_ahead) against a `virtual/_persistence` baseline of forecast=8.0
+    (`feed_id` forecasts 10.5): both land in a `publication_rankings` row
+    via :func:`_seed_score_cache`, confident (n=3 matches this file's
+    seeded ``min_n``)."""
     persistence_id = _feed_id(conn, "virtual", "_persistence")
-    for target_feed, forecast in ((persistence_id, 8.0), (feed_id, 10.5)):
-        for valid_at, lead_hours in zip(
-            _FAR_FUTURE_VALID_ATS, _FAR_FUTURE_LEAD_HOURS, strict=True
-        ):
-            _insert_pair(
-                conn,
-                feed_id=target_feed,
-                variable=variable,
-                issued_at="2035-06-30T00:00:00Z",
-                valid_at=valid_at,
-                lead_hours=lead_hours,
-                day_ahead=day_ahead,
-                forecast=forecast,
-            )
+    _seed_score_cache(
+        conn,
+        variable=variable,
+        day_ahead=day_ahead,
+        forecasts={persistence_id: 8.0, feed_id: 10.5},
+    )
 
 
 def _seed_hourly(
@@ -229,39 +178,6 @@ def _seed_varying(
         )
 
 
-def _seed_scoring_pairs(
-    conn: sqlite3.Connection,
-    *,
-    feed_id: int,
-    variable: str,
-    day_ahead: int,
-    forecast: float,
-) -> None:
-    """Seed 3 far-future scoring pairs for ``feed_id`` at ``day_ahead``.
-
-    Observed is 10.0; ``forecast`` sets the error magnitude. For temperature/
-    wind (ContinuousStrategy) a nearer forecast => lower MSE => higher skill vs
-    the persistence baseline, so seeding persistence + two competitors with
-    different forecasts orders them on skill. Far-future (2035) valid_ats keep
-    the pairs inside ``forecast_ranking``'s real-wall-clock rolling cutoff
-    (same reason as ``_make_confident``). n = 3 = seeded ``min_n`` => confident
-    whenever a skill score exists (persistence present + Continuous strategy).
-    """
-    for valid_at, lead in zip(
-        _FAR_FUTURE_VALID_ATS, _FAR_FUTURE_LEAD_HOURS, strict=True
-    ):
-        _insert_pair(
-            conn,
-            feed_id=feed_id,
-            variable=variable,
-            issued_at="2035-06-30T00:00:00Z",
-            valid_at=valid_at,
-            lead_hours=lead,
-            day_ahead=day_ahead,
-            forecast=forecast,
-        )
-
-
 def _seed_far_horizon_collapse(conn: sqlite3.Connection) -> None:
     """D+7 temperature tile that COLLAPSES under pre-fix selection.
 
@@ -311,65 +227,99 @@ def _seed_far_horizon_collapse(conn: sqlite3.Connection) -> None:
         lead_hours=12,
         value=25.0,  # outside the covered range: a pre-fix collapse is obvious
     )
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="temperature", day_ahead=7, forecast=8.0
-    )
     # degenerate OUT-skills covered (forecast nearer observed 10.0).
-    _seed_scoring_pairs(
-        conn, feed_id=degenerate_id, variable="temperature", day_ahead=7, forecast=10.2
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=covered_id, variable="temperature", day_ahead=7, forecast=11.0
+    _seed_score_cache(
+        conn,
+        variable="temperature",
+        day_ahead=7,
+        forecasts={persistence_id: 8.0, degenerate_id: 10.2, covered_id: 11.0},
     )
 
 
-def _seed_complete_score_cache(
-    conn: sqlite3.Connection, *, variable: str, day_ahead: int
+_TEST_PUBLICATION_WINDOW_DAYS = 30
+_TEST_PUBLICATION_WINDOW_KEY = f"w:{_TEST_PUBLICATION_WINDOW_DAYS}"
+
+
+def _ensure_test_publication(conn: sqlite3.Connection, *, min_n: int) -> int:
+    """This connection's one site-1 publication, created on first use.
+
+    ``leaderboard_with_status``'s ``rolling`` window now always reads the
+    active publication (9.2), never a live recompute, so every ranking
+    this file seeds must land in ONE publication -- its ``min_n`` is baked
+    in at creation, matching the runtime ``min_n`` setting at that point,
+    so the read-time confidence check agrees with what
+    :func:`_seed_score_cache` computed.
+    """
+    row = conn.execute(
+        "SELECT id FROM publications WHERE site_id = 1 ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row is not None:
+        return int(row["id"])
+    return seed_active_publication(
+        conn,
+        site_id=1,
+        cutoff=date(2035, 6, 30),
+        published_at=datetime(2035, 6, 30, tzinfo=UTC),
+        window_days=_TEST_PUBLICATION_WINDOW_DAYS,
+        min_n=min_n,
+    )
+
+
+def _seed_score_cache(
+    conn: sqlite3.Connection,
+    *,
+    variable: str,
+    day_ahead: int,
+    forecasts: dict[int, float],
 ) -> None:
-    """Seed a fresh, complete score_cache snapshot for every feed that has
-    forecast_pairs at (site 1, `variable`, `day_ahead`) on the default
-    rolling window.
+    """Seed one published-ranking row per feed in ``forecasts`` (site 1,
+    ``variable``, ``day_ahead``), each hand-derived from an explicit
+    ``MetricSums``: `leaderboard_with_status`'s ``rolling`` window always
+    reads the active publication (9.2), never a live recompute.
 
-    Cache-backed forecast_ranking (via leaderboard_with_status) requires a
-    snapshot whose feed set equals the query's expected-active-feed set
-    EXACTLY -- a partial snapshot is treated as absent, same as no snapshot
-    at all -- or the cell degrades to a 'rebuilding' empty ranking rather
-    than the live-recomputed skill/confidence values these tests assert on.
-    Seeding via the same `strategy_for(...).aggregate` call the live path
-    used to make reproduces identical numbers, so this changes WHERE the
-    numbers come from, never what they are. `computed_at` is the REAL
-    current UTC time (never a fixture-injected `now`) because
-    `is_cache_fresh` buckets against the actual wall-clock UTC day.
+    Every key of ``forecasts`` stands for 3 identical far-future pairs
+    against a fixed observed=10.0 baseline (``n=3``, matching this file's
+    seeded ``min_n``), so bias/MAE/RMSE are exact, not approximated. A
+    feed's skill is computed only when ``forecasts`` also carries the
+    seeded ``virtual/_persistence`` feed id, paired 1:1 against
+    persistence's own (also constant) error over the same 3 valid_ats --
+    a forecast nearer 10.0 than persistence's own reads a higher skill.
+    ``forecasts`` is local to the caller: no module-level state survives
+    this call, so a stale ``id(conn)`` reuse across tests can never leak
+    one test's values into another's.
     """
     min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-    resolved = resolve_window(conn, "rolling")
-    feed_ids = {
-        int(row["feed_id"])
-        for row in conn.execute(
-            "SELECT DISTINCT feed_id FROM forecast_pairs "
-            "WHERE site_id=1 AND variable=? AND day_ahead=?",
-            (variable, day_ahead),
-        ).fetchall()
-    }
-    for feed_id in feed_ids:
-        result = strategy_for(variable).aggregate(
+    pub_id = _ensure_test_publication(conn, min_n=min_n)
+    persistence_id = _feed_id(conn, "virtual", "_persistence")
+    persistence_forecast = forecasts.get(persistence_id)
+    persistence_sq = (
+        None if persistence_forecast is None else (persistence_forecast - 10.0) ** 2
+    )
+    for feed_id, forecast in forecasts.items():
+        error = forecast - 10.0
+        sums: MetricSums = {
+            "n": 3,
+            "err_n": 3,
+            "err_sum": error * 3,
+            "abs_sum": abs(error) * 3,
+            "sq_sum": error * error * 3,
+        }
+        if persistence_sq is not None:
+            sums = {
+                **sums,
+                "skill_n": 3,
+                "skill_sq_sum": error * error * 3,
+                "skill_ref_sq_sum": persistence_sq * 3,
+            }
+        result = metrics_from_sums(sums, variable=variable, min_n=min_n)
+        seed_publication_ranking(
             conn,
-            site_id=1,
+            publication_id=pub_id,
             feed_id=feed_id,
             variable=variable,
             day_ahead=day_ahead,
-            window_cutoff=resolved.cutoff,
-            min_n=min_n,
-        )
-        upsert_score_cache(
-            conn,
-            site_id=1,
-            feed_id=feed_id,
-            variable=variable,
-            day_ahead=day_ahead,
-            window_key=resolved.window_key,
+            window_key=_TEST_PUBLICATION_WINDOW_KEY,
             result=result,
-            computed_at=isoformat_utc(),
         )
 
 
@@ -401,7 +351,6 @@ def test_b2_prior_day_run_in_todays_tile_ranks_by_issue_relative_day_ahead() -> 
     # service wrongly ranked by the display day index (0) instead, this feed
     # would find no ranking row there and read as not-confident.
     _make_confident(conn, feed_id=feed_id, variable="temperature", day_ahead=1)
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
     conn.commit()
     view = build_forecast(
@@ -421,7 +370,7 @@ def test_b2_prior_day_run_in_todays_tile_ranks_by_issue_relative_day_ahead() -> 
 
 
 def test_b2_paired_negative_wrong_cell_reads_low_confidence() -> None:
-    """Sanity companion to the B2 gate above: if pairs are seeded at the
+    """Sanity companion to the B2 gate above: if a ranking is seeded at the
     DISPLAY day_ahead (0) instead of the issue-relative one (1), the SAME
     sample fixture reads low_confidence -- proving the positive test above is
     actually discriminating on which day_ahead was used, not vacuously green."""
@@ -470,7 +419,6 @@ def test_stale_badge_orthogonal_to_normal_state() -> None:
     # feed).
     _stamp_usable_fetch(conn, feed_id=feed_id, at="2026-07-19T08:00:00Z")
     _make_confident(conn, feed_id=feed_id, variable="temperature", day_ahead=1)
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
     conn.commit()
     view = build_forecast(
@@ -509,7 +457,6 @@ def test_temperature_extrema_suppressed_under_coverage_partial_badge_set() -> No
         value=12.0,
     )
     _make_confident(conn, feed_id=feed_id, variable="temperature", day_ahead=1)
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
     conn.commit()
     view = build_forecast(
@@ -546,6 +493,42 @@ def _seed_wind_weight(
         " VALUES (?, ?, ?, 1.0, 30, ?)",
         (publication_id, feed_id, day_ahead, weight),
     )
+
+
+def _seed_wind_publication(
+    conn: sqlite3.Connection,
+    *,
+    weights_by_feed: dict[int, float],
+    day_ahead: int = 1,
+    site_id: int = 1,
+) -> int:
+    """Turn the daily close on and publish each feed's raw wind weight.
+
+    Replaces the removed training-from-pairs pipeline for the tests whose
+    subject is SERVING: wind serving now reads only the active
+    publication's ``publication_wind_weights`` (``load_wind_serving``),
+    never a live recompute from ``forecast_pairs``. ``day_ahead`` must
+    match the representative lead ``_candidates`` computes for the seeded
+    samples (1, for the usual "issued the evening before, 24h today"
+    shape this file's wind fixtures use).
+    """
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY
+
+    cutoff = date(2026, 7, 19)
+    published_at = datetime(2026, 7, 19, 21, 0, tzinfo=UTC)
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(published_at))
+    publication_id = seed_active_publication(
+        conn, site_id=site_id, cutoff=cutoff, published_at=published_at
+    )
+    for feed_id, weight in weights_by_feed.items():
+        _seed_wind_weight(
+            conn,
+            publication_id=publication_id,
+            feed_id=feed_id,
+            day_ahead=day_ahead,
+            weight=weight,
+        )
+    return publication_id
 
 
 def test_tile_precedence_low_confidence_beats_normal_not_available_excluded() -> None:
@@ -711,14 +694,15 @@ def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
 
 
 def test_mixed_representative_leads_stay_normal_confident_winner() -> None:
-    """O3: a rebuilding key on a feed the ladder never selects must not
+    """O3: an unconfident key on a feed the ladder never selects must not
     relabel a cell whose selected feed has a settled, confident ranking.
 
     Feed A (rep day_ahead=1) is confident with a complete score_cache
-    snapshot; feed B (rep day_ahead=0) has forecast_pairs but no snapshot
-    there, so its key is genuinely "rebuilding" -- not "empty". Rung 1
-    selects the confident feed A alone, so B (the rebuilding-keyed feed)
-    never enters either surface's rendered set.
+    snapshot; feed B (rep day_ahead=0) has samples but no ranking row
+    there, so its leaderboard still reads "hit" (the published leaderboard
+    has no other status now that there is an active publication) but with
+    no row for feed B. Rung 1 selects the confident feed A alone, so B
+    (the unconfident feed) never enters either surface's rendered set.
 
     ``uv run pytest tests/test_forecast_service.py -k mixed_lead``
     """
@@ -737,19 +721,16 @@ def test_mixed_representative_leads_stay_normal_confident_winner() -> None:
         valid_ats=valid_ats,
     )
     _make_confident(conn, feed_id=feed_a, variable="temperature", day_ahead=1)
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
-    # Feed B: issued the same morning -> representative day_ahead=0. Pairs
-    # exist (not an empty universe) but no snapshot -> rebuilding.
+    # Feed B: issued the same morning -> representative day_ahead=0. Has
+    # samples (not an empty universe) but no ranking row -> unconfident
+    # there.
     _seed_hourly(
         conn,
         feed_id=feed_b,
         variable="temperature",
         issued_at="2026-07-20T00:00:00Z",
         valid_ats=valid_ats,
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=feed_b, variable="temperature", day_ahead=0, forecast=10.5
     )
 
     conn.commit()
@@ -759,11 +740,14 @@ def test_mixed_representative_leads_stay_normal_confident_winner() -> None:
         ).status
         == "hit"
     )
+    # An active publication exists (seeded above for day_ahead=1), so every
+    # cell's leaderboard status is "hit" -- there is no "rebuilding" status
+    # any more -- even though day_ahead=0 has no ranking row for feed B.
     assert (
         leaderboard_with_status(
             conn, site_id=1, variable="temperature", day_ahead=0, window="rolling"
         ).status
-        == "rebuilding"
+        == "hit"
     )
 
     view = build_forecast(
@@ -779,9 +763,8 @@ def test_mixed_representative_leads_stay_low_confidence_unconfident_winner() -> 
     """O7: sibling of the test above with feed A scored but NOT confident
     (n > 0, below the raised min_n floor) rather than absent entirely. Rung
     1 finds no confident candidate and skips; rung 2 selects the scored
-    feed A alone (feed B still reads pair_n=0 under its rebuilding key), so
-    the cell must stay low_confidence, not become rebuilding, on both
-    surfaces.
+    feed A alone (feed B still reads pair_n=0, with no ranking row at its
+    cell), so the cell must stay low_confidence on both surfaces.
     """
     conn = _make_db()
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
@@ -789,7 +772,7 @@ def test_mixed_representative_leads_stay_low_confidence_unconfident_winner() -> 
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
     valid_ats = _hours("2026-07-20", 4, 20)
 
-    # Raise min_n above the 3 pairs _seed_scoring_pairs seeds, so feed A's
+    # Raise min_n above the n=3 _seed_score_cache seeds, so feed A's
     # cached row is scored (n=3 > 0) but not confident (n < min_n).
     set_setting(conn, "min_n", "4")
 
@@ -800,10 +783,11 @@ def test_mixed_representative_leads_stay_low_confidence_unconfident_winner() -> 
         issued_at="2026-07-19T20:00:00Z",
         valid_ats=valid_ats,
     )
-    _seed_scoring_pairs(
-        conn, feed_id=feed_a, variable="temperature", day_ahead=1, forecast=10.5
+    # No persistence forecast given -> no skill, but a ranking row still
+    # exists (n=3, not confident since n < the raised min_n=4).
+    _seed_score_cache(
+        conn, variable="temperature", day_ahead=1, forecasts={feed_a: 10.5}
     )
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
     _seed_hourly(
         conn,
@@ -811,9 +795,6 @@ def test_mixed_representative_leads_stay_low_confidence_unconfident_winner() -> 
         variable="temperature",
         issued_at="2026-07-20T00:00:00Z",
         valid_ats=valid_ats,
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=feed_b, variable="temperature", day_ahead=0, forecast=10.5
     )
 
     conn.commit()
@@ -823,11 +804,14 @@ def test_mixed_representative_leads_stay_low_confidence_unconfident_winner() -> 
         ).status
         == "hit"
     )
+    # An active publication exists (seeded above for day_ahead=1), so every
+    # cell's leaderboard status is "hit" -- there is no "rebuilding" status
+    # any more -- even though day_ahead=0 has no ranking row for feed B.
     assert (
         leaderboard_with_status(
             conn, site_id=1, variable="temperature", day_ahead=0, window="rolling"
         ).status
-        == "rebuilding"
+        == "hit"
     )
 
     view = build_forecast(
@@ -839,97 +823,14 @@ def test_mixed_representative_leads_stay_low_confidence_unconfident_winner() -> 
     assert hourly["states"]["temperature"] == "low_confidence"
 
 
-def test_coverage_guard_splits_tile_and_drill_down_rebuilding_state() -> None:
-    """O8: the ONLY oracle in this suite where the tile and its own
-    drill-down are REQUIRED to disagree, and both are correct (D2). The
-    drill-down can read a more alarmed state than the tile, never the
-    reverse.
-
-    Feed A (rep day_ahead=1) covers >=18 hours -- clears the coverage guard
-    -- but has NO forecast_pairs at that cell, so its key is "empty" and it
-    reads pair_n=0. Feed B (rep day_ahead=0) covers 12-17 hours -- below the
-    guard but above the selection pool floor -- and has forecast_pairs with
-    no snapshot, so its key is genuinely "rebuilding". Neither is scored, so
-    rung 3 selects both feeds at the default blend depth of 2, ranked by
-    future-sample count (A's 20 samples outrank B's 14).
-
-    ``clearing_subset`` then keeps A alone for the tile: the tile's clearing
-    subset (A alone) never saw a rebuilding-keyed ranking, so it reads
-    low_confidence. ``build_hourly`` blends and plots the full selection,
-    A AND B, so it reads rebuilding -- true of what it actually draws.
-    """
-    conn = _make_db()
-    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
-    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-
-    # Feed A: representative day_ahead=1, 20 covered hours (clears the
-    # 18-hour coverage guard), no forecast_pairs at all -> "empty".
-    _seed_hourly(
-        conn,
-        feed_id=feed_a,
-        variable="temperature",
-        issued_at="2026-07-19T20:00:00Z",
-        valid_ats=_hours("2026-07-20", 0, 20),
-    )
-
-    # Feed B: representative day_ahead=0, 14 covered hours (clears the
-    # 12-hour selection floor but not the 18-hour coverage guard);
-    # forecast_pairs exist with no snapshot -> "rebuilding".
-    _seed_hourly(
-        conn,
-        feed_id=feed_b,
-        variable="temperature",
-        issued_at="2026-07-20T00:00:00Z",
-        valid_ats=_hours("2026-07-20", 4, 14),
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=feed_b, variable="temperature", day_ahead=0, forecast=10.5
-    )
-
-    conn.commit()
-    assert (
-        leaderboard_with_status(
-            conn, site_id=1, variable="temperature", day_ahead=1, window="rolling"
-        ).status
-        == "empty"
-    )
-    # Assertion 5: without this, a fixture that quietly produced "empty" for
-    # B (instead of the intended "rebuilding") would pass vacuously.
-    assert (
-        leaderboard_with_status(
-            conn, site_id=1, variable="temperature", day_ahead=0, window="rolling"
-        ).status
-        == "rebuilding"
-    )
-
-    view = build_forecast(
-        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
-    )
-    today = view.tiles[0]
-    # Assertion 1: the tile's clearing subset (A alone) never saw a
-    # rebuilding-keyed ranking.
-    assert today.temp.meta.state == "low_confidence"
-    # Assertion 2 (Item F): for temperature, ``meta.feeds`` names the
-    # EXTREMA set, not the blend set A/B were ranked into. Neither A (20 of
-    # 24 hours) nor B (14 of 24) covers the whole local day, so no candidate
-    # is extrema-eligible and the extrema set is empty -- neither feed is
-    # named, and the daily high/low are suppressed.
-    feed_ids = {ref.feed_id for ref in today.temp.meta.feeds}
-    assert feed_a not in feed_ids
-    assert feed_b not in feed_ids
-    assert today.temp.meta.extrema_unavailable is True
-
-    hourly = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
-    # Assertion 3: the ONLY kill in this plan for M9 (collapsing the
-    # drill-down onto the tile's width). This is by design: the drill-down
-    # can be more alarmed than the tile, never less (D2).
-    assert hourly["states"]["temperature"] == "rebuilding"
-    # Assertion 4: anchors that wider status to a chart that demonstrably
-    # contains B, not an assumption about what build_hourly selected.
-    hourly_feed_ids = {feed["feed_id"] for feed in hourly["feeds"]}
-    assert feed_a in hourly_feed_ids
-    assert feed_b in hourly_feed_ids
+# NOTE (storage release): ``test_coverage_guard_splits_tile_and_drill_down_
+# rebuilding_state`` (O8) is removed here, not updated. Its subject WAS the
+# "rebuilding" leaderboard status and its precedence against low_confidence
+# on the tile vs. the drill-down -- the published leaderboard
+# (scoring/leaderboard.py's ``_published_leaderboard``) never returns
+# "rebuilding" any more (only "hit", "live" or "empty"), so the disagreement
+# this test pinned can no longer occur; there is no updated assertion to
+# write in its place.
 
 
 # ---------------------------------------------------------------------------
@@ -1093,8 +994,7 @@ def test_build_hourly_hour_axis_reflects_selected_feed_only() -> None:
         valid_ats=_hours("2026-07-20", 4, 2),
     )
     _make_confident(conn, feed_id=winner_id, variable="temperature", day_ahead=1)
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
-    # Loser: not confident (no pairs), disjoint hours.
+    # Loser: not confident (no ranking row), disjoint hours.
     _seed_hourly(
         conn,
         feed_id=loser_id,
@@ -1136,43 +1036,6 @@ def test_build_hourly_wind_untrained_feed_is_not_served() -> None:
     assert payload["notes"] == {"wind": NOT_ENOUGH_FEEDS_NOTE}
 
 
-def _seed_wind_training(
-    conn: sqlite3.Connection, *, forecast_by_feed: dict[int, float], observed: float
-) -> None:
-    """Thirty complete training days before 2026-07-20 (UTC site 1).
-
-    Each feed's day-before 20:00Z run forecasts a constant wind for all 24
-    hours of each day at day_ahead 1, and the site observes a constant wind
-    for all 24 hours, so each feed's MAE is ``|forecast - observed|``.
-    """
-    for offset in range(1, 31):
-        target = date(2026, 7, 20) - timedelta(days=offset)
-        issued_at = f"{target - timedelta(days=1)}T20:00:00Z"
-        valid_ats = _hours(target.isoformat(), 0, 24)
-        for feed_id, forecast in forecast_by_feed.items():
-            for hour, valid_at in enumerate(valid_ats):
-                _insert_pair(
-                    conn,
-                    feed_id=feed_id,
-                    variable="wind",
-                    issued_at=issued_at,
-                    valid_at=valid_at,
-                    lead_hours=4 + hour,
-                    day_ahead=1,
-                    forecast=forecast,
-                    observed=observed,
-                )
-        for valid_at in valid_ats:
-            conn.execute(
-                """
-                INSERT INTO observations
-                    (site_id, variable, valid_at, value, n_stations, computed_at)
-                VALUES (1, 'wind', ?, ?, 1, ?)
-                """,
-                (valid_at, observed, valid_at),
-            )
-
-
 def _pause_feed(conn: sqlite3.Connection, pause_kind: str, feed_id: int) -> None:
     """Pause ``feed_id`` at site 1, per ``pause_kind`` ("none" is a no-op)."""
     if pause_kind == "none":
@@ -1187,18 +1050,18 @@ def _pause_feed(conn: sqlite3.Connection, pause_kind: str, feed_id: int) -> None
 
 
 def test_build_hourly_wind_series_weighted_and_kmh_converted() -> None:
-    """Two trained feeds: the wind line is their accuracy-weighted mean.
+    """Two published feeds: the wind line is their accuracy-weighted mean.
 
-    Observed 4.0 m/s every training day: feed A forecasts 5.0 (MAE 1.0,
-    weight 1.0) and feed B 6.0 (MAE 2.0, weight 0.5), normalized to 2/3 and
-    1/3. Tomorrow A says 4.0 m/s and B 7.0 m/s, so the weighted value is
-    5.0 m/s = 18.0 km/h (the unweighted mean would be 5.5 m/s = 19.8 km/h).
+    Feed A's published weight (1.0) stands in for an MAE of 1.0 and feed
+    B's (0.5) for an MAE of 2.0, normalized to 2/3 and 1/3. Tomorrow A says
+    4.0 m/s and B 7.0 m/s, so the weighted value is 5.0 m/s = 18.0 km/h
+    (the unweighted mean would be 5.5 m/s = 19.8 km/h).
     """
     conn = _make_db()
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_wind_training(conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0}, observed=4.0)
+    _seed_wind_publication(conn, weights_by_feed={feed_a: 1.0, feed_b: 0.5})
     hours = _hours("2026-07-20", 0, 24)
     for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0)):
         _seed_hourly(
@@ -1225,51 +1088,26 @@ def test_build_hourly_wind_series_weighted_and_kmh_converted() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A paused feed (global or site-level) never trains and never serves wind.
+# A paused feed (global or site-level) never serves wind.
+#
+# NOTE (storage release): the sibling training-side test (pausing feed C
+# dropping it out of ``load_wind_training``'s feed_highs) is removed here,
+# not updated -- ``load_wind_training`` no longer exists: wind weights come
+# only from the active publication's ``publication_wind_weights``, never a
+# live recompute from training pairs.
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("pause_kind", ["global", "site"])
-def test_wind_training_skips_paused_feed(pause_kind: str) -> None:
-    """Pausing feed C drops it out of ``load_wind_training``'s feed_highs.
-
-    Catches: no filter at all on the training read (``feed_c`` would stay
-    in ``after.feed_highs`` for both ``pause_kind`` values); a bare
-    ``feeds.enabled`` check (the ``site`` case alone would then still keep
-    ``feed_c``, since pausing via ``site_feed_state`` never flips
-    ``feeds.enabled``).
-    """
-    conn = _make_db()
-    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
-    feed_c = _feed_id(conn, "open-meteo", "icon_global")
-    _seed_wind_training(
-        conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0, feed_c: 4.5}, observed=4.0
-    )
-    conn.commit()
-
-    before = wind_blend.load_wind_training(
-        conn, site_id=1, timezone="UTC", today=date(2026, 7, 20), as_of=None
-    )
-    assert {feed_id for feed_id, _ in before.feed_highs} == {feed_a, feed_b, feed_c}
-
-    _pause_feed(conn, pause_kind, feed_c)
-    conn.commit()
-
-    after = wind_blend.load_wind_training(
-        conn, site_id=1, timezone="UTC", today=date(2026, 7, 20), as_of=None
-    )
-    assert {feed_id for feed_id, _ in after.feed_highs} == {feed_a, feed_b}
 
 
 @pytest.mark.parametrize("pause_kind", ["global", "site"])
 def test_build_hourly_wind_excludes_paused_feed(pause_kind: str) -> None:
     """Pausing feed C drops it from the served wind blend and its weights.
 
-    Before the pause, A (weight 1/MAE=1.0), B (0.5), and C (2.0) blend
-    tomorrow's 4.0/7.0/9.0 m/s to 25.5/3.5 m/s = 26.23 km/h. After, only A
-    and B remain and the blend/weights match the two-feed baseline above
-    (18.0 km/h, 2/3 and 1/3).
+    Before the pause, A (weight 1.0), B (0.5), and C (2.0) blend tomorrow's
+    4.0/7.0/9.0 m/s to 25.5/3.5 m/s = 26.23 km/h. After, only A and B remain
+    and the blend/weights match the two-feed baseline above (18.0 km/h, 2/3
+    and 1/3). Pausing a feed only narrows the candidate pool, never the
+    publication's weight rows, so no re-seeding is needed for the "after"
+    call.
 
     Catches: no filter on the serving path (the post-pause blend, weights,
     and ``payload["feeds"]`` would still include C, identical to the
@@ -1280,8 +1118,8 @@ def test_build_hourly_wind_excludes_paused_feed(pause_kind: str) -> None:
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     feed_c = _feed_id(conn, "open-meteo", "icon_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_wind_training(
-        conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0, feed_c: 4.5}, observed=4.0
+    _seed_wind_publication(
+        conn, weights_by_feed={feed_a: 1.0, feed_b: 0.5, feed_c: 2.0}
     )
     hours = _hours("2026-07-20", 0, 24)
     for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0), (feed_c, 9.0)):
@@ -1392,7 +1230,6 @@ def test_paused_feed_does_not_narrow_the_pool(pause_kind: str) -> None:
         valid_ats=_hours("2026-07-20", 4, 4),
     )
     _make_confident(conn, feed_id=feed_a, variable="temperature", day_ahead=1)
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
     _seed_hourly(
         conn,
         feed_id=feed_b,
@@ -1426,15 +1263,14 @@ def test_drop_takes_a_member_off_the_served_wind() -> None:
     feed's own row.
 
     A real meteoblue member registers through the fetcher's own
-    registration path, trains alongside two open-meteo feeds, and is
-    confirmed served, weighted and trained BEFORE the pause (so the pass
-    below is not vacuous); the pause then removes it from all four.
+    registration path, published alongside two open-meteo feeds, and is
+    confirmed served and weighted BEFORE the pause (so the pass below is
+    not vacuous); the pause then removes it from both.
 
     Catches: a pause that misses the member row the fetcher creates (wrong
     ``source`` or case -- the member would keep its control-era payload
-    weight); Step 3 missing (the member would stay in the training ids;
-    the payload alone cannot show this, because Step 2 already drops the
-    member's samples from ``build_hourly``'s candidates).
+    weight); Step 2 missing (the member's samples would stay in
+    ``build_hourly``'s candidates and the payload would still include it).
     """
     conn = _make_db()
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
@@ -1448,10 +1284,8 @@ def test_drop_takes_a_member_off_the_served_wind() -> None:
         (package_id,),
     )
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_wind_training(
-        conn,
-        forecast_by_feed={feed_a: 5.0, feed_b: 6.0, feed_m: 4.5},
-        observed=4.0,
+    _seed_wind_publication(
+        conn, weights_by_feed={feed_a: 1.0, feed_b: 0.5, feed_m: 2.0}
     )
     hours = _hours("2026-07-20", 0, 24)
     for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0), (feed_m, 9.0)):
@@ -1465,12 +1299,6 @@ def test_drop_takes_a_member_off_the_served_wind() -> None:
         )
     conn.commit()
 
-    def _training_ids() -> set[int]:
-        training = wind_blend.load_wind_training(
-            conn, site_id=1, timezone="UTC", today=date(2026, 7, 20), as_of=None
-        )
-        return {feed_id for feed_id, _ in training.feed_highs}
-
     before = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
     assert before["weights"] == {
         "wind": {
@@ -1481,7 +1309,6 @@ def test_drop_takes_a_member_off_the_served_wind() -> None:
     }
     assert before["blend"]["wind_kmh"] == pytest.approx([25.5 / 3.5 * 3.6] * 24)
     assert feed_m in {feed["feed_id"] for feed in before["feeds"]}
-    assert _training_ids() == {feed_a, feed_b, feed_m}
 
     pause_dropped_meteoblue_members(conn)
     conn.commit()
@@ -1493,7 +1320,6 @@ def test_drop_takes_a_member_off_the_served_wind() -> None:
     assert after["blend"]["wind_kmh"] == pytest.approx([18.0] * 24)
     assert after["notes"] == {"wind": None}
     assert feed_m not in {feed["feed_id"] for feed in after["feeds"]}
-    assert _training_ids() == {feed_a, feed_b}
 
 
 # ---------------------------------------------------------------------------
@@ -1528,7 +1354,6 @@ def test_far_horizon_multipoint_feed_rescues_collapsed_tile() -> None:
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)  # local date 2026-07-20
     set_setting(conn, "forecast_blend_depth", "1")
     _seed_far_horizon_collapse(conn)
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=7)
 
     conn.commit()
     view = build_forecast(
@@ -1580,16 +1405,14 @@ def test_near_tile_skill_still_decides_end_to_end() -> None:
         valid_ats=hrs,
         values=[20.0 + i * 0.1 for i in range(24)],
     )
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="temperature", day_ahead=1, forecast=8.0
+    # high_id's forecast is nearer persistence's observed baseline than
+    # low_id's -> higher skill.
+    _seed_score_cache(
+        conn,
+        variable="temperature",
+        day_ahead=1,
+        forecasts={persistence_id: 8.0, high_id: 10.2, low_id: 11.0},
     )
-    _seed_scoring_pairs(
-        conn, feed_id=high_id, variable="temperature", day_ahead=1, forecast=10.2
-    )  # higher skill
-    _seed_scoring_pairs(
-        conn, feed_id=low_id, variable="temperature", day_ahead=1, forecast=11.0
-    )  # lower skill
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
     conn.commit()
     view = build_forecast(
@@ -1611,7 +1434,6 @@ def test_build_hourly_far_tile_is_not_a_single_point() -> None:
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
     set_setting(conn, "forecast_blend_depth", "1")
     _seed_far_horizon_collapse(conn)
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=7)
 
     conn.commit()
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=7, now=now)
@@ -1672,16 +1494,13 @@ def test_far_horizon_multipoint_tier_rescues_when_best_below_adequate() -> None:
         lead_hours=12,
         value=25.0,
     )
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="temperature", day_ahead=7, forecast=8.0
+    # degenerate OUT-skills partial (forecast nearer observed 10.0).
+    _seed_score_cache(
+        conn,
+        variable="temperature",
+        day_ahead=7,
+        forecasts={persistence_id: 8.0, degenerate_id: 10.2, partial_id: 11.0},
     )
-    _seed_scoring_pairs(
-        conn, feed_id=degenerate_id, variable="temperature", day_ahead=7, forecast=10.2
-    )  # higher skill
-    _seed_scoring_pairs(
-        conn, feed_id=partial_id, variable="temperature", day_ahead=7, forecast=11.0
-    )  # lower skill
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=7)
 
     conn.commit()
     view = build_forecast(
@@ -1758,22 +1577,20 @@ def test_far_horizon_two_single_slot_feeds_collapse_at_default_depth() -> None:
         lead_hours=12,
         value=10.43,
     )
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="temperature", day_ahead=7, forecast=8.0
-    )
     # Both single-slot feeds out-skill the covered feed (forecast nearer the
     # seeded observed 10.0 => lower MSE => higher skill), so pre-fix the top-2
     # ladder selects BOTH of them and never the covered feed.
-    _seed_scoring_pairs(
-        conn, feed_id=single_a, variable="temperature", day_ahead=7, forecast=10.1
+    _seed_score_cache(
+        conn,
+        variable="temperature",
+        day_ahead=7,
+        forecasts={
+            persistence_id: 8.0,
+            single_a: 10.1,
+            single_b: 10.2,
+            covered: 11.0,
+        },
     )
-    _seed_scoring_pairs(
-        conn, feed_id=single_b, variable="temperature", day_ahead=7, forecast=10.2
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=covered, variable="temperature", day_ahead=7, forecast=11.0
-    )
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=7)
 
     conn.commit()
     view = build_forecast(

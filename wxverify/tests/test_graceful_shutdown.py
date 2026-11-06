@@ -36,13 +36,11 @@ from wxverify.api.app import _cancel_and_reap, create_app, lifespan
 from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.connection import Database, close_db, get_db, init_db
 from wxverify.db.queue import (
-    claim_next_current_obs_job,
     claim_next_job,
     reclaim_all_stale,
 )
 from wxverify.worker.processor import (
     _shutdown_reclaim,  # noqa: PLC2701
-    run_claimed_job,
     run_worker,
 )
 from wxverify.worker.station_pacing import weathercom_call_lock
@@ -569,13 +567,13 @@ def test_cancellation_inside_claim_transaction_reclaims_cleanly_without_a_boot_s
 def test_startup_failure_after_task_creation_still_reaps_every_task(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A startup failure AFTER all three tasks exist must still cancel and
+    """A startup failure AFTER both tasks exist must still cancel and
     await every one of them to completion.
 
-    Catches: the pre-fix shape where the three ``create_task`` calls sit
+    Catches: the pre-fix shape where the two ``create_task`` calls sit
     ABOVE the ``try:``. There, a raise from ``publish_discovery`` (which
-    runs after all three creations, before ``yield``) never enters the
-    ``try``, so the ``finally`` never runs and all three tasks leak --
+    runs after both creations, before ``yield``) never enters the
+    ``try``, so the ``finally`` never runs and both tasks leak --
     cancelled never, awaited never.
     """
     _init_tmp_db(tmp_path)
@@ -603,15 +601,12 @@ def test_startup_failure_after_task_creation_still_reaps_every_task(
         "wxverify.api.routes.db_transfer.run_export_sweeper",
         _make_stub("export sweeper"),
     )
-    monkeypatch.setattr(
-        "wxverify.api.app.warm_read_cache", _make_stub("read-cache warm")
-    )
 
     async def _boom(_port: int) -> None:
         # The leading `await asyncio.sleep(0)` is not padding: `create_task`
         # only SCHEDULES a task via `call_soon`, it does not run it. Without
         # an intervening scheduling turn here, a synchronous raise never
-        # yields control back to the loop, so the three just-created tasks
+        # yields control back to the loop, so the two just-created tasks
         # never reach their first `await` before `.cancel()` lands on them
         # in the `finally`. Cancelling a task that has never been stepped
         # throws `CancelledError` in at the very top of its coroutine --
@@ -619,8 +614,8 @@ def test_startup_failure_after_task_creation_still_reaps_every_task(
         # never fire even against CORRECT code, silently destroying this
         # test's ability to discriminate (verified empirically: dropping
         # this line collapses `reaped` to `[]` under the fix too, not only
-        # under the base). One scheduling turn is enough for all three
-        # tasks to reach their `asyncio.Event().wait()`.
+        # under the base). One scheduling turn is enough for both tasks to
+        # reach their `asyncio.Event().wait()`.
         await asyncio.sleep(0)
         raise RuntimeError("discovery boom")
 
@@ -638,7 +633,7 @@ def test_startup_failure_after_task_creation_still_reaps_every_task(
         # asserting here (rather than after asyncio.run) is load-bearing --
         # asyncio.run's own loop teardown would reap the leaked tasks too
         # and make a post-run assertion pass vacuously.
-        assert sorted(reaped) == ["export sweeper", "read-cache warm", "worker"]
+        assert sorted(reaped) == ["export sweeper", "worker"]
 
     asyncio.run(_run())
     assert stopped == [], "the default hard-kill stop_process must never fire"
@@ -682,9 +677,6 @@ def test_a_failing_task_does_not_prevent_sibling_reaping(
     monkeypatch.setattr(
         "wxverify.api.routes.db_transfer.run_export_sweeper", _crashing_sweeper
     )
-    monkeypatch.setattr(
-        "wxverify.api.app.warm_read_cache", _make_stub("read-cache warm")
-    )
 
     async def _noop_discovery(_port: int) -> None:
         return None
@@ -707,7 +699,7 @@ def test_a_failing_task_does_not_prevent_sibling_reaping(
             await cm.__aexit__(None, None, None)
         # No await since __aexit__ returned: the assertion must sit before
         # asyncio.run's own teardown can reap anything on its own.
-        assert sorted(reaped) == ["read-cache warm", "worker"]
+        assert sorted(reaped) == ["worker"]
 
     asyncio.run(_run())
 
@@ -744,8 +736,9 @@ def test_a_failing_task_does_not_prevent_sibling_reaping(
 # analogues of a second real cancellation reaching `lifespan()`'s `finally`
 # while it awaits `_cancel_and_reap`; this one is chosen because it keeps
 # `__aenter__` (task creation) off the task being cancelled, so the
-# cancellation is guaranteed to land exactly at the `await
-# asyncio.shield(reap)` inside `_cancel_and_reap` and nowhere earlier.
+# cancellation is guaranteed to land exactly at the `await asyncio.wait(...,
+# timeout=left)` inside `core.stop.wait_within_budget` (called from
+# `_cancel_and_reap`) and nowhere earlier.
 # ---------------------------------------------------------------------------
 
 
@@ -770,9 +763,9 @@ def _make_gated_worker_stub(
 
 
 def _make_immediate_stub(_name: str):
-    """A sibling stand-in (export sweeper / read-cache warm) that reacts to
-    cancellation immediately, with no gating -- only the worker stub above
-    needs to be held open for these tests' rendezvous."""
+    """A sibling stand-in (export sweeper) that reacts to cancellation
+    immediately, with no gating -- only the worker stub above needs to be
+    held open for these tests' rendezvous."""
 
     async def _stub(*_args: object) -> None:
         try:
@@ -786,8 +779,8 @@ def _make_immediate_stub(_name: str):
 def _wire_gated_lifespan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[list[str], asyncio.Event, asyncio.Event, list[None]]:
-    """Shared wiring for T3, T5 and T7: a gated worker plus two immediately
-    re-raising siblings, with a noop discovery publish and a captured
+    """Shared wiring for T3, T5 and T7: a gated worker plus an immediately
+    re-raising sibling, with a noop discovery publish and a captured
     ``stop_process`` (the production default is ``os._exit(1)``, which would
     kill the test process outright)."""
     order: list[str] = []
@@ -800,13 +793,10 @@ def _wire_gated_lifespan(
         "wxverify.api.routes.db_transfer.run_export_sweeper",
         _make_immediate_stub("export sweeper"),
     )
-    monkeypatch.setattr(
-        "wxverify.api.app.warm_read_cache", _make_immediate_stub("read-cache warm")
-    )
 
     # This coroutine has no `await` in its body, so awaiting it never
     # yields control back to the loop -- `__aenter__` therefore runs
-    # straight through to `yield` without ever stepping the three
+    # straight through to `yield` without ever stepping the two
     # `create_task`ed tasks. It is the test's later `await entered.wait()`
     # / `await sweeper_reached_raise.wait()` that first suspends and lets
     # the loop run them, which is what gets every stub past its own first
@@ -825,14 +815,15 @@ def test_second_cancellation_is_shielded_from_children(
     """A second cancellation of shutdown must not reach the worker mid-reap,
     and shutdown cannot finish before the worker's own cleanup does.
 
-    Catches: the shield-removal mutant, i.e. `_cancel_and_reap`'s body as it
-    was before this fix -- a bare `await asyncio.gather(*handles,
-    return_exceptions=True)` with no shield, no loop, and no re-raise. Under
-    that shape, cancelling the `shutdown` task cancels the `_GatheringFuture`
-    directly, which re-cancels every unfinished child -- the worker's
-    `await release.wait()` raises `CancelledError` there instead of
-    returning normally, so its handler aborts and `"worker-cleanup-done"` is
-    never appended.
+    Catches: the retry-loop-removal mutant, i.e. `_cancel_and_reap`'s body as
+    it was before this fix -- a bare `await asyncio.gather(*handles,
+    return_exceptions=True)` with no bounded wait, no retry loop (no
+    `core.stop.wait_within_budget`), and no re-raise. Under that shape,
+    cancelling the `shutdown` task cancels the `_GatheringFuture` directly,
+    which re-cancels every unfinished child -- the worker's `await
+    release.wait()` raises `CancelledError` there instead of returning
+    normally, so its handler aborts and `"worker-cleanup-done"` is never
+    appended.
     """
     _init_tmp_db(tmp_path)
     order, entered, release, stopped = _wire_gated_lifespan(monkeypatch)
@@ -862,7 +853,7 @@ def test_outcome_report_survives_second_cancellation(
     """A sibling failure discovered before shutdown even starts must still
     be reported by name after a second cancellation lands mid-reap.
 
-    Catches: the same shield-removal mutant as
+    Catches: the same retry-loop-removal mutant as
     `test_second_cancellation_is_shielded_from_children`, through a
     different mechanism -- under it, the second `.cancel()` makes the bare
     `await gather(...)` raise instead of returning the results list, so the
@@ -966,39 +957,46 @@ def test_second_cancellation_is_deferred_not_swallowed(
 def test_shielded_reap_survives_repeated_cancellation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_count: int
 ) -> None:
-    """The shield holds across N cancellations, not just the first.
+    """The `wait_within_budget` retry loop holds across N cancellations, not
+    just the first.
 
-    Catches: the partial-fix mutant `try: await asyncio.shield(reap) except
-    asyncio.CancelledError: ...` WITHOUT the enclosing `while not
-    reap.done():`. Empirically (verified against a scratch mutant, not just
-    theorized) that mutant falls straight through to `reap.result()` the
-    moment ONE cancellation is caught, and this harness's worker stub is
-    still deliberately parked on `release.wait()` at that point -- so
-    `reap.result()` raises `InvalidStateError` on the very first cancel,
-    before a second is ever issued. Both parametrized cases (`cancel_count`
-    1 and 2) therefore kill this mutant at the same divergence point for the
-    same reason; they are not two different discriminators here.
+    Catches: the partial-fix mutant `try: await asyncio.wait(pending,
+    timeout=left) except asyncio.CancelledError: ...` WITHOUT the enclosing
+    `while True:` retry loop in `core.stop.wait_within_budget`. Empirically
+    (verified against a scratch mutant, not just theorized) that mutant
+    falls straight through to `reap.result()` the moment ONE cancellation is
+    caught, and this harness's worker stub is still deliberately parked on
+    `release.wait()` at that point -- so `reap.result()` raises
+    `InvalidStateError` on the very first cancel, before a second is ever
+    issued. Both parametrized cases (`cancel_count` 1 and 2) therefore kill
+    this mutant at the same divergence point for the same reason; they are
+    not two different discriminators here.
     `test_second_cancellation_is_shielded_from_children` kills that same
     mutant at that same `reap.result()`, so this test is not its only
     pin; and no construction can restore a 1-vs-2 split against it,
     because the mutant reaches `reap.result()` in the same synchronous
     step in which it catches the cancellation, while a `reap` that is
-    already done makes `asyncio.shield` return the inner future
-    outright, leaving no await at which a cancellation could be
-    delivered. The parametrize is kept because it is still the direct expression of the
-    property the `while` loop provides -- "retry across N cancels, not just
-    one" -- and this is no longer hypothetical: a single-retry mutant
-    (`try: await asyncio.shield(reap) except CancelledError: cancelled =
-    exc; await asyncio.shield(reap)`, i.e. one manual retry instead of the
-    `while` loop, so it DOES reach `reap.result()` only once `reap` is
-    actually done rather than mid-cancel) was built and measured, not
-    predicted. `cancel_count=1` is the matched control and PASSES against
-    it; `cancel_count=2` FAILS against it, with `order ==
-    ["shutdown-returned"]` instead of `["worker-cleanup-done",
-    "shutdown-returned"]` -- the second cancel outruns the retry's own
-    reap. `cancel_count=2` is therefore this test's discriminator for that
-    mutant, distinct from the shield-removal mutant both cases catch
-    identically above.
+    already done makes `wait_within_budget`'s loop return immediately
+    without ever calling `asyncio.wait`, leaving no await at which a
+    cancellation could be delivered. The parametrize is kept because it is
+    still the direct expression of the property the `while` loop provides
+    -- "retry across N cancels, not just one" -- and this is no longer
+    hypothetical: a single-retry mutant
+    (`try: await asyncio.wait(pending, timeout=left) except CancelledError
+    as exc: cancelled = exc; await asyncio.wait(pending, timeout=left)`,
+    i.e. one manual retry instead of the `while True` loop, so it DOES
+    reach `reap.result()` only once `reap` is actually done rather than
+    mid-cancel) was built and measured, not predicted, against the
+    `asyncio.shield`-based shape this test predates; the `asyncio.wait`
+    form above is the same mutant expressed against the current
+    `wait_within_budget` loop, not an independently re-measured one.
+    `cancel_count=1` is
+    the matched control and PASSES against it; `cancel_count=2` FAILS
+    against it, with `order == ["shutdown-returned"]` instead of
+    `["worker-cleanup-done", "shutdown-returned"]` -- the second cancel
+    outruns the retry's own reap. `cancel_count=2` is therefore this test's
+    discriminator for that mutant, distinct from the retry-loop-removal
+    mutant both cases catch identically above.
     """
     _init_tmp_db(tmp_path)
     order, entered, release, stopped = _wire_gated_lifespan(monkeypatch)
@@ -1029,11 +1027,12 @@ def test_cancel_and_reap_with_no_tasks_is_a_noop(
     """`_cancel_and_reap([])` completes, returns `None`, and emits no
     `wxverify.api.app` records.
 
-    Shape guard, not a shielding discriminator: `gather()` with zero
+    Shape guard, not a wait-loop discriminator: `gather()` with zero
     arguments returns an already-resolved plain future rather than a
     `_GatheringFuture`, so `reap.done()` is `True` immediately and the
-    shield loop's body never runs -- this test cannot tell a shielded reap
-    from an unshielded one. It exists only to catch a `zip(...,
+    `wait_within_budget` loop's body never runs -- this test cannot tell a
+    budget-bounded wait from an unbounded one. It exists only to catch a
+    `zip(...,
     strict=True)` mis-pairing regression and any rewrite that indexes
     `handles[0]` or awaits unconditionally in a way that raises on an empty
     task list.
@@ -1097,9 +1096,6 @@ def test_close_runs_only_after_the_reaps_write_commits(
     monkeypatch.setattr(
         "wxverify.api.routes.db_transfer.run_export_sweeper",
         _make_immediate_stub("export sweeper"),
-    )
-    monkeypatch.setattr(
-        "wxverify.api.app.warm_read_cache", _make_immediate_stub("read-cache warm")
     )
 
     async def _noop_discovery(_port: int) -> None:
@@ -1455,9 +1451,6 @@ def test_close_failure_reported_not_propagated(
         "wxverify.api.routes.db_transfer.run_export_sweeper",
         _make_immediate_stub("export sweeper"),
     )
-    monkeypatch.setattr(
-        "wxverify.api.app.warm_read_cache", _make_immediate_stub("read-cache warm")
-    )
 
     async def _noop_discovery(_port: int) -> None:
         return None
@@ -1500,7 +1493,7 @@ def test_close_failure_reported_not_propagated(
 def test_startup_failure_after_task_creation_still_closes_the_database(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A startup failure AFTER all three tasks exist must still close the
+    """A startup failure AFTER both tasks exist must still close the
     database, not merely reap the tasks -- and pins F6's boundary: this is
     the failure case that IS covered, since it fires after the
     task-creation ``try`` opens.
@@ -1528,9 +1521,6 @@ def test_startup_failure_after_task_creation_still_closes_the_database(
         "wxverify.api.routes.db_transfer.run_export_sweeper",
         _make_stub("export sweeper"),
     )
-    monkeypatch.setattr(
-        "wxverify.api.app.warm_read_cache", _make_stub("read-cache warm")
-    )
 
     real_close_if_idle = Database.close_if_idle
 
@@ -1554,7 +1544,7 @@ def test_startup_failure_after_task_creation_still_closes_the_database(
         cm = lifespan(app)
         with pytest.raises(RuntimeError, match="discovery boom"):
             await cm.__aenter__()
-        assert sorted(reaped) == ["export sweeper", "read-cache warm", "worker"]
+        assert sorted(reaped) == ["export sweeper", "worker"]
         assert order == ["db-closed"]
 
     asyncio.run(_run())
@@ -1574,8 +1564,9 @@ def test_startup_failure_after_task_creation_still_closes_the_database(
 # `wxverify.worker.processor` import-site attributes, the same seam
 # `idle_current_obs_poller` uses elsewhere); C3's plain-cancel/interrupted-
 # drain cases do the same; C3's repeated-cancel case unit-tests
-# `_shutdown_reclaim` directly; C4's stale-generation case and DL4/DL5 drive
-# a REAL tmp `Database` end to end, matching this file's existing idiom.
+# `_shutdown_reclaim` directly; DL4/DL5 drive a REAL tmp `Database` end to
+# end, matching this file's existing idiom. (C4, the stale-generation case,
+# was removed with the generation fence itself -- storage-release plan 5.5.)
 # ---------------------------------------------------------------------------
 
 
@@ -1996,265 +1987,6 @@ def test_app_level_stop_reports_the_failing_lanes_exception_by_identity(
     assert len(crashed) == 1, [r.getMessage() for r in caplog.records]
     exc_info = crashed[0].exc_info
     assert exc_info is not None and exc_info[1] is poller_exc
-
-
-def test_c4_stale_generation_between_reserve_and_outcome_abandons_only_that_job(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """C4 -- the stale-generation case: a database replacement (import) that
-    lands between the current-obs lane's reserve and its outcome write
-    abandons only that job, releases the call lock, and does not disturb
-    the other lane's ability to keep claiming.
-
-    Construction: `wxverify.worker.processor.fetch_current_observation` --
-    the provider call that runs strictly BETWEEN the reserve write and the
-    outcome write inside `_fetch_current_obs` -- bumps `db._generation` as a
-    side effect before returning its canned reply, landing the swap in
-    exactly that window without a real import.
-
-    NOTE on the "ordinary failure" mutant (`run_claimed_job` letting
-    `StaleGenerationError` fall into the generic `except Exception` branch
-    instead of the immediate `raise`): empirically verified EQUIVALENT under
-    every assertion in THIS test. `FencedWriter.write` rejects with
-    `StaleGenerationError` before its callback ever runs (the generation
-    check happens inside `write_fenced`, before `_call()`), so the generic
-    branch's own `_fail_job` write raises the identical
-    `StaleGenerationError`, which is caught by this same outer handler --
-    same INFO log, same untouched job row, same released lock. The one real
-    divergence is write-lock contention (the mutant's doomed write briefly
-    queues on `Database._write_lock`; the immediate raise never touches it)
-    -- see `test_c4_ordinary_failure_mutant_would_block_on_the_write_lock`
-    below for the oracle that samples inside that window.
-    """
-    conn = _init_tmp_db(tmp_path)
-    Path(config.options_path).write_text(
-        json.dumps({"weathercom_key": "ci-placeholder"}), encoding="utf-8"
-    )
-    db = get_db()
-
-    cur = conn.execute(
-        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone, "
-        "enabled) VALUES ('C4 Site', 40.0, -105.0, 900.0, 'UTC', 1)"
-    )
-    site_id = cur.lastrowid
-    assert site_id is not None
-    cur = conn.execute(
-        "INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m) "
-        "VALUES (?, 'ISTATION-C4', 40.0, -105.0, 900.0)",
-        (site_id,),
-    )
-    station_id = cur.lastrowid
-    assert station_id is not None
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, payload, status, max_retries) "
-        "VALUES ('fetch_current_obs', ?, ?, ?, 'pending', 3)",
-        (site_id, f"curobs:{station_id}", json.dumps({"station_id": station_id})),
-    )
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, payload, status, max_retries) "
-        "VALUES ('fetch_obs', ?, 'obs', '{}', 'pending', 3)",
-        (site_id,),
-    )
-    conn.commit()
-
-    def _online_body() -> bytes:
-        return json.dumps(
-            {
-                "observations": [
-                    {
-                        "obsTimeUtc": "2026-07-10T11:55:00Z",
-                        "humidity": 50.0,
-                        "winddir": 180.0,
-                        "uv": 1.0,
-                        "neighborhood": "Test Quarter",
-                        "metric": {
-                            "temp": 20.0,
-                            "dewpt": 10.0,
-                            "windSpeed": 5.0,
-                            "windGust": 8.0,
-                            "pressure": 1012.0,
-                            "precipRate": 0.0,
-                            "precipTotal": 0.0,
-                        },
-                    }
-                ]
-            }
-        ).encode()
-
-    async def _bump_generation_then_reply(
-        pws_station_id: str,
-        api_key: str,
-        *,
-        client: httpx.AsyncClient | None = None,
-        timeout_seconds: float = 10.0,
-    ) -> httpx.Response:
-        db._generation += 1  # noqa: SLF001 -- simulates an import replacing the db
-        return httpx.Response(
-            200,
-            content=_online_body(),
-            headers={"content-type": "application/json"},
-            request=httpx.Request(
-                "GET", "https://api.weather.com/v2/pws/observations/current"
-            ),
-        )
-
-    monkeypatch.setattr(
-        "wxverify.worker.processor.fetch_current_observation",
-        _bump_generation_then_reply,
-    )
-
-    async def _run() -> None:
-        lock = weathercom_call_lock()
-        job = await db.write(claim_next_current_obs_job)
-        assert job is not None
-
-        with caplog.at_level(logging.INFO, logger="wxverify.worker.processor"):
-            await run_claimed_job(db, job, lane="current_obs")
-
-        row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job.id,)).fetchone()
-        assert row is not None and row["status"] == "running", (
-            "an abandoned job is left exactly as claimed -- no further write "
-            "is safe against a generation it no longer belongs to"
-        )
-        assert lock.locked() is False
-        abandoned = [r for r in caplog.records if "job abandoned id=" in r.getMessage()]
-        assert len(abandoned) == 1, [r.getMessage() for r in caplog.records]
-
-        # The other lane keeps claiming: the unrelated main-lane job seeded
-        # above is still claimable after the current-obs lane's abandon.
-        other = await db.write(claim_next_job)
-        assert other is not None and other.type == "fetch_obs"
-
-    asyncio.run(_run())
-
-
-def test_c4_ordinary_failure_mutant_attempts_a_second_fenced_write(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """C4 discriminator: exactly two fenced writes are attempted while
-    abandoning a stale-generation job -- the reserve (which still matches
-    the generation it was captured under) and the outcome write that
-    discovers the swap and raises `StaleGenerationError`. Nothing
-    downstream retries a further write against a generation the job no
-    longer belongs to.
-
-    This is the oracle that samples INSIDE the window the main C4 test
-    cannot see: the "ordinary failure" mutant (letting `StaleGenerationError`
-    fall into the generic `except Exception` branch instead of the immediate
-    `raise`) is equivalent to the correct code at every END state the main
-    C4 test asserts -- same log, same job row, same released call lock --
-    because `FencedWriter.write` rejects with `StaleGenerationError` before
-    its callback ever runs, so the generic branch's own `_fail_job` write
-    raises the identical error, caught by the same outer handler. The
-    divergence is COUNT, not outcome: the mutant issues a second, doomed
-    `writer.write` call (the generic branch's `_fail_job` attempt) that the
-    correct code never reaches.
-
-    Mutant: `run_claimed_job` letting `StaleGenerationError` propagate via
-    the generic branch instead of raising immediately -- `write_fenced`
-    call count would be 3, not 2.
-    """
-    conn = _init_tmp_db(tmp_path)
-    Path(config.options_path).write_text(
-        json.dumps({"weathercom_key": "ci-placeholder"}), encoding="utf-8"
-    )
-    db = get_db()
-
-    cur = conn.execute(
-        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone, "
-        "enabled) VALUES ('C4b Site', 40.0, -105.0, 900.0, 'UTC', 1)"
-    )
-    site_id = cur.lastrowid
-    assert site_id is not None
-    cur = conn.execute(
-        "INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m) "
-        "VALUES (?, 'ISTATION-C4B', 40.0, -105.0, 900.0)",
-        (site_id,),
-    )
-    station_id = cur.lastrowid
-    assert station_id is not None
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, payload, status, max_retries) "
-        "VALUES ('fetch_current_obs', ?, ?, ?, 'pending', 3)",
-        (site_id, f"curobs:{station_id}", json.dumps({"station_id": station_id})),
-    )
-    conn.commit()
-
-    def _online_body() -> bytes:
-        return json.dumps(
-            {
-                "observations": [
-                    {
-                        "obsTimeUtc": "2026-07-10T11:55:00Z",
-                        "humidity": 50.0,
-                        "winddir": 180.0,
-                        "uv": 1.0,
-                        "neighborhood": "Test Quarter",
-                        "metric": {
-                            "temp": 20.0,
-                            "dewpt": 10.0,
-                            "windSpeed": 5.0,
-                            "windGust": 8.0,
-                            "pressure": 1012.0,
-                            "precipRate": 0.0,
-                            "precipTotal": 0.0,
-                        },
-                    }
-                ]
-            }
-        ).encode()
-
-    async def _bump_generation_then_reply(
-        pws_station_id: str,
-        api_key: str,
-        *,
-        client: httpx.AsyncClient | None = None,
-        timeout_seconds: float = 10.0,
-    ) -> httpx.Response:
-        db._generation += 1  # noqa: SLF001 -- simulates an import replacing the db
-        return httpx.Response(
-            200,
-            content=_online_body(),
-            headers={"content-type": "application/json"},
-            request=httpx.Request(
-                "GET", "https://api.weather.com/v2/pws/observations/current"
-            ),
-        )
-
-    monkeypatch.setattr(
-        "wxverify.worker.processor.fetch_current_observation",
-        _bump_generation_then_reply,
-    )
-
-    fenced_write_calls = 0
-    real_write_fenced = type(db).write_fenced
-
-    async def _counting_write_fenced(
-        self: Any, fn: Any, *, generation: int, epoch_exempt: bool = False
-    ) -> Any:
-        nonlocal fenced_write_calls
-        fenced_write_calls += 1
-        return await real_write_fenced(
-            self, fn, generation=generation, epoch_exempt=epoch_exempt
-        )
-
-    monkeypatch.setattr(type(db), "write_fenced", _counting_write_fenced)
-
-    async def _run() -> None:
-        job = await db.write(claim_next_current_obs_job)
-        assert job is not None
-
-        nonlocal fenced_write_calls
-        fenced_write_calls = 0  # exclude the claim write above
-        await run_claimed_job(db, job, lane="current_obs")
-
-        assert fenced_write_calls == 2, (
-            "exactly two fenced writes (the reserve, then the outcome write "
-            f"that discovers the stale generation) should be attempted; "
-            f"saw {fenced_write_calls}"
-        )
-
-    asyncio.run(_run())
 
 
 def test_dl5_cancel_mid_call_releases_the_lock_and_reclaims_the_job(

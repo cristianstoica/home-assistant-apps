@@ -25,7 +25,7 @@ from typing import Final
 
 import pytest
 
-from tests.helpers import D, day_close_site, note_day_clock
+from tests.helpers import D, close_off, day_close_site, note_day_clock
 from wxverify import config
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import close_db, init_db
@@ -208,6 +208,7 @@ def test_wp1_refusals_name_the_close_when_it_is_off(tmp_path: Path) -> None:
     from wxverify.db.switch import history_prune_refusals
 
     conn = _init_tmp_db(tmp_path)
+    close_off(conn)
     refusals = history_prune_refusals(conn)
     assert len(refusals) == 1, refusals
 

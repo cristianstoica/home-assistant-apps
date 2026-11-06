@@ -26,9 +26,8 @@ from tests.helpers import (
     NOW,
     D,
     asof_conn,
-    asof_insert_pair,
-    asof_make_real_feed,
     asof_make_site,
+    close_off,
     day_close_site,
     note_day_clock,
 )
@@ -57,11 +56,9 @@ from wxverify.db.site_days import (
     finish_close,
     local_clock_utc,
     mark_missed,
-    open_day_clause,
     open_day_on_copy,
     record_station_change,
     start_site_days,
-    writable_pairs_clause,
     zone_flagged,
 )
 
@@ -162,6 +159,7 @@ def _ds8_fixture(
     """Build one of DS8's state fixtures; return (conn, site_id, instant, date)."""
     if state == "close_off":
         conn = asof_conn()
+        close_off(conn)
         site_id = day_close_site(conn, close_on=False, with_records=False)
         return conn, site_id, isoformat_utc(NOW), D
 
@@ -210,9 +208,13 @@ def test_ds8_check_day_write_matches_table_5_2(state: str, kind: WriteKind) -> N
     )
 
 
-@pytest.mark.parametrize("state", list(_TABLE_5_2))
+@pytest.mark.parametrize("state", [s for s in _TABLE_5_2 if s != "close_off"])
 @pytest.mark.parametrize("kind", _ALL_KINDS)
 def test_ds8_check_date_write_matches_table_5_2(state: str, kind: WriteKind) -> None:
+    # "close_off" is excluded: check_date_write lost its close-off branch
+    # (storage-release plan 3.2) and now always follows table 5.2's
+    # close-on rule, so that fixture state no longer applies to it.
+    # ``check_day_write``, tested above, still has it via filter_day_writes.
     conn, site_id, _instant, local_date = _ds8_fixture(state)
     assert (
         check_date_write(conn, site_id, local_date, kind, now_utc=NOW)
@@ -278,6 +280,7 @@ def test_ds8_history_prune_before_first_record_needs_close_on() -> None:
         )
 
     conn_off = asof_conn()
+    close_off(conn_off)
     site_off = day_close_site(conn_off, close_on=False, with_records=False)
     assert (
         check_day_write(
@@ -1003,90 +1006,6 @@ def test_ds9_filter_day_writes_matches_check_day_write() -> None:
     assert allowed == frozenset({d_minus_1_instant})
 
 
-def test_ds10_writable_pairs_clause() -> None:
-    conn = asof_conn()
-    site_id = day_close_site(conn)
-    feed_id = asof_make_real_feed(conn, "model-x")
-    d_minus_3 = D - timedelta(days=3)
-    d_minus_1 = D - timedelta(days=1)
-    for day in (d_minus_3, d_minus_1):
-        asof_insert_pair(
-            conn,
-            site_id=site_id,
-            feed_id=feed_id,
-            valid_at=isoformat_utc(
-                datetime(day.year, day.month, day.day, 6, tzinfo=UTC)
-            ),
-            issued_at=isoformat_utc(
-                datetime(day.year, day.month, day.day, 0, tzinfo=UTC)
-            ),
-            forecast=10.0,
-            observed=9.0,
-            first_known_at=None,
-        )
-
-    clause = writable_pairs_clause(conn, site_id, now_utc=NOW)
-    conn.execute(
-        f"DELETE FROM forecast_pairs WHERE site_id = ? AND {clause}", (site_id,)
-    )
-    remaining = {
-        r["valid_at"][:10]
-        for r in conn.execute(
-            "SELECT valid_at FROM forecast_pairs WHERE site_id = ?", (site_id,)
-        )
-    }
-    assert remaining == {d_minus_3.isoformat()}
-
-
-def test_ds10_writable_pairs_clause_none_site_id_is_per_site() -> None:
-    conn = asof_conn()
-    site_a = day_close_site(conn)
-    site_b = asof_make_site(conn, "second-site")
-    # Plan row :921 wants a second site whose D-1 is also closed, so the
-    # None-site_id clause must keep site_b's D-1 pairs while still deleting
-    # site_a's (D-1 open).
-    d_minus_1 = D - timedelta(days=1)
-    start_site_days(
-        conn,
-        site_b,
-        d_minus_1,
-        now_utc=datetime(d_minus_1.year, d_minus_1.month, d_minus_1.day, tzinfo=UTC),
-    )
-    ensure_site_days(conn, site_b, now_utc=NOW)
-    b1_row = conn.execute(
-        "SELECT day_end_utc FROM site_days WHERE site_id = ? AND local_date = ?",
-        (site_b, d_minus_1.isoformat()),
-    ).fetchone()
-    assert b1_row is not None
-    t_b = parse_utc(b1_row[0]) + timedelta(minutes=30)
-    begin_close(conn, site_b, d_minus_1, now_utc=t_b)
-    finish_close(conn, site_b, d_minus_1, now_utc=t_b)
-
-    feed_id = asof_make_real_feed(conn, "model-y")
-    for site_id in (site_a, site_b):
-        asof_insert_pair(
-            conn,
-            site_id=site_id,
-            feed_id=feed_id,
-            valid_at=isoformat_utc(
-                datetime(D.year, D.month, D.day, 6, tzinfo=UTC) - timedelta(days=1)
-            ),
-            issued_at=isoformat_utc(
-                datetime(D.year, D.month, D.day, 0, tzinfo=UTC) - timedelta(days=1)
-            ),
-            forecast=10.0,
-            observed=9.0,
-            first_known_at=None,
-        )
-
-    clause = writable_pairs_clause(conn, None, now_utc=NOW)
-    conn.execute(f"DELETE FROM forecast_pairs WHERE {clause}")
-    remaining_sites = {
-        r["site_id"] for r in conn.execute("SELECT site_id FROM forecast_pairs")
-    }
-    assert remaining_sites == {site_b}
-
-
 def test_ds11_station_list_rule() -> None:
     conn = asof_conn()
     site_id = day_close_site(conn, with_records=False)
@@ -1154,6 +1073,7 @@ def test_ds11_station_list_rule() -> None:
 
 def test_ds12_record_station_change_effective_dates() -> None:
     conn = asof_conn()
+    close_off(conn)
     site_id = day_close_site(conn, close_on=False, with_records=False)
     station_id = int(
         conn.execute(
@@ -1415,6 +1335,7 @@ def test_ds15c_enter_zone_change_when_no_day_has_started() -> None:
 
 def test_ds16_enter_zone_change_refusals_and_acceptance() -> None:
     conn = asof_conn()
+    close_off(conn)
     site_id = day_close_site(conn, close_on=False)
     with pytest.raises(ValueError, match="close"):
         enter_zone_change(conn, site_id, "Etc/GMT-1", now_utc=NOW)
@@ -1692,12 +1613,14 @@ def test_ds17b_zone_flag_after_a_change() -> None:
 
 def test_ds18_daily_close_on_not_cached() -> None:
     conn = asof_conn()
+    close_off(conn)
     asof_make_site(conn, "no-close-site")
     assert daily_close_on(conn) is False
     set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(NOW))
     assert daily_close_on(conn) is True
 
     conn2 = asof_conn()
+    close_off(conn2)
     assert daily_close_on(conn2) is False
     set_runtime_state(conn2, DAILY_CLOSE_ON_KEY, isoformat_utc(NOW))
     assert daily_close_on(conn2) is True
@@ -1725,6 +1648,7 @@ def test_ds19_import_rule_of_site_days_module() -> None:
 
 def test_ds20_close_off_site_takes_no_write_but_table_tables_stay_empty() -> None:
     conn = asof_conn()
+    close_off(conn)
     site_id = day_close_site(conn, close_on=False, with_records=False)
     ensure_site_days(conn, site_id, now_utc=NOW)
 
@@ -1743,7 +1667,11 @@ def test_ds20_close_off_site_takes_no_write_but_table_tables_stay_empty() -> Non
             check_day_write(conn, site_id, "not-an-instant", kind, now_utc=NOW)
             is expected
         )
-        assert check_date_write(conn, site_id, D, kind, now_utc=NOW) is expected
+        # check_date_write is not checked here: it lost its close-off branch
+        # (storage-release plan 3.2) and now always creates the site's
+        # missing day records before applying table 5.2, so it no longer
+        # takes no write while the close is off, and calling it here would
+        # also break the table-stays-empty assertion below.
         assert filter_day_writes(
             conn,
             site_id,
@@ -1755,14 +1683,6 @@ def test_ds20_close_off_site_takes_no_write_but_table_tables_stay_empty() -> Non
             if expected
             else frozenset()
         )
-
-    assert writable_pairs_clause(conn, site_id, now_utc=NOW) == "1"
-    assert (
-        open_day_clause(
-            conn, site_expr="observations.site_id", instant_expr="observations.valid_at"
-        )
-        == "1"
-    )
 
     # Asserted last: every call above, including the guard functions, must
     # have created no record while the close stayed off (M45r: a guard that
@@ -1785,58 +1705,6 @@ def test_ds20_close_off_site_takes_no_write_but_table_tables_stay_empty() -> Non
             "SELECT COUNT(*) FROM site_zone_changes WHERE site_id = ?", (site_id,)
         ).fetchone()[0]
         == 0
-    )
-
-
-def test_ds21_open_day_clause_per_site_and_validation() -> None:
-    conn = asof_conn()
-    site_a = day_close_site(conn)
-    site_b = day_close_site(conn, station_ids=("ISTATION03", "ISTATION04"))
-    d_minus_1 = D - timedelta(days=1)
-
-    # site_a's D-1: open -> closing (stays there).
-    begin_close(conn, site_a, d_minus_1, now_utc=NOW)
-    # site_b's D-1: open -> closing -> retry_due, so the same local date is
-    # "open" (closing counts, per open_day_clause's docstring) on site_a and
-    # not open on site_b -- a clause that ignores the site, or one that
-    # treats retry_due as open, would select site_b's row too.
-    begin_close(conn, site_b, d_minus_1, now_utc=NOW)
-    fail_close(conn, site_b, d_minus_1, now_utc=NOW, reason="x")
-
-    clause = open_day_clause(conn, site_expr="o.site_id", instant_expr="o.valid_at")
-    for site_id, local_date, expect_open in (
-        (site_a, D - timedelta(days=3), False),  # closed
-        (site_a, D - timedelta(days=2), False),  # missed
-        (site_a, d_minus_1, True),  # closing
-        (site_a, D, True),  # open
-        (site_b, D - timedelta(days=3), False),  # closed
-        (site_b, D - timedelta(days=2), False),  # missed
-        (site_b, d_minus_1, False),  # retry_due
-        (site_b, D, True),  # open
-    ):
-        instant = isoformat_utc(
-            datetime(local_date.year, local_date.month, local_date.day, 6, tzinfo=UTC)
-        )
-        conn.execute(
-            "INSERT INTO observations (site_id, variable, valid_at, value, n_stations)"
-            " VALUES (?, 'temperature', ?, 1.0, 1)",
-            (site_id, instant),
-        )
-        row = conn.execute(
-            f"SELECT 1 FROM observations AS o WHERE o.site_id = ? AND o.valid_at = ?"
-            f" AND {clause}",
-            (site_id, instant),
-        ).fetchone()
-        assert (row is not None) is expect_open
-
-    with pytest.raises(ValueError):
-        open_day_clause(conn, site_expr="site_id", instant_expr="valid_at")
-
-    conn_off = asof_conn()
-    day_close_site(conn_off, close_on=False, with_records=False)
-    assert (
-        open_day_clause(conn_off, site_expr="o.site_id", instant_expr="o.valid_at")
-        == "1"
     )
 
 
@@ -1949,6 +1817,7 @@ def test_ds24_start_site_days_refuses_a_second_first_record_and_a_past_date() ->
 
 def test_ds25_daily_close_on_at() -> None:
     conn = asof_conn()
+    close_off(conn)
     asof_make_site(conn, "ds25-site")
     assert daily_close_on_at(conn) is None
 
@@ -1979,6 +1848,7 @@ def test_ds26_open_day_on_copy(tmp_path: Path) -> None:
         copy_conn.row_factory = sqlite3.Row
         copy_conn.execute("PRAGMA foreign_keys=ON")
         run_migrations(copy_conn)
+        close_off(copy_conn)
         site_id = day_close_site(copy_conn, close_on=False, with_records=False)
         copy_conn.commit()
         return copy_conn, copy_path, site_id
@@ -2045,49 +1915,3 @@ def test_ds26_open_day_on_copy(tmp_path: Path) -> None:
     fresh_conn.commit()
     with pytest.raises(DayStateError):
         start_site_days(fresh_conn, fresh_site, d_minus_5, now_utc=NOW)
-
-
-def test_ds26b_seed_reaches_a_copys_past_day(tmp_path: Path) -> None:
-    from wxverify.db.migrations import migrate_v11_daily_close_days
-
-    db_path = tmp_path / "ds26b.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(conn)
-    site_id = asof_make_site(conn, "ds26b-site")
-    a_id = int(
-        conn.execute(
-            "INSERT INTO stations (site_id, pws_station_id, lat, lon,"
-            " dem_elevation_m, enabled) VALUES (?, 'ISTATION01', 0, 0, 0, 1)",
-            (site_id,),
-        ).lastrowid
-    )
-    conn.execute(
-        "INSERT INTO stations (site_id, pws_station_id, lat, lon,"
-        " dem_elevation_m, enabled) VALUES (?, 'ISTATION02', 0, 0, 0, 0)",
-        (site_id,),
-    )
-    conn.commit()
-
-    migrate_at = datetime(D.year, D.month, D.day, 0, 30, tzinfo=UTC)
-    import wxverify.db.migrations as migrations_module
-
-    original_utc_now = migrations_module.utc_now
-    migrations_module.utc_now = lambda: migrate_at  # type: ignore[assignment]
-    try:
-        migrate_v11_daily_close_days(conn)
-    finally:
-        migrations_module.utc_now = original_utc_now
-    conn.commit()
-
-    set_runtime_state(conn, OFFLINE_COPY_KEY, isoformat_utc(NOW))
-    conn.commit()
-
-    d_minus_30 = D - timedelta(days=30)
-    other_live_path = tmp_path / "ds26b-live.db"
-    open_day_on_copy(
-        conn, site_id, d_minus_30, now_utc=NOW, live_db_path=other_live_path
-    )
-
-    assert day_station_ids(conn, site_id, d_minus_30) == frozenset({a_id})

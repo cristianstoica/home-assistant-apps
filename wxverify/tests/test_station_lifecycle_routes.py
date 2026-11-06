@@ -37,6 +37,7 @@ from tests.helpers import (
     D,
     asof_insert_observation,
     asof_make_site,
+    close_off,
     day_close_site,
 )
 from wxverify import config
@@ -353,10 +354,10 @@ def test_lr3_readd_a_retired_station_at_the_same_site(
                             (b_id,),
                         ).fetchall()
                     ],
-                    "forecast_pairs": [
+                    "forecast_history": [
                         dict(r)
                         for r in conn.execute(
-                            "SELECT * FROM forecast_pairs WHERE site_id = ? "
+                            "SELECT * FROM forecast_history WHERE site_id = ? "
                             "ORDER BY variable, valid_at, feed_id",
                             (site_id,),
                         ).fetchall()
@@ -517,10 +518,10 @@ def test_lr5_toggle_off_does_not_touch_closed_or_open_day_data(
                             (site_id,),
                         ).fetchall()
                     ],
-                    "forecast_pairs": [
+                    "forecast_history": [
                         dict(r)
                         for r in conn.execute(
-                            "SELECT * FROM forecast_pairs WHERE site_id = ? "
+                            "SELECT * FROM forecast_history WHERE site_id = ? "
                             "ORDER BY variable, valid_at, feed_id",
                             (site_id,),
                         ).fetchall()
@@ -870,6 +871,10 @@ def test_lr10_off_site_gets_no_record(
     app = _setup_app(tmp_path, monkeypatch, "lr10b")
     with TestClient(app) as client:
         headers = _csrf_headers(client)
+        # The close is permanently on from the build (storage release 3.2);
+        # this test's subject is close-OFF behaviour, so force it off right
+        # after the database is built, before anything reads the key.
+        get_db().write_sync(close_off)
 
         resp = client.post(
             "/api/sites",

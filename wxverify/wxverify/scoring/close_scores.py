@@ -6,7 +6,8 @@ passes: for every real feed considered at D (6.2) and day ahead k it takes
 the scored values the first stored download of D - k left in
 ``forecast_scored`` (4.1, 4.3; rain release Part B, ``scoring/downloads.py``
 ``scored_values``), pairs them with D's hourly values, makes the two yardsticks
-(4.6), and stores the pairs (``close_pairs``), the day's sums
+(4.6), and stores the scored hours (``forecast_history``: real feeds and the
+mean, never persistence; storage release 3.3), the day's sums
 (``day_scores``) and the per-close record (``close_records``,
 ``close_record_downloads``), replacing an earlier attempt's rows. Since the
 rain release (Part C, C1) it also writes D's rain nearby (``rain_days``) and
@@ -16,8 +17,7 @@ commits, enqueues nothing, changes no day state, fetches nothing and reads
 the clock only through ``now_utc``.
 
 ``metrics_from_sums`` lives in ``scoring/metrics.py`` beside
-``MetricResult``, so today's strategies call it without importing this
-module; it is re-exported here beside the sums it reads (6.4).
+``MetricResult``; it is re-exported here beside the sums it reads (6.4).
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ from wxverify.scoring.downloads import (
     scored_values_download,
 )
 from wxverify.scoring.effective import active_competitor_clause
+from wxverify.scoring.history import PERSISTENCE_MAX_LEAD_HOURS, persistence_cells
 from wxverify.scoring.metrics import metrics_from_sums as metrics_from_sums
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.verification.methodology import TEMP_TRUTH_MIN_HOURS
@@ -65,8 +66,6 @@ MULTIMODEL_MEAN_KEY: Final = "multimodel_mean"
 DayScoreStatus = Literal["scored", "absent", "no_hours", "not_counted"]
 
 _DAYS_AHEAD: Final = tuple(range(8))
-# Persistence's leads, 1 to 168 hours (4.6).
-_PERSISTENCE_MAX_LEAD_HOURS: Final = 168
 # The mean needs at least two real feeds at an hour and day ahead (4.6).
 _MEAN_MIN_CONTRIBUTORS: Final = 2
 _TRUTH_QUANTITIES: Final = frozenset(
@@ -97,14 +96,25 @@ _REAL_FEEDS_SQL: Final = (
 _YARDSTICK_SQL: Final = "SELECT id FROM feeds WHERE source = 'virtual' AND model = ?"
 
 # Step 3 of 6.1: an earlier attempt's rows for D, so a retry replaces.
+# ``forecast_history`` has its own delete below.
 _DELETE_EARLIER_SQL: Final = (
-    "DELETE FROM close_pairs WHERE site_id = ? AND local_date = ?",
     "DELETE FROM day_scores WHERE site_id = ? AND local_date = ?",
     "DELETE FROM close_record_downloads WHERE site_id = ? AND local_date = ?",
     "DELETE FROM close_records WHERE site_id = ? AND local_date = ?",
     "DELETE FROM rain_days WHERE site_id = ? AND local_date = ?",
     "DELETE FROM rain_forecast_days WHERE site_id = ? AND local_date = ?",
 )
+# Storage release 3.6: an earlier attempt's ``forecast_history`` rows for D,
+# one primary-key seek per feed, variable and day ahead. The ``valid_at``
+# bounds are D's widened by one day each side and only let the key seek;
+# ``local_date`` decides. Parameters: site, feed, variable, day ahead, the
+# two bounds, D.
+_DELETE_FORECAST_HISTORY_SQL: Final = (
+    "DELETE FROM forecast_history"
+    " WHERE site_id = ? AND feed_id = ? AND variable = ? AND day_ahead = ?"
+    " AND valid_at >= ? AND valid_at < ? AND local_date = ?"
+)
+_ALL_FEEDS_SQL: Final = "SELECT id FROM feeds ORDER BY id"
 # Rain nearby (rain release, C1): the day's ``ok`` station rain rows. The
 # station list is bound in Python, so the read seeks each station's key.
 _STATION_RAIN_SQL: Final = (
@@ -131,14 +141,11 @@ RAIN_NEARBY_SINGLE_HUNDREDTHS: Final = 50
 RAIN_DRY_MIN_HOURS: Final = 22
 
 RainOutcome = Literal["rain", "dry", "unknown"]
-_INSERT_PAIR_SQL: Final = """
-    INSERT INTO close_pairs
-        (site_id, local_date, feed_id, variable, day_ahead, valid_at,
-         lead_hours, forecast, observed, error, abs_error, sq_error,
-         cat_hit, cat_false, cat_miss, cat_correct_neg, rain_threshold_mm,
-         ref_sq_error, download_id, download_date, issued_at, fetched_at,
-         contributors)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+_INSERT_HISTORY_SQL: Final = """
+    INSERT INTO forecast_history
+        (site_id, feed_id, variable, day_ahead, valid_at, local_date,
+         value, lead_hours, issued_at, contributors)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 _INSERT_DAY_SCORE_SQL: Final = """
     INSERT INTO day_scores
@@ -357,6 +364,7 @@ def score_day(
     variables = scored_variables(truth.values())
     for sql in _DELETE_EARLIER_SQL:
         conn.execute(sql, (site_id, day_text))
+    _delete_earlier_history(conn, record)
 
     # 6.2: every candidate's scored values of D at each day ahead k, from
     # forecast_scored (rain release, Part B, B4), with the download they
@@ -416,7 +424,7 @@ def score_day(
     # skill reference read (value at valid_at - lead_hours, 6.3).
     max_lead = max(
         [
-            _PERSISTENCE_MAX_LEAD_HOURS,
+            PERSISTENCE_MAX_LEAD_HOURS,
             *(
                 sample.lead_hours
                 for forecast in forecasts.values()
@@ -454,23 +462,18 @@ def score_day(
         if rain.rain_threshold_mm is not None
         else truth["precip_occurrence"].rain_threshold_mm
     )
-    for (feed_id, _variable, k), pairs in cells.items():
-        forecast = forecasts.get((feed_id, k))
-        conn.executemany(
-            _INSERT_PAIR_SQL,
-            [
-                _pair_values(
-                    pair,
-                    site_id=site_id,
-                    day_text=day_text,
-                    feed_id=feed_id,
-                    download=None if forecast is None else forecast.download,
-                    download_date=record.local_date - timedelta(days=k),
-                    threshold=threshold,
-                )
-                for pair in pairs
-            ],
-        )
+    # Storage release 3.3: the scored hours of the real feeds and the mean
+    # go to forecast_history. Persistence's pairs feed the day scores only;
+    # its history is rebuilt on read (3.5).
+    conn.executemany(
+        _INSERT_HISTORY_SQL,
+        [
+            _history_values(pair, site_id=site_id, day_text=day_text, feed_id=feed_id)
+            for (feed_id, _variable, _k), pairs in cells.items()
+            if feed_id != persistence_id
+            for pair in pairs
+        ],
+    )
 
     # 6.4: one day_scores row per (feed, variable, day ahead) considered.
     wind = truth["wind_max"]
@@ -586,6 +589,25 @@ def _read_truth(
     return rows
 
 
+def _delete_earlier_history(conn: sqlite3.Connection, record: DayRecord) -> None:
+    """Remove an earlier attempt's ``forecast_history`` rows for D (storage
+    release 3.6): ``_DELETE_FORECAST_HISTORY_SQL`` for every feed, variable
+    and day ahead, so each delete seeks the primary key and none scans."""
+    low = isoformat_utc(record.day_start_utc - timedelta(days=1))
+    high = isoformat_utc(record.day_end_utc + timedelta(days=1))
+    day_text = record.local_date.isoformat()
+    feed_ids = [int(row["id"]) for row in conn.execute(_ALL_FEEDS_SQL)]
+    conn.executemany(
+        _DELETE_FORECAST_HISTORY_SQL,
+        [
+            (record.site_id, feed_id, variable, k, low, high, day_text)
+            for feed_id in feed_ids
+            for variable in FORECAST_VARIABLES
+            for k in _DAYS_AHEAD
+        ],
+    )
+
+
 def _hourly_values(
     conn: sqlite3.Connection,
     site_id: int,
@@ -678,37 +700,38 @@ def _persistence_pairs(
 ) -> list[_Pair]:
     """Persistence (4.6): for each hour h of D with a value and each lead L
     from 1 to 168, the value at h - L where there is one, at day ahead the
-    local-date difference between h - L and h in the record's zone."""
+    local-date difference between h - L and h in the record's zone. The
+    cells come from the shared definition (``scoring.history``
+    ``persistence_cells``), taken by variable, hour and lead."""
     zone = ZoneInfo(record.timezone)
     pairs: list[_Pair] = []
     for variable in sorted(variables):
         values = hourly.get(variable, {})
-        for instant, hour in sorted(values.items(), key=lambda i: i[0]):
-            if not _in_day(instant, record):
-                continue
-            target_date = instant.astimezone(zone).date()
-            for lead in range(1, _PERSISTENCE_MAX_LEAD_HOURS + 1):
-                source_instant = instant - timedelta(hours=lead)
-                source = values.get(source_instant)
-                if source is None:
-                    continue
-                k = (target_date - source_instant.astimezone(zone).date()).days
-                if k not in _DAYS_AHEAD:
-                    continue
-                pairs.append(
-                    _Pair(
-                        variable=variable,
-                        day_ahead=k,
-                        instant=instant,
-                        valid_at=hour.stamp,
-                        lead_hours=lead,
-                        forecast=source.value,
-                        observed=hour.value,
-                        ref_sq_error=(source.value - hour.value) ** 2,
-                        issued_at=source.stamp,
-                        contributors=None,
-                    )
+        cells = persistence_cells(
+            [(hour.stamp, hour.value) for hour in values.values()],
+            target_valid_at=[
+                hour.stamp
+                for instant, hour in values.items()
+                if _in_day(instant, record)
+            ],
+            zone=zone,
+            max_lead_hours=PERSISTENCE_MAX_LEAD_HOURS,
+        )
+        for cell in sorted(cells, key=lambda c: (c.instant, c.lead_hours)):
+            pairs.append(
+                _Pair(
+                    variable=variable,
+                    day_ahead=cell.day_ahead,
+                    instant=cell.instant,
+                    valid_at=cell.valid_at,
+                    lead_hours=cell.lead_hours,
+                    forecast=cell.forecast,
+                    observed=cell.observed,
+                    ref_sq_error=(cell.forecast - cell.observed) ** 2,
+                    issued_at=cell.source_valid_at,
+                    contributors=None,
                 )
+            )
     return pairs
 
 
@@ -777,45 +800,22 @@ def active_real_feeds(conn: sqlite3.Connection, site_id: int) -> set[int]:
     }
 
 
-def _pair_values(
-    pair: _Pair,
-    *,
-    site_id: int,
-    day_text: str,
-    feed_id: int,
-    download: ScoredDownload | None,
-    download_date: date,
-    threshold: float | None,
+def _history_values(
+    pair: _Pair, *, site_id: int, day_text: str, feed_id: int
 ) -> tuple[object, ...]:
-    """One ``close_pairs`` row in ``_INSERT_PAIR_SQL`` order (6.3)."""
-    rain_threshold = threshold if pair.variable == "precip" else None
-    hit, false, miss, correct_neg = precip_flags(
-        pair.variable, pair.forecast, pair.observed, rain_threshold
-    )
-    error = pair.forecast - pair.observed
+    """One ``forecast_history`` row in ``_INSERT_HISTORY_SQL`` order
+    (storage release 3.1, 3.3): ``valid_at`` is the observation hour's stored
+    text; the mean's ``issued_at`` is ``None`` and its ``contributors`` set."""
     return (
         site_id,
-        day_text,
         feed_id,
         pair.variable,
         pair.day_ahead,
         pair.valid_at,
-        pair.lead_hours,
+        day_text,
         pair.forecast,
-        pair.observed,
-        error,
-        abs(error),
-        error**2,
-        hit,
-        false,
-        miss,
-        correct_neg,
-        rain_threshold,
-        pair.ref_sq_error,
-        None if download is None else download.download_id,
-        (download_date if download is None else download.local_date).isoformat(),
+        pair.lead_hours,
         pair.issued_at,
-        None if download is None else download.fetched_at,
         pair.contributors,
     )
 

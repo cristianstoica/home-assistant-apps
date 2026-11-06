@@ -1,18 +1,11 @@
-"""O1-O15 (incl. O12b) and O17 for task-death notification (0.14.0 plan).
-
-Two independently-detected facts, two independent surfaces:
-
-* the export sweeper's death (external ``add_done_callback``, latched in
-  ``db_transfer.py``, surfaced as a ``CRITICAL`` log plus one monitor
-  condition, group ``process``);
-* the read-cache warm's outcome (internal self-report inside
-  ``warm_read_cache``, surfaced only at ``/api/worker/status``).
+"""O1-O9 for task-death notification (0.14.0 plan): the export sweeper's
+death (external ``add_done_callback``, latched in ``db_transfer.py``,
+surfaced as a ``CRITICAL`` log plus one monitor condition, group
+``process``).
 
 Every mutant a claim below names is verified against a real scratch rebind
-of the production symbol (never a repo edit, except the two placement
-mutants noted below, each run under its own ``PYTHONPYCACHEPREFIX`` and
-restored with an md5-verified diff): the oracle FAILS with the mutant
-applied and PASSES once it is reverted. That run is captured in the
+of the production symbol (never a repo edit): the oracle FAILS with the
+mutant applied and PASSES once it is reverted. That run is captured in the
 dispatching QA report, not asserted here as prose.
 
 Mutant table:
@@ -21,11 +14,6 @@ Mutant table:
 | --- | --- | --- |
 | A   ``on_export_sweeper_done``'s ``cancelled()`` guard deleted            | O2 |
 | B   swallows ``CancelledError`` from ``task.exception()`` into ``None``   | O2 |
-| M1  ``detail=sanitized_exception(exc)`` unguarded (case 3 driver)          | O11 |
-| M2  same bare rendering (case 1 driver: the class-name prefix is lost)    | O11 |
-| M5  unconditional prefix ``f"{name}: {sanitized_exception(exc)}"`` (case 2) | O11 |
-| M3  the ``running`` write moved outside the ``try`` (source edit)         | O11 |
-| M4  the ``failed``-write guard deleted, ``safe_detail`` kept (source edit) | O11 |
 
 O16 (the four-file ``_BASE_WORKER_STATUS_KEYS`` / autouse-reset migration)
 and O18/O19 (unmodified re-runs / cross-test isolation) are out of scope for
@@ -37,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -50,7 +37,6 @@ from wxverify.api.routes.db_transfer import export_sweeper_death
 from wxverify.db.connection import close_db, init_db
 from wxverify.db.migrations import run_migrations
 from wxverify.monitor import build_verdict
-from wxverify.verification import read_cache as rc
 
 # ---------------------------------------------------------------------------
 # Shared stubs
@@ -59,10 +45,6 @@ from wxverify.verification import read_cache as rc
 
 async def _idle_worker(db: object) -> None:
     await asyncio.Event().wait()
-
-
-async def _no_warm(db: object) -> None:
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +68,6 @@ def test_o1_crash_latches_with_redacted_diagnosable_detail(
     config.db_path = str(tmp_path / "o1-crash.db")
     config.options_path = str(tmp_path / "o1-missing-options.json")
     monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
-    monkeypatch.setattr("wxverify.api.app.warm_read_cache", _no_warm)
 
     reached = asyncio.Event()
 
@@ -132,7 +113,6 @@ def test_o1_zero_argument_crash_detail_never_empty(
     config.db_path = str(tmp_path / "o1-zeroarg.db")
     config.options_path = str(tmp_path / "o1-zeroarg-missing-options.json")
     monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
-    monkeypatch.setattr("wxverify.api.app.warm_read_cache", _no_warm)
 
     reached = asyncio.Event()
 
@@ -547,472 +527,3 @@ def test_o9_condition_survives_a_db_readable_sqlite_error(tmp_path: Path) -> Non
     db_cond = next(c for c in verdict["conditions"] if c["id"] == "db_readable")
     assert db_cond["ok"] is False
     assert verdict["overall"] == "critical"
-
-
-# ---------------------------------------------------------------------------
-# Group C - warm self-report
-# ---------------------------------------------------------------------------
-
-
-def test_o10_successful_warm_records_ok(tmp_path: Path) -> None:
-    """A clean warm (no published targets at all) records ``ok`` with zero
-    failed derivations.
-
-    O10 -> at ``outcome.state``: correct = ``"ok"``, mutant (state never
-    advanced past ``running``, e.g. the terminal ``_note_warm`` call
-    deleted) = ``"running"``.
-    """
-    close_db()
-    db = init_db(str(tmp_path / "o10-ok.db"))
-    assert rc.warm_outcome() is None
-    asyncio.run(rc.warm_read_cache(db))
-    outcome = rc.warm_outcome()
-    assert outcome is not None
-    assert outcome.state == "ok"
-    assert outcome.derivations_failed == 0
-
-
-def test_o11_case1_published_targets_crash_records_failed_with_redacted_detail(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Case 1: a crash inside the snapshot step records ``failed`` with a
-    declared, redacted detail, and the existing failure log still fires
-    verbatim.
-
-    O11 -> at ``outcome.detail``: correct =
-    ``"RuntimeError: boom at https://api.example.com/v1?key=%2A%2A%2A"``,
-    mutant M1 (``detail=sanitized_exception(exc)`` unguarded — irrelevant
-    here since ``sanitized_exception`` alone still renders fine for a
-    normal ``__str__``, so this case does not discriminate M1 by itself;
-    see case 3) would instead drop the type-name prefix, giving
-    ``"boom at https://api.example.com/v1?key=%2A%2A%2A"``.
-    """
-    close_db()
-    db = init_db(str(tmp_path / "o11-case1.db"))
-
-    def _boom(conn: sqlite3.Connection) -> list[tuple[int, int]]:
-        raise RuntimeError("boom at https://api.example.com/v1?key=abc")
-
-    monkeypatch.setattr(rc, "_published_targets", _boom)
-    with caplog.at_level(logging.ERROR, logger="wxverify.verification.read_cache"):
-        result = asyncio.run(rc.warm_read_cache(db))
-    assert result is None
-
-    outcome = rc.warm_outcome()
-    assert outcome is not None
-    assert outcome.state == "failed"
-    assert (
-        outcome.detail
-        == "RuntimeError: boom at https://api.example.com/v1?key=%2A%2A%2A"
-    )
-    assert "abc" not in outcome.detail
-    assert any(r.getMessage() == "read-cache warm failed" for r in caplog.records)
-
-
-def test_o11_case2_zero_argument_exception_detail_never_empty(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Case 2: a zero-argument exception yields the class name alone --
-    non-empty and named exactly once.
-
-    O11 -> at ``outcome.detail``: correct = ``"RuntimeError"``, mutant M5
-    (``f"{name}: {sanitized_exception(exc)}"``, the prefix applied
-    unconditionally) = ``"RuntimeError: RuntimeError"``. Mutant M2 (bare
-    ``detail=sanitized_exception(exc)``) renders ``"RuntimeError"`` here
-    too and is separated by case 1's missing prefix, not by this case.
-    """
-    close_db()
-    db = init_db(str(tmp_path / "o11-case2.db"))
-
-    def _boom(conn: sqlite3.Connection) -> list[tuple[int, int]]:
-        raise RuntimeError
-
-    monkeypatch.setattr(rc, "_published_targets", _boom)
-    asyncio.run(rc.warm_read_cache(db))
-    outcome = rc.warm_outcome()
-    assert outcome is not None
-    assert outcome.state == "failed"
-    assert outcome.detail == "RuntimeError"
-
-
-def test_o11_case3_pathological_str_never_escapes_and_never_raises(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Case 3: an exception whose ``__str__`` itself raises still degrades
-    to the class-name-only detail, and ``warm_read_cache`` never raises.
-
-    O11 -> at ``outcome.state``: correct = ``"failed"`` (``safe_detail``'s
-    own guard degrades the unrenderable exception to ``"BoomError"`` before
-    ``_note_warm("failed", ...)`` is called), mutant M1
-    (``detail=sanitized_exception(exc)`` unguarded, swapped into the SAME
-    inner ``try`` that already surrounds this ``_note_warm`` call) =
-    ``"running"`` — the render itself raises while the argument is being
-    evaluated, so the inner ``except`` catches it before ``_note_warm``'s
-    body ever runs, and the ``"running"`` write from entry is never
-    overwritten. ``result is None`` still holds under both, since the outer
-    handler swallows the render failure either way — it is not the
-    discriminator.
-    """
-    close_db()
-    db = init_db(str(tmp_path / "o11-case3.db"))
-
-    class BoomError(RuntimeError):
-        def __str__(self) -> str:
-            raise ValueError("str exploded")
-
-    def _boom(conn: sqlite3.Connection) -> list[tuple[int, int]]:
-        raise BoomError("unrendered")
-
-    monkeypatch.setattr(rc, "_published_targets", _boom)
-    result = asyncio.run(rc.warm_read_cache(db))
-    assert result is None
-
-    outcome = rc.warm_outcome()
-    assert outcome is not None
-    assert outcome.state == "failed"
-    assert outcome.detail == "BoomError"
-
-
-def test_o11_case4_running_write_placement_survives_a_first_call_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Case 4: the entry-time ``running`` write raising does not escape,
-    because it sits inside the total ``try``; the guarded ``failed`` write
-    that follows (the second ``_note_warm`` call, unaffected by the stub by
-    then) still lands.
-
-    O11 -> at ``outcome.state``: correct = ``"failed"`` with ``calls["n"]
-    == 2``, mutant M3 (the ``running`` write moved outside the ``try``) lets
-    the first-call raise escape ``warm_read_cache`` entirely, so
-    ``asyncio.run(...)`` raises instead of returning ``None``. (M3 is
-    verified separately via a source edit under its own
-    ``PYTHONPYCACHEPREFIX``, restored and md5-checked — see the release's
-    mutation report.)
-    """
-    close_db()
-    db = init_db(str(tmp_path / "o11-case4.db"))
-
-    calls = {"n": 0}
-    real_note_warm = rc._note_warm
-
-    def _counted_note_warm(*args: object, **kwargs: object) -> None:
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise RuntimeError("first _note_warm call fails")
-        real_note_warm(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(rc, "_note_warm", _counted_note_warm)
-    result = asyncio.run(rc.warm_read_cache(db))
-    assert result is None
-
-    outcome = rc.warm_outcome()
-    assert outcome is not None
-    assert outcome.state == "failed"
-    assert calls["n"] == 2
-
-
-def test_o11_case5_always_raising_writer_never_escapes_and_logs_the_guard(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Case 5: an outcome writer that raises on every call still never
-    escapes ``warm_read_cache``, and the inner guard's own failure log
-    fires. Deliberately no assertion on ``warm_outcome().state``: with an
-    always-raising writer the entry-time ``running`` write is call 1 and it
-    raises too, so nothing is ever recorded.
-
-    O11 -> at ``result``: correct = ``None`` (this is the control: the
-    guard, present, still lets ``warm_read_cache`` return normally), mutant
-    M4 (the inner ``try``/``except`` around the ``failed`` write deleted)
-    lets the second ``_note_warm`` raise escape the outer handler, so
-    ``asyncio.run(...)`` raises instead of returning ``None``. (M4 is
-    verified separately via a source edit under its own
-    ``PYTHONPYCACHEPREFIX``, restored and md5-checked — see the release's
-    mutation report.)
-    """
-    close_db()
-    db = init_db(str(tmp_path / "o11-case5.db"))
-
-    def _always_raising(*args: object, **kwargs: object) -> None:
-        raise RuntimeError("note_warm always fails")
-
-    monkeypatch.setattr(rc, "_note_warm", _always_raising)
-    with caplog.at_level(logging.ERROR, logger="wxverify.verification.read_cache"):
-        result = asyncio.run(rc.warm_read_cache(db))
-    assert result is None
-    assert any(
-        r.getMessage() == "read-cache warm: recording the outcome failed"
-        for r in caplog.records
-    )
-
-
-def test_o12_never_finished_warm_stays_running(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A ``BaseException`` leaving the frame (the class cancellation
-    belongs to) writes no terminal state at all: the outcome stays
-    ``running``.
-
-    O12 -> at ``outcome.state``: correct = ``"running"``, mutant (an
-    unconditional ``finally: _note_warm("ok")``) = ``"ok"`` — erasing
-    exactly the signal this plan exists to create.
-    """
-    close_db()
-    db = init_db(str(tmp_path / "o12-neverfinished.db"))
-
-    class _Fatal(BaseException):
-        pass
-
-    def _boom(*args: object, **kwargs: object) -> None:
-        raise _Fatal("simulated fatal exit")
-
-    monkeypatch.setattr(rc, "_reconcile_pins", _boom)
-
-    async def _drive() -> None:
-        task = asyncio.ensure_future(rc.warm_read_cache(db))
-        with pytest.raises(_Fatal):
-            await task
-        assert task.done()
-
-    asyncio.run(_drive())
-
-    outcome = rc.warm_outcome()
-    assert outcome is not None
-    assert outcome.state == "running"
-
-
-def test_o12b_later_warm_overwrites_a_dead_warms_running(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A later warm overwrites a dead warm's ``running`` with its own
-    terminal state — the accepted cost of the single-slot design (F10).
-    Warm 1 is TERMINATED (a ``BaseException`` out of it, reusing O12's own
-    construction), never suspended-and-released: a suspend/release
-    construction would let warm 1 resume, find its ticket stale, and write
-    ``superseded`` — failing this oracle's own ``== "ok"`` assertion
-    against correct code. That construction belongs to O13, not here.
-
-    O12b -> at the final ``outcome.state``: correct = ``"ok"`` (warm 2's
-    own terminal write), mutant (an implementation that refuses to
-    overwrite a ``running`` state from a later warm) would leave the slot
-    at ``"running"`` — which would look like a fix and would instead make
-    the live warm invisible.
-    """
-    close_db()
-    db = init_db(str(tmp_path / "o12b-overwrite.db"))
-
-    class _Fatal(BaseException):
-        pass
-
-    real_reconcile_pins = rc._reconcile_pins
-
-    def _boom(*args: object, **kwargs: object) -> None:
-        raise _Fatal("simulated fatal exit")
-
-    monkeypatch.setattr(rc, "_reconcile_pins", _boom)
-
-    async def _kill_warm_1() -> None:
-        task = asyncio.ensure_future(rc.warm_read_cache(db))
-        with pytest.raises(_Fatal):
-            await task
-
-    asyncio.run(_kill_warm_1())
-
-    # Liveness control: the state this oracle claims to overwrite really was
-    # established by warm 1 finishing dead.
-    outcome = rc.warm_outcome()
-    assert outcome is not None
-    assert outcome.state == "running"
-
-    monkeypatch.setattr(rc, "_reconcile_pins", real_reconcile_pins)
-    asyncio.run(rc.warm_read_cache(db))  # warm 2, real, runs to completion
-
-    outcome = rc.warm_outcome()
-    assert outcome is not None
-    assert outcome.state == "ok"
-
-
-def test_o13_superseded_is_neither_failed_nor_ok(tmp_path: Path) -> None:
-    """A warm that loses the epoch race INSIDE ``_fill`` (the realistic
-    shape) records ``superseded``, and the loser's keys never reach the
-    pinned tier.
-
-    Single-site construction, named explicitly per the plan: warm A blocks
-    inside ``_fill`` (via a blocking ``_is_published``, so A holds no stripe
-    while parked), warm B bumps the epoch and runs to completion, then A is
-    released.
-
-    O13 -> at ``outcome.state``: correct = ``"superseded"``, mutant (an
-    unconditional ``_note_warm("ok")`` after ``_reconcile_pins``, the naive
-    "completed normally" reading) = ``"ok"`` for a warm that pinned nothing.
-    Paired: ``not any(k[2] == run_a for k in rc._PINNED)`` grounds the label
-    in the observable effect (A's keys never pinned) rather than the label
-    asserting about itself.
-    """
-    from tests.test_verification_read_cache import _full_run, _site
-
-    close_db()
-    db = init_db(str(tmp_path / "o13-superseded.db"))
-    conn = db._conn  # noqa: SLF001
-    site_id = _site(conn)
-    run_a = _full_run(conn, site_id, state="published")
-    conn.commit()
-
-    entered_a = threading.Event()
-    gate_a = threading.Event()
-    real_is_published = rc._is_published  # noqa: SLF001
-    gate_a_result: bool | None = None
-
-    def _blocking_is_published(conn: sqlite3.Connection, run_id: int) -> bool:
-        nonlocal gate_a_result
-        # Park A at the published gate: the one `_cached` step BEFORE the
-        # stripe lock (`read_cache.py` "Step 1: the published gate, ahead of
-        # the key AND the lookup"). Parked inside `daily_rank_conclusions`
-        # instead, A would hold `_STRIPES[hash(key) % 8]` for the whole
-        # wait, and warm B's W13 key shares that stripe under roughly 9% of
-        # per-process hash seeds -- B would then wait on A's stripe, A on
-        # this gate, and the gate is only set after B returns: a
-        # seed-dependent deadlock-timeout flake. Parked here, A holds no
-        # stripe while parked, so B's `_fill` never contends with it.
-        if run_id == run_a and not entered_a.is_set():
-            entered_a.set()
-            gate_a_result = gate_a.wait(timeout=5.0)
-        return real_is_published(conn, run_id)
-
-    rc._is_published = _blocking_is_published  # type: ignore[assignment]
-    try:
-
-        async def _scenario() -> None:
-            task_a = asyncio.create_task(rc.warm_read_cache(db))
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(entered_a.wait, 5.0), timeout=5.0
-                )
-
-                _full_run(conn, site_id, state="published")
-                conn.commit()
-                await rc.warm_read_cache(db)  # warm B, real, runs to completion
-            finally:
-                # Gate release and task cleanup happen even if the body
-                # above raised, so warm A's task never dangles past the
-                # test.
-                gate_a.set()
-                await asyncio.wait_for(task_a, timeout=5.0)
-
-        asyncio.run(_scenario())
-    finally:
-        rc._is_published = real_is_published  # type: ignore[assignment]
-
-    # Asserted first, before any outcome/state assertion: a starved gate
-    # wait must surface as a named gate timeout, never as a misleading
-    # `outcome.state` mismatch downstream of it.
-    assert gate_a_result is True, (
-        "gate_a.wait(timeout=5.0) returned False: warm A never observed "
-        "the gate release"
-    )
-
-    outcome = rc.warm_outcome()
-    assert outcome is not None
-    assert outcome.state == "superseded"
-    assert not any(k[2] == run_a for k in rc._PINNED)
-
-
-def test_o14_partial_derivation_failure_surfaces_the_fixture_derived_count(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Making exactly ``daily_rank_conclusions`` raise for one site yields
-    ``derivations_failed == 1`` with ``state == "ok"`` — a warm that warmed
-    partially is visible, not indistinguishable from a clean one.
-
-    O14 -> at ``outcome.derivations_failed``: correct = ``1`` (one of the
-    site's two per-site derivations, W7, raised and was swallowed), mutant
-    (the counter dropped, i.e. ``_fill``'s inner catch never appends to
-    ``failures``) = ``0``, reporting a clean ``ok`` for a warm that warmed
-    nothing.
-    """
-    from tests.test_verification_read_cache import _full_run, _site
-
-    close_db()
-    db = init_db(str(tmp_path / "o14-partial.db"))
-    conn = db._conn  # noqa: SLF001
-    site_id = _site(conn)
-    _full_run(conn, site_id, state="published")
-    conn.commit()
-
-    def _boom_w7(
-        conn: sqlite3.Connection,
-        run_id: int,
-        *,
-        leads: tuple[int, ...] | None = None,
-    ) -> dict[str, dict[str, object]]:
-        raise RuntimeError("W7 exploded for this site")
-
-    monkeypatch.setattr(rc, "daily_rank_conclusions", _boom_w7)
-    asyncio.run(rc.warm_read_cache(db))
-
-    outcome = rc.warm_outcome()
-    assert outcome is not None
-    assert outcome.state == "ok"
-    assert outcome.derivations_failed == 1
-
-
-# ---------------------------------------------------------------------------
-# Group D - surfaces and regressions
-# ---------------------------------------------------------------------------
-
-
-def test_o17_read_cache_warm_key_present_and_none_before_any_warm(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With the boot warm stubbed out, the key is present and ``None``
-    before any warm has run — never absent.
-
-    O17 -> at ``body["read_cache_warm"]``: correct = ``None``, mutant (a
-    set-only-after-a-warm implementation, i.e. an absent key, F12) fails
-    ``"read_cache_warm" in body`` outright.
-    """
-    close_db()
-    config.db_path = str(tmp_path / "o17-stubbed.db")
-    config.options_path = str(tmp_path / "o17-missing-options.json")
-    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
-    monkeypatch.setattr("wxverify.api.app.warm_read_cache", _no_warm)
-    app = create_app(root_path="")
-    with TestClient(app) as client:
-        body = client.get("/api/worker/status").json()
-
-    assert "read_cache_warm" in body
-    assert body["read_cache_warm"] is None
-
-
-def test_o17_un_stubbed_control_returns_a_dict_once_a_warm_has_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Un-stubbed control: without the boot-warm stub, the real warm task
-    has already written ``running`` (or further) by the time the first
-    request is served, proving the stub above — not vacuous test setup — is
-    what makes ``None`` reachable.
-
-    O17 -> at ``body["read_cache_warm"]``: correct = a ``dict``, mutant
-    (none named; this is the positive half of the paired absence test) —
-    without this control, O17's ``is None`` assertion would be
-    indistinguishable from a test that never gave the warm a chance to run
-    at all.
-    """
-    close_db()
-    config.db_path = str(tmp_path / "o17-control.db")
-    config.options_path = str(tmp_path / "o17-control-missing-options.json")
-    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
-    app = create_app(root_path="")
-    with TestClient(app) as client:
-        body = client.get("/api/worker/status").json()
-
-    assert isinstance(body["read_cache_warm"], dict)
-    assert set(body["read_cache_warm"]) == {
-        "state",
-        "at",
-        "detail",
-        "derivations_failed",
-    }

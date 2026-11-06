@@ -19,7 +19,7 @@ from wxverify.api.schemas import StationCreate, StationOut, StationUpdate
 from wxverify.collection.budget import reserve_budget
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import isoformat_utc_micro, utc_now
-from wxverify.db.connection import FencedWriter, get_db
+from wxverify.db.connection import get_db
 from wxverify.db.site_days import (
     StationChange,
     current_day_has_other_station,
@@ -216,8 +216,6 @@ async def _provider_call[T](call: Awaitable[T], *, provider: _Provider) -> T:
         http_response = exc.response if isinstance(exc, httpx.HTTPStatusError) else None
     # Reached only through the except block: the try body returns.
     if http_response is not None:
-        # Exempt: domain_backoffs is keyed by domain, not by site/station --
-        # no entity for a swap to contaminate, so this runs unfenced.
         next_attempt_at = await get_db().write(
             lambda conn, response=http_response: record_http_backoff(conn, response)
         )
@@ -275,13 +273,7 @@ async def create_station(
     if not api_key:
         raise ApiError(503, "weathercom key is not configured")
 
-    # Bound to the generation this route's site_id read happens in, below:
-    # a database replace landing during either provider await (validate_station,
-    # lookup_elevation_m) is then rejected at the write instead of silently
-    # attaching this station to whatever now owns that site_id in the
-    # replacement database. Same disposition as the worker's (see
-    # worker.processor.run_claimed_job).
-    writer = FencedWriter(get_db(), get_db().generation)
+    db = get_db()
 
     def _reserve(conn: sqlite3.Connection) -> None:
         if (
@@ -304,7 +296,7 @@ async def create_station(
             503, "Weather provider busy; station was not added. Try again shortly."
         )
     try:
-        await writer.write(_reserve)
+        await db.write(_reserve)
         pws = await _provider_call(
             validate_station(body.pws_station_id, api_key), provider="weathercom"
         )
@@ -320,7 +312,7 @@ async def create_station(
         check_domain_backoff(conn, source_domain("open-meteo"))
         reserve_budget(conn, "open-meteo", 1)
 
-    await writer.write(_reserve_elevation)
+    await db.write(_reserve_elevation)
     dem = await _provider_call(
         lookup_elevation_m(pws.lat, pws.lon), provider="open-meteo"
     )
@@ -387,7 +379,7 @@ async def create_station(
             raise RuntimeError("station insert failed")
         return _station_out(row)
 
-    station = await writer.write(_write)
+    station = await db.write(_write)
     if _wants_html(request):
         from wxverify.web.routes import render_station_cluster
 

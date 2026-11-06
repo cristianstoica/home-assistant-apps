@@ -87,7 +87,7 @@ def _run_claimed_job(conn: sqlite3.Connection) -> int:
     assert job is not None
     db = get_db()
     try:
-        asyncio.run(dispatch(db, FencedWriter(db, db.generation), job))
+        asyncio.run(dispatch(db, FencedWriter(db), job))
         complete(conn, job.id)
     except JobDeferred as exc:
         defer_job(conn, job.id, exc.next_attempt_at)

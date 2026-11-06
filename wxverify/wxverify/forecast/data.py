@@ -37,7 +37,6 @@ from wxverify.scoring.effective import active_competitor_clause
 from wxverify.scoring.leaderboard import (
     LeaderboardRow,
     LeaderboardStatus,
-    asof_leaderboard,
     leaderboard_with_status,
     leaderboard_with_status_in_transaction,
 )
@@ -555,29 +554,6 @@ def _publication_token(conn: sqlite3.Connection, *, site_id: int) -> str:
     return f"-p{0 if pub is None else pub.id}"
 
 
-def forecast_ranking(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    variable: str,
-    day_ahead: int,
-    window: str = "rolling",
-    as_of: str | None = None,
-    declared_min_n: int | None = None,
-    declared_window_days: int | None = None,
-) -> dict[int, LeaderboardRow]:
-    return forecast_ranking_with_status(
-        conn,
-        site_id=site_id,
-        variable=variable,
-        day_ahead=day_ahead,
-        window=window,
-        as_of=as_of,
-        declared_min_n=declared_min_n,
-        declared_window_days=declared_window_days,
-    ).rows
-
-
 def forecast_ranking_with_status(
     conn: sqlite3.Connection,
     *,
@@ -585,9 +561,6 @@ def forecast_ranking_with_status(
     variable: str,
     day_ahead: int,
     window: str = "rolling",
-    as_of: str | None = None,
-    declared_min_n: int | None = None,
-    declared_window_days: int | None = None,
 ) -> ForecastRanking:
     """Skill ranking for one (variable, day_ahead) cell, keyed by feed id.
 
@@ -596,21 +569,12 @@ def forecast_ranking_with_status(
     package feed are removed here explicitly, not left to the intersection
     with fresh samples. Keep the filter here even if it looks redundant.
 
-    ``as_of`` (plan §6): the ranking is recomputed live from pairs knowable
-    at T under the run's declared configuration (``declared_min_n``,
-    ``declared_window_days`` — never live settings, never ``score_cache``;
-    ``window`` is ignored on this path). The eligibility exclusions below
-    apply IDENTICALLY on both paths — one filter, two row sources. The
-    as-of branch reports ``live`` — it never reads ``score_cache``, and
-    that is the status ``leaderboard_with_status`` assigns to a
-    non-cache-backed window.
-
-    The live path (``as_of`` is None) reads the verdict inside one read
-    snapshot either way. With no transaction open on ``conn`` it calls the
-    ``leaderboard_with_status`` facade, which opens its own. Inside a forecast
-    route's read snapshot it calls ``leaderboard_with_status_in_transaction``,
-    because the facade's snapshot refuses to nest; the route's snapshot then
-    covers the verdict and every other read the response renders.
+    The verdict is read inside one read snapshot either way. With no
+    transaction open on ``conn`` it calls the ``leaderboard_with_status``
+    facade, which opens its own. Inside a forecast route's read snapshot it
+    calls ``leaderboard_with_status_in_transaction``, because the facade's
+    snapshot refuses to nest; the route's snapshot then covers the verdict
+    and every other read the response renders.
     """
     excluded = {
         int(row["id"])
@@ -622,40 +586,23 @@ def forecast_ranking_with_status(
             """
         ).fetchall()
     }
-    status: LeaderboardStatus
-    if as_of is not None:
-        if declared_min_n is None:
-            raise ValueError("as-of forecast_ranking requires declared_min_n")
-        rows = asof_leaderboard(
+    if conn.in_transaction:
+        result = leaderboard_with_status_in_transaction(
             conn,
             site_id=site_id,
             variable=variable,
             day_ahead=day_ahead,
-            as_of=as_of,
-            min_n=declared_min_n,
-            window_days=declared_window_days,
+            window=window,
         )
-        status = "live"
     else:
-        if conn.in_transaction:
-            result = leaderboard_with_status_in_transaction(
-                conn,
-                site_id=site_id,
-                variable=variable,
-                day_ahead=day_ahead,
-                window=window,
-            )
-        else:
-            result = leaderboard_with_status(
-                conn,
-                site_id=site_id,
-                variable=variable,
-                day_ahead=day_ahead,
-                window=window,
-            )
-        rows = result.rows
-        status = result.status
+        result = leaderboard_with_status(
+            conn,
+            site_id=site_id,
+            variable=variable,
+            day_ahead=day_ahead,
+            window=window,
+        )
     return ForecastRanking(
-        rows={row.feed_id: row for row in rows if row.feed_id not in excluded},
-        status=status,
+        rows={row.feed_id: row for row in result.rows if row.feed_id not in excluded},
+        status=result.status,
     )

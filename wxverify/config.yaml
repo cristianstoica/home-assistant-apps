@@ -1,5 +1,5 @@
 name: "Weather Verify"
-version: "0.16.15"
+version: "0.16.16"
 slug: wxverify
 description: "Verify weather-forecast accuracy via cluster-consensus ground truth"
 url: "https://github.com/cristianstoica/home-assistant-apps/tree/main/wxverify"
@@ -8,6 +8,10 @@ arch:
   - amd64
 startup: services
 init: false
+# Seconds the Supervisor waits after its stop signal before killing the
+# container (allowed 10-300): STOP_BUDGET_S in wxverify/core/stop.py + 15, so
+# it outlasts the s6 grace times set in Dockerfile. Change all three together.
+timeout: 79
 # cold: the supervisor stops the container before archiving /data, so no
 # process is writing while the archive is taken and the whole SQLite file
 # set (.db plus its -wal/-shm sidecars) is captured as one consistent

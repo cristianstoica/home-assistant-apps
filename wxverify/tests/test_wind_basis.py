@@ -6,34 +6,30 @@ store one write it by its literal name and expect the same outcome whatever
 it holds.
 
 Isolation: fresh ``sqlite3.connect(":memory:")`` + ``run_migrations`` per
-test (mirrors test_forecast_service.py), except T24 which drives the real
-``Database.replace_from`` swap path and therefore needs the async
-``wxverify.db.connection.Database`` plus real tmp-path files.
+test (mirrors test_forecast_service.py), except T24 which builds a
+file-backed database via ``wxverify.db.connection.Database`` and real
+tmp-path files.
 """
 
 from __future__ import annotations
 
 import ast
-import asyncio
 import re
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+from tests.helpers import close_off
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database
 from wxverify.db.migrations import run_migrations
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
-from wxverify.db.switch import ensure_site_generation
 from wxverify.db.wind_basis import PAIR_MAX_SOURCE_PREFIX
 from wxverify.scoring.consensus import (
     insert_station_observation,
     write_station_observation,
 )
-from wxverify.scoring.engine import _distinct_cells  # noqa: PLC2701 - direct unit test
-from wxverify.scoring.pairing import compute_real_model_pairs
-from wxverify.scoring.persistence import compute_persistence_pairs
 
 
 def _make_db() -> sqlite3.Connection:
@@ -59,17 +55,6 @@ def _make_station(conn: sqlite3.Connection, site_id: int, pws_id: str) -> int:
         "INSERT INTO stations (site_id, pws_station_id, lat, lon,"
         " dem_elevation_m, enabled) VALUES (?, ?, 0.0, 0.0, 0.0, 1)",
         (site_id, pws_id),
-    )
-    assert cur.lastrowid is not None
-    return int(cur.lastrowid)
-
-
-def _make_feed(conn: sqlite3.Connection, model: str) -> int:
-    cur = conn.execute(
-        "INSERT INTO feeds (source, model, default_subscribed,"
-        " fetch_interval_minutes, max_lead_hours)"
-        " VALUES ('example-src', ?, 1, 360, 48)",
-        (model,),
     )
     assert cur.lastrowid is not None
     return int(cur.lastrowid)
@@ -145,6 +130,7 @@ def test_insert_guard_always_accepts_temperature(state: str | None) -> None:
     accidentally covers every ``variable``) would refuse this in every
     state."""
     conn = _make_db()
+    close_off(conn)
     site = _make_site(conn)
     station = _make_station(conn, site, "KTEST001")
     _store_wind_key(conn, site, state)
@@ -196,35 +182,34 @@ def _build_legacy_shaped_replacement(tmp_path: Path, filename: str) -> Path:
     return path
 
 
-def test_replace_from_reopen_writes_no_wind_basis_key_on_the_imported_file(
+def test_database_open_writes_no_wind_basis_key_on_a_legacy_shaped_file(
     tmp_path: Path,
 ) -> None:
-    """Drives the real import-swap path end to end: ``replace_from`` ->
-    ``_open`` -> ``run_migrations``. Opening a database writes no wind key
-    (plan §3 item 1), so the swapped-in file's old wind row leaves the site
-    without one.
+    """Opening a database writes no wind key (plan §3 item 1), even for a
+    file carrying a legacy station_observations wind row.
+
+    The import-swap path this used to drive end to end (``replace_from``
+    -> ``_open`` -> ``run_migrations``) was removed in the storage-release
+    plan (5.5). Re-pointed to inspect the legacy-shaped file directly:
+    ``_build_legacy_shaped_replacement``'s own ``Database(...)``
+    construction already runs the identical open path, so no behaviour
+    under test is lost.
+
     mutant_open_writes_wind_key -> at this assertion: correct = None (no
-    ``wind_basis:`` key after the reopen), mutant (``run_migrations``
-    calling the removed open-time wind initializer again) = "staging", the
-    swapped-in file's legacy row recognized on reopen."""
-
-    async def _run() -> str | None:
-        db = Database(str(tmp_path / "live.db"))
-        try:
-            new_path = _build_legacy_shaped_replacement(tmp_path, "legacy-import.db")
-            backup_path = tmp_path / "backup.db.bak"
-            await db.replace_from(new_path, backup_path)
-            row = await db.read(
-                lambda conn: conn.execute(
-                    "SELECT value FROM runtime_state WHERE key LIKE 'wind_basis:%'"
-                ).fetchone()
-            )
-            return None if row is None else str(row["value"])
-        finally:
-            db.close()
-
-    state = asyncio.run(_run())
-    assert state is None
+    ``wind_basis:`` key after open), mutant (``run_migrations`` calling the
+    removed open-time wind initializer again) = "staging", the file's
+    legacy row recognized on open.
+    """
+    path = _build_legacy_shaped_replacement(tmp_path, "legacy-import.db")
+    direct = sqlite3.connect(str(path))
+    direct.row_factory = sqlite3.Row
+    try:
+        row = direct.execute(
+            "SELECT value FROM runtime_state WHERE key LIKE 'wind_basis:%'"
+        ).fetchone()
+    finally:
+        direct.close()
+    assert row is None
 
 
 # --- T25 -------------------------------------------------------------------
@@ -232,6 +217,7 @@ def test_replace_from_reopen_writes_no_wind_basis_key_on_the_imported_file(
 
 def test_write_station_observation_stamps_fetched_at_no_materialize() -> None:
     conn = _make_db()
+    close_off(conn)
     site = _make_site(conn)
     station = _make_station(conn, site, "KTEST001")
     changed = write_station_observation(
@@ -286,6 +272,7 @@ def test_insert_station_observation_does_materialize() -> None:
     not here, or omitted from both) would leave it absent if omitted
     entirely from the guarded caller."""
     conn = _make_db()
+    close_off(conn)
     site = _make_site(conn)
     station = _make_station(conn, site, "KTEST001")
     insert_station_observation(
@@ -350,114 +337,6 @@ def test_station_trust_reader_ignores_wind_basis_state(state: str | None) -> Non
     rows = load_station_trust(conn)
     wind_stations = {r.station for r in rows if r.variable == "wind"}
     assert wind_stations == {"KTEST001", "KTEST002"}
-
-
-def _seed_real_model_candidate(
-    conn: sqlite3.Connection, site: int, feed: int, variable: str
-) -> None:
-    conn.execute(
-        "INSERT INTO forecast_samples (site_id, feed_id, variable, issued_at,"
-        " valid_at, lead_hours, value, source_raw, model_run_id, fetched_at)"
-        " VALUES (?, ?, ?, '2026-07-01T00:00:00Z', '2026-07-01T03:00:00Z', 3,"
-        " 10.0, '{}', 'run-x', ?)",
-        (site, feed, variable, isoformat_utc()),
-    )
-    conn.execute(
-        "INSERT INTO observations (site_id, variable, valid_at, value,"
-        " n_stations, rejected_stations, computed_at) VALUES"
-        " (?, ?, '2026-07-01T03:00:00Z', 12.0, 1, 0, ?)",
-        (site, variable, isoformat_utc()),
-    )
-
-
-@pytest.mark.parametrize("state", _STORED_WIND_KEY_VALUES)
-def test_real_model_pairing_reader_ignores_wind_basis_state(
-    state: str | None,
-) -> None:
-    conn = _make_db()
-    site = _make_site(conn)
-    feed = _make_feed(conn, "real-model")
-    _store_wind_key(conn, site, state)
-    _seed_real_model_candidate(conn, site, feed, "wind")
-    _seed_real_model_candidate(conn, site, feed, "temperature")
-    delta = compute_real_model_pairs(conn, site)
-    variables = {str(op.values[2]) for op in delta.ops}
-    assert "wind" in variables
-    assert "temperature" in variables
-
-
-def _seed_persistence_candidate(conn: sqlite3.Connection, site: int) -> None:
-    conn.execute(
-        "INSERT INTO feeds (source, model, default_subscribed,"
-        " fetch_interval_minutes, max_lead_hours, is_virtual)"
-        " VALUES ('virtual', '_persistence', 1, 60, 168, 1)"
-        " ON CONFLICT(source, model) DO NOTHING"
-    )
-    for variable, hour in (
-        ("wind", 0),
-        ("wind", 24),
-        ("temperature", 0),
-        ("temperature", 24),
-    ):
-        valid_at = f"2026-07-0{1 + hour // 24}T00:00:00Z"
-        conn.execute(
-            "INSERT INTO observations (site_id, variable, valid_at, value,"
-            " n_stations, rejected_stations, computed_at) VALUES"
-            " (?, ?, ?, 10.0, 1, 0, ?)",
-            (site, variable, valid_at, isoformat_utc()),
-        )
-
-
-@pytest.mark.parametrize("state", _STORED_WIND_KEY_VALUES)
-def test_persistence_pairing_reader_ignores_wind_basis_state(
-    state: str | None,
-) -> None:
-    conn = _make_db()
-    site = _make_site(conn)
-    _store_wind_key(conn, site, state)
-    _seed_persistence_candidate(conn, site)
-    delta = compute_persistence_pairs(conn, site)
-    variables = {str(op.values[2]) for op in delta.ops}
-    assert "wind" in variables
-    assert "temperature" in variables
-
-
-def _seed_published_wind_pair(conn: sqlite3.Connection, site: int, feed: int) -> None:
-    generation = ensure_site_generation(conn, site)
-    conn.execute(
-        "INSERT INTO forecast_pairs"
-        " (site_id, feed_id, variable, issued_at, valid_at, lead_hours,"
-        "  day_ahead, forecast, observed, error, abs_error, sq_error,"
-        "  first_known_at, tz_generation_id)"
-        " VALUES (?, ?, 'wind', '2026-07-01T00:00:00Z', '2026-07-01T03:00:00Z',"
-        "  3, 0, 10.0, 12.0, -2.0, 2.0, 4.0, '2026-07-01T00:00:00Z', ?)",
-        (site, feed, generation),
-    )
-
-
-@pytest.mark.parametrize("state", _STORED_WIND_KEY_VALUES)
-def test_distinct_cells_reader_ignores_wind_basis_state(state: str | None) -> None:
-    conn = _make_db()
-    site = _make_site(conn)
-    feed = _make_feed(conn, "wind-model")
-    _store_wind_key(conn, site, state)
-    _seed_published_wind_pair(conn, site, feed)
-    # Also a temperature cell: the reader returns wind's cell alongside the
-    # other variables', not in place of them.
-    generation = ensure_site_generation(conn, site)
-    conn.execute(
-        "INSERT INTO forecast_pairs (site_id, feed_id, variable, issued_at,"
-        " valid_at, lead_hours, day_ahead, forecast, observed, error,"
-        " abs_error, sq_error, first_known_at, tz_generation_id) VALUES"
-        " (?, ?, 'temperature', '2026-07-01T00:00:00Z',"
-        " '2026-07-01T03:00:00Z', 3, 0, 10.0, 12.0, -2.0, 2.0, 4.0,"
-        " '2026-07-01T00:00:00Z', ?)",
-        (site, feed, generation),
-    )
-    cells = _distinct_cells(conn, site)
-    variables = {c.variable for c in cells}
-    assert "wind" in variables
-    assert "temperature" in variables
 
 
 # --- T28 -----------------------------------------------------------------

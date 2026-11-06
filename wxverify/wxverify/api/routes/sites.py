@@ -14,15 +14,9 @@ from wxverify.api.schemas import SiteCreate, SiteOut, SiteUpdate
 from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import get_db
 from wxverify.db.runtime_state import delete_runtime_state
-from wxverify.db.site_days import (
-    daily_close_on,
-    start_site_days,
-    writable_pairs_clause,
-)
+from wxverify.db.site_days import daily_close_on, start_site_days
 from wxverify.db.switch import ensure_site_generation
-from wxverify.scoring.engine import pair_and_score
 from wxverify.verification.record import SNAPSHOT_TIME_KEY, gap_scan_failures_key
-from wxverify.verification.runs import published_run_key
 
 router = APIRouter(prefix="/api/sites", tags=["sites"])
 
@@ -130,22 +124,6 @@ async def update_site(
                 "UPDATE sites SET rain_threshold_mm=? WHERE id=?",
                 (body.rain_threshold_mm, site_id),
             )
-            # While the daily close is on, done days keep their pairs and
-            # the threshold they were scored with (writable_pairs_clause).
-            day_clause = writable_pairs_clause(conn, site_id, now_utc=utc_now())
-            conn.execute(
-                f"""
-                DELETE FROM forecast_pairs
-                WHERE site_id=? AND variable='precip'
-                  AND {day_clause}
-                """,
-                (site_id,),
-            )
-            conn.execute(
-                "DELETE FROM score_cache WHERE site_id=? AND variable='precip'",
-                (site_id,),
-            )
-            pair_and_score(conn, site_id)
         updated = conn.execute("SELECT * FROM sites WHERE id=?", (site_id,)).fetchone()
         if updated is None:
             raise RuntimeError("site update failed")
@@ -165,11 +143,7 @@ def _clear_site_state(conn: sqlite3.Connection, site_id: int) -> None:
     Site ids are reused (INTEGER PRIMARY KEY, no AUTOINCREMENT) and neither
     table has a foreign key, so the sites cascade never reaches these rows.
     """
-    delete_runtime_state(
-        conn,
-        published_run_key(site_id),
-        gap_scan_failures_key(site_id),
-    )
+    delete_runtime_state(conn, gap_scan_failures_key(site_id))
     conn.execute(
         "DELETE FROM settings WHERE key = ?", (f"{SNAPSHOT_TIME_KEY}:{site_id}",)
     )

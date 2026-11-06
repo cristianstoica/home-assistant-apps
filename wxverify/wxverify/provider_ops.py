@@ -19,11 +19,9 @@ from wxverify.collection.forecast_validation import (
 )
 from wxverify.core.options import SECRET_ENV
 from wxverify.core.secrets import key_status
-from wxverify.core.timeutil import utc_now, window_cutoff
+from wxverify.core.timeutil import window_cutoff
 from wxverify.db.migrations import seed_default_feeds, seed_default_sources
 from wxverify.db.queue import enqueue_if_absent
-from wxverify.db.site_days import writable_pairs_clause
-from wxverify.scoring.engine import pair_and_score
 from wxverify.worker.feed_fetch import feed_fetch_target
 
 # Days of history the provider-health route aggregates per feed. A display
@@ -206,14 +204,15 @@ def set_site_subscription(
     enabled: bool,
     enqueue_on_enable: bool = False,
 ) -> SubscriptionResult:
-    """Set one site's subscription to one feed, rebuilding its mean on a change.
+    """Set one site's subscription to one feed.
 
     Must be called inside the caller's write transaction, so the stored value
-    read here cannot move before the upsert, and a failed rebuild rolls the
-    upsert back with it. Only an explicit stored value equal to ``enabled``
-    counts as unchanged: a missing row or a NULL ``enabled`` (inherit) is
-    written and rebuilt as a change. An unchanged value writes nothing and
-    skips the rebuild; the fetch rule on enable runs either way.
+    read here cannot move before the upsert. Only an explicit stored value
+    equal to ``enabled`` counts as unchanged: a missing row or a NULL
+    ``enabled`` (inherit) is written as a change. An unchanged value writes
+    nothing; the fetch rule on enable runs either way. The daily close scores
+    each closed day, so nothing here writes a score (storage-release plan,
+    table 1.B row B13).
     """
     if conn.execute("SELECT 1 FROM sites WHERE id=?", (site_id,)).fetchone() is None:
         raise ProviderOpsError(404, "site not found")
@@ -244,7 +243,6 @@ def set_site_subscription(
             """,
             (site_id, feed_id, 1 if enabled else 0),
         )
-        rebuild_mean_for_site(conn, site_id)
     fetch_result = (
         enqueue_fetch_for_feed(conn, site_id, feed_id)
         if enabled and enqueue_on_enable
@@ -718,11 +716,6 @@ def smoke_stored_sample_check(
     return SmokeStoredCheck(ok=not reasons, reasons=tuple(reasons), metrics=metrics)
 
 
-def rebuild_mean_for_site(conn: sqlite3.Connection, site_id: int) -> None:
-    _invalidate_mean_for_site(conn, site_id)
-    pair_and_score(conn, site_id)
-
-
 def provider_doctor_failures(health: Sequence[dict[str, object]]) -> tuple[str, ...]:
     failures: list[str] = []
     for group in health:
@@ -868,28 +861,6 @@ def _feed_ref(row: sqlite3.Row) -> FeedRef:
 def _table_count(conn: sqlite3.Connection, table: str) -> int:
     row = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
     return 0 if row is None else int(row["n"])
-
-
-def _mean_feed_id(conn: sqlite3.Connection) -> int | None:
-    row = conn.execute(
-        "SELECT id FROM feeds WHERE source='virtual' AND model='_multimodel_mean'"
-    ).fetchone()
-    return None if row is None else int(row["id"])
-
-
-def _invalidate_mean_for_site(conn: sqlite3.Connection, site_id: int) -> None:
-    feed_id = _mean_feed_id(conn)
-    if feed_id is None:
-        return
-    # While the daily close is on, done days keep their mean pairs.
-    day_clause = writable_pairs_clause(conn, site_id, now_utc=utc_now())
-    conn.execute(
-        f"DELETE FROM forecast_pairs WHERE site_id=? AND feed_id=? AND {day_clause}",
-        (site_id, feed_id),
-    )
-    conn.execute(
-        "DELETE FROM score_cache WHERE site_id=? AND feed_id=?", (site_id, feed_id)
-    )
 
 
 def _placeholders(values: Iterable[object]) -> str:

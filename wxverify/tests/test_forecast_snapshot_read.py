@@ -24,14 +24,18 @@ import sqlite3
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.helpers import assert_read_pool_at_rest
+from tests.helpers import (
+    assert_read_pool_at_rest,
+    seed_active_publication,
+    seed_publication_ranking,
+)
 from tests.test_forecast_tiles_poll import (
     _current_fingerprint,
     _feed_id,
@@ -47,11 +51,8 @@ from wxverify import config
 from wxverify.core.timeutil import floor_hour, isoformat_utc, utc_now
 from wxverify.db.connection import _READ_POOL_SIZE, Database, get_db
 from wxverify.db.snapshot import read_snapshot
-from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.data import forecast_ranking_with_status
-from wxverify.scoring.cache import upsert_score_cache
-from wxverify.scoring.leaderboard import resolve_window
-from wxverify.scoring.metrics import strategy_for
+from wxverify.scoring.metrics import MetricSums, metrics_from_sums
 from wxverify.settings.keys import get_number_setting, set_setting
 from wxverify.web.routes import _load_forecast_context
 
@@ -60,12 +61,7 @@ from wxverify.web.routes import _load_forecast_context
 # ---------------------------------------------------------------------------
 
 
-async def _no_warm(db: object) -> None:
-    return None
-
-
 def _make_app(monkeypatch: pytest.MonkeyPatch) -> Any:
-    monkeypatch.setattr("wxverify.api.app.warm_read_cache", _no_warm)
     return _make_app_base(monkeypatch)
 
 
@@ -104,62 +100,47 @@ def _seed_s0(conn: sqlite3.Connection) -> Seed:
                 value=value,
             )
 
-    far_valid_ats = [
-        "2035-06-30T00:00:00Z",
-        "2035-06-30T01:00:00Z",
-        "2035-06-30T02:00:00Z",
-    ]
-    far_lead_hours = [1, 2, 3]
-    for target_feed, forecast in (
-        (persistence_id, 8.0),
-        (feed_a, 10.5),
-        (feed_b, 9.0),
-    ):
-        for valid_at, lead_hours in zip(far_valid_ats, far_lead_hours, strict=True):
-            error = forecast - 10.0
-            conn.execute(
-                """
-                INSERT INTO forecast_pairs
-                    (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                     day_ahead, forecast, observed, error, abs_error, sq_error,
-                     tz_generation_id)
-                VALUES (?, ?, 'temperature', '2035-06-29T00:00:00Z', ?, ?, 1, ?,
-                        10.0, ?, ?, ?, ?)
-                """,
-                (
-                    site_id,
-                    target_feed,
-                    valid_at,
-                    lead_hours,
-                    forecast,
-                    error,
-                    abs(error),
-                    error * error,
-                    ensure_site_generation(conn, site_id),
-                ),
-            )
-
     min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-    resolved = resolve_window(conn, "rolling")
+    # leaderboard_with_status's `rolling` window now always reads the
+    # active publication (9.2), never a live recompute, so the three feeds'
+    # rankings land in one site publication instead of score_cache.
+    pub_id = seed_active_publication(
+        conn,
+        site_id=site_id,
+        cutoff=date(2035, 6, 30),
+        published_at=datetime(2035, 6, 30, tzinfo=UTC),
+        window_days=30,
+        min_n=min_n,
+    )
+    # The pair-aggregate SQL that used to compute these (`strategy_for(
+    # ...).aggregate`) is gone (W6b), and no pair table is read for
+    # scoring any more (storage release 3.1): hand-derived here as if from
+    # 3 identical far-future hours (forecast/observed=10.0, persistence
+    # forecast=8.0), through the surviving pure `metrics_from_sums`,
+    # skill-paired 1:1 against persistence's own (also constant) error.
+    forecasts = {persistence_id: 8.0, feed_a: 10.5, feed_b: 9.0}
+    persistence_sq = (forecasts[persistence_id] - 10.0) ** 2
     for target_feed in (feed_a, feed_b, persistence_id):
-        result = strategy_for("temperature").aggregate(
+        error = forecasts[target_feed] - 10.0
+        sums: MetricSums = {
+            "n": 3,
+            "err_n": 3,
+            "err_sum": error * 3,
+            "abs_sum": abs(error) * 3,
+            "sq_sum": error * error * 3,
+            "skill_n": 3,
+            "skill_sq_sum": error * error * 3,
+            "skill_ref_sq_sum": persistence_sq * 3,
+        }
+        result = metrics_from_sums(sums, variable="temperature", min_n=min_n)
+        seed_publication_ranking(
             conn,
-            site_id=site_id,
+            publication_id=pub_id,
             feed_id=target_feed,
             variable="temperature",
             day_ahead=1,
-            window_cutoff=resolved.cutoff,
-            min_n=min_n,
-        )
-        upsert_score_cache(
-            conn,
-            site_id=site_id,
-            feed_id=target_feed,
-            variable="temperature",
-            day_ahead=1,
-            window_key=resolved.window_key,
+            window_key="w:30",
             result=result,
-            computed_at=isoformat_utc(),
         )
 
     return Seed(
@@ -229,7 +210,7 @@ def _commit_once(
     return counts
 
 
-_TOKEN_RE = re.compile(r'fingerprint=([0-9-]*)"')
+_TOKEN_RE = re.compile(r'fingerprint=([0-9a-z-]*)"')
 _DEPTH_LINE_RE = re.compile(r'<p class="muted depth-line">(.*?)</p>', re.DOTALL)
 
 
@@ -330,8 +311,11 @@ def _assert_checkpoint_clean(db_path: str) -> None:
 V0 = ["13° / 13°"]
 V1 = ["23° / 23°"]
 V2 = ["21° / 21°"]
-T0 = "48"
-T1 = "96"
+#: ``-p1`` is the seed's single active publication, the first and only
+#: row `_seed_s0` inserts into `publications` (with the daily close on,
+#: `forecast_fingerprint` always ends in `-p<id>` of that publication).
+T0 = "48-p1"
+T1 = "96-p1"
 D2 = "Blend depth: temperature 2 (global) · wind 2 (global) · precip 2 (global)"
 D1 = "Blend depth: temperature 1 (global) · wind 1 (global) · precip 1 (global)"
 

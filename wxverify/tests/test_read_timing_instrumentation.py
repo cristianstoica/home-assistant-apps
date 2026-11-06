@@ -13,8 +13,6 @@ import itertools
 import logging
 import sqlite3
 import threading
-import time
-from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -28,7 +26,6 @@ from wxverify.db.connection import (  # noqa: SLF001
     close_db,
     get_db,
 )
-from wxverify.db.switch import ensure_site_generation
 
 
 def _shared_read(conn: sqlite3.Connection) -> int:
@@ -184,175 +181,6 @@ def test_read_cancelled_while_waiting_for_the_lock_still_records_a_lower_bound_w
     assert timing["wait_ms"] >= 15.0
 
 
-def test_gate_ms_is_near_zero_normally_and_bounded_below_during_a_swap(
-    tmp_path: Path,
-) -> None:
-    """gate_ms must track time parked behind a closed import-swap gate
-    separately from wait_ms: a read served while the gate is already open
-    should show ~0 gate_ms, and a read parked behind an in-progress swap
-    should show a bounded-below gate_ms without that same time leaking
-    into wait_ms once it reaches the (by then fully restocked) pool.
-    """
-
-    def _build_replacement_db(path: Path) -> Path:
-        placeholder = Database(str(path))
-        placeholder.close()
-        return path
-
-    async def _drive() -> tuple[dict[str, float], dict[str, float]]:
-        db = Database(str(tmp_path / "db.sqlite"))
-        try:
-            await db.read(lambda conn: conn.execute("SELECT 1").fetchone())
-            before_labels = set(db.read_timing_snapshot())
-
-            real_replace_sync = Database._replace_sync  # noqa: SLF001
-
-            def _slow_replace_sync(self: Database, new_db: Path, backup: Path) -> None:
-                # A fixed, deterministic hold so the gate-closed interval
-                # has a known lower bound to check gate_ms against.
-                time.sleep(0.02)
-                real_replace_sync(self, new_db, backup)
-
-            Database._replace_sync = _slow_replace_sync  # type: ignore[method-assign]  # noqa: SLF001
-            try:
-                new_path = _build_replacement_db(tmp_path / "new.db")
-                backup_path = tmp_path / "backup.db.bak"
-                swap_task = asyncio.create_task(db.replace_from(new_path, backup_path))
-                await asyncio.sleep(0)
-                assert db._read_gate.is_set() is False, (  # noqa: SLF001
-                    "the gate must already be closed before the gated "
-                    "read below is dispatched, or it proves nothing"
-                )
-
-                await db.read(lambda conn: conn.execute("SELECT 2").fetchone())
-                await swap_task
-            finally:
-                Database._replace_sync = real_replace_sync  # type: ignore[method-assign]  # noqa: SLF001
-
-            snapshot = db.read_timing_snapshot()
-            normal_label = next(iter(before_labels))
-            gated_label = next(iter(set(snapshot) - before_labels))
-            return snapshot[normal_label], snapshot[gated_label]
-        finally:
-            db.close()
-
-    normal, gated = asyncio.run(_drive())
-    assert normal["gate_ms"] < 15.0, (
-        "a read served while the gate is already open must not show a "
-        "meaningful gate_ms"
-    )
-    # 5 ms margin below the 20 ms hold: one-sided (a loaded machine only
-    # makes the sleep longer, never shorter), so this should not be flaky.
-    assert gated["gate_ms"] >= 15.0, (
-        "a read parked behind an in-progress swap must show that wait in gate_ms"
-    )
-    assert gated["wait_ms"] < 15.0, (
-        "gate time must not leak into wait_ms -- by the time the gated "
-        "read passes the gate, the pool has already been restocked, so "
-        "its pool wait should stay near zero"
-    )
-
-
-def test_last_import_swap_at_and_generation_stamped_on_replace_from(
-    tmp_path: Path,
-) -> None:
-    """A fresh ``Database`` starts at generation 0 with no swap stamp; each
-    completed ``replace_from`` bumps generation and stamps
-    ``last_import_swap_at`` with the current UTC time -- in-memory process
-    state, never a value the replacement file itself could carry.
-    """
-
-    def _build_replacement_db(path: Path) -> Path:
-        placeholder = Database(str(path))
-        placeholder.close()
-        return path
-
-    async def _drive() -> tuple[int, str | None, int, str | None]:
-        db = Database(str(tmp_path / "db.sqlite"))
-        try:
-            before_generation = db.generation
-            before_stamp = db.last_import_swap_at
-
-            new_path = _build_replacement_db(tmp_path / "new.db")
-            backup_path = tmp_path / "backup.db.bak"
-            await db.replace_from(new_path, backup_path)
-
-            return (
-                before_generation,
-                before_stamp,
-                db.generation,
-                db.last_import_swap_at,
-            )
-        finally:
-            db.close()
-
-    before_generation, before_stamp, after_generation, after_stamp = asyncio.run(
-        _drive()
-    )
-    assert before_generation == 0
-    assert before_stamp is None
-    assert after_generation == before_generation + 1
-    assert after_stamp is not None
-    # Must be a parseable ISO-8601 UTC stamp, not just any non-None value.
-    datetime.fromisoformat(after_stamp.replace("Z", "+00:00"))
-
-
-def test_last_import_swap_at_and_generation_stamped_on_rollback_restore(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The rollback-restore branch of ``_replace_sync`` -- reopen-on-new-file
-    fails, so the backup is restored and reopened -- must ALSO bump
-    ``generation`` and stamp ``last_import_swap_at``, not only the
-    happy-path reopen. It must also NOT be whatever an imported/restored
-    database's own file could carry -- the value observed after recovery
-    always traces to this process's own ``isoformat_utc()`` call, never a
-    stamp copied in from the backup file's content.
-    """
-
-    def _build_replacement_db(path: Path) -> Path:
-        placeholder = Database(str(path))
-        placeholder.close()
-        return path
-
-    real_open = Database._open  # noqa: SLF001
-    call_count = 0
-
-    def _open_fails_once_after_rename(self: Database) -> None:
-        nonlocal call_count
-        call_count += 1
-        # Patch is installed only for the replace_from() call below, so the
-        # 1st call it ever sees is the reopen-on-new-file step inside
-        # _replace_sync, right after the atomic rename -- fail here to
-        # force the rollback-restore branch. The 2nd call is the rollback
-        # branch's own reopen, on the restored backup -- must succeed so
-        # the test can inspect the recovered state.
-        if call_count == 1:
-            raise RuntimeError("synthetic reopen-on-new-file failure")
-        real_open(self)
-
-    async def _drive() -> tuple[int, str | None]:
-        db = Database(str(tmp_path / "db.sqlite"))
-        try:
-            before_generation = db.generation
-            new_path = _build_replacement_db(tmp_path / "new.db")
-            backup_path = tmp_path / "backup.db.bak"
-            with monkeypatch.context() as mp:
-                mp.setattr(Database, "_open", _open_fails_once_after_rename)
-                with pytest.raises(RuntimeError, match="synthetic reopen"):
-                    await db.replace_from(new_path, backup_path)
-            return before_generation, db.last_import_swap_at
-        finally:
-            db.close()
-
-    before_generation, after_stamp = asyncio.run(_drive())
-    assert before_generation == 0
-    assert after_stamp is not None, (
-        "the rollback-restore reopen must also stamp last_import_swap_at, "
-        "not only the straight-through success path"
-    )
-    datetime.fromisoformat(after_stamp.replace("Z", "+00:00"))
-
-
 def test_wait_ms_is_near_zero_within_pool_capacity_and_bounded_below_beyond_it(
     tmp_path: Path,
 ) -> None:
@@ -433,55 +261,12 @@ def test_wait_ms_is_near_zero_within_pool_capacity_and_bounded_below_beyond_it(
     )
 
 
-def test_read_cancelled_while_waiting_for_the_gate_still_records_an_error(
-    tmp_path: Path,
-) -> None:
-    """A read cancelled while parked behind a closed gate -- the new
-    failure phase this pool introduces -- must still be counted as a
-    failed call, exactly like a read cancelled while queued for a pooled
-    connection already is.
-    """
-
-    async def _drive() -> dict[str, dict[str, float]]:
-        db = Database(str(tmp_path / "db.sqlite"))
-        try:
-            db._read_gate.clear()  # noqa: SLF001
-            task = asyncio.create_task(
-                db.read(lambda conn: conn.execute("SELECT 1").fetchone())
-            )
-            await asyncio.sleep(0)
-            assert not task.done(), "read must be parked behind the closed gate"
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-            return db.read_timing_snapshot()
-        finally:
-            db._read_gate.set()  # noqa: SLF001
-            db.close()
-
-    snapshot = asyncio.run(_drive())
-    assert len(snapshot) == 1
-    timing = next(iter(snapshot.values()))
-    assert timing["calls"] == 1
-    assert timing["errors"] == 1
-    assert timing["dispatch_ms"] == 0.0
-    assert timing["exec_ms"] == 0.0
-    assert timing["wait_ms"] == 0.0, (
-        "a read cancelled before ever passing the gate never reached the "
-        "pool-wait phase, so wait_ms must stay at its untouched default "
-        "rather than borrowing time from the gate phase"
-    )
-
-
 _BASE_WORKER_STATUS_KEYS = frozenset(
     {
         "jobs",
         "worker_started_at",
         "worker_last_loop_at",
         "scheduler_last_tick_at",
-        "import_rebuild_done_at",
-        "import_rebuild_state",
-        "import_rebuild_error",
         "last_completed_fetch_feed_at",
         "last_completed_fetch_obs_at",
         "last_completed_pair_and_score_at",
@@ -494,7 +279,7 @@ async def _idle_worker(db: object) -> None:
     await asyncio.Event().wait()
 
 
-def _seed_one_sample_and_one_pair(conn: sqlite3.Connection) -> None:
+def _seed_one_sample_and_one_history_row(conn: sqlite3.Connection) -> None:
     site_id = int(
         conn.execute(
             """
@@ -520,14 +305,13 @@ def _seed_one_sample_and_one_pair(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
-        INSERT INTO forecast_pairs
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error,
-             tz_generation_id)
-        VALUES (?, ?, 'temperature', '2026-01-01T00:00:00Z',
-                '2026-01-01T06:00:00Z', 24, 1, 10.0, 10.0, 0.0, 0.0, 0.0, ?)
+        INSERT INTO forecast_history
+            (site_id, feed_id, variable, day_ahead, valid_at, local_date,
+             value, lead_hours, issued_at, contributors)
+        VALUES (?, ?, 'temperature', 1, '2026-01-01T06:00:00Z', '2026-01-01',
+                10.0, 24, '2026-01-01T00:00:00Z', NULL)
         """,
-        (site_id, feed_id, ensure_site_generation(conn, site_id)),
+        (site_id, feed_id),
     )
 
 
@@ -547,57 +331,9 @@ def test_worker_status_default_response_gains_read_timing_unconditionally(
     assert set(body.keys()) == _BASE_WORKER_STATUS_KEYS | {
         "read_timing",
         "read_timing_since",
-        "generation",
-        "last_import_swap_at",
-        "read_cache_warm",
-        "wind_weights_cache",
     }
     assert isinstance(body["read_timing"], dict)
     assert isinstance(body["read_timing_since"], str)
-    assert body["generation"] == 0
-    assert body["last_import_swap_at"] is None
-
-
-def test_worker_status_import_rebuild_done_at_present_and_none_before_any_import(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The key is present-and-None before any import, not absent entirely."""
-    close_db()
-    config.db_path = str(tmp_path / "worker-status-rebuild-none.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-    config.standalone_origin = None
-    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
-    app = create_app(root_path="")
-    with TestClient(app) as client:
-        response = client.get("/api/worker/status")
-    assert response.status_code == 200
-    body = response.json()
-    assert "import_rebuild_done_at" in body
-    assert body["import_rebuild_done_at"] is None
-
-
-def test_worker_status_import_rebuild_done_at_stamped_after_rebuild(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Once a rebuild has run, the key surfaces a timestamp, not None."""
-    from wxverify.db.runtime_state import set_runtime_state_now
-
-    close_db()
-    config.db_path = str(tmp_path / "worker-status-rebuild-stamped.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-    config.standalone_origin = None
-    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
-    app = create_app(root_path="")
-    with TestClient(app) as client:
-        db = get_db()
-        db.write_sync(
-            lambda conn: set_runtime_state_now(conn, "import_rebuild_done_at")
-        )
-        response = client.get("/api/worker/status")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["import_rebuild_done_at"] is not None
-    assert isinstance(body["import_rebuild_done_at"], str)
 
 
 def test_worker_status_counts_exact_adds_the_two_row_counts(
@@ -611,7 +347,7 @@ def test_worker_status_counts_exact_adds_the_two_row_counts(
     app = create_app(root_path="")
     with TestClient(app) as client:
         db = get_db()
-        db.write_sync(_seed_one_sample_and_one_pair)
+        db.write_sync(_seed_one_sample_and_one_history_row)
         response = client.get("/api/worker/status", params={"counts": "exact"})
     assert response.status_code == 200
     body = response.json()
@@ -620,13 +356,9 @@ def test_worker_status_counts_exact_adds_the_two_row_counts(
         | {
             "read_timing",
             "read_timing_since",
-            "generation",
-            "last_import_swap_at",
-            "read_cache_warm",
-            "wind_weights_cache",
             "forecast_samples_rows",
-            "forecast_pairs_rows",
+            "forecast_history_rows",
         }
     )
     assert body["forecast_samples_rows"] == 1
-    assert body["forecast_pairs_rows"] == 1
+    assert body["forecast_history_rows"] == 1

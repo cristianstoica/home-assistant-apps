@@ -382,7 +382,7 @@ def test_o10_enumeration_on_the_real_repo() -> None:
         assert (_REPO / root).is_dir()
 
     rel = {p.relative_to(_REPO).as_posix() for p in _production_python_files(_REPO)}
-    assert "wxverify/verification/decision.py" in rel
+    assert "wxverify/verification/coverage.py" in rel
     assert "wxverify/__init__.py" in rel
     assert "scripts/bench_cache_hot_path.py" in rel
     assert not any(r.startswith("tests/") for r in rel)
@@ -410,9 +410,9 @@ def test_o12_message_format() -> None:
 
 
 def test_o13_liveness_on_real_production_text() -> None:
-    path = _REPO / "wxverify" / "verification" / "decision.py"
+    path = _REPO / "wxverify" / "verification" / "coverage.py"
     text = path.read_text(encoding="utf-8")
-    rel = "wxverify/verification/decision.py"
+    rel = "wxverify/verification/coverage.py"
     assert _python_findings(text, rel) == []
     planted = text + "# planted zzz.py:1\n"
     findings = _python_findings(planted, rel)
@@ -631,7 +631,7 @@ def test_ob8_real_loader_enumeration() -> None:
         if p.is_file() and _is_template_name(p.relative_to(tdir).as_posix())
     }
     assert via_loader == via_rglob
-    assert "wxverify/web/templates/verification/show.html" in via_loader
+    assert "wxverify/web/templates/dashboard/show.html" in via_loader
     assert "wxverify/web/templates/base.html" in via_loader
     assert via_loader
 

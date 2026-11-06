@@ -50,7 +50,7 @@ from wxverify.core.timeutil import (
     parse_utc,
     utc_now,
 )
-from wxverify.db.connection import Database, FencedWriter, StaleGenerationError
+from wxverify.db.connection import Database, FencedWriter
 from wxverify.db.site_days import (
     DayRecord,
     current_day,
@@ -738,9 +738,8 @@ async def _run_row(
                     records=records,
                     no_content=no_content,
                 ),
-                reservation,
             )
-        except (StaleGenerationError, sqlite3.OperationalError, JobControl):
+        except (sqlite3.OperationalError, JobControl):
             raise
         except Exception as exc:
             message = _row_message(row, exc)
@@ -755,7 +754,6 @@ async def _run_row(
                     tz_name=chunk.tz_name,
                     message=message,
                 ),
-                reservation,
             )
             exc.add_note(
                 f"station={row.pws_station_id} progress={position + 1}/{total}"
@@ -882,7 +880,7 @@ async def _fetch_failed(
                 )
 
             entry = await write_after_reservation(
-                chunk.db, chunk.writer, record_refusal, reservation
+                chunk.db, chunk.writer, record_refusal
             )
             _log_try(entry)
             return "fetched"
@@ -909,7 +907,7 @@ async def _fetch_failed(
                 return wake, failed_try(conn, attempt, "provider", "http 429")
 
             wake, entry = await write_after_reservation(
-                chunk.db, chunk.writer, rate_limited, reservation
+                chunk.db, chunk.writer, rate_limited
             )
             _log_try(entry)
             raise JobDeferred(_capped_wake(wake, entry)) from exc
@@ -927,7 +925,7 @@ async def _fetch_failed(
             # In the window as in the daytime (4.2): the job waits for the
             # back-off's end, so the run's other today rows keep their slot.
             wake, entry = await write_after_reservation(
-                chunk.db, chunk.writer, server_error, reservation
+                chunk.db, chunk.writer, server_error
             )
             _log_try(entry)
             raise JobDeferred(_capped_wake(wake, entry)) from exc
@@ -937,11 +935,7 @@ async def _fetch_failed(
             failure(conn)
             return failed_try(conn, attempt, "provider", f"http {status}")
 
-        _log_try(
-            await write_after_reservation(
-                chunk.db, chunk.writer, http_failure, reservation
-            )
-        )
+        _log_try(await write_after_reservation(chunk.db, chunk.writer, http_failure))
         return "fetched"
     if (
         isinstance(exc, UpstreamPayloadError)
@@ -954,11 +948,7 @@ async def _fetch_failed(
             failure(conn)
             return failed_try(conn, attempt, "provider", fault)
 
-        _log_try(
-            await write_after_reservation(
-                chunk.db, chunk.writer, payload_failure, reservation
-            )
-        )
+        _log_try(await write_after_reservation(chunk.db, chunk.writer, payload_failure))
         return "fetched"
     if isinstance(exc, (httpx.TransportError, TimeoutError)):
         refund = is_refundable_transport_error(exc)
@@ -976,7 +966,7 @@ async def _fetch_failed(
             return wake, failed_try(conn, attempt, "network", "network")
 
         wake, entry = await write_after_reservation(
-            chunk.db, chunk.writer, transport_failure, reservation
+            chunk.db, chunk.writer, transport_failure
         )
         _log_try(entry)
         if entry is not None and entry.in_window:
@@ -984,7 +974,7 @@ async def _fetch_failed(
             # on to its other today rows instead of deferring 15 minutes.
             return "fetched"
         raise JobDeferred(_capped_wake(wake, entry)) from exc
-    await write_after_reservation(chunk.db, chunk.writer, failure, reservation)
+    await write_after_reservation(chunk.db, chunk.writer, failure)
     return "reraise"
 
 

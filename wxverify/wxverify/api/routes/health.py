@@ -19,11 +19,9 @@ from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import get_db
 from wxverify.db.runtime_state import runtime_status
 from wxverify.db.site_days import daily_close_on
-from wxverify.forecast.wind_blend import wind_weights_cache_stats
 from wxverify.monitor import build_verdict, error_verdict
 from wxverify.provider_ops import provider_health
 from wxverify.scoring.publication import latest_published_at
-from wxverify.verification.read_cache import warm_outcome
 
 router = APIRouter(prefix="/api", tags=["health"])
 
@@ -31,7 +29,10 @@ router = APIRouter(prefix="/api", tags=["health"])
 # re-typed copy: a bare COUNT(*) with no WHERE lets the planner pick whichever
 # index is smallest, so this stays a table-free scan without an INDEXED BY hint.
 FORECAST_SAMPLES_COUNT_SQL = "SELECT COUNT(*) AS n FROM forecast_samples"
-FORECAST_PAIRS_COUNT_SQL = "SELECT COUNT(*) AS n FROM forecast_pairs"
+# forecast_history has no index but its primary key (storage-release plan
+# 3.1), so its count walks the table's own key b-tree; it runs only when
+# opted in.
+FORECAST_HISTORY_COUNT_SQL = "SELECT COUNT(*) AS n FROM forecast_history"
 
 # Two probes over one body: `/api/health/feeds` answers with an exact COUNT by
 # default, and with a plain EXISTS when the caller opts out of `sample_count`.
@@ -363,7 +364,6 @@ async def worker_status(counts: str = Query("")) -> dict[str, object]:
         for job_type, job_key in (
             ("fetch_feed", None),
             ("fetch_obs", "obs"),
-            ("pair_and_score", None),
         ):
             row = conn.execute(
                 """
@@ -377,23 +377,24 @@ async def worker_status(counts: str = Query("")) -> dict[str, object]:
             status[f"last_completed_{job_type}_at"] = (
                 None if row is None else row["completed_at"]
             )
-        # With the daily close on no pair_and_score run completes, so the key
-        # Home Assistant's last-score sensor reads carries the newest
-        # published_at over the sites' active publications instead, or null
-        # before the first (daily-close plan P5, 9.6).
+        # The key Home Assistant's last-score sensor reads: the newest
+        # published_at over the sites' active publications, or null before
+        # the first and while the daily close is off (daily-close plan P5,
+        # 9.6).
+        status["last_completed_pair_and_score_at"] = None
         if daily_close_on(conn):
             status["last_completed_pair_and_score_at"] = latest_published_at(conn)
-        # Exact, not estimated, and opt-in: forecast_pairs has five delete
-        # paths (multimodel rematerialization on every scoring run among
-        # them), so its rowid watermark is not a valid row-count estimate,
-        # and this route is a five-minutely coordinator-polled core slice
-        # that must not carry the cost of an exact count on every poll.
+        # Exact counts, opt-in: forecast_history is a WITHOUT ROWID table, so
+        # it has no rowid watermark to estimate from, and this route is a
+        # five-minutely coordinator-polled core slice that must not carry the
+        # cost of an exact count on every poll (storage-release plan, table
+        # 1.A row A5).
         if counts == "exact":
             status["forecast_samples_rows"] = int(
                 conn.execute(FORECAST_SAMPLES_COUNT_SQL).fetchone()["n"]
             )
-            status["forecast_pairs_rows"] = int(
-                conn.execute(FORECAST_PAIRS_COUNT_SQL).fetchone()["n"]
+            status["forecast_history_rows"] = int(
+                conn.execute(FORECAST_HISTORY_COUNT_SQL).fetchone()["n"]
             )
         return status
 
@@ -403,28 +404,6 @@ async def worker_status(counts: str = Query("")) -> dict[str, object]:
     # not run under the read lock it is reporting on.
     result["read_timing"] = db.read_timing_snapshot()
     result["read_timing_since"] = db.read_timing_since
-    # Also process state, not DB state -- same reasoning as read_timing
-    # above, must not run inside _read under the read lock.
-    result["generation"] = db.generation
-    result["last_import_swap_at"] = db.last_import_swap_at
-    # Process state too, and present-and-None before any warm has run rather
-    # than absent. One slot shared by the boot warm and every publish-time
-    # warm, so a `running` state is only diagnosable against its `at` stamp.
-    warm = warm_outcome()
-    result["read_cache_warm"] = (
-        None
-        if warm is None
-        else {
-            "state": warm.state,
-            "at": warm.at,
-            "detail": warm.detail,
-            "derivations_failed": warm.derivations_failed,
-        }
-    )
-    # Process state as well: the wind weights cache's counters. Taken under
-    # the cache's stats lock only, never its compute lock, so this never
-    # waits on a weights compute.
-    result["wind_weights_cache"] = wind_weights_cache_stats()
     return result
 
 

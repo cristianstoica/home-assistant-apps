@@ -1,27 +1,16 @@
-"""§18.10 oracle: export/restore round-trip over the 0.11.0 state.
+"""§18.10 oracle: export round-trip over the 0.11.0 state.
 
-The strong form of the round-trip contract: a DB carrying every new
-artifact — a published verification run (with a 'skipped' verdict,
-NULL-metric results, evidence, day context, a trigger decision, and the
-published-run pointer), per-variable depth-override settings, global +
-per-site record-snapshot-time settings, and a full day of
-forecast_of_record rows — is served by app A, then its bytes are
-imported into a fresh app B, and B must serve BYTE-IDENTICAL JSON on
-every read-only verification endpoint. Both apps run the same
-options.json (carrying the depth override) because startup's
-apply_plain_settings clears any depth-override row absent from options —
-the §15 clearing rule — so a mismatch there would make the two apps
-diverge for reasons outside the transfer path.
+Drives the shipped export path -- POST /api/export/begin -> /export/status
+-> /export/download (VACUUM INTO + gzip) -- then opens the downloaded,
+decompressed snapshot read-only and compares its rows directly against the
+source: truth generations (``timezone_generations`` + ``daily_truth``), a
+per-variable depth-override setting, and station observation rows --
+proving the export carries every 0.11.0 artifact over faithfully, row for
+row.
 
-A second oracle drives the SHIPPED transfer path instead of hand-built
-bytes — POST /api/export/begin -> /export/status -> /export/download
-(VACUUM INTO + gzip) -> POST /api/import/db — and adds the two §18.10
-artifacts a payload comparison cannot see: truth generations
-(``timezone_generations`` + ``daily_truth``), and the import's rule for a
-file without the daily-close key (switch-over plan 11.2, R18): nothing is
-rebuilt, so ``observations`` stays as the file holds it, the rebuild
-state reads ``done``, and every verification artifact and the
-published-run pointer survive.
+The import half of this round trip (POST /api/import/db) was removed in the
+storage-release plan (5.5); a hand-built-payload oracle that drove the
+import directly, with no export step at all, was removed with it.
 
 Synthetic fixtures only: invented town names, UTC, fake fingerprints, an
 invented PWS station id.
@@ -33,7 +22,6 @@ import gzip
 import json
 import sqlite3
 import time
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -43,233 +31,18 @@ from tests.test_phase7_surface import (
     _csrf_headers,
     _make_app,
     _make_site,
-    _seed_published_run,
 )
 from wxverify import config
-from wxverify.db.connection import Database, close_db, init_db
+from wxverify.db.connection import close_db, init_db
 from wxverify.settings.depth import depth_override_key
 from wxverify.settings.keys import set_setting
-from wxverify.verification.record import SNAPSHOT_TIME_KEY, build_forecast_record
-
-_RECORD_DAY = "2026-05-20"
-
-_ENDPOINT_SUFFIXES = (
-    "status",
-    "runs",
-    "run_detail",
-    "verdicts",
-    "evidence",
-    "diagnostics",
-    "methodology",
-)
-
-
-def _seed_record_grid(conn: sqlite3.Connection, site_id: int) -> None:
-    """Samples for every identity of the ``_RECORD_DAY`` grid.
-
-    The record now writes only identities that had samples at T, so the
-    24-row round-trip anchor below needs a fully seeded day.
-    """
-    cur = conn.execute(
-        """
-        INSERT INTO feeds (source, model, default_subscribed,
-                           fetch_interval_minutes, max_lead_hours)
-        VALUES ('example-src', 'grid-model', 1, 360, 192)
-        """
-    )
-    assert cur.lastrowid is not None
-    feed_id = int(cur.lastrowid)
-    start = datetime.fromisoformat(f"{_RECORD_DAY}T00:00:00+00:00")
-    issued = start.strftime("%Y-%m-%dT%H:%M:%SZ")
-    fetched = (start + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    for offset in range(8):
-        for variable, value in (("temperature", 10.0), ("wind", 5.0), ("precip", 0.0)):
-            for hour in range(24):
-                valid = start + timedelta(days=offset, hours=hour)
-                conn.execute(
-                    """
-                    INSERT INTO forecast_samples
-                        (site_id, feed_id, variable, issued_at, valid_at,
-                         lead_hours, value, source_raw, model_run_id, fetched_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'run-x', ?)
-                    """,
-                    (
-                        site_id,
-                        feed_id,
-                        variable,
-                        issued,
-                        valid.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        max(1, int((valid - start).total_seconds() // 3600)),
-                        value,
-                        fetched,
-                    ),
-                )
-
-
-def _capture(client: TestClient, site_id: int, run_id: int) -> dict[str, object]:
-    urls = {
-        "status": f"/api/verification/status?site={site_id}",
-        "runs": f"/api/verification/runs?site={site_id}",
-        "run_detail": f"/api/verification/runs/{run_id}",
-        "verdicts": f"/api/verification/runs/{run_id}/verdicts",
-        "evidence": f"/api/verification/runs/{run_id}/evidence",
-        "diagnostics": f"/api/verification/runs/{run_id}/diagnostics",
-        "methodology": f"/api/verification/runs/{run_id}/methodology",
-    }
-    out: dict[str, object] = {}
-    for name in _ENDPOINT_SUFFIXES:
-        resp = client.get(urls[name])
-        assert resp.status_code == 200, name
-        out[name] = resp.json()
-    return out
-
-
-def test_round_trip_serves_identical_api_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # --- Build the source DB standalone (app-layer connection only). ----
-    source_path = tmp_path / "source-a.db"
-    a_db = Database(str(source_path))
-    try:
-        conn_a = a_db._conn  # noqa: SLF001
-        site_id = _make_site(conn_a, "Export Origin Town")
-        # Settings BEFORE the run seed so the snapshot/fingerprint pin the
-        # override (precip depth 5) and the per-site wall clock (06:30).
-        set_setting(conn_a, depth_override_key("precip"), "5")
-        set_setting(conn_a, SNAPSHOT_TIME_KEY, "05:45")
-        set_setting(conn_a, f"{SNAPSHOT_TIME_KEY}:{site_id}", "06:30")
-        run_id = _seed_published_run(conn_a, site_id)
-        _seed_record_grid(conn_a, site_id)
-        # One full record day: 8 target days x 3 variables = 24 rows,
-        # written at T=06:30 local (the per-site override) + 30 minutes.
-        build_forecast_record(
-            conn_a,
-            site_id,
-            _RECORD_DAY,
-            now=datetime(2026, 5, 20, 7, 0, tzinfo=UTC),
-        )
-        conn_a.commit()
-        conn_a.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    finally:
-        a_db.close()
-    payload = source_path.read_bytes()
-
-    # Both apps run the SAME options so startup's clearing rule keeps the
-    # precip override alive on each side.
-    options_path = tmp_path / "options.json"
-    options_path.write_text(
-        json.dumps({"forecast_blend_depth_precip": 5}), encoding="utf-8"
-    )
-    config.options_path = str(options_path)
-
-    # --- App A serves the source DB directly. ---------------------------
-    close_db()
-    config.db_path = str(source_path)
-    init_db(str(source_path))
-    app_a = _make_app(monkeypatch)
-    with TestClient(app_a) as client_a:
-        responses_a = _capture(client_a, site_id, run_id)
-    close_db()
-
-    # Non-vacuity anchors on side A before comparing: the payloads carry
-    # the real phase-7 state, not empty shells.
-    status_sites = responses_a["status"]["sites"]  # type: ignore[index]
-    assert status_sites[0]["published_run"]["run_id"] == run_id
-    verdicts = responses_a["verdicts"]["verdicts"]  # type: ignore[index]
-    assert {v["variable"]: v["outcome"] for v in verdicts} == {
-        "temperature": "recommend",
-        "wind": "retain_incumbent",
-        "precip": "skipped",
-    }
-    assert len(responses_a["evidence"]["evidence"]) == 3  # type: ignore[index]
-    snapshot = responses_a["run_detail"]["run"]["config_snapshot"]  # type: ignore[index]
-    assert snapshot["blend_depths"] == {"temperature": 2, "wind": 2, "precip": 5}
-    assert snapshot["wall_clock"] == "06:30"
-
-    # --- App B: fresh DB, import the bytes, serve the same endpoints. ---
-    b_path = tmp_path / "serving-b.db"
-    config.db_path = str(b_path)
-    init_db(str(b_path))
-    app_b = _make_app(monkeypatch)
-    with TestClient(app_b) as client_b:
-        headers = {
-            **_csrf_headers(client_b),
-            "Content-Type": "application/octet-stream",
-        }
-        resp = client_b.post("/api/import/db", content=payload, headers=headers)
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "imported"
-        responses_b = _capture(client_b, site_id, run_id)
-    close_db()
-
-    assert responses_b == responses_a
-
-    # --- Direct row-level checks on the imported store. -----------------
-    direct = sqlite3.connect(config.db_path)
-    direct.row_factory = sqlite3.Row
-    try:
-        record_rows = direct.execute(
-            """
-            SELECT COUNT(*) AS n FROM forecast_of_record
-            WHERE site_id = ? AND snapshot_local_date = ?
-            """,
-            (site_id, _RECORD_DAY),
-        ).fetchone()
-        assert int(record_rows["n"]) == 24  # 8 days x 3 variables
-
-        settings = {
-            str(r["key"]): str(r["value"])
-            for r in direct.execute(
-                "SELECT key, value FROM settings WHERE key IN (?, ?, ?)",
-                (
-                    depth_override_key("precip"),
-                    SNAPSHOT_TIME_KEY,
-                    f"{SNAPSHOT_TIME_KEY}:{site_id}",
-                ),
-            )
-        }
-        assert settings == {
-            depth_override_key("precip"): "5",
-            SNAPSHOT_TIME_KEY: "05:45",
-            f"{SNAPSHOT_TIME_KEY}:{site_id}": "06:30",
-        }
-
-        pointer = direct.execute(
-            "SELECT value FROM runtime_state WHERE key = ?",
-            (f"verification_published_run:{site_id}",),
-        ).fetchone()
-        assert pointer is not None
-        assert int(pointer["value"]) == run_id
-
-        policy = direct.execute(
-            """
-            SELECT policy FROM forecast_of_record
-            WHERE site_id = ? AND snapshot_local_date = ?
-            ORDER BY id LIMIT 1
-            """,
-            (site_id, _RECORD_DAY),
-        ).fetchone()
-        parsed = json.loads(str(policy["policy"]))
-        assert parsed["blend_depths"] == {
-            "temperature": 2,
-            "wind": 2,
-            "precip": 5,
-        }
-        assert parsed["blend_depth_sources"]["precip"] == "override"
-    finally:
-        direct.close()
-
 
 # ---------------------------------------------------------------------------
-# The REAL transfer path. The oracle above hand-builds the source file and
-# posts its bytes; that never exercises `POST /api/export/begin` ->
-# `GET /export/status` -> `GET /export/download` (VACUUM INTO + gzip), so an
-# export that failed to carry the 0.11.0 tables would go unnoticed there.
-# This one runs the shipped loop end to end and adds the two §18.10 artifacts
-# the byte-comparison above cannot see: truth generations (timezone_
-# generations + daily_truth) and the import of a file without the close key,
-# which rebuilds nothing (R18) and must leave every verification artifact
-# and the published-run pointer untouched.
+# The shipped export path, driven end to end: POST /api/export/begin ->
+# GET /export/status -> GET /export/download (VACUUM INTO + gzip). Covers
+# the §18.10 artifact a bare schema-copy comparison would not reach: truth
+# generations (timezone_generations + daily_truth), read directly off the
+# downloaded snapshot.
 # ---------------------------------------------------------------------------
 
 _EXPORT_BASE = "/api/export"
@@ -321,6 +94,14 @@ def _seed_truth_generation(conn: sqlite3.Connection, site_id: int) -> tuple[int,
 def test_shipped_export_download_restores_full_0_11_0_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The real shipped export path (VACUUM INTO + gzip) carries every
+    0.11.0 artifact over faithfully. The import half of this round-trip
+    (POST /api/import/db) was removed in the storage-release plan (5.5);
+    re-pointed to open the downloaded, decompressed snapshot read-only and
+    compare its rows directly against the source, per the plan's own
+    export-round-trip guidance (5.5) rather than driving it back through a
+    second live app.
+    """
     options_path = tmp_path / "options.json"
     options_path.write_text(
         json.dumps({"forecast_blend_depth_precip": 5}), encoding="utf-8"
@@ -334,11 +115,7 @@ def test_shipped_export_download_restores_full_0_11_0_state(
     conn_a = init_db(str(source_path))._conn  # noqa: SLF001
     site_id = _make_site(conn_a, "Shipped Export Town")
     set_setting(conn_a, depth_override_key("precip"), "5")
-    run_id = _seed_published_run(conn_a, site_id)
     generation_id, truth_date = _seed_truth_generation(conn_a, site_id)
-    # Station rows with no consensus rows: a rebuild of this file, which has
-    # no close key, would materialize 24 observations from them, so the
-    # count below tells kept-as-it-stands (R18) from rebuilt.
     station_id = int(
         conn_a.execute(
             """
@@ -358,6 +135,12 @@ def test_shipped_export_download_restores_full_0_11_0_state(
         [(station_id, f"2026-05-19T{h:02d}:00:00Z", 10.0 + h) for h in range(24)],
     )
     conn_a.commit()
+    source_obs_count = int(
+        conn_a.execute(
+            "SELECT COUNT(*) AS n FROM station_observations WHERE station_id = ?",
+            (station_id,),
+        ).fetchone()["n"]
+    )
 
     app_a = _make_app(monkeypatch)
     with TestClient(app_a) as client_a:
@@ -369,45 +152,24 @@ def test_shipped_export_download_restores_full_0_11_0_state(
         assert download.status_code == 200
         assert download.content[:2] == b"\x1f\x8b"  # gzip magic
         payload = gzip.decompress(download.content)
-        source_api = _capture(client_a, site_id, run_id)
     close_db()
 
-    # --- Destination instance: empty DB, then the shipped import. -------
-    dest_path = tmp_path / "dest.db"
-    config.db_path = str(dest_path)
-    init_db(str(dest_path))
-    app_b = _make_app(monkeypatch)
-    with TestClient(app_b) as client_b:
-        # Non-vacuity: before the import the destination knows nothing
-        # about this run, so the post-import equality below cannot be
-        # satisfied by ambient state.
-        assert client_b.get(f"/api/verification/runs/{run_id}").status_code == 404
-        headers = {
-            **_csrf_headers(client_b),
-            "Content-Type": "application/octet-stream",
-        }
-        resp = client_b.post("/api/import/db", content=payload, headers=headers)
-        assert resp.status_code == 200
-        # The post-import background task marks the rebuild done; the
-        # capture below re-enters the loop and lets it finish first.
-        dest_api = _capture(client_b, site_id, run_id)
-    close_db()
-
-    assert dest_api == source_api
-
-    # --- Row-level survival of the artifacts the API does not expose. ---
-    direct = Database(str(dest_path))
+    # --- Open the downloaded snapshot directly and compare row-for-row. --
+    snapshot_path = tmp_path / "snapshot.db"
+    snapshot_path.write_bytes(payload)
+    snapshot = sqlite3.connect(f"file:{snapshot_path}?mode=ro", uri=True)
+    snapshot.row_factory = sqlite3.Row
     try:
-        conn_b = direct._conn  # noqa: SLF001
+        assert snapshot.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         # Truth generations: same generation id, same materialized row.
-        gen = conn_b.execute(
+        gen = snapshot.execute(
             "SELECT id, state FROM timezone_generations WHERE site_id = ?",
             (site_id,),
         ).fetchall()
         assert [(int(r["id"]), str(r["state"])) for r in gen] == [
             (generation_id, "published")
         ]
-        truth = conn_b.execute(
+        truth = snapshot.execute(
             """
             SELECT value, covered_hours, eligible FROM daily_truth
             WHERE site_id = ? AND local_date = ? AND quantity = 'temperature_high'
@@ -418,38 +180,20 @@ def test_shipped_export_download_restores_full_0_11_0_state(
         assert float(truth["value"]) == 21.5
         assert int(truth["covered_hours"]) == 24
         assert int(truth["eligible"]) == 1
-        # The run still points at that generation.
-        run_gen = conn_b.execute(
-            "SELECT tz_generation_id FROM verification_runs WHERE id = ?", (run_id,)
+        # The exported snapshot carries exactly the source's own station
+        # rows -- VACUUM INTO neither drops nor fabricates rows.
+        obs = snapshot.execute(
+            "SELECT COUNT(*) AS n FROM station_observations WHERE station_id = ?",
+            (station_id,),
         ).fetchone()
-        assert int(run_gen["tz_generation_id"]) == generation_id
-        # Published-run pointer survived the import.
-        pointer = conn_b.execute(
-            "SELECT value FROM runtime_state WHERE key = ?",
-            (f"verification_published_run:{site_id}",),
-        ).fetchone()
-        assert pointer is not None and int(pointer["value"]) == run_id
-        # No rebuild for a file without the close key (R18, switch-over plan
-        # 11.2): the 24 imported station rows were never materialized into
-        # consensus, and the import keeps that as it stands.
-        obs = conn_b.execute(
-            "SELECT COUNT(*) AS n FROM observations WHERE site_id = ?", (site_id,)
-        ).fetchone()
-        assert int(obs["n"]) == 0, (
-            "R18: correct = 0 (the source file held no observations rows),"
-            " mutant (a keyless file rebuilt) = 24"
-        )
-        rebuild = conn_b.execute(
-            "SELECT value FROM runtime_state WHERE key = 'import_rebuild_state'"
-        ).fetchone()
-        assert rebuild is not None and str(rebuild["value"]) == "done"
+        assert int(obs["n"]) == source_obs_count
         # And the depth override is still an override, not a global.
         assert (
-            conn_b.execute(
+            snapshot.execute(
                 "SELECT value FROM settings WHERE key = ?",
                 (depth_override_key("precip"),),
             ).fetchone()["value"]
             == "5"
         )
     finally:
-        direct.close()
+        snapshot.close()

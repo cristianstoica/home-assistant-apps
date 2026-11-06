@@ -15,10 +15,9 @@ side), not from the plan table's wording, per plan §10.4's instruction.
 
 Isolation: most pins drive a plain ``sqlite3.connect(":memory:")`` +
 ``run_migrations`` connection directly against the function under test,
-mirroring ``tests/test_wind_auth_hold.py``. The few that need the live app
-or a real write path (D7, D9, D12) use a ``tmp_path``-backed
-``get_db()``/``TestClient``, mirroring
-``tests/test_scoring_split.py`` and ``tests/test_phase8_verification_v16.py``.
+mirroring ``tests/test_wind_auth_hold.py``. The few that need a real write
+path (D12) use a ``tmp_path``-backed ``get_db()``, mirroring
+``tests/test_scoring_split.py``.
 
 Synthetic data only (public repo): site name "Testsite", pws station ids
 ``WSTATION01``/``WSTATION02``, coordinates 0.0/0.0 or 40.0/-105.0 (matching
@@ -35,9 +34,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
-from fastapi.testclient import TestClient
 
 import wxverify
+from tests.helpers import close_off
 from tests.test_forecast_record import (
     _DAY,
     _insert_full_grid,
@@ -56,40 +55,10 @@ from tests.test_forecast_service import (
     _feed_id,
     _hours,
     _seed_hourly,
-    _seed_wind_training,
+    _seed_wind_publication,
 )
 from tests.test_forecast_service import (
     _make_db as _fs_make_db,
-)
-from tests.test_phase8_verification_v16 import (
-    _init_tmp_db as _v16_init_tmp_db,
-)
-from tests.test_phase8_verification_v16 import (
-    _make_app as _v16_make_app,
-)
-from tests.test_phase8_verification_v16 import (
-    _make_site as _v16_make_site,
-)
-from tests.test_phase8_verification_v16 import (
-    _seed_rich_run,
-)
-from tests.test_wind_basis import (
-    _make_db as _wb_make_db,
-)
-from tests.test_wind_basis import (
-    _make_feed as _wb_make_feed,
-)
-from tests.test_wind_basis import (
-    _make_site as _wb_make_site,
-)
-from tests.test_wind_basis import (
-    _seed_persistence_candidate as _wb_seed_persistence_candidate,
-)
-from tests.test_wind_basis import (
-    _seed_published_wind_pair as _wb_seed_published_wind_pair,
-)
-from tests.test_wind_basis import (
-    _seed_real_model_candidate as _wb_seed_real_model_candidate,
 )
 from wxverify.db.migrations import run_migrations, seed_default_sources
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
@@ -98,11 +67,7 @@ from wxverify.forecast.wind_blend import WIND_METHOD
 from wxverify.monitor import _wind_history_trips  # noqa: PLC2701
 from wxverify.obs.pws_adapter import observations_from_payload
 from wxverify.scoring.consensus import insert_station_observation, materialize_consensus
-from wxverify.scoring.engine import _distinct_cells  # noqa: PLC2701
-from wxverify.scoring.pairing import compute_real_model_pairs
-from wxverify.scoring.persistence import compute_persistence_pairs
 from wxverify.verification.record import build_forecast_record
-from wxverify.verification.runs import capture_config_snapshot
 from wxverify.web.context import (
     load_site,
     load_station_trust,
@@ -227,6 +192,7 @@ def test_d2_materialize_admits_the_pair_max_row_regardless_of_the_key(
     tree has no such filter: the one seeded reading always becomes the
     consensus observation."""
     conn = _wa_make_db()
+    close_off(conn)
     site_id = _wa_make_site(conn)
     station_id = _wa_make_station(conn, site_id, "WSTATION01")
     set_runtime_state(conn, f"wind_basis:{site_id}", key_value)
@@ -252,40 +218,10 @@ def test_d2_materialize_admits_the_pair_max_row_regardless_of_the_key(
     assert float(row["value"]) == pytest.approx(6.0)
 
 
-# ---------------------------------------------------------------------------
-# D3 -- the pairing, persistence and engine wind_open_clause readers.
-# ---------------------------------------------------------------------------
-
-
-def test_d3_pairing_persistence_and_engine_readers_admit_wind_under_switching() -> None:
-    """Base's ``wind_open_clause`` (db/wind_basis.py), read by
-    ``scoring/pairing.py``'s ``compute_real_model_pairs``,
-    ``scoring/persistence.py``'s ``compute_persistence_pairs`` and
-    ``scoring/engine.py``'s ``_distinct_cells``, excludes every wind row
-    while the key reads "switching". The removal tree's three files read
-    no such key -- all three admit the wind candidate alongside it."""
-    conn = _wb_make_db()
-    site_id = _wb_make_site(conn)
-    feed_id = _wb_make_feed(conn, "real-model")
-    set_runtime_state(conn, f"wind_basis:{site_id}", "switching")
-    conn.commit()
-
-    _wb_seed_real_model_candidate(conn, site_id, feed_id, "wind")
-    _wb_seed_real_model_candidate(conn, site_id, feed_id, "temperature")
-    pair_delta = compute_real_model_pairs(conn, site_id)
-    pair_variables = {str(op.values[2]) for op in pair_delta.ops}
-
-    _wb_seed_persistence_candidate(conn, site_id)
-    persistence_delta = compute_persistence_pairs(conn, site_id)
-    persistence_variables = {str(op.values[2]) for op in persistence_delta.ops}
-
-    _wb_seed_published_wind_pair(conn, site_id, feed_id)
-    cells = _distinct_cells(conn, site_id)
-    cell_variables = {cell.variable for cell in cells}
-
-    assert "wind" in pair_variables
-    assert "wind" in persistence_variables
-    assert "wind" in cell_variables
+# D3 (the pairing, persistence and engine wind_open_clause readers) is
+# removed: `wxverify.scoring.pairing`, `.persistence` and `.engine` -- the
+# three modules it drove -- are themselves gone with the old pair-and-score
+# pipeline (storage-release plan 2026-11-02, table 1.B).
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +247,7 @@ def test_d4_hourly_wind_blend_is_weighted_regardless_of_the_key() -> None:
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_wind_training(conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0}, observed=4.0)
+    _seed_wind_publication(conn, weights_by_feed={feed_a: 1.0, feed_b: 0.5})
     hours = _hours("2026-07-20", 0, 24)
     for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0)):
         _seed_hourly(
@@ -356,7 +292,7 @@ def test_d4_forecast_wind_daily_high_is_weighted_regardless_of_the_key() -> None
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_wind_training(conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0}, observed=4.0)
+    _seed_wind_publication(conn, weights_by_feed={feed_a: 1.0, feed_b: 0.5})
     hours = _hours("2026-07-20", 0, 24)
     for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0)):
         _seed_hourly(
@@ -495,53 +431,6 @@ def test_d6_monitor_today_checks_run_under_a_blocked_switching_key() -> None:
     assert first == "no wind readings today from any station"
     assert first is not None
     assert not first.startswith("wind rebuild")
-
-
-# ---------------------------------------------------------------------------
-# D8 -- the run's captured config snapshot.
-# ---------------------------------------------------------------------------
-
-
-def test_d8_run_snapshot_pins_pair_max_wind_basis_regardless_of_the_key() -> None:
-    """``verification/runs.py``'s ``_config_snapshot`` writes the literal
-    "pair_max" for ``wind_basis`` unconditionally. Base instead writes
-    ``wind_basis_state(conn, site_id)``, which under the "staging" key
-    reads "staging", not "pair_max"."""
-    conn = _wa_make_db()
-    site_id = _wa_make_site(conn)
-    set_runtime_state(conn, f"wind_basis:{site_id}", "staging")
-    conn.commit()
-
-    snapshot = capture_config_snapshot(conn, site_id)
-
-    assert snapshot["wind_basis"] == "pair_max"
-
-
-# ---------------------------------------------------------------------------
-# D9 -- the verification page's wind diagnostic notice.
-# ---------------------------------------------------------------------------
-
-
-def test_d9_verification_page_wind_diagnostic_is_unconditional(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``web/templates/verification/show.html``'s wind-diagnostic notice is
-    now gated only on ``v.variable == 'wind'``. Base also requires the
-    page's ``wind_pair_max`` context flag, which
-    ``web/verification.py`` sets to
-    ``wind_basis_state(conn, site.id) == "pair_max"`` -- false under the
-    "staging" key, so the notice is absent there."""
-    conn = _v16_init_tmp_db(tmp_path)
-    site_id = _v16_make_site(conn)
-    set_runtime_state(conn, f"wind_basis:{site_id}", "staging")
-    conn.commit()
-    _seed_rich_run(conn, site_id, methodology_version=1)
-    app = _v16_make_app(monkeypatch)
-    with TestClient(app) as client:
-        response = client.get(f"/verification?site={site_id}")
-    assert response.status_code == 200
-
-    assert 'id="verification-wind-diagnostic"' in response.text
 
 
 # ---------------------------------------------------------------------------

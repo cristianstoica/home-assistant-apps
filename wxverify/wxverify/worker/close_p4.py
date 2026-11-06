@@ -1,4 +1,4 @@
-"""P4's four call points in the daily close (plan 14.1).
+"""P4's three call points in the daily close (plan 14.1).
 
 The close calls the scored round and publication plan (P4) only through
 these names, always through this module, so P4 binds them here. Each is a
@@ -109,17 +109,3 @@ async def publish(
         attempt=attempt,
         now_utc=now_utc,
     )
-
-
-async def clean_worksheets(
-    db: Database, writer: FencedWriter, *, site_id: int, now_utc: datetime
-) -> int:
-    """Delete the worksheets of runs older than the latest published (stage 8).
-
-    Works in small saves and returns how many runs it finished. Commits in
-    its own writes and is safe to repeat. Body: ``verification/cleanup.py``
-    ``clean_worksheets``.
-    """
-    from wxverify.verification.cleanup import clean_worksheets as body
-
-    return await body(db, writer, site_id=site_id, now_utc=now_utc)

@@ -34,6 +34,7 @@ from wxverify.db.queue import (
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.db.site_days import (
     OFFLINE_COPY_KEY,
+    RETIRED_CONTROL_MESSAGE,
     DayStateError,
     daily_close_on,
     day_record,
@@ -59,7 +60,6 @@ from wxverify.provider_ops import (
     set_site_subscription,
     smoke_stored_sample_check,
 )
-from wxverify.scoring.engine import pair_and_score
 from wxverify.settings.keys import get_setting, set_setting
 from wxverify.settings.service import set_rolling_window_days_sync
 from wxverify.worker.close_chain import (
@@ -68,7 +68,6 @@ from wxverify.worker.close_chain import (
     run_offline_stage,
     stage_log,
 )
-from wxverify.worker.cutover import RETIRED_CONTROL_MESSAGE
 from wxverify.worker.feed_fetch import (
     BackoffActive,
     BudgetExhausted,
@@ -112,8 +111,6 @@ def main(argv: list[str] | None = None) -> int:
         # Before init_db, which writes the file: --dry-run reads only (plan 12.5).
         return _wind_history(args)
     init_db(args.db)
-    if args.command == "score":
-        return _score(args)
     if args.command == "fetch":
         return _fetch(args)
     if args.command == "settings":
@@ -148,9 +145,6 @@ def _build_parser() -> argparse.ArgumentParser:
     fetch = sub.add_parser("fetch")
     fetch.add_argument("site_id", type=int)
     fetch.add_argument("feed_id", type=int)
-
-    score = sub.add_parser("score")
-    score.add_argument("--site-id", type=int)
 
     # Retired with the daily close; the parsers stay, so a script that calls
     # them gets the retirement message, not a usage error (plan 7.3).
@@ -315,11 +309,6 @@ def _configure_logging() -> None:
         wire_logger = logging.getLogger(name)
         wire_logger.setLevel(wire_level)
         wire_logger.addFilter(redaction_filter)
-
-
-def _score(args: argparse.Namespace) -> int:
-    get_db().write_sync(lambda conn: pair_and_score(conn, args.site_id))
-    return 0
 
 
 def _fetch(args: argparse.Namespace) -> int:

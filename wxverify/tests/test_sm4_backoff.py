@@ -75,24 +75,15 @@ class _RealDb:
     single-threaded asyncio.run() test context and avoids a real file path.
     """
 
-    generation = 0
-
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
-    async def write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+    async def write(
+        self, fn: Callable[[sqlite3.Connection], T], *, epoch_exempt: bool = False
+    ) -> T:
         return fn(self._conn)
 
     async def read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        return fn(self._conn)
-
-    async def write_fenced(
-        self,
-        fn: Callable[[sqlite3.Connection], T],
-        *,
-        generation: int,
-        epoch_exempt: bool = False,
-    ) -> T:
         return fn(self._conn)
 
 
@@ -296,7 +287,7 @@ class TestHttpErrorBackoff:
             ),
         ):
             db = _RealDb(conn)
-            writer = FencedWriter(db, db.generation)  # type: ignore[arg-type]
+            writer = FencedWriter(db)  # type: ignore[arg-type]
             with pytest.raises(JobDeferred):
                 asyncio.run(_fetch_current_obs(db, writer, site_id, station_id))  # type: ignore[arg-type]
 
@@ -423,7 +414,7 @@ class TestTransportFailNoBackoff:
             _patched_now(_NOW),
         ):
             db = _RealDb(conn)
-            writer = FencedWriter(db, db.generation)  # type: ignore[arg-type]
+            writer = FencedWriter(db)  # type: ignore[arg-type]
             # 1. Transport exception propagates (not swallowed, not wrapped).
             with pytest.raises(httpx.TransportError):
                 asyncio.run(_fetch_current_obs(db, writer, site_id, station_id))  # type: ignore[arg-type]
@@ -531,7 +522,7 @@ class TestMalformedJsonBodyEscapesToTransientFloor:
             _patched_now(_NOW),
         ):
             db = _RealDb(conn)
-            writer = FencedWriter(db, db.generation)  # type: ignore[arg-type]
+            writer = FencedWriter(db)  # type: ignore[arg-type]
             # response.json() raises a decode error that decode_observations_
             # payload wraps as UpstreamPayloadError (kind=json_decode); the
             # except block re-raises that wrapped exception, but only after

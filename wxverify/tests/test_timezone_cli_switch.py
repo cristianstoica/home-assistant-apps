@@ -63,9 +63,10 @@ def test_tc1_change_is_refused_while_off_and_works_as_before_while_on(
 ) -> None:
     import datetime as _dt
 
-    from tests.helpers import NOW, D, day_close_site
+    from tests.helpers import NOW, D, close_off, day_close_site
 
-    _init_tmp_db(tmp_path)
+    conn = _init_tmp_db(tmp_path)
+    close_off(conn)
     monkeypatch.setattr("wxverify.__main__.utc_now", lambda: NOW)
 
     # --- Key absent: the close is off (plan 10.4, R16). M52. ---------------

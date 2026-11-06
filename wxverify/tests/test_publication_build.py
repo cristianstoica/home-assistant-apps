@@ -1,6 +1,12 @@
 """The publication (daily-close plan 2026-10-22-daily-close-pairs-and-
 publication.md, sections 7 and 8; test IDs PB1-PB17, plan 18.7).
 
+PB14, PB15 and PB18 drove ``publish_first``, ``seed_starting_history`` and
+``_SEED_UNSETTLED_SQL`` directly. The starting history is read-only now
+(storage-release plan 2026-11-02, table 1.B) and those names are gone from
+``wxverify.scoring.publication``, so all three pinned removed behaviour and
+are deleted with it.
+
 Written before ``wxverify.scoring.publication`` exists: every test below
 collects, then fails at its own ``from wxverify.scoring.publication import
 ...`` with ``ModuleNotFoundError`` -- the failure Step 3 accepts. Once
@@ -20,10 +26,7 @@ would never run).
 Piece rule (plan 20, Step 4's table): PB rows go green in piece 6, so every
 seed here is a plain INSERT into ``day_scores``/``starting_scores``/
 ``starting_wind_days``/``publications`` and its child tables -- never
-through ``score_day`` or ``publish`` itself, except where a row's own text
-says otherwise (PB14, PB15 exercise ``seed_starting_history`` and
-``publish_first`` directly, so those two seed ``forecast_pairs`` instead,
-the table that function reads per plan 7.3).
+through ``score_day`` or ``publish`` itself.
 
 Column shapes assumed for the five new tables this file seeds directly
 (``day_scores``, ``starting_scores``, ``starting_wind_days``,
@@ -42,12 +45,11 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import NOW, D, asof_make_site, day_close_site, note_day_clock
+from tests.helpers import NOW, D, day_close_site, note_day_clock
 from wxverify import config
 from wxverify.core.timeutil import is_canonical_utc_stamp, isoformat_utc, parse_utc
 from wxverify.db.connection import Database, FencedWriter, close_db, init_db
 from wxverify.db.site_days import begin_close, ensure_site_days, start_site_days
-from wxverify.db.switch import ensure_site_generation
 from wxverify.settings.keys import set_setting
 
 CUTOFF = D - timedelta(days=1)
@@ -68,7 +70,7 @@ def _make_db(tmp_path: Path) -> tuple[Database, FencedWriter, sqlite3.Connection
     config.db_path = str(db_path)
     db = init_db(str(db_path))
     conn = db._conn  # noqa: SLF001 -- tests build the fixture on the real writer conn
-    return db, FencedWriter(db, db.generation), conn
+    return db, FencedWriter(db), conn
 
 
 def _close_through(
@@ -1206,247 +1208,6 @@ def test_pb11_wind_weight_needs_min_training_days(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# PB14
-# ---------------------------------------------------------------------------
-
-
-def _seed_pair(
-    conn: sqlite3.Connection,
-    *,
-    site_id,
-    feed_id,
-    variable,
-    issued_at,
-    valid_at,
-    lead_hours,
-    day_ahead,
-    forecast,
-    observed,
-    generation_id,
-) -> None:
-    error = forecast - observed
-    conn.execute(
-        "INSERT INTO forecast_pairs"
-        " (site_id, feed_id, variable, issued_at, valid_at, lead_hours,"
-        "  day_ahead, forecast, observed, error, abs_error, sq_error,"
-        "  tz_generation_id)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            site_id,
-            feed_id,
-            variable,
-            issued_at,
-            valid_at,
-            lead_hours,
-            day_ahead,
-            forecast,
-            observed,
-            error,
-            abs(error),
-            error * error,
-            generation_id,
-        ),
-    )
-
-
-def test_pb14_publish_first_builds_the_cutover_publication(tmp_path: Path) -> None:
-    """PB14: ``publish_first`` for D-3 (no P1 record yet) builds cutoff D-4
-    from starting rows only; a repeat returns the same id; D-2 gives a new
-    publication at cutoff D-3; an empty site still gets a publication, with
-    no ranking rows (16.3)."""
-
-    async def _run() -> None:
-        from wxverify.scoring.publication import publish_first, seed_starting_history
-
-        db, writer, conn = _make_db(tmp_path)
-        site_id = asof_make_site(conn, "pb14-site")
-        generation_id = ensure_site_generation(conn, site_id)
-        feed_x = _make_feed(conn, "X")
-        starting_date = D - timedelta(days=4)
-        _seed_pair(
-            conn,
-            site_id=site_id,
-            feed_id=feed_x,
-            variable="temperature",
-            issued_at=f"{(starting_date - timedelta(days=1)).isoformat()}T00:00:00Z",
-            valid_at=f"{starting_date.isoformat()}T12:00:00Z",
-            lead_hours=36,
-            day_ahead=1,
-            forecast=12.0,
-            observed=10.0,
-            generation_id=generation_id,
-        )
-        conn.commit()
-
-        await seed_starting_history(
-            writer,
-            site_id=site_id,
-            first_record_date=D - timedelta(days=3),
-            generation_id=generation_id,
-            timezone="UTC",
-        )
-
-        first_id = await publish_first(
-            db,
-            writer,
-            site_id=site_id,
-            first_record_date=D - timedelta(days=3),
-            now_utc=NOW,
-        )
-        pub = _fetch_publication(conn, site_id, D - timedelta(days=4))
-        assert pub is not None
-        assert str(pub["id"]) == first_id
-        assert pub["first_record_date"] == (D - timedelta(days=3)).isoformat()
-        rank = _fetch_ranking(conn, pub["id"], feed_x, "temperature", 1, "w:all")
-        assert rank is not None and rank["n"] == 1
-
-        repeat_id = await publish_first(
-            db,
-            writer,
-            site_id=site_id,
-            first_record_date=D - timedelta(days=3),
-            now_utc=NOW + timedelta(minutes=1),
-        )
-        assert repeat_id == first_id, (
-            "M77 -> at this assertion: correct = the same id on a repeat"
-            " for the same first_record_date, mutant M77's own text"
-            " (publish_first requires a closed cutoff) would instead raise"
-            " PublicationFailed('cutoff_not_closed') here, since D-4 is"
-            " never a P1 record"
-        )
-
-        second_id = await publish_first(
-            db,
-            writer,
-            site_id=site_id,
-            first_record_date=D - timedelta(days=2),
-            now_utc=NOW + timedelta(minutes=2),
-        )
-        assert second_id != first_id
-        pub2 = _fetch_publication(conn, site_id, D - timedelta(days=3))
-        assert pub2 is not None
-        assert str(pub2["id"]) == second_id
-
-        empty_db, empty_writer, empty_conn = _make_db(tmp_path / "empty")
-        empty_site_id = asof_make_site(empty_conn, "pb14-empty-site")
-        empty_conn.commit()
-        empty_id = await publish_first(
-            empty_db,
-            empty_writer,
-            site_id=empty_site_id,
-            first_record_date=D - timedelta(days=3),
-            now_utc=NOW,
-        )
-        empty_pub = _fetch_publication(empty_conn, empty_site_id, D - timedelta(days=4))
-        assert empty_pub is not None and str(empty_pub["id"]) == empty_id
-        empty_rank_count = empty_conn.execute(
-            "SELECT COUNT(*) FROM publication_rankings WHERE publication_id = ?",
-            (empty_pub["id"],),
-        ).fetchone()[0]
-        assert empty_rank_count == 0
-
-    asyncio.run(_run())
-
-
-# ---------------------------------------------------------------------------
-# PB15
-# ---------------------------------------------------------------------------
-
-
-def test_pb15_seed_starting_history_sums_only_the_passed_generation(
-    tmp_path: Path,
-) -> None:
-    """PB15: two generations' ``forecast_pairs`` on the same date; the seed
-    sums only the passed generation's rows, and a second call replaces,
-    never adds (7.3)."""
-
-    async def _run() -> None:
-        from wxverify.scoring.publication import seed_starting_history
-
-        _db, writer, conn = _make_db(tmp_path)
-        site_id = asof_make_site(conn, "pb15-site")
-        g1 = ensure_site_generation(conn, site_id)
-        cur = conn.execute(
-            "INSERT INTO timezone_generations (site_id, timezone, mode, state)"
-            " VALUES (?, 'UTC', 'initial', 'published')",
-            (site_id,),
-        )
-        assert cur.lastrowid is not None
-        g2 = int(cur.lastrowid)
-        feed_x = _make_feed(conn, "X")
-        local_date = D - timedelta(days=6)
-        issued_at = f"{(local_date - timedelta(days=1)).isoformat()}T00:00:00Z"
-        valid_at = f"{local_date.isoformat()}T12:00:00Z"
-
-        _seed_pair(
-            conn,
-            site_id=site_id,
-            feed_id=feed_x,
-            variable="temperature",
-            issued_at=issued_at,
-            valid_at=valid_at,
-            lead_hours=36,
-            day_ahead=1,
-            forecast=12.0,
-            observed=10.0,
-            generation_id=g1,
-        )
-        _seed_pair(
-            conn,
-            site_id=site_id,
-            feed_id=feed_x,
-            variable="temperature",
-            issued_at=issued_at,
-            valid_at=f"{local_date.isoformat()}T13:00:00Z",
-            lead_hours=37,
-            day_ahead=1,
-            forecast=100.0,
-            observed=10.0,
-            generation_id=g2,
-        )
-        conn.commit()
-
-        await seed_starting_history(
-            writer,
-            site_id=site_id,
-            first_record_date=D - timedelta(days=3),
-            generation_id=g1,
-            timezone="UTC",
-        )
-
-        row = conn.execute(
-            "SELECT n, err_sum FROM starting_scores"
-            " WHERE site_id = ? AND local_date = ? AND feed_id = ? AND variable = ?"
-            " AND day_ahead = 1",
-            (site_id, local_date.isoformat(), feed_x, "temperature"),
-        ).fetchone()
-        assert row is not None
-        assert (row["n"], row["err_sum"]) == (1, 2.0), (
-            "M78 -> at this assertion: correct = (1, 2.0) (only g1's pair,"
-            " forecast 12 - observed 10), mutant M78 (the seed ignores the"
-            " generation it is passed) would also sum g2's pair, giving"
-            " (2, 92.0)"
-        )
-
-        await seed_starting_history(
-            writer,
-            site_id=site_id,
-            first_record_date=D - timedelta(days=3),
-            generation_id=g1,
-            timezone="UTC",
-        )
-        count = conn.execute(
-            "SELECT COUNT(*) FROM starting_scores"
-            " WHERE site_id = ? AND local_date = ? AND feed_id = ? AND variable = ?"
-            " AND day_ahead = 1",
-            (site_id, local_date.isoformat(), feed_x, "temperature"),
-        ).fetchone()[0]
-        assert count == 1, "a second call must replace, not add, a duplicate row"
-
-    asyncio.run(_run())
-
-
-# ---------------------------------------------------------------------------
 # PB16
 # ---------------------------------------------------------------------------
 
@@ -1678,69 +1439,3 @@ def test_pb17_a_missed_dates_leftover_day_scores_rows_are_excluded(
         )
 
     asyncio.run(_run())
-
-
-# ---------------------------------------------------------------------------
-# PB18
-# ---------------------------------------------------------------------------
-
-
-def _plan_ops_for_alias(details: list[str], alias: str) -> list[str]:
-    """The leading ``SCAN``/``SEARCH`` op of every plan line naming
-    ``alias`` as its table reference (the plan detail's second word), or
-    ``[]`` for a line with no such reference (e.g. ``USE TEMP B-TREE``)."""
-    ops = []
-    for d in details:
-        parts = d.split()
-        if len(parts) >= 2 and parts[1] == alias:
-            ops.append(parts[0])
-    return ops
-
-
-def test_pb18_seed_unsettled_plan_searches_station_wind_days_by_station(
-    tmp_path: Path,
-) -> None:
-    """PB18: ``_SEED_UNSETTLED_SQL``'s own query plan, pinned directly
-    (data-layer fix), run exactly as the add-on runs it -- with bound
-    parameters, never with the values written into the SQL text. Pins
-    that ``station_wind_days`` (alias ``d``) is SOUGHT per station via
-    a ``station_id=`` SEARCH and never walked in full, since a SCAN of
-    that table grows with stations * days and nothing else prunes it;
-    a scan of the small ``stations`` table is allowed (one row per
-    enabled station). On this SQLite build, with no statistics
-    gathered, the older inner-join form (``FROM station_wind_days d
-    JOIN stations st ON st.id = d.station_id``) plans identically to
-    the current CROSS JOIN form when run with bound parameters, so
-    this test does not distinguish the two; the CROSS JOIN exists to
-    keep the loop order fixed regardless of whatever statistics the
-    planner later gathers. Matched on alias plus SCAN/SEARCH and the
-    bound column name only, never the whole plan line (the shipping
-    SQLite build differs from the dev one)."""
-    from wxverify.scoring.publication import _SEED_UNSETTLED_SQL
-
-    _db, _writer, conn = _make_db(tmp_path)
-    site_id = asof_make_site(conn, "pb18-site")
-    bound_date = (D - timedelta(days=3)).isoformat()
-
-    plan_rows = conn.execute(
-        f"EXPLAIN QUERY PLAN {_SEED_UNSETTLED_SQL}", (site_id, bound_date)
-    ).fetchall()
-    details = [str(row["detail"]) for row in plan_rows]
-
-    d_ops = _plan_ops_for_alias(details, "d")
-    assert "SCAN" not in d_ops, (
-        "correct = no SCAN of station_wind_days (alias d; stations drives"
-        " the loop and station_wind_days is sought per station), a broken"
-        " form = SCAN d (e.g. the join's station_id condition dropped, or"
-        " a planner choice under statistics that puts station_wind_days"
-        f" outer, so the whole table is walked), got plan lines {details!r}"
-    )
-
-    search_d_lines = [d for d in details if d.split()[:2] == ["SEARCH", "d"]]
-    assert search_d_lines and any("station_id=" in d for d in search_d_lines), (
-        "correct = a SEARCH d line binding station_id= (station_wind_days"
-        " sought per station, not walked), a broken form = no such SEARCH d"
-        " line (station_wind_days walked instead, e.g. with the join's"
-        " station_id condition dropped or under a planner choice that puts"
-        f" station_wind_days outer), got plan lines {details!r}"
-    )

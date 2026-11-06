@@ -654,7 +654,7 @@ def test_forecast_record_never_persists_into_a_recreated_site(
         assert job.type == "forecast_record" and job.site_id == site_id
 
         db = get_db()
-        writer = FencedWriter(db, db.generation)
+        writer = FencedWriter(db)
         monkeypatch.setattr(
             record_mod, "utc_now", lambda: _snapshot_t() + timedelta(minutes=5)
         )
@@ -741,10 +741,10 @@ def test_gap_scan_never_runs_against_a_recreated_site(
 
         if recreate:
             with pytest.raises(JobCancelled):
-                asyncio.run(dispatch(db, FencedWriter(db, db.generation), job))
+                asyncio.run(dispatch(db, FencedWriter(db), job))
             assert calls == []
         else:
-            result = asyncio.run(dispatch(db, FencedWriter(db, db.generation), job))
+            result = asyncio.run(dispatch(db, FencedWriter(db), job))
             assert result is None
             assert calls == [site_x]
     finally:

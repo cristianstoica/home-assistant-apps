@@ -128,14 +128,14 @@ def test_ho1_the_standard_night_hands_off_every_stage_in_order(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """HO1: the standard night, ``run_due_jobs`` from R 00:40Z. Claims in
-    order: ``day_close`` stages 2 to 6, ``day_publish`` stages 7 and 8,
-    each keyed as 8.1; D ``closed``; the publication ``published``,
-    ``pub-D`` (8.1).
+    order: ``day_close`` stages 2 to 6, ``day_publish`` stage 7, each
+    keyed as 8.1; D ``closed``; the publication ``published``, ``pub-D``
+    (8.1).
 
     M46 -> at the keys assertion below: correct = the five ``day_close``
-    keys end ``:2`` through ``:6`` and the two ``day_publish`` keys end
-    ``:7``/``:8`` in that order, mutant M46 (the stage number left out of
-    the job key) = every key of one kind collapses to the SAME key
+    keys end ``:2`` through ``:6`` and the ``day_publish`` key ends ``:7``,
+    in that order, mutant M46 (the stage number left out of the job key)
+    = every ``day_close`` key collapses to the SAME key
     (``close:{site}:{date}`` with no stage suffix), so ``enqueue_if_absent``
     dedupes every later stage against the first and only one job of each
     kind is ever created.
@@ -161,14 +161,13 @@ def test_ho1_the_standard_night_hands_off_every_stage_in_order(
             f"close:{site_id}:{D.isoformat()}:5",
             f"close:{site_id}:{D.isoformat()}:6",
             f"publish:{site_id}:7",
-            f"publish:{site_id}:8",
         ]
         assert keys == expected, (
             f"M46 -> at this assertion: correct = {expected!r} (one job per"
             " stage, each keyed with its own stage number), mutant M46"
             " (the stage number left out of the job key) = every day_close"
-            " key collapses to one value and every day_publish key to"
-            " another, so stages 3-6 and 8 are deduped away and never run"
+            " key collapses to one value, so stages 3-6 are deduped away"
+            " and never run"
         )
 
         claim_types = [t for t, _k, _o in claims]
@@ -179,8 +178,7 @@ def test_ho1_the_standard_night_hands_off_every_stage_in_order(
             "day_close",
             "day_close",
             "day_publish",
-            "day_publish",
-        ], "the claim order must be stages 2-6 then 7, 8, nothing interleaved"
+        ], "the claim order must be stages 2-6 then 7, nothing interleaved"
 
         record = await _state(db, site_id)
         assert record.state == "closed", "the standard night must close D"
@@ -229,9 +227,10 @@ def test_ho2_a_lost_handoff_is_repaired_once_a_published_record_never(
 ) -> None:
     """HO2: after each completion of stages 1 to 6, the next job deleted;
     then one tick enqueues exactly that stage, a second tick adds nothing.
-    After stage 7's completion, the stage-8 job deleted: a tick enqueues
-    NOTHING (stage 8 is never repaired, 8.2). After stage 8 completes, a
-    tick also adds nothing (a published record is never repaired).
+    Before stage 7 (the chain's last stage) runs, its job is deleted too:
+    a tick repairs it the same way. Once that repaired job runs and the
+    publication is published, a further tick adds nothing (a published
+    record is never repaired).
 
     M40 (its stage-6 case) -> at the stage-7-after-stage-6-deletion
     assertion below: correct = the repair re-enqueues ``publish:{site}:7``
@@ -287,27 +286,6 @@ def test_ho2_a_lost_handoff_is_repaired_once_a_published_record_never(
         still7 = await _job_exists(db, "day_publish", 7)
         assert still7 == repaired7, "a second tick must add no duplicate"
 
-        await run_due_jobs(db, clock, stop_before=("day_publish", 8))
-        await _delete_job(db, "day_publish", 8)
-        await tick(db, clock)
-        not_repaired8 = await _job_exists(db, "day_publish", 8)
-        assert not_repaired8 == [], (
-            "stage 8 is never repaired (8.2): deleting its job and ticking"
-            " must leave no day_publish job keyed ':8'"
-        )
-
-        # Re-seed stage 8 by hand (as the next night's stage 8 would) so
-        # the suite can observe the "after stage 8 completes" case too.
-        await db.write(
-            lambda c: enqueue_if_absent(
-                c,
-                "day_publish",
-                site_id,
-                f"publish:{site_id}:8",
-                {"cutoff": D.isoformat(), "attempt": 1},
-                max_retries=0,
-            )
-        )
         await run_due_jobs(db, clock)
         before_count = await db.read(
             lambda c: c.execute("SELECT COUNT(*) FROM jobs").fetchone()

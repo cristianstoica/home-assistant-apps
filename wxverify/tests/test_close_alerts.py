@@ -1880,7 +1880,9 @@ def test_dw7_close_alerts_writes_nothing() -> None:
         return (
             conn.execute("SELECT * FROM station_observations ORDER BY id").fetchall(),
             conn.execute("SELECT * FROM observations ORDER BY id").fetchall(),
-            conn.execute("SELECT * FROM forecast_pairs ORDER BY id").fetchall(),
+            conn.execute(
+                "SELECT * FROM forecast_history ORDER BY feed_id, valid_at"
+            ).fetchall(),
         )
 
     before = _snapshot()
@@ -1888,7 +1890,7 @@ def test_dw7_close_alerts_writes_nothing() -> None:
     after = _snapshot()
     assert before == after, (
         "M67 -> at this assertion: correct = station_observations,"
-        " observations and forecast_pairs unchanged, mutant = the warning"
+        " observations and forecast_history unchanged, mutant = the warning"
         " writes a stored row (a materialize_consensus call added)"
     )
 
