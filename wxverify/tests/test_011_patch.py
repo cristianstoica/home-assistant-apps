@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -491,6 +492,93 @@ def test_fetch_feed_429_consumes_budget_and_writes_backoff(tmp_path: Path) -> No
 
     backoff = conn.execute("SELECT domain FROM domain_backoffs").fetchone()
     assert backoff is not None, "backoff row must be written"
+
+
+def test_ft2_feed_401_with_reason_matches_the_empty_body_outcome(
+    tmp_path: Path,
+) -> None:
+    """Part F, FT2 (health-release plan §6): a feed's 401 whose body
+    carries the provider's own reason gets it appended to
+    ``site_feed_state.last_error``; ``error_count`` and the backoff
+    outcome are unaffected by the reason's presence, compared against the
+    identical 401 with an empty body.
+
+    Catches: the feeds left out of Part F (TODO item 4) -- at the
+    "ends with" assertion below: correct = the suffix present, mutant =
+    absent. The equality assertions after it catch the reason changing
+    ``error_count`` or the backoff outcome (it must not).
+    """
+    req = httpx.Request(
+        "GET", "https://api.synthetic-provider.example.com/v1?apikey=synthetic"
+    )
+    body_with_reason = json.dumps(
+        {"message": "Invalid API key. See https://docs.example.test/errors for help."}
+    ).encode()
+
+    def _run(db_dir: Path, body: bytes) -> tuple[str, int, bool]:
+        db_dir.mkdir()
+        conn = _init_tmp_db(db_dir)
+        site_id = _insert_site(conn)
+        feed_id = _open_meteo_feed_id(conn)
+        db = get_db()
+        resp = httpx.Response(401, content=body, request=req)
+
+        class _Http401Adapter:
+            def estimate_cost(self, req: Any) -> CostEstimate:
+                return CostEstimate(calls=1)
+
+            async def fetch_forecast(self, r: Any) -> FetchResult:
+                raise httpx.HTTPStatusError("401", request=req, response=resp)
+
+        def _build(source: str, client: httpx.AsyncClient) -> _Http401Adapter:
+            return _Http401Adapter()
+
+        with pytest.raises(httpx.HTTPStatusError):
+            asyncio.run(
+                fetch_feed_once(
+                    db,
+                    site_id,
+                    feed_id,
+                    adapter_builder=_build,
+                    slot=DownloadSlot(
+                        slot="unscheduled",
+                        round_date=None,
+                        round_try=None,
+                        started_at=utc_now(),
+                    ),
+                )
+            )
+
+        state = conn.execute(
+            "SELECT last_error, error_count FROM site_feed_state"
+            " WHERE site_id=? AND feed_id=?",
+            (site_id, feed_id),
+        ).fetchone()
+        assert state is not None
+        has_backoff = (
+            conn.execute("SELECT COUNT(*) FROM domain_backoffs").fetchone()[0] > 0
+        )
+        return str(state["last_error"]), int(state["error_count"]), has_backoff
+
+    with_error, with_count, with_backoff = _run(
+        tmp_path / "with_reason", body_with_reason
+    )
+    no_error, no_count, no_backoff = _run(tmp_path / "no_reason", b"")
+
+    suffix = '; provider says "Invalid API key. See [address] for help."'
+    assert with_error.endswith(suffix), (
+        "mutant -> at this assertion: correct = the suffix present, mutant ="
+        f" {with_error!r}"
+    )
+    assert with_error.removesuffix(suffix) == no_error, (
+        "mutant -> at this assertion: correct = today's text unchanged"
+        f" apart from the suffix, mutant = {with_error!r} vs {no_error!r}"
+    )
+    assert with_count == no_count, (
+        "mutant -> at this assertion: correct = error_count unaffected by"
+        f" the reason, mutant = {with_count} vs {no_count}"
+    )
+    assert with_backoff == no_backoff
 
 
 def test_fetch_feed_read_timeout_keeps_budget(tmp_path: Path) -> None:

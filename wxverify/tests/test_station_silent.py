@@ -376,7 +376,7 @@ def test_sl5_current_obs_hold_suppresses_then_clears(
     monkeypatch.setattr(
         "wxverify.worker.access_hold.utc_now", lambda: now - timedelta(minutes=5)
     )
-    record_access_refused(conn, "current_obs", 401)
+    record_access_refused(conn, "current_obs", 401, reason=None)
 
     held = station_silent(conn, now, close_on=False)
     assert not held.tripped, (

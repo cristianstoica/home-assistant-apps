@@ -110,7 +110,7 @@ def test_ah1_hold_boundary_is_strict_less_than_and_3600_seconds_long(
     """
     conn = _make_conn()
     _freeze(monkeypatch, _NOW)
-    until = record_access_refused(conn, "hourly", 401)
+    until = record_access_refused(conn, "hourly", 401, reason=None)
 
     assert ACCESS_HOLD_SECONDS == 3600
     record = read_access_record(conn, "hourly")
@@ -161,7 +161,7 @@ def test_ah2_since_preserved_across_refusals_but_status_and_until_update(
     conn = _make_conn()
     t0 = _NOW
     _freeze(monkeypatch, t0)
-    record_access_refused(conn, "current_obs", 401)
+    record_access_refused(conn, "current_obs", 401, reason=None)
     first = read_access_record(conn, "current_obs")
     assert first is not None and first.since is not None
     assert first.since == "2026-07-10T12:00:00Z", (
@@ -170,7 +170,7 @@ def test_ah2_since_preserved_across_refusals_but_status_and_until_update(
 
     t1 = t0 + timedelta(hours=2)
     _freeze(monkeypatch, t1)
-    record_access_refused(conn, "current_obs", 403)
+    record_access_refused(conn, "current_obs", 403, reason=None)
     second = read_access_record(conn, "current_obs")
     assert second is not None
 
@@ -216,7 +216,7 @@ def test_ah3_check_access_hold_never_writes_the_row(
     conn = _make_conn()
     t0 = _NOW
     _freeze(monkeypatch, t0)
-    until = record_access_refused(conn, "current_obs", 401)
+    until = record_access_refused(conn, "current_obs", 401, reason=None)
     key = access_hold_key("current_obs")
     before_held_check = _runtime_state_row(conn, key)
     assert before_held_check is not None
@@ -245,7 +245,7 @@ def test_ah3_check_access_hold_never_writes_the_row(
     # Paired positive: a real refusal DOES change the row, proving the two
     # byte-identical checks above were comparing a row that is actually
     # capable of changing.
-    record_access_refused(conn, "current_obs", 403)
+    record_access_refused(conn, "current_obs", 403, reason=None)
     assert _runtime_state_row(conn, key) != before_held_check
 
 
@@ -330,7 +330,7 @@ def test_ah4_unreadable_until_fails_open_and_logs_warning(
     # Paired positive: a readable hold on the SAME kind, now inside the
     # window, IS held.
     caplog.clear()
-    record_access_refused(conn, "current_obs", 401)
+    record_access_refused(conn, "current_obs", 401, reason=None)
     assert access_held(conn, "current_obs", now + timedelta(seconds=10)) is not None, (
         f"[{case_name}] paired positive: a readable hold inside the window IS held"
     )
@@ -367,7 +367,7 @@ def test_ah5_hold_on_one_kind_never_holds_another(
     conn = _make_conn()
     now = _NOW
     _freeze(monkeypatch, now)
-    record_access_refused(conn, "hourly", 401)
+    record_access_refused(conn, "hourly", 401, reason=None)
 
     check_at = now + timedelta(seconds=10)
     assert access_held(conn, "hourly", check_at) is not None, (
@@ -411,7 +411,7 @@ def test_record_access_refused_stores_whole_second_stamps(
     now_with_micros = datetime(2026, 10, 28, 12, 0, 0, 654321, tzinfo=UTC)
     _freeze(monkeypatch, now_with_micros)
 
-    until = record_access_refused(conn, "hourly", 401)
+    until = record_access_refused(conn, "hourly", 401, reason=None)
     assert until == "2026-10-28T13:00:00Z"
 
     record = read_access_record(conn, "hourly")

@@ -362,6 +362,120 @@ def test_co1_refusal_writes_hold_and_touches_nothing_else(
 
 
 # ---------------------------------------------------------------------------
+# FT1 (health-release plan §6, Part F): a refusal whose body carries the
+# provider's own reason stores it, masked, on the current_obs hold.
+# ---------------------------------------------------------------------------
+
+_FT1_THROTTLED_BODY = json.dumps(
+    {
+        "errors": [
+            {"error": {"code": "SYNTHETIC-CODE", "message": "API key is throttled"}}
+        ]
+    }
+).encode()
+_FT1_UNAUTHORIZED_BODY = json.dumps(
+    {
+        "errors": [
+            {
+                "error": {
+                    "code": "SYNTHETIC-CODE",
+                    "message": "apikey is not authorized for this product",
+                }
+            }
+        ]
+    }
+).encode()
+
+
+def _refusal_response_with_body(status: int, body: bytes) -> httpx.Response:
+    return httpx.Response(
+        status,
+        content=body,
+        headers={"content-type": "application/json"},
+        request=httpx.Request("GET", str(_WEATHER_COM_URL)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("refusal_status", "body", "expected_reason"),
+    [
+        (401, _FT1_THROTTLED_BODY, "API key is throttled"),
+        (403, _FT1_UNAUTHORIZED_BODY, "apikey is not authorized for this product"),
+    ],
+)
+def test_ft1_current_obs_refusal_stores_providers_masked_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    refusal_status: int,
+    body: bytes,
+    expected_reason: str,
+) -> None:
+    """Part F, FT1 (plan §6): a weather.com 401/403 whose body carries the
+    provider's own reason stores it, masked, on the current_obs hold --
+    status/until/since are unaffected by the reason's presence, compared
+    against the SAME kind rewritten with an empty body at the same frozen
+    now.
+
+    Catches: only `_http_status_error` changed so the owner's two real
+    cases are never shown on the hold (TODO item 4) -- at the "the hold
+    row's reason" assertion below: correct = expected_reason, mutant =
+    None.
+    """
+
+    async def run() -> None:
+        t0 = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
+        monkeypatch.setattr("wxverify.worker.access_hold.utc_now", lambda: t0)
+        db = _init_tmp_db(tmp_path)
+        conn = db._conn  # noqa: SLF001
+        site_id = _seed_site(conn)
+        station_id = _seed_station(conn, site_id, pws_id="ISTATION01")
+        _seed_poll_state(
+            conn, station_id, health_state="online", next_poll_at=_PAST_ISO
+        )
+        _seed_current_obs_job(conn, site_id, station_id)
+
+        async def _fake_fetch(
+            pws_station_id: str,
+            api_key: str,
+            *,
+            client: httpx.AsyncClient | None = None,
+            timeout_seconds: float = 10.0,
+        ) -> httpx.Response:
+            return _refusal_response_with_body(refusal_status, body)
+
+        monkeypatch.setattr(
+            "wxverify.worker.processor.fetch_current_observation", _fake_fetch
+        )
+
+        job = await db.write(claim_next_current_obs_job)
+        assert job is not None
+        await run_claimed_job(db, job, lane="current_obs")
+
+        record = read_access_record(conn, "current_obs")
+        assert record is not None
+        assert record.reason == expected_reason, (
+            "mutant -> at this assertion: correct ="
+            f" {expected_reason!r}, mutant = {record.reason!r}"
+        )
+        stored_status, stored_until, stored_since = (
+            record.status,
+            record.until,
+            record.since,
+        )
+
+        # The same kind, same frozen now, an empty body -- the control for
+        # status/until/since: the reason must not change them.
+        record_access_refused(conn, "current_obs", refusal_status, reason=None)
+        control = read_access_record(conn, "current_obs")
+        assert control is not None and control.reason is None
+        assert stored_status == control.status
+        assert stored_until == control.until
+        assert stored_since == control.since
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
 # CO2 — a hold in force blocks reservation entirely; no budget consumed
 # ---------------------------------------------------------------------------
 
@@ -390,7 +504,7 @@ def test_co2_hold_in_force_blocks_reservation_before_any_budget_write() -> None:
     conn = _make_conn()
     site_id = _seed_site(conn)
     station_id = _seed_station(conn, site_id, pws_id="ISTATION01")
-    record_access_refused(conn, "current_obs", 401)
+    record_access_refused(conn, "current_obs", 401, reason=None)
 
     with pytest.raises(AccessHeld):
         _reserve_current_obs_call(conn, site_id, station_id)
@@ -449,7 +563,7 @@ def test_co2_job_level_hold_in_force_defers_the_claimed_job_without_a_call(
         )
         before_poll_state = dict(_poll_state_row(conn, station_id))
 
-        until = record_access_refused(conn, "current_obs", 401)
+        until = record_access_refused(conn, "current_obs", 401, reason=None)
 
         _seed_current_obs_job(conn, site_id, station_id)
 
@@ -660,8 +774,8 @@ def test_co4_2xx_reply_clears_only_current_obs_hold(
             error_count=5,
         )
 
-        until = record_access_refused(conn, "current_obs", 401)
-        record_access_refused(conn, "hourly", 403)
+        until = record_access_refused(conn, "current_obs", 401, reason=None)
+        record_access_refused(conn, "hourly", 403, reason=None)
 
         # Advance access_hold's own clock past the hold's end -- the job's
         # own due time is seeded in the past independently, so no other

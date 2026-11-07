@@ -19,15 +19,38 @@ holds.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
+import httpx
 import pytest
 
-from tests.helpers import NOW, D, asof_conn, close_off, day_close_site
-from wxverify.core.timeutil import isoformat_utc
+from tests.helpers import (
+    NOW,
+    D,
+    asof_conn,
+    close_off,
+    day_close_site,
+    disable_station_pacing,
+    patch_weathercom_transport,
+    write_weathercom_key,
+)
+from wxverify import config
+from wxverify.core.timeutil import isoformat_utc, parse_utc
+from wxverify.db.connection import Database, FencedWriter, close_db, init_db
+from wxverify.db.site_days import (
+    begin_close,
+    ensure_site_days,
+    finish_close,
+    mark_missed,
+    start_site_days,
+)
 from wxverify.monitor import build_verdict
-from wxverify.worker.access_hold import record_access_refused
+from wxverify.worker.access_hold import read_access_record, record_access_refused
+from wxverify.worker.day_values import fill_gaps
 
 # conftest.py's autouse ``_check_day_close_records`` fixture already covers
 # every connection ``day_close_site`` builds in this module; no test here
@@ -93,6 +116,172 @@ def _station_id(conn: sqlite3.Connection, site_id: int, pws_station_id: str) -> 
     return int(row[0])
 
 
+#: GAP_DAY: the day this test's gap fill runs over (mirrors
+#: ``tests/test_gap_fill.py``'s own ``GAP_DAY``, D-1).
+_FT1_GAP_DAY = D - timedelta(days=1)
+#: The frozen instant ``wxverify.worker.access_hold.utc_now`` reads when this
+#: test's refusal is recorded -- unrelated to ``NOW``/``D`` (the day-close
+#: clock ``fill_gaps`` itself reads through its own ``now_utc`` argument).
+#: Both parametrized runs below freeze to this SAME instant, in their own
+#: fresh ``monkeypatch`` fixture, so ``since``/``until`` are directly
+#: comparable literals rather than two live wall-clock reads that could
+#: straddle a second.
+_FT1_REFUSAL_AT = datetime(2026, 7, 10, 9, 0, tzinfo=UTC)
+
+
+def _init_fill_gaps_db(base: Path) -> Database:
+    """A fresh real SQLite file under ``base`` (``init_db``, real
+    migrations), closing any process-global ``Database`` first -- the
+    pattern of ``tests/test_gap_fill.py``'s ``_init_tmp_db``."""
+    close_db()
+    base.mkdir(parents=True, exist_ok=True)
+    db_path = base / "wxverify.db"
+    config.db_path = str(db_path)
+    return init_db(str(db_path))
+
+
+def _build_ft1_gap_day_site(conn: sqlite3.Connection) -> int:
+    """A site with D-3 closed, D-2 missed and ``_FT1_GAP_DAY`` (D-1) moved
+    to ``closing`` with nothing filled -- station A (``ISTATION01``) has a
+    full day of gap hours, so ``fill_gaps`` always calls out for it (the
+    layout of ``tests/test_gap_fill.py``'s ``_build_base_site``, trimmed
+    to the one station this test needs)."""
+    site_id = day_close_site(conn, timezone="UTC", close_on=True, with_records=False)
+    d_minus_3 = D - timedelta(days=3)
+    start_site_days(
+        conn,
+        site_id,
+        d_minus_3,
+        now_utc=datetime(d_minus_3.year, d_minus_3.month, d_minus_3.day, tzinfo=UTC),
+    )
+    ensure_site_days(conn, site_id, now_utc=NOW)
+    d3_row = conn.execute(
+        "SELECT day_end_utc FROM site_days WHERE site_id=? AND local_date=?",
+        (site_id, d_minus_3.isoformat()),
+    ).fetchone()
+    assert d3_row is not None
+    t1 = parse_utc(d3_row[0]) + timedelta(minutes=30)
+    begin_close(conn, site_id, d_minus_3, now_utc=t1)
+    finish_close(conn, site_id, d_minus_3, now_utc=t1)
+
+    d_minus_2 = D - timedelta(days=2)
+    d2_row = conn.execute(
+        "SELECT day_end_utc FROM site_days WHERE site_id=? AND local_date=?",
+        (site_id, d_minus_2.isoformat()),
+    ).fetchone()
+    assert d2_row is not None
+    t2 = parse_utc(d2_row[0]) + timedelta(minutes=30)
+    mark_missed(conn, site_id, d_minus_2, now_utc=t2, reason="never_attempted")
+
+    begin_close(conn, site_id, _FT1_GAP_DAY, now_utc=NOW)
+    conn.commit()
+    return site_id
+
+
+_FT1_REASON_BODY = json.dumps(
+    {
+        "errors": [
+            {
+                "error": {
+                    "code": "SYNTHETIC-CODE",
+                    "message": "apikey is not authorized for this product",
+                }
+            }
+        ]
+    }
+).encode()
+
+
+@pytest.mark.parametrize(
+    ("case", "reply_content", "reply_headers", "expected_reason"),
+    [
+        (
+            "with_reason",
+            _FT1_REASON_BODY,
+            {"content-type": "application/json"},
+            "apikey is not authorized for this product",
+        ),
+        ("empty_body", b"", {}, None),
+    ],
+    ids=["with_reason", "empty_body"],
+)
+def test_ft1_hourly_download_path_stores_providers_masked_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    reply_content: bytes,
+    reply_headers: dict[str, str],
+    expected_reason: str | None,
+) -> None:
+    """Part F, FT1 (health-release plan §6): a weather.com 403 reaching
+    the REAL hourly download inside ``fill_gaps`` -- never
+    ``provider_reason``/``record_access_refused`` called directly by this
+    test -- stores the provider's own masked reason on the hourly hold;
+    an empty body stores no reason. Two separate parametrized runs, each
+    with its own fresh ``monkeypatch`` fixture (so each gets its own,
+    un-wrapped patch of ``wxverify.worker.day_values.httpx.AsyncClient`` --
+    patching it a second time inside ONE test would wrap the first
+    handler instead of replacing it, since ``patch_weathercom_transport``
+    captures ``httpx.AsyncClient`` at call time, which is already the
+    first patch's lambda by then) -- both freeze
+    ``wxverify.worker.access_hold.utc_now`` to the SAME literal instant
+    (``_FT1_REFUSAL_AT``), so ``since``/``until`` are checked against
+    literals computed from it, never two live wall-clock reads that could
+    straddle a second.
+
+    Drives ``wxverify.worker.day_values.fill_gaps`` over a site whose
+    station A has a full day of gap hours (``_build_ft1_gap_day_site``),
+    with the hourly download's client patched onto an
+    ``httpx.MockTransport`` (``tests.helpers.patch_weathercom_transport``,
+    the harness ``tests/test_gap_fill.py``'s GF4 case uses for its own
+    401/403/500/network outcomes) -- so it is ``_http_failed`` itself
+    that calls ``provider_reason`` on the real response and then
+    ``record_access_refused`` with its result.
+
+    Catches: only `_http_status_error` changed so the owner's real case
+    is never shown on the hold (TODO item 4), or the hourly caller
+    passing `reason=None` instead of the real `provider_reason` result --
+    at the "the hold row's reason" assertion below: correct =
+    ``expected_reason``, mutant = the other run's reason.
+    """
+    _freeze(monkeypatch, _FT1_REFUSAL_AT)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, content=reply_content, headers=reply_headers)
+
+    db = _init_fill_gaps_db(tmp_path / case)
+    conn = db._conn  # noqa: SLF001 - test inspects the real writer connection
+    write_weathercom_key(monkeypatch, tmp_path / case)
+    disable_station_pacing(monkeypatch)
+    site_id = _build_ft1_gap_day_site(conn)
+    writer = FencedWriter(db)
+    patch_weathercom_transport(monkeypatch, handler)
+    asyncio.run(
+        fill_gaps(db, writer, site_id=site_id, local_date=_FT1_GAP_DAY, now_utc=NOW)
+    )
+
+    record = read_access_record(conn, "hourly")
+    assert record is not None
+    assert record.reason == expected_reason, (
+        "mutant -> at this assertion: correct ="
+        f" {expected_reason!r}, mutant = {record.reason!r}"
+    )
+    assert record.status == 403
+
+    frozen = _FT1_REFUSAL_AT.replace(microsecond=0)
+    expected_until = isoformat_utc(frozen + timedelta(hours=1))
+    assert record.since == isoformat_utc(frozen), (
+        "mutant -> at this assertion: correct ="
+        f" {isoformat_utc(frozen)!r} (the reason's presence must not move"
+        f" since), mutant = {record.since!r}"
+    )
+    assert record.until == expected_until, (
+        "mutant -> at this assertion: correct ="
+        f" {expected_until!r} (the reason's presence must not move until),"
+        f" mutant = {record.until!r}"
+    )
+
+
 def test_ac1_next_try_before_and_after_until(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC1 (plan §13.6, §6.4): the five_minute next-try clause (M53).
 
@@ -107,7 +296,7 @@ def test_ac1_next_try_before_and_after_until(monkeypatch: pytest.MonkeyPatch) ->
     station_b = _station_id(conn, site_id, "ISTATION02")
     refusal_at = datetime(D.year, D.month, D.day, 9, 0, tzinfo=UTC)
     _freeze(monkeypatch, refusal_at)
-    until = record_access_refused(conn, "five_minute", 401)
+    until = record_access_refused(conn, "five_minute", 401, reason=None)
     assert until == isoformat_utc(refusal_at + timedelta(hours=1))
 
     before_until = datetime(D.year, D.month, D.day, 9, 30, tzinfo=UTC)
@@ -160,7 +349,7 @@ def test_ac2_days_affected_spans_two_days(monkeypatch: pytest.MonkeyPatch) -> No
         d_minus_1.year, d_minus_1.month, d_minus_1.day, 23, 30, tzinfo=UTC
     )
     _freeze(monkeypatch, refusal_at)
-    record_access_refused(conn, "five_minute", 401)
+    record_access_refused(conn, "five_minute", 401, reason=None)
 
     now = datetime(D.year, D.month, D.day, 0, 20, tzinfo=UTC)
     begin_close(
@@ -195,7 +384,7 @@ def test_ac3_current_obs_clause_after_until(monkeypatch: pytest.MonkeyPatch) -> 
 
     refusal_at = datetime(D.year, D.month, D.day, 9, 0, tzinfo=UTC)
     _freeze(monkeypatch, refusal_at)
-    until = record_access_refused(conn, "current_obs", 403)
+    until = record_access_refused(conn, "current_obs", 403, reason=None)
 
     in_force = _cond(conn, refusal_at + timedelta(minutes=5))
     in_force_detail = str(in_force["detail"])
@@ -251,7 +440,7 @@ def test_ac4_hourly_clause_reads_retry_at(monkeypatch: pytest.MonkeyPatch) -> No
 
     refusal_at = day_end + timedelta(minutes=15)
     _freeze(monkeypatch, refusal_at)
-    record_access_refused(conn, "hourly", 401)
+    record_access_refused(conn, "hourly", 401, reason=None)
 
     cond = _cond(conn, refusal_at + timedelta(minutes=1))
     detail = str(cond["detail"])
@@ -293,7 +482,7 @@ def test_ac5_days_affected_caps_at_three(monkeypatch: pytest.MonkeyPatch) -> Non
         d_minus_3.year, d_minus_3.month, d_minus_3.day, 0, 0, tzinfo=UTC
     )
     _freeze(monkeypatch, refusal_at)
-    record_access_refused(conn, "hourly", 401)
+    record_access_refused(conn, "hourly", 401, reason=None)
 
     now = datetime(D.year, D.month, D.day, 0, 10, tzinfo=UTC)
     cond = _cond(conn, now)
@@ -325,7 +514,7 @@ def test_ac6_detail_unchanged_with_close_off(monkeypatch: pytest.MonkeyPatch) ->
 
     refusal_at = datetime(D.year, D.month, D.day, 9, 0, tzinfo=UTC)
     _freeze(monkeypatch, refusal_at)
-    until = record_access_refused(conn, "five_minute", 401)
+    until = record_access_refused(conn, "five_minute", 401, reason=None)
 
     cond = _cond(conn, refusal_at + timedelta(minutes=5))
     detail = str(cond["detail"])
@@ -468,7 +657,7 @@ def test_ac7_no_station_named_with_alert3_and_gap_fill_pause(
 
     refusal_at = datetime(D.year, D.month, D.day, 9, 0, tzinfo=UTC)
     _freeze(monkeypatch, refusal_at)
-    record_access_refused(conn, "five_minute", 401)
+    record_access_refused(conn, "five_minute", 401, reason=None)
 
     now = refusal_at + timedelta(minutes=5)
     cond = _cond(conn, now)

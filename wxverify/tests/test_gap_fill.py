@@ -555,7 +555,7 @@ def test_gf4_held_refused_failed_and_network_outcomes(
     db, writer, site_id, station_a = _minimal_site(tmp_path / "held")
     conn = db._conn  # noqa: SLF001
     monkeypatch.setattr("wxverify.worker.access_hold.utc_now", lambda: NOW)
-    record_access_refused(conn, "hourly", 403)
+    record_access_refused(conn, "hourly", 403, reason=None)
     before = _budget_calls(conn)
     called: list[str] = []
 

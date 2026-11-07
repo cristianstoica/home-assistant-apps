@@ -65,13 +65,18 @@ class AccessHeld(Exception):
 
 @dataclass(frozen=True)
 class AccessRecord:
-    """One kind's stored hold. ``until`` is None when the row is unreadable."""
+    """One kind's stored hold. ``until`` is None when the row is unreadable.
+
+    ``reason`` is the provider's own masked reason (``provider_reason``);
+    None when the reply gave none, and on rows written before it was stored.
+    """
 
     kind: AccessKind
     since: str | None
     until: str | None
     status: int | None
     message: str | None
+    reason: str | None
 
 
 # --- keys ------------------------------------------------------------------
@@ -103,8 +108,8 @@ def read_access_record(
 
     A value that is not a JSON object, or whose ``until`` does not parse, is
     returned with ``until`` None and logged at WARNING. ``since`` is likewise
-    None unless it parses, and ``status`` and ``message`` unless they have
-    their stored types.
+    None unless it parses, and ``status``, ``message`` and ``reason`` unless
+    they have their stored types.
     """
     raw = get_runtime_state(conn, access_hold_key(kind))
     if raw is None:
@@ -117,6 +122,7 @@ def read_access_record(
         logger.warning("unreadable weather.com access hold kind=%s", kind)
     status = fields.get("status")
     message = fields.get("message")
+    reason = fields.get("reason")
     return AccessRecord(
         kind=kind,
         since=_stamp_or_none(fields.get("since")),
@@ -125,6 +131,7 @@ def read_access_record(
             status if isinstance(status, int) and not isinstance(status, bool) else None
         ),
         message=message if isinstance(message, str) else None,
+        reason=reason if isinstance(reason, str) else None,
     )
 
 
@@ -180,13 +187,16 @@ def refused_kinds(conn: sqlite3.Connection, now: datetime) -> list[AccessRecord]
 
 
 def record_access_refused(
-    conn: sqlite3.Connection, kind: AccessKind, status: int
+    conn: sqlite3.Connection, kind: AccessKind, status: int, *, reason: str | None
 ) -> str:
     """Hold ``kind`` after a refused (401/403) call; return the new ``until``.
 
     ``until`` is now plus ``ACCESS_HOLD_SECONDS``. ``since`` is kept from an
     existing readable row, the first refusal of the current run, else set to
-    now. ``status`` and ``message`` come from this refusal.
+    now. ``status`` and ``message`` come from this refusal, and so does
+    ``reason``, the reply's ``provider_reason``, stored only when not None.
+    ``reason`` has no default, so a new caller cannot leave it out; it never
+    changes the hold itself.
     """
     now = utc_now().replace(microsecond=0)
     until = isoformat_utc(now + timedelta(seconds=ACCESS_HOLD_SECONDS))
@@ -198,12 +208,14 @@ def record_access_refused(
         and existing.since is not None
         else isoformat_utc(now)
     )
-    value = {
+    value: dict[str, object] = {
         "since": since,
         "until": until,
         "status": status,
         "message": f"access refused (HTTP {status})",
     }
+    if reason is not None:
+        value["reason"] = reason
     set_runtime_state(conn, access_hold_key(kind), json.dumps(value))
     logger.warning(
         "weather.com access refused kind=%s status=%d held until %s",

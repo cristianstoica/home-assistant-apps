@@ -37,6 +37,7 @@ from wxverify.collection.budget import (
     reserve_budget,
     write_after_reservation,
 )
+from wxverify.core.error_sanitize import provider_reason
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import floor_hour, isoformat_utc, parse_utc
 from wxverify.core.units import kmh_to_ms
@@ -593,10 +594,14 @@ class _Fill:
         status = response.status_code
         detail = f"http {status}"
         if status in (401, 403):
+            # The provider's own reason is read here, outside the write.
+            reason = provider_reason(response)
             until = await write_after_reservation(
                 self.db,
                 self.writer,
-                lambda conn: record_access_refused(conn, "hourly", status),
+                lambda conn: record_access_refused(
+                    conn, "hourly", status, reason=reason
+                ),
             )
             return StationFill(
                 outcome="refused",

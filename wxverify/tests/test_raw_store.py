@@ -531,7 +531,7 @@ def test_rs7_poll_values_pass_the_per_value_check_before_the_raw_insert(
     monkeypatch.setattr("wxverify.worker.current_obs.utc_now", lambda: now)
     monkeypatch.setattr("wxverify.worker.processor.utc_now", lambda: now)
 
-    record_access_refused(conn, "current_obs", 401)
+    record_access_refused(conn, "current_obs", 401, reason=None)
     conn.commit()
 
     all_null = classify_current_obs(

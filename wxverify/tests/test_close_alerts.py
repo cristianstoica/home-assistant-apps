@@ -1694,7 +1694,7 @@ def test_dw3_refused_five_minute_kind_left_out(
     _store_five_minute(conn, station_a, store_time)
     at = store_time + timedelta(hours=6, seconds=1)
     monkeypatch.setattr("wxverify.worker.access_hold.utc_now", lambda: at)
-    record_access_refused(conn, "five_minute", 401)
+    record_access_refused(conn, "five_minute", 401, reason=None)
 
     alerts = close_alerts(conn, at)
     warning = next(a for a in alerts if a.id == "daytime_download_missed")

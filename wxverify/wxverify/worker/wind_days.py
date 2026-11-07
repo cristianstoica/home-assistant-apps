@@ -41,7 +41,7 @@ from wxverify.collection.wind_quota import (
     backfill_headroom,
     lane_counter_key,
 )
-from wxverify.core.error_sanitize import sanitized_exception
+from wxverify.core.error_sanitize import provider_reason, sanitized_exception
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import (
     isoformat_utc,
@@ -843,14 +843,18 @@ async def _fetch_failed(
             # Today's 5-minute download was refused: hold the five_minute
             # kind for every station. The call was made, so nothing is
             # refunded; the row keeps its status and moves to its next try.
+            # The provider's own reason is read here, outside the write.
+            reason = provider_reason(response)
             refused = (
                 f"station={row.pws_station_id} date={local_date.isoformat()}: "
                 f"access refused (HTTP {status})"
             )
+            if reason is not None:
+                refused += f'; provider says "{reason}"'
 
             def record_refusal(conn: sqlite3.Connection) -> _TryLog | None:
                 attempt = begin(conn)
-                record_access_refused(conn, "five_minute", status)
+                record_access_refused(conn, "five_minute", status, reason=reason)
                 stamp = isoformat_utc(utc_now())
                 moved = (
                     None

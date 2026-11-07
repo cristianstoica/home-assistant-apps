@@ -1511,8 +1511,10 @@ def load_access_holds(conn: sqlite3.Connection) -> list[AccessHoldView]:
 
     Every row is shown however long ago its hold ended (no 24 h cut, unlike
     the monitor): the row stays until a granted reply of its kind deletes it.
-    Times are the stored UTC stamps. An unreadable row is named
-    ``<label> (unreadable hold)`` and shows no time. Read-only.
+    Times are the stored UTC stamps. The provider's stored reason, when the
+    row has one, follows the kind's label as ``; provider says "<reason>"``.
+    An unreadable row then reads `` (unreadable hold)`` and shows no time.
+    Read-only.
     """
     now = utc_now()
     views: list[AccessHoldView] = []
@@ -1524,6 +1526,8 @@ def load_access_holds(conn: sqlite3.Connection) -> list[AccessHoldView]:
         if record.status is not None:
             head += f" (HTTP {record.status})"
         text = f"{head}: {ACCESS_KIND_LABELS[kind]}"
+        if record.reason is not None:
+            text += f'; provider says "{record.reason}"'
         if record.until is None:
             text += " (unreadable hold), waiting for the next try"
         else:

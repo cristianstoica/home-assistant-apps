@@ -463,7 +463,7 @@ def test_op8_alert_lines_include_each_tripped_alert(
     )
 
     # Alert 6: a current_obs refusal in force.
-    record_access_refused(conn, "current_obs", 401)
+    record_access_refused(conn, "current_obs", 401, reason=None)
 
     panel = load_close_status(conn, NOW, close_on=True)
     assert panel is not None

@@ -39,9 +39,11 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from tests.helpers import close_off
 from wxverify import config
+from wxverify.api.app import create_app
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database, FencedWriter, close_db, init_db
 from wxverify.db.queue import (
@@ -142,6 +144,10 @@ def _online_response() -> httpx.Response:
         headers={"content-type": "application/json"},
         request=httpx.Request("GET", str(_WEATHER_COM_URL)),
     )
+
+
+async def _idle_worker(_db: object) -> None:
+    await asyncio.Event().wait()
 
 
 def _freeze(monkeypatch: pytest.MonkeyPatch, when: datetime) -> None:
@@ -506,6 +512,99 @@ def test_ah3_a_401_for_the_first_station_holds_the_others_in_the_same_run(
     close_db()
 
 
+# ---------------------------------------------------------------------------
+# FT1 (health-release plan §6, Part F): the refusal's body carries the
+# provider's own reason -- stored on the hold AND appended to the day's
+# last_error, shown both on the Ops access-hold line (right after the kind
+# label) and in the Wind History table's Last error column.
+# ---------------------------------------------------------------------------
+
+
+def test_ft1_five_minute_refusal_stores_and_shows_providers_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Part F, FT1 (plan §6): a 401 whose body carries weather.com's own
+    reason -- stored on the five_minute hold and appended to the day's
+    ``last_error``, and shown both on the Ops access-hold line (right
+    after the kind label) and in the Wind History table's Last error
+    column.
+
+    Catches: only `_http_status_error` changed so the reason never
+    reaches the five_minute hold or the station error list (TODO item 4)
+    -- at the "hold row's reason" and "last_error ends with" assertions
+    below: correct = the message text, mutant = None/absent.
+    """
+    from wxverify.worker.wind_days import evening_slot_instants  # new name (P2)
+
+    db = _init_tmp_db(tmp_path)
+    conn = db._conn  # noqa: SLF001
+    close_off(conn)
+    site_id = _seed_site(conn)
+    station_id = _seed_station(conn, site_id, pws_id="ISTATION01")
+
+    slots = evening_slot_instants(_AH_DAY, _AH_TZ)
+    slot_2300 = slots[0]
+    _insert_today_row(
+        conn, station_id, _AH_DAY, next_attempt_at=isoformat_utc(slot_2300)
+    )
+
+    body = json.dumps(
+        {
+            "errors": [
+                {
+                    "error": {
+                        "code": "SYNTHETIC-CODE",
+                        "message": "API key is throttled",
+                    }
+                }
+            ]
+        }
+    ).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            content=body,
+            headers={"content-type": "application/json"},
+            request=request,
+        )
+
+    _freeze(monkeypatch, slot_2300)
+    _run_wind_days_chunk(db, site_id, handler, monkeypatch=monkeypatch)
+
+    record = read_access_record(conn, "five_minute")
+    assert record is not None and record.reason == "API key is throttled", (
+        "mutant -> at this assertion: correct = 'API key is throttled',"
+        f" mutant = {record.reason if record is not None else None!r}"
+    )
+
+    row = _ah_day_row(conn, station_id)
+    last_error = str(row["last_error"])
+    assert last_error.endswith('; provider says "API key is throttled"'), (
+        "mutant -> at this assertion: correct = the day's last_error ending"
+        " '; provider says \"API key is throttled\"', mutant ="
+        f" {last_error!r}"
+    )
+
+    close_db()
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        resp = client.get("/ops")
+    assert resp.status_code == 200, resp.text
+    html = " ".join(resp.text.split())
+    assert (
+        "weather.com access refused (HTTP 401): 5-minute readings;"
+        " provider says &#34;API key is throttled&#34;" in html
+    ), "the Ops line must show the reason right after the kind label"
+    assert html.count("provider says &#34;API key is throttled&#34;") == 2, (
+        "the reason must show once on the Ops access-hold line and once in"
+        " the Wind History table's Last error column"
+        f"; html={html!r}"
+    )
+    close_db()
+
+
 def test_ah4_a_2xx_clears_only_five_minute_not_current_obs_or_hourly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -608,7 +707,7 @@ def test_fm4_each_kinds_hold_leaves_the_other_two_lanes_running(
     )
     conn.commit()
 
-    record_access_refused(conn, held, 401)
+    record_access_refused(conn, held, 401, reason=None)
     conn.commit()
 
     ensure_wind_days(conn, site_id, ZoneInfo("UTC"), now.date())

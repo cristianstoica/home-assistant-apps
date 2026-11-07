@@ -23,7 +23,7 @@ from wxverify.collection.budget import (
     write_after_reservation,
 )
 from wxverify.core import stop
-from wxverify.core.error_sanitize import sanitized_exception
+from wxverify.core.error_sanitize import provider_reason, sanitized_exception
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.db.connection import Database, FencedWriter
@@ -637,10 +637,14 @@ async def _fetch_current_obs(
         # station keeps what its last real reply left (classify_current_obs's
         # TERMINAL for these codes is never persisted).
         if status in (401, 403):
+            # The provider's own reason is read here, outside the write.
+            reason = provider_reason(response)
             until = await write_after_reservation(
                 db,
                 writer,
-                lambda conn, s=status: record_access_refused(conn, "current_obs", s),
+                lambda conn, s=status, r=reason: record_access_refused(
+                    conn, "current_obs", s, reason=r
+                ),
             )
             raise JobDeferred(until)
 
