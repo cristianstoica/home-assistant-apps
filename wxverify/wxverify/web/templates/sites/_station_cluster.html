@@ -40,8 +40,18 @@
                 <td>{{ "%.4f"|format(station.lat) }}</td>
                 <td>{{ "%.4f"|format(station.lon) }}</td>
                 <td>{{ "%.0f"|format(station.dem_elevation_m) }}</td>
-                <td>{{ "Enabled" if station.enabled else "Disabled" }}{% if station.observation_age is not none %} · latest observation {{ station.observation_age }}{% endif %}{% if station.rain_not_counted_since is not none %} · rain not counted since {{ station.rain_not_counted_since }}{% endif %}</td>
+                <td>{{ "Enabled" if station.enabled else "Disabled" }}{% if station.poll_status is not none %} · {{ station.poll_status }}{% endif %}{% if station.observation_age is not none %} · latest observation {{ station.observation_age }}{% endif %}{% if station.rain_not_counted_since is not none %} · rain not counted since {{ station.rain_not_counted_since }}{% endif %}</td>
                 <td class="actions">
+                  {% if station.retry_now %}
+                  <button
+                    type="button"
+                    hx-post="{{ url('/api/sites/' ~ site.id ~ '/stations/' ~ station.id ~ '/retry-now') }}"
+                    hx-ext="json-enc"
+                    hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'
+                    hx-target="#station-cluster-{{ site.id }}"
+                    hx-swap="outerHTML"
+                    hx-disabled-elt="this">Retry now</button>
+                  {% endif %}
                   <button
                     type="button"
                     {% if last_enabled %}disabled{% endif %}

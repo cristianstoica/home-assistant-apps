@@ -581,10 +581,13 @@ class TestPersistPollResult:
         assert st["error_count"] == 99
         assert st["last_run_at"] == "2026-01-01T00:00:00Z"
 
-    # -- OFFLINE: next_poll_at = now + 86400; stations.* untouched ------------
+    # -- OFFLINE: next_poll_at = now + 1 h (recheck ladder); stations.* ------
+    # -- untouched -------------------------------------------------------------
 
-    def test_offline_next_poll_at_86400_and_stations_untouched(self) -> None:
-        """OFFLINE: next_poll_at = now + 86400 s; stations.* sentinel unchanged."""
+    def test_offline_next_poll_at_1h_and_stations_untouched(self) -> None:
+        """OFFLINE: next_poll_at = now + 1 h, pause columns (1, 'offline')
+        (health release, Part B: the first empty reply waits 1 h, not
+        the old 86400-s park); stations.* sentinel unchanged."""
         conn = _make_conn()
         site_id = _seed_site(conn)
         station_id = _seed_station(conn, site_id, last_error="sentinel", error_count=7)
@@ -597,10 +600,11 @@ class TestPersistPollResult:
         row = _poll_state(conn, station_id)
         assert row is not None
         assert row["health_state"] == "offline"
+        assert (row["pause_evidence_count"], row["pause_reason"]) == (1, "offline")
         actual = datetime.fromisoformat(
             row["next_poll_at"].replace("Z", "+00:00")
         ).astimezone(UTC)
-        expected = _NOW + timedelta(seconds=MAX_BACKOFF_SECONDS)
+        expected = _NOW + timedelta(hours=1)
         assert actual == expected
 
         st = _station_row(conn, station_id)

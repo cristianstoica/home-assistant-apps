@@ -308,7 +308,12 @@ def create_tables(conn: sqlite3.Connection) -> None:
             last_poll_at TEXT,
             last_error TEXT,
             error_count INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            pause_reason TEXT
+                CHECK(pause_reason IS NULL OR pause_reason IN ('offline','not_found')),
+            pause_evidence_count INTEGER NOT NULL DEFAULT 0
+                CHECK(pause_evidence_count >= 0
+                      AND (pause_evidence_count = 0) = (pause_reason IS NULL))
         );
 
         CREATE TABLE IF NOT EXISTS station_current_obs (
@@ -1279,10 +1284,12 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     18 (``newer than this app``); a file at 1 to 16 (or below 0), with
     ``install 0.16.17 first``. Then, in order: `create_tables`; on every
     start, `drop_forecast_record`; `create_indexes`; at 17 only,
-    `migrate_v18`; the four one-shot corrections, the three seeds and the
-    rain-label boundary; at 0 only, the fresh file's two keys
-    (`_record_fresh_build_keys`); last, ``user_version`` 18. A file already
-    at 18 runs the same steps less the upgrade and the fresh keys.
+    `migrate_v18` (the station poll-pause columns and their carry-over,
+    then the drop of the unused write state, in one savepoint); the four
+    one-shot corrections, the three seeds and the rain-label boundary; at
+    0 only, the fresh file's two keys (`_record_fresh_build_keys`); last,
+    ``user_version`` 18. A file already at 18 runs the same steps less the
+    upgrade and the fresh keys.
 
     A stop is checked before each step (``core.stop.begin_step``), which
     also names the step for ``Database._open``'s log line; `migrate_v18`
@@ -1416,9 +1423,10 @@ def migrate_v18(conn: sqlite3.Connection) -> None:
     sets it to 0 on this connection, so the deletes do not overwrite each
     freed page; the ``finally`` puts it back, whatever happens.
 
-    One SAVEPOINT holds the upgrade: the sub-step
-    `_v18_drop_unused_write_state`, under the stop check
-    ``v18_drop_unused_write_state``, then ``user_version`` 18. The version
+    One SAVEPOINT holds the upgrade, each sub-step under a stop check of
+    its own name: `_v18_poll_pause` (``v18_poll_pause``), then
+    `_v18_drop_unused_write_state` (``v18_drop_unused_write_state``), then
+    ``user_version`` 18. The version
     sits in the file header, which the savepoint rolls back with everything
     else. `create_tables`'s ``executescript`` has already committed any
     outer transaction, so the RELEASE is the commit, and nothing inside the
@@ -1438,6 +1446,8 @@ def migrate_v18(conn: sqlite3.Connection) -> None:
     try:
         conn.execute("SAVEPOINT migrate_v18")
         try:
+            stop.begin_step("v18_poll_pause")
+            _v18_poll_pause(conn)
             stop.begin_step("v18_drop_unused_write_state")
             _v18_drop_unused_write_state(conn)
             conn.execute("PRAGMA user_version = 18")
@@ -1450,6 +1460,72 @@ def migrate_v18(conn: sqlite3.Connection) -> None:
     finally:
         restored = "FAST" if secure_delete == 2 else str(secure_delete)
         conn.execute(f"PRAGMA secure_delete = {restored}")
+
+
+# Part B's two station_poll_state columns, as `create_tables` writes them,
+# pause_reason first: the count's CHECK names it.
+_V18_POLL_PAUSE_COLUMNS: Final = (
+    (
+        "pause_reason",
+        "pause_reason TEXT CHECK(pause_reason IS NULL OR pause_reason IN"
+        " ('offline','not_found'))",
+    ),
+    (
+        "pause_evidence_count",
+        "pause_evidence_count INTEGER NOT NULL DEFAULT 0"
+        " CHECK(pause_evidence_count >= 0"
+        " AND (pause_evidence_count = 0) = (pause_reason IS NULL))",
+    ),
+)
+
+
+def _v18_poll_pause(conn: sqlite3.Connection) -> None:
+    """Add the two poll-pause columns and recheck the stations parked for a day.
+
+    A sub-step of `migrate_v18`, run inside its savepoint. ``PRAGMA
+    table_info(station_poll_state)`` lists the columns present, and
+    ``pause_reason``, then ``pause_evidence_count``, is each added with
+    ``ALTER TABLE ... ADD COLUMN`` only when absent, so a file this release
+    built and a repeat add none. The column text is `create_tables`' own,
+    so a fresh and an upgraded table compare equal. Then one UPDATE takes
+    each ``offline`` row, and each ``terminal`` row whose last error is
+    ``http 404``, as one evidence reply: count 1, reason ``offline`` or
+    ``not_found``, and ``next_poll_at`` now when it is unset or later, so
+    the station is due at once rather than at the end of its day-long park.
+    Rows with any other error keep count 0. Plain ``conn.execute`` only:
+    nothing here ends the transaction. One INFO line gives the counts and
+    the time taken.
+    """
+    started = time.perf_counter()
+    present = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(station_poll_state)").fetchall()
+    }
+    added = 0
+    for name, ddl in _V18_POLL_PAUSE_COLUMNS:
+        if name not in present:
+            conn.execute(f"ALTER TABLE station_poll_state ADD COLUMN {ddl}")
+            added += 1
+    rechecked = conn.execute(
+        """
+        UPDATE station_poll_state
+        SET pause_reason = CASE health_state
+                               WHEN 'offline' THEN 'offline' ELSE 'not_found' END,
+            pause_evidence_count = 1,
+            next_poll_at = CASE WHEN next_poll_at IS NULL OR next_poll_at > :now
+                                THEN :now ELSE next_poll_at END
+        WHERE health_state = 'offline'
+           OR (health_state = 'terminal' AND last_error = 'http 404')
+        """,
+        {"now": isoformat_utc(utc_now())},
+    ).rowcount
+    logger.info(
+        "v18 upgrade: station poll pause columns added=%d, "
+        "%d station(s) set to recheck, %d ms",
+        added,
+        rechecked,
+        _elapsed_ms(started),
+    )
 
 
 def _v18_drop_unused_write_state(conn: sqlite3.Connection) -> None:

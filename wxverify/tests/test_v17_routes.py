@@ -160,7 +160,7 @@ def test_v17_database_opens_and_every_route_answers_without_db_error(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
                 (table,),
             ).fetchone()
-            assert row is None, f"{table} must be absent from a v17 file"
+            assert row is None, f"{table} must be absent after the v17-to-v18 upgrade"
 
         ids = _seed(conn)
         site_id, feed_id, station_id = (
@@ -234,6 +234,11 @@ def test_v17_database_opens_and_every_route_answers_without_db_error(
                     "headers": headers,
                     "json": {"enabled": True},
                 },
+            ),
+            (
+                "POST",
+                f"/api/sites/{site_id}/stations/{station_id}/retry-now",
+                {"headers": headers},
             ),
             ("GET", "/api/feeds", {}),
             (
@@ -348,6 +353,7 @@ def test_every_route_in_app_routes_is_either_called_above_or_explicitly_skipped(
         ("DELETE", "/api/sites/{site_id}"),
         ("GET", "/api/sites/{site_id}/stations"),
         ("PUT", "/api/sites/{site_id}/stations/{station_id}"),
+        ("POST", "/api/sites/{site_id}/stations/{station_id}/retry-now"),
         ("DELETE", "/api/sites/{site_id}/stations/{station_id}"),
         ("GET", "/api/feeds"),
         ("PUT", "/api/feeds/{feed_id}"),

@@ -75,6 +75,7 @@ from wxverify.worker.access_hold import (
 )
 from wxverify.worker.close_chain import record_collection_try
 from wxverify.worker.control import JobCancelled, JobControl, JobDeferred
+from wxverify.worker.current_obs import end_poll_pause_on_fresh_reading
 from wxverify.worker.domain_backoff import (
     check_domain_backoff,
     clear_domain_backoff,
@@ -1358,7 +1359,9 @@ def _persist_day(
     so that a station clock running ahead stores nothing in the future, go
     through ``store_readings`` with source ``five_minute``, which asks the
     closed-day guard (``READING``) at each ``obs_at``; a refused reading is
-    not stored.
+    not stored. Then ``end_poll_pause_on_fresh_reading`` ends the station's
+    current-conditions poll pause when a stored ``five_minute`` reading is
+    fresh.
     """
     now = utc_now()
     start, end, _ = local_day_slots(local_date, tz_name)
@@ -1386,6 +1389,7 @@ def _persist_day(
         fetched_at=now,
         now_utc=now,
     )
+    end_poll_pause_on_fresh_reading(conn, station_id, now_utc=now)
     row = _read_day(conn, station_id, local_date)
     if row is None:
         logger.warning(

@@ -73,7 +73,8 @@ def test_sz2_migration_run_twice_adds_nothing_twice(tmp_path: Path) -> None:
         " so storage_compacted_at is untouched), mutant = second_compacted"
         " differs from first_compacted (a later timestamp written by a"
         " bug that re-ran the fresh-build key writer on a non-fresh"
-        " migration)"
+        " migration). Catches: a bug that writes storage_compacted_at"
+        " again on a start that is not a fresh build."
     )
 
 

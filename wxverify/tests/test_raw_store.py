@@ -36,7 +36,11 @@ from wxverify.db.migrations import run_migrations
 from wxverify.db.station_readings import StoreResult, store_readings
 from wxverify.obs.hourly_values import StationReading
 from wxverify.worker.access_hold import read_access_record, record_access_refused
-from wxverify.worker.current_obs import Health, classify_current_obs
+from wxverify.worker.current_obs import (
+    Health,
+    classify_current_obs,
+    end_poll_pause_on_fresh_reading,
+)
 from wxverify.worker.processor import (  # noqa: PLC2701 -- private, exercised directly
     _persist_poll_result_clearing,
 )
@@ -807,4 +811,231 @@ def test_rs8_todays_row_keeps_only_yesterday_and_todays_bounds(
         + "\nactual stored = "
         + repr(sorted(stored))
     )
+    close_db()
+
+
+# =============================================================================
+# BT5 -- the 5-minute download ends a current-conditions poll pause (plan
+# 2026-11-07-health-release.md §2, Part B4).
+# =============================================================================
+
+
+def _seed_poll_pause(
+    conn: sqlite3.Connection,
+    station_id: int,
+    *,
+    count: int,
+    reason: str | None,
+    next_poll_at: str | None,
+) -> None:
+    conn.execute(
+        "INSERT INTO station_poll_state"
+        " (station_id, health_state, next_poll_at, pause_reason,"
+        "  pause_evidence_count)"
+        " VALUES (?, 'offline', ?, ?, ?)",
+        (station_id, next_poll_at, reason, count),
+    )
+    conn.commit()
+
+
+def _poll_pause_row(conn: sqlite3.Connection, station_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT pause_evidence_count, pause_reason, next_poll_at"
+        " FROM station_poll_state WHERE station_id = ?",
+        (station_id,),
+    ).fetchone()
+
+
+def _clear_poll_pause_and_raw_rows(conn: sqlite3.Connection, station_id: int) -> None:
+    conn.execute("DELETE FROM station_poll_state WHERE station_id = ?", (station_id,))
+    conn.execute("DELETE FROM station_wind_records WHERE station_id = ?", (station_id,))
+    conn.commit()
+
+
+def test_bt5_fresh_five_minute_reading_ends_the_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan §2 BT5 (first case): station B seeded at (3, 'not_found'),
+    ``next_poll_at`` 8 h ahead. A reply with a reading 10 min old ends the
+    pause: count 0, reason NULL, ``next_poll_at`` equal to the frozen now.
+    Catches: the call not wired into ``_persist_day`` -- a unit-only test
+    of ``end_poll_pause_on_fresh_reading`` would pass without it."""
+    from tests.helpers import NOW, day_close_site
+
+    db = _init_tmp_db(tmp_path, monkeypatch)
+    conn = db._conn  # noqa: SLF001 -- real writer connection, as other tests do
+    close_off(conn)
+    site_id = day_close_site(conn, close_on=False, with_records=False)
+    conn.execute("UPDATE stations SET enabled = 0 WHERE pws_station_id = 'ISTATION01'")
+    station_b = conn.execute(
+        "SELECT id FROM stations WHERE pws_station_id = 'ISTATION02'"
+    ).fetchone()["id"]
+    far_future = isoformat_utc(NOW + timedelta(hours=8))
+    _seed_poll_pause(
+        conn, station_b, count=3, reason="not_found", next_poll_at=far_future
+    )
+    _freeze_wind_lane(monkeypatch, NOW)
+
+    fresh_reading = [(NOW - timedelta(minutes=10), 9.0, 0.0, 3.0)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _five_minute_response(fresh_reading)
+
+    _run_wind_chunk(db, site_id, handler)
+
+    row = _poll_pause_row(conn, station_b)
+    assert row is not None
+    assert (row["pause_evidence_count"], row["pause_reason"]) == (0, None)
+    assert row["next_poll_at"] == isoformat_utc(NOW)
+    close_db()
+
+
+def test_bt5_stale_five_minute_reading_does_not_end_the_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan §2 BT5 (second case): a reply whose readings are all more than
+    60 minutes old leaves a paused station's poll-state row unchanged."""
+    from tests.helpers import NOW, day_close_site
+
+    db = _init_tmp_db(tmp_path, monkeypatch)
+    conn = db._conn  # noqa: SLF001 -- real writer connection, as other tests do
+    close_off(conn)
+    site_id = day_close_site(conn, close_on=False, with_records=False)
+    conn.execute("UPDATE stations SET enabled = 0 WHERE pws_station_id = 'ISTATION01'")
+    station_b = conn.execute(
+        "SELECT id FROM stations WHERE pws_station_id = 'ISTATION02'"
+    ).fetchone()["id"]
+    far_future = isoformat_utc(NOW + timedelta(hours=8))
+    _seed_poll_pause(
+        conn, station_b, count=3, reason="not_found", next_poll_at=far_future
+    )
+    _freeze_wind_lane(monkeypatch, NOW)
+
+    stale_reading = [(NOW - timedelta(minutes=90), 9.0, 0.0, 3.0)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _five_minute_response(stale_reading)
+
+    _run_wind_chunk(db, site_id, handler)
+
+    row = _poll_pause_row(conn, station_b)
+    assert row is not None
+    assert (row["pause_evidence_count"], row["pause_reason"]) == (3, "not_found")
+    assert row["next_poll_at"] == far_future
+    close_db()
+
+
+def test_bt5_end_poll_pause_on_fresh_reading_direct_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Direct calls of ``end_poll_pause_on_fresh_reading``: an ``hourly``
+    or ``current_obs`` row 10 min old ends nothing; at count 0, a
+    ``five_minute`` row 10 min old with ``next_poll_at`` 10 min ahead
+    returns ``False`` and writes nothing; at count 2, a ``five_minute``
+    row exactly 60 min old ends the pause, as does one exactly 60 min
+    ahead (a separate case), while one 60 min 1 s old or ahead ends
+    nothing. Catches: the hourly source counted (the TODO keeps scoring
+    input out); a healthy station's poll pulled forward (the count guard
+    dropped, reached only with a fresh row present); the 1 s left off the
+    excluded end (the row exactly 60 min ahead missed)."""
+    from tests.helpers import NOW, day_close_site
+
+    db = _init_tmp_db(tmp_path, monkeypatch)
+    conn = db._conn  # noqa: SLF001 -- real writer connection, as other tests do
+    close_off(conn)
+    day_close_site(conn, close_on=False, with_records=False)
+    conn.execute("UPDATE stations SET enabled = 0 WHERE pws_station_id = 'ISTATION01'")
+    station_b = conn.execute(
+        "SELECT id FROM stations WHERE pws_station_id = 'ISTATION02'"
+    ).fetchone()["id"]
+    conn.commit()
+    far_future = isoformat_utc(NOW + timedelta(hours=8))
+
+    def _insert_raw(obs_at: datetime, source: str) -> None:
+        conn.execute(
+            "INSERT INTO station_wind_records"
+            " (station_id, obs_at, source, local_date, speed_kmh)"
+            " VALUES (?, ?, ?, ?, 5.0)",
+            (station_b, isoformat_utc(obs_at), source, obs_at.date().isoformat()),
+        )
+        conn.commit()
+
+    # hourly, 10 min old, count 2: ends nothing.
+    _seed_poll_pause(
+        conn, station_b, count=2, reason="offline", next_poll_at=far_future
+    )
+    _insert_raw(NOW - timedelta(minutes=10), "hourly")
+    assert end_poll_pause_on_fresh_reading(conn, station_b, now_utc=NOW) is False
+    row = _poll_pause_row(conn, station_b)
+    assert row is not None
+    assert (row["pause_evidence_count"], row["pause_reason"]) == (2, "offline")
+    _clear_poll_pause_and_raw_rows(conn, station_b)
+
+    # current_obs, 10 min old, count 2: ends nothing.
+    _seed_poll_pause(
+        conn, station_b, count=2, reason="offline", next_poll_at=far_future
+    )
+    _insert_raw(NOW - timedelta(minutes=10), "current_obs")
+    assert end_poll_pause_on_fresh_reading(conn, station_b, now_utc=NOW) is False
+    row = _poll_pause_row(conn, station_b)
+    assert row is not None
+    assert (row["pause_evidence_count"], row["pause_reason"]) == (2, "offline")
+    _clear_poll_pause_and_raw_rows(conn, station_b)
+
+    # count 0, five_minute 10 min old: returns False, writes nothing.
+    near_future = isoformat_utc(NOW + timedelta(minutes=10))
+    _seed_poll_pause(conn, station_b, count=0, reason=None, next_poll_at=near_future)
+    _insert_raw(NOW - timedelta(minutes=10), "five_minute")
+    assert end_poll_pause_on_fresh_reading(conn, station_b, now_utc=NOW) is False
+    row = _poll_pause_row(conn, station_b)
+    assert row is not None
+    assert row["next_poll_at"] == near_future, (
+        "a healthy station's own poll must not be pulled forward"
+    )
+    _clear_poll_pause_and_raw_rows(conn, station_b)
+
+    # count 2, five_minute EXACTLY 60 min old: ends the pause.
+    _seed_poll_pause(
+        conn, station_b, count=2, reason="offline", next_poll_at=far_future
+    )
+    _insert_raw(NOW - timedelta(minutes=60), "five_minute")
+    assert end_poll_pause_on_fresh_reading(conn, station_b, now_utc=NOW) is True
+    row = _poll_pause_row(conn, station_b)
+    assert row is not None
+    assert (row["pause_evidence_count"], row["pause_reason"]) == (0, None)
+    assert row["next_poll_at"] == isoformat_utc(NOW)
+    _clear_poll_pause_and_raw_rows(conn, station_b)
+
+    # count 2, five_minute EXACTLY 60 min ahead: ends the pause too.
+    _seed_poll_pause(
+        conn, station_b, count=2, reason="offline", next_poll_at=far_future
+    )
+    _insert_raw(NOW + timedelta(minutes=60), "five_minute")
+    assert end_poll_pause_on_fresh_reading(conn, station_b, now_utc=NOW) is True
+    row = _poll_pause_row(conn, station_b)
+    assert row is not None
+    assert (row["pause_evidence_count"], row["pause_reason"]) == (0, None)
+    _clear_poll_pause_and_raw_rows(conn, station_b)
+
+    # count 2, five_minute 60 min 1 s OLD: ends nothing.
+    _seed_poll_pause(
+        conn, station_b, count=2, reason="offline", next_poll_at=far_future
+    )
+    _insert_raw(NOW - timedelta(minutes=60, seconds=1), "five_minute")
+    assert end_poll_pause_on_fresh_reading(conn, station_b, now_utc=NOW) is False
+    row = _poll_pause_row(conn, station_b)
+    assert row is not None
+    assert (row["pause_evidence_count"], row["pause_reason"]) == (2, "offline")
+    _clear_poll_pause_and_raw_rows(conn, station_b)
+
+    # count 2, five_minute 60 min 1 s AHEAD: ends nothing.
+    _seed_poll_pause(
+        conn, station_b, count=2, reason="offline", next_poll_at=far_future
+    )
+    _insert_raw(NOW + timedelta(minutes=60, seconds=1), "five_minute")
+    assert end_poll_pause_on_fresh_reading(conn, station_b, now_utc=NOW) is False
+    row = _poll_pause_row(conn, station_b)
+    assert row is not None
+    assert (row["pause_evidence_count"], row["pause_reason"]) == (2, "offline")
+
     close_db()

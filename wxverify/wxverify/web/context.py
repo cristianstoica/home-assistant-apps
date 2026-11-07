@@ -89,6 +89,12 @@ class StationView:
     #: The first day the rain check left the station's rain out, ISO date,
     #: while it is set aside; None while it is counted (rain release, A5).
     rain_not_counted_since: str | None
+    #: The current-conditions recheck or pause (``poll_status_text``); None
+    #: at evidence count 0 and for a disabled station or site.
+    poll_status: str | None
+    #: Whether the Retry now button shows: evidence count 1 or more, the
+    #: station and its site enabled.
+    retry_now: bool
 
 
 @dataclass(frozen=True)
@@ -1739,7 +1745,12 @@ def _site_from_row(conn: sqlite3.Connection, row: sqlite3.Row) -> SiteView:
         timezone=str(row["timezone"]),
         enabled=bool(row["enabled"]),
         rain_threshold_mm=float(row["rain_threshold_mm"]),
-        stations=_load_stations(conn, site_id),
+        stations=_load_stations(
+            conn,
+            site_id,
+            timezone=str(row["timezone"]),
+            site_enabled=bool(row["enabled"]),
+        ),
         feeds=_fetch_unit_feeds(conn, site_id),
     )
 
@@ -1771,11 +1782,65 @@ def observation_age_text(last_obstime: str | None, *, now: datetime) -> str | No
     return f"{age // timedelta(days=1)} d old"
 
 
-def _load_stations(conn: sqlite3.Connection, site_id: int) -> list[StationView]:
+# The status-cell texts by pause reason: (count 1, count 2 or more).
+_POLL_STATUS_TEXTS: Final[dict[str, tuple[str, str]]] = {
+    "offline": (
+        "Rechecking after an empty reply",
+        "Current-condition polling paused (empty reply)",
+    ),
+    "not_found": (
+        "Rechecking after station not found (http 404)",
+        "Current-condition polling paused (station not found, http 404)",
+    ),
+}
+
+
+def poll_status_text(
+    reason: str | None, count: int, next_poll_at: str | None, *, zone_name: str
+) -> str | None:
+    """Say how a station's current-conditions poll is being rechecked.
+
+    ``None`` at evidence count 0 (and for a reason the schema does not
+    allow). At count 1 the station is being rechecked, from count 2 its
+    polling is paused; the text names the reason, an empty reply
+    (``offline``) or a 404 (``not_found``), and ends ``· next check <t>``.
+    ``<t>`` is ``next_poll_at`` in the zone ``zone_name`` as ``YYYY-MM-DD
+    HH:MM``; in UTC with a `` UTC`` suffix when the zone does not load; and
+    ``unknown`` when ``next_poll_at`` is ``None`` or ``parse_utc`` rejects
+    it. Pure: reads no clock and no database.
+    """
+    if count < 1 or reason is None:
+        return None
+    texts = _POLL_STATUS_TEXTS.get(reason)
+    if texts is None:
+        return None
+    text = texts[0] if count == 1 else texts[1]
+    return f"{text} · next check {_next_check_text(next_poll_at, zone_name)}"
+
+
+def _next_check_text(next_poll_at: str | None, zone_name: str) -> str:
+    """``poll_status_text``'s ``<t>``: local time, UTC time or ``unknown``."""
+    if next_poll_at is None:
+        return "unknown"
+    try:
+        when = parse_utc(next_poll_at)
+    except ValueError:
+        return "unknown"
+    try:
+        local = when.astimezone(ZoneInfo(zone_name))
+    except (ZoneInfoNotFoundError, ValueError, OverflowError):
+        return f"{when:%Y-%m-%d %H:%M} UTC"
+    return f"{local:%Y-%m-%d %H:%M}"
+
+
+def _load_stations(
+    conn: sqlite3.Connection, site_id: int, *, timezone: str, site_enabled: bool
+) -> list[StationView]:
     rows = conn.execute(
         """
         SELECT st.id, st.pws_station_id, st.lat, st.lon, st.dem_elevation_m,
-               st.enabled, sps.last_obstime AS last_obstime
+               st.enabled, sps.last_obstime AS last_obstime,
+               sps.pause_reason, sps.pause_evidence_count, sps.next_poll_at
         FROM stations st
         LEFT JOIN station_poll_state sps ON sps.station_id = st.id
         WHERE st.site_id = ? AND st.retired_at IS NULL
@@ -1785,23 +1850,43 @@ def _load_stations(conn: sqlite3.Connection, site_id: int) -> list[StationView]:
     ).fetchall()
     now = utc_now()
     set_aside = rain_not_counted_since(conn, site_id)
-    return [
-        StationView(
-            id=int(row["id"]),
-            pws_station_id=str(row["pws_station_id"]),
-            lat=float(row["lat"]),
-            lon=float(row["lon"]),
-            dem_elevation_m=float(row["dem_elevation_m"]),
-            enabled=bool(row["enabled"]),
-            observation_age=observation_age_text(row["last_obstime"], now=now),
-            rain_not_counted_since=(
-                since.isoformat()
-                if (since := set_aside.get(int(row["id"]))) is not None
-                else None
-            ),
+    stations: list[StationView] = []
+    for row in rows:
+        enabled = bool(row["enabled"])
+        raw_count = row["pause_evidence_count"]
+        count = 0 if raw_count is None else int(raw_count)
+        raw_reason = row["pause_reason"]
+        raw_next = row["next_poll_at"]
+        # Shown only while the station and its site are enabled.
+        polled = enabled and site_enabled
+        stations.append(
+            StationView(
+                id=int(row["id"]),
+                pws_station_id=str(row["pws_station_id"]),
+                lat=float(row["lat"]),
+                lon=float(row["lon"]),
+                dem_elevation_m=float(row["dem_elevation_m"]),
+                enabled=enabled,
+                observation_age=observation_age_text(row["last_obstime"], now=now),
+                rain_not_counted_since=(
+                    since.isoformat()
+                    if (since := set_aside.get(int(row["id"]))) is not None
+                    else None
+                ),
+                poll_status=(
+                    poll_status_text(
+                        None if raw_reason is None else str(raw_reason),
+                        count,
+                        None if raw_next is None else str(raw_next),
+                        zone_name=timezone,
+                    )
+                    if polled
+                    else None
+                ),
+                retry_now=polled and count >= 1,
+            )
         )
-        for row in rows
-    ]
+    return stations
 
 
 def _fetch_unit_feeds(

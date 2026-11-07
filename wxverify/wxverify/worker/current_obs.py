@@ -14,6 +14,13 @@ station terminal), and the 204 / empty-body / empty-``observations`` OFFLINE che
 runs BEFORE ``response.json()`` (a 204 is 2xx, so ``raise_for_status`` won't fire,
 and parsing its empty body would raise and be misread as a transient error).
 401 and 403 are handled by the caller before persisting (refused-access hold).
+
+A station whose replies say it has nothing to give (an empty reply, or a
+404) is rechecked on a ladder of 1, 2, 4, 8, 16 and 24 hours rather than
+parked for a day: ``station_poll_state.pause_evidence_count`` counts those
+replies and ``pause_reason`` names the last one. A fresh reading, from the
+poll or from the stored raw readings of a 5-minute download
+(``end_poll_pause_on_fresh_reading``), sets the count back to 0.
 """
 
 from __future__ import annotations
@@ -22,12 +29,14 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from enum import Enum
+from typing import Final
 
 import httpx
 
-from wxverify.core.timeutil import isoformat_utc, utc_now
+from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
+from wxverify.db.station_readings import reading_times
 from wxverify.obs import cadence
 from wxverify.obs.pws_adapter import (
     CurrentObservation,
@@ -44,14 +53,24 @@ logger = logging.getLogger(__name__)
 # the fallback when the row is absent and the ``get_number_setting`` floor.
 
 # The floor poll interval and cold-start learned interval, in seconds. Also the
-# transient-retry backoff (retry at the floor, not a long freeze).
+# transient-retry backoff of a station that is not paused (retry at the floor,
+# not a long freeze); a paused one waits its current ladder rung.
 MIN_INTERVAL_SECONDS = 300
-# The terminal / offline park interval: a dead or auth-rejected station is
-# re-polled at most once a day.
+# The park interval of a 4xx other than a 404 (re-polled at most once a
+# day), and the cap of each recheck-ladder rung.
 MAX_BACKOFF_SECONDS = 86400
 # get_number_setting floors, matching the config.yaml int() schema bounds.
 _MIN_INTERVAL_FLOOR = 60
 _MAX_BACKOFF_FLOOR = 60
+
+# The recheck ladder, in hours, by evidence count: the first empty reply or
+# 404 waits 1 h, the second 2 h, and so on up to 24 h, which every later
+# reply keeps. ``max_backoff_seconds`` caps each rung.
+LADDER_HOURS: Final = (1, 2, 4, 8, 16, 24)
+# A 404's error text, as ``classify_current_obs`` writes it.
+_NOT_FOUND_ERROR: Final = "http 404"
+# A reading at most this far from now, either way, is fresh.
+_FRESH_WITHIN: Final = timedelta(minutes=60)
 
 
 class Health(Enum):
@@ -121,6 +140,57 @@ def classify_current_obs(response: httpx.Response) -> PollOutcome:
         # Live-but-unparseable timestamp ⇒ retry at the floor, do NOT freeze.
         return PollOutcome(Health.TRANSIENT, error="unparseable obstime")
     return PollOutcome(Health.ONLINE, obs=obs, obs_instant=obs.obs_time_utc)
+
+
+def ladder_delay(count: int) -> timedelta:
+    """The recheck delay after the ``count``-th evidence reply in a row.
+
+    ``LADDER_HOURS`` by count: 1 h at 1, then 2, 4, 8 and 16 h, and 24 h
+    from 6 on. ``ValueError`` below 1: a count of 0 is no pause.
+    """
+    if count < 1:
+        raise ValueError(f"evidence count must be at least 1, got {count}")
+    return timedelta(hours=LADDER_HOURS[min(count, len(LADDER_HOURS)) - 1])
+
+
+def _load_pause(
+    conn: sqlite3.Connection, station_id: int
+) -> tuple[int, str | None, str | None]:
+    """The station's ``(pause_evidence_count, pause_reason, health_state)``.
+
+    ``(0, None, None)`` when the station has no poll-state row yet.
+    """
+    row = conn.execute(
+        "SELECT pause_evidence_count, pause_reason, health_state"
+        " FROM station_poll_state WHERE station_id = ?",
+        (station_id,),
+    ).fetchone()
+    if row is None:
+        return 0, None, None
+    reason = None if row["pause_reason"] is None else str(row["pause_reason"])
+    health = None if row["health_state"] is None else str(row["health_state"])
+    return int(row["pause_evidence_count"]), reason, health
+
+
+def _stale_reading_error(obs_instant: str, now: datetime) -> str | None:
+    """``None`` for a fresh reading, else the error text a stale one records.
+
+    Fresh: at most 60 minutes from ``now``, before or after it. A reading
+    more than 60 minutes ahead reads ``observation dated N min ahead``, an
+    older one ``stale observation (age N min)``, ``N`` in whole minutes
+    rounded down. A stamp ``parse_utc`` rejects is not fresh and reads
+    ``stale observation (age unknown)``.
+    """
+    try:
+        observed = parse_utc(obs_instant)
+    except ValueError:
+        return "stale observation (age unknown)"
+    age = now - observed
+    if abs(age) <= _FRESH_WITHIN:
+        return None
+    if age < timedelta(0):
+        return f"observation dated {-age // timedelta(minutes=1)} min ahead"
+    return f"stale observation (age {age // timedelta(minutes=1)} min)"
 
 
 def _load_poll_state(
@@ -195,8 +265,25 @@ def persist_poll_result(
     on every other state). Diagnostics land on ``station_poll_state``'s own
     columns; ``stations`` is never touched here.
 
+    The recheck ladder: ``n`` is the row's ``pause_evidence_count`` (0 with
+    no row). An evidence reply sets it to ``n + 1``, with ``next_poll_at``
+    now plus ``ladder_delay(n + 1)`` capped at ``max_backoff_seconds``. The
+    evidence is an ``OFFLINE`` reply (reason ``offline``), a ``TERMINAL``
+    404 (reason ``not_found``), and, at ``n >= 1``, an ``ONLINE`` reply
+    whose reading is not fresh (``_stale_reading_error``; reason kept). That
+    stale reply writes no snapshot, no cadence and no ``last_obstime``, and
+    keeps the row's ``health_state``, so a paused station never reads
+    online on an old reading. An ``ONLINE`` reply that is fresh, or comes
+    at ``n == 0``, is today's online write and sets the count to 0. Any
+    other ``TERMINAL`` keeps the ``max_backoff_seconds`` park and leaves the
+    count and reason as they are; a ``TRANSIENT`` reply leaves them too and
+    waits ``min_interval_seconds`` at ``n == 0``, the current rung (capped)
+    at ``n >= 1``, where it also keeps the row's ``health_state``, so a
+    paused station stays offline or terminal through a timeout.
+
     Returns whether it wrote: ``False`` when the station was deleted, disabled
     or moved to another site, and nothing was saved. Callers may ignore it.
+    The stale ``ONLINE`` write returns ``True``.
     """
     # Station may have been deleted/disabled between enqueue and run.
     row = conn.execute(
@@ -205,6 +292,7 @@ def persist_poll_result(
     ).fetchone()
     if row is None:
         return False
+    count, reason, row_health = _load_pause(conn, station_id)
 
     now = utc_now()
     now_iso = isoformat_utc(now)
@@ -218,9 +306,32 @@ def persist_poll_result(
     max_backoff = get_number_setting(
         conn, "max_backoff_seconds", MAX_BACKOFF_SECONDS, minimum=_MAX_BACKOFF_FLOOR
     )
+    max_backoff_delay = timedelta(seconds=max_backoff)
+
+    def _evidence(health: str, new_reason: str | None, error: str | None) -> bool:
+        evidence = count + 1
+        _upsert_poll_state_failure(
+            conn,
+            station_id,
+            health=health,
+            next_poll_at=isoformat_utc(
+                now + min(ladder_delay(evidence), max_backoff_delay)
+            ),
+            error=error,
+            now_iso=now_iso,
+            pause_reason=new_reason,
+            pause_evidence_count=evidence,
+        )
+        return True
 
     if outcome.health is Health.ONLINE:
         assert outcome.obs is not None and outcome.obs_instant is not None
+        if count >= 1:
+            stale = _stale_reading_error(outcome.obs_instant, now)
+            if stale is not None:
+                # A row exists at n >= 1, so its health_state is set.
+                assert row_health is not None
+                return _evidence(row_health, reason, stale)
         events, last_obstime = _load_poll_state(conn, station_id)
         new_events, learned, delay = _online_cadence(
             station_id,
@@ -244,14 +355,24 @@ def persist_poll_result(
         return True
 
     if outcome.health is Health.OFFLINE:
-        health = "offline"
-        next_poll_at = isoformat_utc(now + timedelta(seconds=max_backoff))
-    elif outcome.health is Health.TERMINAL:
+        return _evidence("offline", "offline", outcome.error)
+    if outcome.health is Health.TERMINAL and outcome.error == _NOT_FOUND_ERROR:
+        return _evidence("terminal", "not_found", outcome.error)
+
+    if outcome.health is Health.TERMINAL:
         health = "terminal"
-        next_poll_at = isoformat_utc(now + timedelta(seconds=max_backoff))
+        next_poll_at = isoformat_utc(now + max_backoff_delay)
     else:  # TRANSIENT
-        health = "transient"
-        next_poll_at = isoformat_utc(now + timedelta(seconds=min_interval))
+        if count >= 1:
+            # A row exists at n >= 1 and holds the paused verdict (offline or
+            # terminal); a timeout says nothing new about the station.
+            assert row_health is not None
+            health = row_health
+            wait = min(ladder_delay(count), max_backoff_delay)
+        else:
+            health = "transient"
+            wait = timedelta(seconds=min_interval)
+        next_poll_at = isoformat_utc(now + wait)
 
     _upsert_poll_state_failure(
         conn,
@@ -260,6 +381,8 @@ def persist_poll_result(
         next_poll_at=next_poll_at,
         error=outcome.error,
         now_iso=now_iso,
+        pause_reason=reason,
+        pause_evidence_count=count,
     )
     return True
 
@@ -327,9 +450,9 @@ def _upsert_poll_state_online(
         INSERT INTO station_poll_state (
             station_id, cadence_events, last_obstime, learned_interval_seconds,
             health_state, next_poll_at, last_poll_at, last_error, error_count,
-            updated_at
+            updated_at, pause_reason, pause_evidence_count
         )
-        VALUES (?, ?, ?, ?, 'online', ?, ?, NULL, 0, ?)
+        VALUES (?, ?, ?, ?, 'online', ?, ?, NULL, 0, ?, NULL, 0)
         ON CONFLICT(station_id) DO UPDATE SET
             cadence_events=excluded.cadence_events,
             last_obstime=excluded.last_obstime,
@@ -339,7 +462,9 @@ def _upsert_poll_state_online(
             last_poll_at=excluded.last_poll_at,
             last_error=NULL,
             error_count=0,
-            updated_at=excluded.updated_at
+            updated_at=excluded.updated_at,
+            pause_reason=NULL,
+            pause_evidence_count=0
         """,
         (
             station_id,
@@ -361,27 +486,91 @@ def _upsert_poll_state_failure(
     next_poll_at: str,
     error: str | None,
     now_iso: str,
+    pause_reason: str | None,
+    pause_evidence_count: int,
 ) -> None:
     """Persist a non-online poll: cadence window is FROZEN (never appended here).
 
     ``cadence_events`` / ``last_obstime`` / ``learned_interval_seconds`` are left
     untouched on the existing row (retain last-good learning), and default on an
     unseeded row. ``error_count`` increments on the row's own diagnostic column.
+    ``pause_reason`` and ``pause_evidence_count`` are written as given, on a
+    new row and an existing one alike; a caller that leaves the pause as it
+    is passes the row's own values back.
     """
     conn.execute(
         """
         INSERT INTO station_poll_state (
             station_id, health_state, next_poll_at, last_poll_at,
-            last_error, error_count, updated_at
+            last_error, error_count, updated_at,
+            pause_reason, pause_evidence_count
         )
-        VALUES (?, ?, ?, ?, ?, 1, ?)
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
         ON CONFLICT(station_id) DO UPDATE SET
             health_state=excluded.health_state,
             next_poll_at=excluded.next_poll_at,
             last_poll_at=excluded.last_poll_at,
             last_error=excluded.last_error,
             error_count=station_poll_state.error_count + 1,
-            updated_at=excluded.updated_at
+            updated_at=excluded.updated_at,
+            pause_reason=excluded.pause_reason,
+            pause_evidence_count=excluded.pause_evidence_count
         """,
-        (station_id, health, next_poll_at, now_iso, error, now_iso),
+        (
+            station_id,
+            health,
+            next_poll_at,
+            now_iso,
+            error,
+            now_iso,
+            pause_reason,
+            pause_evidence_count,
+        ),
     )
+
+
+def end_poll_pause_on_fresh_reading(
+    conn: sqlite3.Connection, station_id: int, *, now_utc: datetime
+) -> bool:
+    """End the station's poll pause when a fresh 5-minute reading is stored.
+
+    Called by the wind lane's ``_persist_day`` right after it stores a
+    download, in the same transaction. It reads the stored raw readings,
+    not the download's list, so a reading the closed-day guard refused does
+    not count: ``reading_times`` with source ``five_minute`` from
+    ``now_utc`` (in whole seconds) less 60 minutes to 60 minutes after it,
+    that end included (``reading_times`` excludes its end, hence the extra
+    second). With none, it returns ``False`` and writes nothing. With at
+    least one, a row whose ``pause_evidence_count`` is above 0 has its count
+    set to 0 and its reason cleared, and ``next_poll_at`` is moved back to
+    now when it is unset or later, so the poll runs at once and writes the
+    station's ``health_state``. A row at count 0 is not written, so a
+    healthy station's poll is never pulled forward. Returns whether a row
+    changed; one INFO line when it did.
+    """
+    now_s = now_utc.replace(microsecond=0)
+    fresh = reading_times(
+        conn,
+        station_id=station_id,
+        start_utc=now_s - _FRESH_WITHIN,
+        end_utc=now_s + _FRESH_WITHIN + timedelta(seconds=1),
+        source="five_minute",
+    )
+    if not fresh:
+        return False
+    changed = conn.execute(
+        """
+        UPDATE station_poll_state
+        SET pause_reason = NULL, pause_evidence_count = 0,
+            next_poll_at = CASE WHEN next_poll_at IS NULL OR next_poll_at > :now
+                                THEN :now ELSE next_poll_at END
+        WHERE station_id = :sid AND pause_evidence_count > 0
+        """,
+        {"now": isoformat_utc(now_s), "sid": station_id},
+    ).rowcount
+    if changed > 0:
+        logger.info(
+            "current_obs poll pause ended by a fresh 5-minute reading station=%s",
+            station_id,
+        )
+    return changed > 0

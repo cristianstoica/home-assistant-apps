@@ -270,9 +270,7 @@ class Database:
                 # run_to_completion's `Callable[..., T]` erases per-argument
                 # types, so a bare method reference loses the binding between
                 # its own T and this T. Closing over the already-bound `fn`
-                # here resolves `_run_immediate`'s T against it first. Looked
-                # up on the instance at call time: tests and the bench patch
-                # it there.
+                # here resolves `_run_immediate`'s T against it first.
                 def _call() -> T:
                     return self._run_immediate(fn)
 

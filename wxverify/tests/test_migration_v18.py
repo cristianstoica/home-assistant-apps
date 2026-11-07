@@ -1,14 +1,15 @@
 """The version-18 upgrade (plan `2026-11-07-health-release.md` §9, §10;
-test IDs UT1-UT6, adapted to the sub-steps wired in so far). The version
-18 upgrade runs under `migrate_v18`; UT1, UT4, UT5 and UT6 below do not
-depend on which of its sub-steps are wired in, and stay correct as later
-steps add more. Of U4's four sub-steps (``_v18_poll_pause``,
+test IDs UT1-UT6, BT9, adapted to the sub-steps wired in so far). The
+version 18 upgrade runs under `migrate_v18`; UT1, UT4, UT5 and UT6 below do
+not depend on which of its sub-steps are wired in, and stay correct as
+later steps add more. Of U4's four sub-steps (``_v18_poll_pause``,
 ``_v18_drop_unused_write_state``, ``_v18_prune_wind_history``,
-``_v18_drop_bad_display_values``), only ``_v18_drop_unused_write_state`` is
-wired in as of this file; UT2 (each part's effect) and UT3 (all-or-nothing)
-below cover that one sub-step only -- BT9's ``CHECK`` table in UT1 and the
-other three sub-steps' own UT2/UT3 pieces land with the steps that add
-them.
+``_v18_drop_bad_display_values``), ``_v18_poll_pause`` (Part B) and
+``_v18_drop_unused_write_state`` (Part D) are wired in as of this file; UT1
+now also checks BT9's ``CHECK`` table (the two poll-pause columns) on a
+fresh file and on an upgraded one, and BT9's own carry-over test lives
+here too. UT2 and UT3 below cover those two sub-steps only -- the other
+two sub-steps' own UT2/UT3 pieces land with the steps that add them.
 
 Fixture: ``tests/fixtures/v17_schema.sql`` and ``v17_seed.sql``, dumped
 from a fresh 0.16.17 (``6f49f1a``) file the same way the version-16 pair
@@ -23,15 +24,17 @@ surrounding ``BEGIN``, since ``create_tables``'s own ``executescript``
 ends any outer transaction anyway, per plan §9's "the transaction" note).
 
 Isolation: every connection is a real, file-backed SQLite database under
-``tmp_path``; no mocked persistence. Synthetic data only: nothing here
-inserts a site, station or any real identifier -- the fixture itself is
-an empty, pre-seeded shell.
+``tmp_path``; no mocked persistence. Synthetic data only: the fixture
+itself is an empty, pre-seeded shell, and every site/station a test adds
+on top of it (BT9's carry-over test) uses an obviously made-up id
+(``<A>``-style placeholders), never a real identifier.
 """
 
 from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -94,13 +97,67 @@ def _all_table_rows(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ..
 # ---------------------------------------------------------------------------
 
 
+def _insert_bare_station(conn: sqlite3.Connection, pws_id: str) -> int:
+    """One made-up site and one enabled station, for a bare CHECK-constraint
+    probe: no other column of either row is read by that probe."""
+    cur = conn.execute(
+        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+        " timezone) VALUES (?, 1.0, 1.0, 1.0, 'UTC')",
+        (f"UT1 CHECK site {pws_id}",),
+    )
+    site_id = int(cur.lastrowid)
+    cur = conn.execute(
+        "INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m)"
+        " VALUES (?, ?, 1.0, 1.0, 1.0)",
+        (site_id, pws_id),
+    )
+    return int(cur.lastrowid)
+
+
+def _insert_pause_state(
+    conn: sqlite3.Connection, station_id: int, *, count: int, reason: str | None
+) -> None:
+    conn.execute(
+        "INSERT INTO station_poll_state (station_id, pause_evidence_count,"
+        " pause_reason) VALUES (?, ?, ?)",
+        (station_id, count, reason),
+    )
+
+
+def _assert_bt9_check_table(conn: sqlite3.Connection, pws_prefix: str) -> None:
+    """BT9's ``CHECK`` table: ``(0, NULL)`` and ``(1, 'offline')`` accepted;
+    ``(1, NULL)``, ``(0, 'offline')``, ``(-1, None)``, ``(-1, 'offline')``
+    and reason ``'refused'`` all refused. ``(-1, 'offline')`` is the only
+    case that isolates the ``>= 0`` clause: ``(-1, None)`` is already
+    refused by the equality clause alone (count and reason must agree on
+    "paused" or not), so without the extra case a ``>= 0`` bound dropped
+    from the ``CHECK`` would pass unnoticed."""
+    accepted = ((0, None), (1, "offline"))
+    refused = (
+        (1, None),
+        (0, "offline"),
+        (-1, None),
+        (-1, "offline"),
+        (1, "refused"),
+    )
+    for i, (count, reason) in enumerate(accepted):
+        station_id = _insert_bare_station(conn, f"{pws_prefix}-OK{i}")
+        _insert_pause_state(conn, station_id, count=count, reason=reason)
+    for i, (count, reason) in enumerate(refused):
+        station_id = _insert_bare_station(conn, f"{pws_prefix}-BAD{i}")
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_pause_state(conn, station_id, count=count, reason=reason)
+
+
 def test_ut1_fresh_and_upgraded_schema_have_the_same_names_and_table_xinfo(
     tmp_path: Path,
 ) -> None:
     """Catches: a table or index the upgrade leaves behind that a fresh file
     does not have (or vice versa); a column the upgrade adds in a different
     order, type or default than a fresh build's `create_tables` -- either
-    would show up as a `table_xinfo` mismatch for the affected table."""
+    would show up as a `table_xinfo` mismatch for the affected table; BT9's
+    ``CHECK`` table accepted and refused differently on a fresh file than on
+    an upgraded one (a column written in a weaker form by one path)."""
     fresh = sqlite3.connect(str(tmp_path / "fresh.db"), isolation_level=None)
     fresh.row_factory = sqlite3.Row
     fresh.execute("PRAGMA foreign_keys = ON")
@@ -122,6 +179,9 @@ def test_ut1_fresh_and_upgraded_schema_have_the_same_names_and_table_xinfo(
             f"table {table!r} has a different column shape after the v18"
             " upgrade than a fresh build produces"
         )
+
+    _assert_bt9_check_table(fresh, "FRESH")
+    _assert_bt9_check_table(upgraded, "UPGRADED")
 
 
 # ---------------------------------------------------------------------------
@@ -293,11 +353,21 @@ def _seed_score_cache_rows(conn: sqlite3.Connection) -> int:
     return 2
 
 
+def _has_pause_columns(conn: sqlite3.Connection) -> bool:
+    names = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(station_poll_state)").fetchall()
+    }
+    return "pause_reason" in names and "pause_evidence_count" in names
+
+
 def _assert_sub_step_done(conn: sqlite3.Connection) -> None:
-    """The shared, correct end state this sub-step must reach: at 18,
-    `score_cache` gone, `download_record_since` gone -- UT2's own result,
-    reused by UT3's "the next open finishes" checks."""
+    """The shared, correct end state both wired-in sub-steps must reach: at
+    18, the poll-pause columns present, `score_cache` gone,
+    `download_record_since` gone -- UT2's own result, reused by UT3's "the
+    next open finishes" checks."""
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 18
+    assert _has_pause_columns(conn)
     assert not _score_cache_exists(conn)
     assert not _download_record_since_exists(conn)
 
@@ -418,6 +488,11 @@ def test_ut3_a_stop_at_the_sub_step_leaves_everything_as_it_was(
     assert _score_cache_exists(conn)
     assert conn.execute("SELECT COUNT(*) FROM score_cache").fetchone()[0] == inserted
     assert _download_record_since_exists(conn)
+    assert not _has_pause_columns(conn), (
+        "a stop at v18_drop_unused_write_state runs after v18_poll_pause, so"
+        " this would only fail if the poll-pause ALTER TABLEs committed on"
+        " their own instead of rolling back with the rest of the savepoint"
+    )
     assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
     assert _all_table_rows(conn) == before
 
@@ -501,8 +576,202 @@ def test_ut3_a_denied_runtime_state_delete_rolls_back_the_drop_too(
     )
     assert conn.execute("SELECT COUNT(*) FROM score_cache").fetchone()[0] == inserted
     assert _download_record_since_exists(conn)
+    assert not _has_pause_columns(conn), (
+        "v18_poll_pause's ALTER TABLEs run inside the same savepoint, ahead"
+        " of the denied DELETE; if they had committed on their own the"
+        " columns would survive this rollback"
+    )
     assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
     assert _all_table_rows(conn) == before
 
+    migrations.run_migrations(conn)
+    _assert_sub_step_done(conn)
+
+
+# ---------------------------------------------------------------------------
+# U4's second wired-in sub-step: _v18_poll_pause (BT9, Part B).
+# ---------------------------------------------------------------------------
+
+
+def _seed_bare_site(conn: sqlite3.Connection, name: str) -> int:
+    cur = conn.execute(
+        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+        " timezone) VALUES (?, 1.0, 1.0, 1.0, 'UTC')",
+        (name,),
+    )
+    return int(cur.lastrowid)
+
+
+def _seed_bare_station(
+    conn: sqlite3.Connection,
+    site_id: int,
+    pws_id: str,
+    *,
+    health_state: str,
+    next_poll_at: str | None,
+    last_error: str | None = None,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m)"
+        " VALUES (?, ?, 1.0, 1.0, 1.0)",
+        (site_id, pws_id),
+    )
+    station_id = int(cur.lastrowid)
+    conn.execute(
+        "INSERT INTO station_poll_state (station_id, health_state, next_poll_at,"
+        " last_error) VALUES (?, ?, ?, ?)",
+        (station_id, health_state, next_poll_at, last_error),
+    )
+    return station_id
+
+
+def test_bt9_carry_over_recheck_for_offline_and_404_stations(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BT9's carry-over, on the v17 fixture file (plan §2's Upgrade needs,
+    U4's ``_v18_poll_pause``). Rows: ``offline`` (``next_poll_at`` 20 h
+    ahead), ``terminal`` ``http 404`` (``next_poll_at`` unset), ``terminal``
+    ``http 410``, ``terminal`` ``http 401``, ``online`` -- the last three
+    keep a far-future ``next_poll_at`` that must survive untouched. Catches:
+    a 404 station parked for a day instead of rechecked at once (TODO
+    step 2); every 4xx counted as evidence, not just ``offline``/404; the
+    carry-over reaching the ``online`` row; the INFO line's counts wrong.
+    """
+    fixed_now = datetime(2026, 11, 7, 6, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr(migrations, "utc_now", lambda: fixed_now)
+    now_iso = fixed_now.isoformat().replace("+00:00", "Z")
+    far_future = (fixed_now + timedelta(hours=20)).isoformat().replace("+00:00", "Z")
+
+    conn = _v17_connect(tmp_path / "bt9-carry-over.db")
+    site_id = _seed_bare_site(conn, "BT9 carry-over site")
+    station_offline = _seed_bare_station(
+        conn, site_id, "<A>", health_state="offline", next_poll_at=far_future
+    )
+    station_404 = _seed_bare_station(
+        conn,
+        site_id,
+        "<B>",
+        health_state="terminal",
+        next_poll_at=None,
+        last_error="http 404",
+    )
+    station_410 = _seed_bare_station(
+        conn,
+        site_id,
+        "<C>",
+        health_state="terminal",
+        next_poll_at=far_future,
+        last_error="http 410",
+    )
+    station_401 = _seed_bare_station(
+        conn,
+        site_id,
+        "<D>",
+        health_state="terminal",
+        next_poll_at=far_future,
+        last_error="http 401",
+    )
+    station_online = _seed_bare_station(
+        conn, site_id, "<E>", health_state="online", next_poll_at=far_future
+    )
+    conn.commit()
+
+    def _row(station_id: int) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT pause_evidence_count, pause_reason, next_poll_at,"
+            " health_state, last_error FROM station_poll_state"
+            " WHERE station_id = ?",
+            (station_id,),
+        ).fetchone()
+        assert row is not None
+        return row
+
+    with caplog.at_level(logging.INFO, logger="wxverify.db.migrations"):
+        migrations.run_migrations(conn)
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 18
+
+    offline_row = _row(station_offline)
+    assert (offline_row["pause_evidence_count"], offline_row["pause_reason"]) == (
+        1,
+        "offline",
+    ), "an offline row must become one evidence reply, reason offline"
+    assert offline_row["next_poll_at"] == now_iso, (
+        "an offline station parked for a day must be due at once, not at"
+        " the end of its 20-h-ahead park"
+    )
+
+    row_404 = _row(station_404)
+    assert (row_404["pause_evidence_count"], row_404["pause_reason"]) == (
+        1,
+        "not_found",
+    ), "a terminal http 404 row must become one evidence reply, reason not_found"
+    assert row_404["next_poll_at"] == now_iso
+
+    for station_id, expected_error in (
+        (station_410, "http 410"),
+        (station_401, "http 401"),
+    ):
+        row = _row(station_id)
+        assert (row["pause_evidence_count"], row["pause_reason"]) == (0, None), (
+            f"a terminal row with error {expected_error!r} must not be"
+            " swept into the carry-over"
+        )
+        assert row["next_poll_at"] == far_future, (
+            f"a terminal row with error {expected_error!r} must keep its"
+            " own next_poll_at untouched"
+        )
+        assert row["last_error"] == expected_error
+
+    online_row = _row(station_online)
+    assert (online_row["pause_evidence_count"], online_row["pause_reason"]) == (
+        0,
+        None,
+    ), "an online row must not be touched by the carry-over"
+    assert online_row["next_poll_at"] == far_future
+
+    assert any(
+        "2 station(s) set to recheck" in r.getMessage() and "added=2" in r.getMessage()
+        for r in caplog.records
+    ), "the INFO line must report 2 columns added and 2 stations rechecked"
+
+
+def test_ut3_a_stop_at_poll_pause_leaves_everything_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """UT3 for the ``v18_poll_pause`` sub-step. Catches: the two ALTER
+    TABLEs or the carry-over UPDATE running ahead of the
+    ``stop.begin_step("v18_poll_pause")`` check, which would leave the two
+    pause columns (and a rechecked station) on the file even though
+    `run_migrations` never finished -- this sub-step runs FIRST in
+    `migrate_v18`, so a stop here must leave every one of its later
+    sub-steps' effects absent too, which `_all_table_rows` catches."""
+    real_begin_step = stop_module.begin_step
+
+    def _fake_begin_step(name: str) -> None:
+        if name == "v18_poll_pause":
+            raise stop_module.StopRequested
+        real_begin_step(name)
+
+    monkeypatch.setattr(stop_module, "begin_step", _fake_begin_step)
+
+    conn = _v17_connect(tmp_path / "ut3-stop-poll-pause.db")
+    conn.execute("PRAGMA secure_delete = 1")
+    conn.commit()
+    before = _all_table_rows(conn)
+
+    with pytest.raises(stop_module.StopRequested):
+        migrations.run_migrations(conn)
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 17, (
+        "a stop before the poll-pause sub-step runs must leave the version at 17"
+    )
+    assert not _has_pause_columns(conn)
+    assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+    assert _all_table_rows(conn) == before
+
+    monkeypatch.setattr(stop_module, "begin_step", real_begin_step)
     migrations.run_migrations(conn)
     _assert_sub_step_done(conn)

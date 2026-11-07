@@ -284,8 +284,9 @@ async def observations_current(
     form (km/h wind, hPa, mm) — no conversion in the route. Optional
     ``?station=<id>`` filter; empty registry → ``[]``.
 
-    ``provider_reported_offline`` is ``true`` exactly when the latest persisted
-    poll classification is a provider no-data reply (``health_state="offline"``).
+    ``provider_reported_offline`` is ``true`` exactly when ``health_state`` is
+    ``"offline"``. A provider no-data reply sets that state, and while the
+    station is paused a later stale reading or timeout keeps it.
     It is always a JSON bool, never ``null``: ``false`` for every other state and
     for a missing ``station_poll_state`` row.
     """

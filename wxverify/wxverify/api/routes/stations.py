@@ -18,8 +18,9 @@ from wxverify.api.errors import ApiError
 from wxverify.api.schemas import StationCreate, StationOut, StationUpdate
 from wxverify.collection.budget import reserve_budget
 from wxverify.core.secrets import resolve_secret
-from wxverify.core.timeutil import isoformat_utc_micro, utc_now
+from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro, utc_now
 from wxverify.db.connection import get_db
+from wxverify.db.queue import EnqueueResult, enqueue_if_absent
 from wxverify.db.site_days import (
     StationChange,
     current_day_has_other_station,
@@ -417,6 +418,63 @@ async def update_station(
 
         return await render_station_cluster(request, site_id)
     return station
+
+
+@router.post("/{station_id}/retry-now", response_model=None)
+async def retry_station_now(
+    request: Request, site_id: int, station_id: int
+) -> dict[str, bool] | HTMLResponse:
+    """Check a paused station's current conditions now (Retry now).
+
+    One write. Refused before anything is written: 404 for a missing or
+    retired station; 409 ``station is disabled`` or ``site is disabled``;
+    409 ``station is not paused`` when its poll state has no row or an
+    evidence count of 0, so a scripted press spends no call on a healthy
+    station. Otherwise ``next_poll_at`` becomes now and a
+    ``fetch_current_obs`` job is queued through ``enqueue_if_absent``, never
+    the cooldown variant, which operator paths must not use; a job already
+    queued for the station absorbs the press. No provider call here: the
+    job's own reservation applies the domain backoff, the refused-access
+    hold and the daily budget, and its reply is judged by
+    ``persist_poll_result``. Answers the station cluster fragment to an
+    htmx request, else ``{"queued": <whether a job was created>}``.
+    """
+
+    def _write(conn: sqlite3.Connection) -> EnqueueResult:
+        row = _get_station(conn, site_id, station_id)
+        if not bool(row["enabled"]):
+            raise ApiError(409, "station is disabled")
+        site = conn.execute(
+            "SELECT enabled FROM sites WHERE id=?", (site_id,)
+        ).fetchone()
+        if site is None:
+            raise ApiError(404, "site not found")
+        if not bool(site["enabled"]):
+            raise ApiError(409, "site is disabled")
+        state = conn.execute(
+            "SELECT pause_evidence_count FROM station_poll_state WHERE station_id=?",
+            (station_id,),
+        ).fetchone()
+        if state is None or int(state["pause_evidence_count"]) < 1:
+            raise ApiError(409, "station is not paused")
+        conn.execute(
+            "UPDATE station_poll_state SET next_poll_at=? WHERE station_id=?",
+            (isoformat_utc(utc_now()), station_id),
+        )
+        return enqueue_if_absent(
+            conn,
+            "fetch_current_obs",
+            site_id,
+            f"curobs:{station_id}",
+            {"station_id": station_id},
+        )
+
+    result = await get_db().write(_write)
+    if _wants_html(request):
+        from wxverify.web.routes import render_station_cluster
+
+        return await render_station_cluster(request, site_id)
+    return {"queued": result.created}
 
 
 @router.delete("/{station_id}", response_model=None)
