@@ -564,7 +564,8 @@ def build_hourly(
 
     It is :func:`hourly_day` over :func:`load_page_inputs`, plus ``feeds``:
     every feed of any variable's selection, in first-selected order, with
-    its series for each variable on the hour axis.
+    its series for each variable on the hour axis; a feed's samples at
+    hours off the axis are left out.
     """
     at = now or utc_now()
     inputs = load_page_inputs(conn, site_id=site_id, timezone=timezone, at=at)
@@ -801,15 +802,20 @@ def _feed_series(
     """One feed's hourly values for a display day on an hour axis.
 
     ``index`` maps each axis ``valid_at`` to its column. Wind is in km/h;
-    a column the feed has no sample for is null.
+    a column the feed has no sample for is null. A sample whose hour is
+    not on the axis is left out, as the Forecast page leaves it blank: the
+    axis is never widened for it.
     """
     feeds_samples = grouped.get(variable, {}).get(day, {})
     out: list[float | None] = [None] * len(index)
     for sample in feeds_samples.get(feed_id, []):
+        column = index.get(sample.valid_at)
+        if column is None:
+            continue  # off the chart's hours: left out, as the page leaves it blank
         value = sample.value
         if variable == "wind":
             value = ms_to_kmh(value)
-        out[index[sample.valid_at]] = value
+        out[column] = value
     return out
 
 

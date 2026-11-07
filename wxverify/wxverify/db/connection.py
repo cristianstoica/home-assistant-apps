@@ -10,7 +10,7 @@ import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import Final, TypeVar
 
 from wxverify import config
 from wxverify.core import stop
@@ -97,6 +97,31 @@ def _log_slow_write(
         )
 
 
+# The journal modes the writer can run in without WAL and still keep the
+# database file safe: slower (readers and the writer block each other), so
+# _check_journal_mode logs them and lets the open go on. Every other mode
+# (off, memory, or one nobody listed) is refused.
+_ROLLBACK_JOURNAL_MODES: Final = frozenset({"delete", "truncate", "persist"})
+
+
+def _check_journal_mode(mode: str | None) -> None:
+    if mode == "wal":
+        return
+    if mode in _ROLLBACK_JOURNAL_MODES:
+        logger.error(
+            "database journal_mode is %s, not wal: readers and the writer"
+            " block each other and pages slow down; the add-on keeps running",
+            mode,
+        )
+        return
+    logger.error(
+        "database journal_mode is %s, not wal: unsafe for the database file;"
+        " the open fails",
+        mode,
+    )
+    raise RuntimeError(f"journal_mode {mode} is unsafe; refusing to open")
+
+
 class Database:
     def __init__(self, path: str) -> None:
         config.ensure_parent_dir(path)
@@ -135,7 +160,12 @@ class Database:
             self.path, check_same_thread=False, isolation_level=None
         )
         self._conn.row_factory = sqlite3.Row
-        self._assert_pragmas(self._conn)
+        # A refused open (journal mode, foreign_keys) holds no connection.
+        try:
+            self._assert_pragmas(self._conn)
+        except BaseException:
+            self._conn.close()
+            raise
         # Registered while the migrations run, so a stop interrupts them
         # (storage-release plan 6.2); unregistered before anything else.
         stop.register(self._conn)
@@ -220,7 +250,11 @@ class Database:
 
     @staticmethod
     def _assert_pragmas(conn: sqlite3.Connection) -> None:
-        conn.execute("PRAGMA journal_mode=WAL")
+        # The mode SQLite returns, not the one asked for: it can quietly
+        # keep a rollback journal (no shared memory, for one).
+        row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        mode = None if row is None else str(row[0]).lower()
+        _check_journal_mode(mode)
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")

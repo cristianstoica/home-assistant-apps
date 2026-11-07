@@ -36,6 +36,7 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.core.units import ms_to_kmh
 from wxverify.db.migrations import pause_dropped_meteoblue_members, run_migrations
 from wxverify.db.runtime_state import set_runtime_state
+from wxverify.forecast.page import build_forecast_page
 from wxverify.forecast.service import (
     build_forecast,
     build_hourly,
@@ -1010,6 +1011,118 @@ def test_build_hourly_hour_axis_reflects_selected_feed_only() -> None:
     feed_ids = {feed["feed_id"] for feed in payload["feeds"]}
     assert winner_id in feed_ids
     assert loser_id not in feed_ids
+
+
+def _seed_wind_hours_outside_axis_fixture() -> tuple[
+    sqlite3.Connection, int, int, datetime, list[str]
+]:
+    """The base fixture of
+    ``test_build_hourly_hour_axis_reflects_selected_feed_only`` plus
+    ``winner_id`` wind samples at hours outside the temperature-only axis
+    (Part E). With no wind track record no feed has a wind weight
+    (``:1015-1035``), so the wind selection is empty and the axis is the
+    two temperature hours only.
+    """
+    conn = _make_db()
+    winner_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    loser_id = _feed_id(conn, "open-meteo", "gfs_global")
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+    set_setting(conn, "forecast_blend_depth", "1")
+
+    _seed_hourly(
+        conn,
+        feed_id=winner_id,
+        variable="temperature",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=_hours("2026-07-20", 4, 2),
+    )
+    _make_confident(conn, feed_id=winner_id, variable="temperature", day_ahead=1)
+    _seed_hourly(
+        conn,
+        feed_id=loser_id,
+        variable="temperature",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=_hours("2026-07-20", 10, 2),
+    )
+    off_axis_wind_stamps = _hours("2026-07-20", 8, 2)
+    _seed_hourly(
+        conn,
+        feed_id=winner_id,
+        variable="wind",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=off_axis_wind_stamps,
+        value=5.0,
+    )
+    conn.commit()
+    return conn, winner_id, loser_id, now, off_axis_wind_stamps
+
+
+def test_e1_forecast_page_wind_grid_leaves_off_axis_hours_to_the_model_row_only() -> (
+    None
+):
+    """E1: the Forecast page never raises on a wind sample outside the
+    temperature-only axis. The BLEND row stays blank at those hours (the
+    wind selection is empty, so the blend line never reaches them); the
+    model row, read by exact ``valid_at`` key over the full day's
+    columns (not the narrow axis), still shows the winner's own sample at
+    its own hour.
+
+    Catches: a later page change that builds a per-feed series on the
+    axis (the card 7 plan's "Rain-only feed" catch, now for wind at an
+    off-axis hour; ``test_forecast_page.py:412`` covers only an on-axis
+    hour).
+    """
+    conn, winner_id, _loser_id, now, off_axis_wind_stamps = (
+        _seed_wind_hours_outside_axis_fixture()
+    )
+
+    page = build_forecast_page(
+        conn,
+        site_id=1,
+        timezone="UTC",
+        rain_threshold_mm=0.2,
+        selected_day=0,
+        now=now,
+    )
+    assert page.empty is False
+    detail = page.detail
+    assert detail is not None
+    assert all(value is None for value in detail.wind.top.values)
+
+    winner_wind_row = next(row for row in detail.wind.rows if row.feed_id == winner_id)
+    expected_kmh = ms_to_kmh(5.0)
+    for column, value in zip(detail.columns, winner_wind_row.values, strict=True):
+        if column.key in off_axis_wind_stamps:
+            assert value == expected_kmh
+        else:
+            assert value is None
+
+
+def test_e2_build_hourly_skips_off_axis_wind_hours_instead_of_raising() -> None:
+    """E2: ``/api/forecast/hourly`` must not raise on a feed whose wind
+    samples fall outside the temperature-only axis; the off-axis wind
+    hours are left out of that feed's series, the axis is not widened to
+    them, and the feed is not dropped.
+
+    Fails on today's code with ``KeyError`` at ``service.py:812``
+    (``_feed_series`` indexing an off-axis hour); passes once
+    ``_feed_series`` skips the off-axis sample instead.
+
+    Catches: no fix; a fix that widens the axis to the wind hours; a fix
+    that drops the whole feed.
+    """
+    conn, winner_id, _loser_id, now, _off_axis_wind_stamps = (
+        _seed_wind_hours_outside_axis_fixture()
+    )
+
+    payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+    assert payload["hours"] == _hours("2026-07-20", 4, 2)
+
+    winner_feed = next(
+        feed for feed in payload["feeds"] if feed["feed_id"] == winner_id
+    )
+    assert winner_feed["wind_kmh"] == [None, None]
+    assert winner_feed["temp_c"] == [10.0, 10.0]  # _seed_hourly's default value
 
 
 def test_build_hourly_wind_untrained_feed_is_not_served() -> None:
