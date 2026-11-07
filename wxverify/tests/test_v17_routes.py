@@ -2,8 +2,9 @@
 through the real ``init_db``, and every route in ``app.routes`` answers with
 no ``sqlite3.OperationalError`` and no 5xx.
 
-Written against ``migrate_v17_storage``/``TARGET_USER_VERSION == 17``, which
-do not exist yet, so this file's one fixture (``_boot_v17_app``) fails first
+Written against the version-17 upgrade code (since removed, health release
+U2)/``TARGET_USER_VERSION == 17``, which did not exist yet, so this file's
+one fixture (``_boot_v17_app``) failed first
 today: a fresh ``init_db`` on a ``tmp_path`` file opens at ``user_version``
 16 (today's ``TARGET_USER_VERSION``), which is already what `run_migrations`
 has always produced for an empty file -- that part does not itself error.
@@ -145,8 +146,8 @@ def test_v17_database_opens_and_every_route_answers_without_db_error(
     with TestClient(app) as client:
         conn = get_db()._conn  # noqa: SLF001 - test seeds the real writer conn
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        assert version == migrations.TARGET_USER_VERSION == 17, (
-            "a fresh open must land at v17 before the route sweep runs"
+        assert version == migrations.TARGET_USER_VERSION == 18, (
+            "a fresh open must land at v18 before the route sweep runs"
         )
         for table in (
             "forecast_pairs",

@@ -590,18 +590,19 @@ def _build_v12_file(
 ) -> tuple[int, dict[str, int]]:
     """Write a database to ``path`` with one site and stations A and B
     (``ISTATION01``/``ISTATION02``), returning ``(site_id, {pws_id:
-    station_id})``, pinned at user_version 16 rather than fully fresh.
+    station_id})``, pinned at user_version 17 rather than fully fresh.
 
     The five ``close_*`` tables and the widened ``jobs`` CHECK this
     fixture used to undo by hand (copied locally from
     ``tests/test_close_day_cli.py``'s own, now-retired ``_build_v12_file``)
     are unconditional parts of ``create_tables`` now -- migrate_v13_
     close_jobs is deleted along with every other migrate_v2 ...
-    migrate_v16 function, and user_version 1-15 is refused outright
-    (storage release 4.1) -- so there is nothing left to undo onto a
-    reachable schema. Pinning at 16 instead of 17 still exercises a real
-    ``run_migrations`` call on open (migrate_v17_storage's own "already
-    converted" guard makes it a fast no-op here).
+    migrate_v16 function, and user_version 1-16 is refused outright
+    (storage release 4.1, health release U1) -- so there is nothing left
+    to undo onto a reachable schema. Pinning at 17 instead of 18 still
+    exercises a real ``run_migrations`` call on open (step 1's
+    ``migrate_v18`` holds only the ``secure_delete`` toggle and the
+    version write, so it is a fast no-op here).
     """
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
@@ -630,7 +631,7 @@ def _build_v12_file(
         ).lastrowid
         assert station_id is not None
         stations[pws_id] = int(station_id)
-    conn.execute("PRAGMA user_version = 16")
+    conn.execute("PRAGMA user_version = 17")
     conn.commit()
     conn.close()
     return int(site_id), stations

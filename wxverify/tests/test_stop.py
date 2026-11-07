@@ -263,7 +263,7 @@ def test_check_inside_a_savepoint_leaves_user_version_and_rows_unchanged_after_r
     """W1 case 2. A step that opens a savepoint, changes ``user_version``
     and inserts a row, then calls ``check()`` with ``STOP`` already set,
     must see ``check()`` raise ``StopRequested`` -- and rolling back to the
-    savepoint on that exception (as ``run_migrations``/``migrate_v17_storage``
+    savepoint on that exception (as ``run_migrations``/``migrate_v18``
     will, per §6.2) leaves both ``user_version`` and the row exactly as they
     were beforehand.
 

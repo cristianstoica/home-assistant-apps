@@ -1,4 +1,4 @@
--- Rows a fresh wxverify 0.16.15 database is seeded with, in load order (sources before feeds), dumped with iterdump.
+-- Rows a fresh wxverify 0.16.17 database is seeded with, in load order (sources before feeds), dumped with iterdump.
 INSERT INTO "sources" VALUES('open-meteo',10000,NULL,'UTC');
 INSERT INTO "sources" VALUES('meteoblue',5,65000,'UTC');
 INSERT INTO "sources" VALUES('weathercom',1000,NULL,'UTC');
@@ -27,9 +27,10 @@ INSERT INTO "settings" VALUES('rolling_window_days','30');
 INSERT INTO "settings" VALUES('min_n','30');
 INSERT INTO "settings" VALUES('obs_interval_minutes','180');
 INSERT INTO "settings" VALUES('obs_jitter_minutes','20');
-INSERT INTO "runtime_state" VALUES('download_record_since','2026-11-03T09:59:50Z','2026-11-03T09:59:50.247Z');
-INSERT INTO "runtime_state" VALUES('google_horizon_correction_applied','applied','2026-11-03T09:59:50.590Z');
-INSERT INTO "runtime_state" VALUES('open_meteo_horizon_correction_applied','applied','2026-11-03T09:59:50.590Z');
-INSERT INTO "runtime_state" VALUES('open_meteo_interval_correction_applied','applied','2026-11-03T09:59:50.590Z');
-INSERT INTO "runtime_state" VALUES('precip_hour_start_boundary','1970-01-01T00:00:00Z','2026-11-03T09:59:50.591Z');
-INSERT INTO "runtime_state" VALUES('verification_publish_hold_bootstrap','skipped_fresh_install','2026-11-03T09:59:50.606Z');
+INSERT INTO "runtime_state" VALUES('google_horizon_correction_applied','applied','2026-11-07T14:59:03.969Z');
+INSERT INTO "runtime_state" VALUES('open_meteo_horizon_correction_applied','applied','2026-11-07T14:59:03.969Z');
+INSERT INTO "runtime_state" VALUES('open_meteo_interval_correction_applied','applied','2026-11-07T14:59:03.970Z');
+INSERT INTO "runtime_state" VALUES('precip_hour_start_boundary','1970-01-01T00:00:00Z','2026-11-07T14:59:03.984Z');
+INSERT INTO "runtime_state" VALUES('daily_close_on_at','2026-11-07T14:59:03.984484Z','2026-11-07T14:59:03.984Z');
+INSERT INTO "runtime_state" VALUES('download_record_since','2026-11-07T14:59:03Z','2026-11-07T14:59:03.985Z');
+INSERT INTO "runtime_state" VALUES('storage_compacted_at','2026-11-07T14:59:03.984484Z','2026-11-07T14:59:03.985Z');

@@ -2,7 +2,7 @@
 daily-close-day-state-and-guard.md §10.2-10.7, test IDs MG5-MG6).
 
 The fixture is a real database built by migrating a fresh ``:memory:``
-connection with ``run_migrations``, then pinned at user_version 16 (see
+connection with ``run_migrations``, then pinned at user_version 17 (see
 ``_v10_db``'s own docstring for why it no longer genuinely removes the
 v11 additions the way ``tests/test_v8_last_usable_fetch_migration.py``'s
 ``_drop_stamp_column_and_roll_back``/``_v6_db`` still do). It holds
@@ -25,26 +25,27 @@ _FAKED_NOW = NOW.replace(hour=0, minute=30, second=0, microsecond=0)
 
 
 def _v10_db() -> sqlite3.Connection:
-    """A real database, pinned at user_version 16 rather than fully fresh.
+    """A real database, pinned at user_version 17 rather than fully fresh.
 
     This fixture used to genuinely remove the v11 additions (the four new
     tables and the ``stations.retired_at`` column) to stand in for a
     pre-v11 file. That migration (whatever added them below v16) is
     deleted along with every other migrate_v2 ... migrate_v16 function,
     and those tables/column are unconditional parts of ``create_tables``
-    now, with user_version 1-15 refused outright (storage release 4.1) --
-    so there is nothing left to remove onto a reachable schema. Pinning at
-    16 instead of 17 still exercises a real ``run_migrations`` call in
-    ``_migrate`` (migrate_v17_storage's own "already converted" guard
-    makes it a fast no-op here), while this function's own subject -- the
-    live CHECK/foreign-key constraints on these tables -- is unaffected
-    either way.
+    now, with user_version 1-16 refused outright (storage release 4.1,
+    health release U1) -- so there is nothing left to remove onto a
+    reachable schema. Pinning at 17 instead of 18 still exercises a real
+    ``run_migrations`` call in ``_migrate`` (step 1's ``migrate_v18`` holds
+    only the ``secure_delete`` toggle and the version write, so it is a
+    fast no-op here regardless of data present), while this function's
+    own subject -- the live CHECK/foreign-key constraints on these tables
+    -- is unaffected either way.
     """
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     run_migrations(conn)
-    conn.execute("PRAGMA user_version = 16")
+    conn.execute("PRAGMA user_version = 17")
 
     conn.execute(
         """

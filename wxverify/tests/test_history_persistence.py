@@ -64,9 +64,9 @@ The API exposed by ``wxverify.scoring.history``, chosen from what
 Real SQLite throughout for HP3 (``tests.helpers.asof_conn``, real
 migrations); nothing in the code under test is mocked. Synthetic data only:
 site "history-persistence-site", coordinates 0.0/0.0, variable
-``temperature``, zone ``America/New_York`` (already used for a DST
-scenario in ``tests/test_migration_v17.py``; never a new real-place zone
-name), transition date 2026-03-08 (the US spring-forward Sunday --
+``temperature``, zone ``America/New_York`` (already used elsewhere in this
+suite for a DST scenario; never a new real-place zone name), transition
+date 2026-03-08 (the US spring-forward Sunday --
 America/New_York is 23 real hours long that day, 02:00 EST jumps to
 03:00 EDT).
 """

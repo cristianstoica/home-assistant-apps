@@ -1,28 +1,26 @@
-"""SQLite schema, insert-only boot seeds, and the one upgrade to version 17."""
+"""SQLite schema, insert-only boot seeds, and the one upgrade to version 18."""
 
 from __future__ import annotations
 
 import logging
 import sqlite3
 import time
-from dataclasses import dataclass
 from typing import Final
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify import config
 from wxverify.collection.forecast_validation import invalid_stored_sample_sql
 from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
 from wxverify.core import stop
-from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
+from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.db.site_days import DAILY_CLOSE_ON_KEY
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 17
+TARGET_USER_VERSION = 18
 
-# The one version run_migrations upgrades from; 1 to 15 are refused.
-UPGRADE_FROM_USER_VERSION: Final = 16
+# The one version run_migrations upgrades from; 1 to 16 are refused.
+UPGRADE_FROM_USER_VERSION: Final = 17
 
 
 def _executescript(conn: sqlite3.Connection, script: str) -> None:
@@ -33,9 +31,8 @@ def create_tables(conn: sqlite3.Connection) -> None:
     """Every CREATE TABLE IF NOT EXISTS of the current schema, verbatim, and
     the three ``sites`` triggers on ``backfill_status``.
 
-    Runs first in `run_migrations`, before the version 17 upgrade, which
-    writes into ``forecast_history``. No index lives here: `run_migrations`
-    makes them in `create_indexes`, after the upgrade.
+    Runs first in `run_migrations`. No index lives here: `run_migrations`
+    makes them in `create_indexes`, before the version 18 upgrade.
     """
     _executescript(
         conn,
@@ -808,7 +805,7 @@ def create_indexes(conn: sqlite3.Connection) -> None:
     """Every CREATE INDEX IF NOT EXISTS of the current schema, verbatim, plus
     the two code-generated forecast_samples indexes and idx_samples_slot.
 
-    Runs after the version 17 upgrade in `run_migrations`; an index already
+    Runs before the version 18 upgrade in `run_migrations`; an index already
     there is skipped by name.
     """
     _executescript(
@@ -863,7 +860,7 @@ def create_indexes(conn: sqlite3.Connection) -> None:
 def create_schema(conn: sqlite3.Connection) -> None:
     """Fresh-database convenience: tables, then indexes, in one call.
 
-    Not used by `run_migrations`, which runs the version 17 upgrade between
+    Not used by `run_migrations`, which runs `drop_forecast_record` between
     the two halves.
     """
     create_tables(conn)
@@ -1297,28 +1294,26 @@ DOWNLOAD_RECORD_SINCE_KEY: Final = "download_record_since"
 # fresh file gets its build time: it has nothing to compact.
 STORAGE_COMPACTED_KEY: Final = "storage_compacted_at"
 
-_CLOSE_OFF_REFUSAL: Final = (
-    f"database schema {UPGRADE_FROM_USER_VERSION} has no {DAILY_CLOSE_ON_KEY}"
-    " key; this release needs the daily close on"
-)
-
 
 def run_migrations(conn: sqlite3.Connection) -> None:
-    """Bring the file to version 17, or refuse it.
+    """Bring the file to version 18, or refuse it.
 
     Refused with ``RuntimeError`` before anything is written: a file above
-    17; a file at 1 to 15 (or below 0); a file at 16 whose daily close is
-    off (no ``DAILY_CLOSE_ON_KEY``). Then, in order: `create_tables`; at 16
-    only, `migrate_v17_storage`; on every start, `drop_forecast_record`;
-    `create_indexes`; the four one-shot corrections, the three seeds and the
+    18 (``newer than this app``); a file at 1 to 16 (or below 0), with
+    ``install 0.16.17 first``. Then, in order: `create_tables`; on every
+    start, `drop_forecast_record`; `create_indexes`; at 17 only,
+    `migrate_v18`; the four one-shot corrections, the three seeds and the
     rain-label boundary; at 0 only, the fresh file's three keys
-    (`_record_fresh_build_keys`); last, ``user_version`` 17. A file already
-    at 17 runs the same steps less the upgrade and the fresh keys.
+    (`_record_fresh_build_keys`); last, ``user_version`` 18. A file already
+    at 18 runs the same steps less the upgrade and the fresh keys.
 
     A stop is checked before each step (``core.stop.begin_step``), which
     also names the step for ``Database._open``'s log line. A step that does
     not run leaves ``user_version`` unchanged, and each step finds its own
-    work done on a repeat, so the next start reruns from it.
+    work done on a repeat, so the next start reruns from it. `migrate_v18`
+    writes ``user_version`` 18 inside its own savepoint, so a stop after it
+    leaves an upgraded file, which the next start opens at 18; the steps
+    after it, the fresh keys aside, run on every start.
     """
     row = conn.execute("PRAGMA user_version").fetchone()
     current = int(row[0]) if row is not None else 0
@@ -1327,23 +1322,22 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current != 0 and current < UPGRADE_FROM_USER_VERSION:
         raise RuntimeError(
             f"database schema {current} is too old for this release;"
-            " install 0.16.15 first"
+            " install 0.16.17 first"
         )
-    if current == UPGRADE_FROM_USER_VERSION and not _close_on_recorded(conn):
-        raise RuntimeError(_CLOSE_OFF_REFUSAL)
     logger.debug(
         "migrations begin user_version=%s target=%s", current, TARGET_USER_VERSION
     )
     stop.begin_step("create_tables")
     create_tables(conn)
     logger.debug("migrations tables ensured")
-    if current == UPGRADE_FROM_USER_VERSION:
-        migrate_v17_storage(conn)
     stop.begin_step("drop_forecast_record")
     drop_forecast_record(conn)
     stop.begin_step("create_indexes")
     create_indexes(conn)
     logger.debug("migrations indexes ensured")
+    if current == UPGRADE_FROM_USER_VERSION:
+        stop.begin_step("migrate_v18")
+        migrate_v18(conn)
     stop.begin_step("correct_google_horizon")
     correct_google_horizon(conn)
     stop.begin_step("correct_open_meteo_horizons")
@@ -1394,9 +1388,8 @@ _RECORD_GAP_SCAN_KEY_PREFIX: Final = "record_gap_scan_failures:"
 def drop_forecast_record(conn: sqlite3.Connection) -> None:
     """Delete what is left of the removed daily forecast record.
 
-    `run_migrations` calls it on every start, just after
-    `migrate_v17_storage` (which runs at version 16 only). One SAVEPOINT
-    holds three statements, in this order: ``DROP TABLE IF EXISTS
+    `run_migrations` calls it on every start, just after `create_tables`.
+    One SAVEPOINT holds three statements, in this order: ``DROP TABLE IF EXISTS
     forecast_of_record``; a DELETE of the ``forecast_record`` and
     ``record_gap_scan`` jobs, in any status; a DELETE of the
     ``runtime_state`` keys beginning ``record_gap_scan_failures:``. Nothing
@@ -1435,389 +1428,48 @@ def drop_forecast_record(conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The version 17 upgrade: one forecast history
+# The version 18 upgrade
 # ---------------------------------------------------------------------------
 
-#: The tables `migrate_v17_storage` drops, in its order: every child before
-#: its parent. With foreign keys on, dropping a parent first runs an implicit
-#: DELETE of its rows, which cascades row by row, or fails on a plain
-#: REFERENCES with no ON DELETE action.
-V17_DROP_ORDER: Final[tuple[str, ...]] = (
-    "verification_evidence",
-    "verification_day_context",
-    "verification_results",
-    "verification_verdicts",
-    "verification_run_inputs",
-    "verification_trigger_decisions",
-    "verification_runs",
-    "close_pairs",
-    "forecast_pairs",
-)
 
-# The jobs the upgrade keeps, in any status: the kinds dispatch still runs,
-# and fetch_obs only under the key wind-days. IS, not =, so a NULL job_key
-# compares as a value.
-_V17_KEPT_JOBS_SQL: Final = """
-    type IN ('fetch_current_obs', 'fetch_feed', 'day_close', 'day_publish')
-    OR (type = 'fetch_obs' AND job_key IS 'wind-days')
-"""
-# The persistence yardstick's feed id, left out of the forecast history.
-_V17_PERSISTENCE_FEEDS_SQL: Final = (
-    "SELECT id FROM feeds WHERE source = 'virtual' AND model = '_persistence'"
-)
-# The runtime_state keys of the removed code: a prefix, and one key.
-_V17_REMOVED_KEY_PREFIX: Final = "verification_"
-_V17_REMOVED_KEY: Final = "import_rebuild_state"
-_V17_REMOVED_SETTING: Final = "verification_publish_hold"
-# The day_publish stage whose jobs the upgrade deletes; the close chain's
-# stages end at 7.
-_V17_REMOVED_PUBLISH_STAGE: Final = 8
+def migrate_v18(conn: sqlite3.Connection) -> None:
+    """Upgrade a version 17 file to version 18.
 
+    `run_migrations` calls it at version 17 only, after `create_indexes`,
+    under the stop check ``migrate_v18``. Logs ``PRAGMA secure_delete`` and
+    sets it to 0 on this connection, so the deletes do not overwrite each
+    freed page; the ``finally`` puts it back, whatever happens.
 
-@dataclass(frozen=True, slots=True)
-class _V17Site:
-    """One site's source for the pre-close conversion: its ``published`` time
-    zone generation, and the ``valid_at`` text its rows lie below (its first
-    record's ``day_start_utc``; None while it has no record: every row)."""
-
-    site_id: int
-    generation_id: int
-    bound: str | None
-
-
-def migrate_v17_storage(conn: sqlite3.Connection) -> None:
-    """Upgrade a version 16 file to one forecast history.
-
-    `run_migrations` calls it at version 16 only, after `create_tables` made
-    ``forecast_history``, and writes ``user_version`` 17 after it.
-
-    Raises ``RuntimeError``, writing nothing, when ``DAILY_CLOSE_ON_KEY`` is
-    absent. Logs ``PRAGMA secure_delete`` and sets it to 0 on this
-    connection, so the drops do not overwrite each freed page; it is put
-    back on the way out. With ``forecast_pairs`` gone, an earlier run
-    committed every step: one INFO line "already converted", and it returns.
-
-    Otherwise one SAVEPOINT holds five steps, each named for a stop check
-    (``core.stop.begin_step``) and logged at INFO with its rows and
-    milliseconds:
-
-    1. ``v17_date_map``: the TEMP table ``v17_dates``, the local date of
-       each hour the conversion reads (`_v17_date_map`);
-    2. ``v17_convert_pre_close``: each site's ``forecast_pairs`` rows from
-       before its first record (`_v17_convert_pre_close`);
-    3. ``v17_copy_close_pairs``: the ``close_pairs`` rows
-       (`_v17_copy_close_pairs`);
-    4. ``v17_delete_removed_jobs_keys``: the jobs, keys and setting of
-       removed code (`_v17_delete_removed_jobs_keys`);
-    5. ``v17_drop_tables``: ``V17_DROP_ORDER``, then ``v17_dates``
-       (`_v17_drop_tables`).
+    One SAVEPOINT holds the upgrade, ending with ``user_version`` 18: the
+    version sits in the file header, which the savepoint rolls back with
+    everything else. `create_tables`'s ``executescript`` has already
+    committed any outer transaction, so the RELEASE is the commit, and
+    nothing inside the savepoint may end the transaction (no
+    ``executescript``, commit, rollback, ``BEGIN`` or ``VACUUM``).
 
     Any error rolls the savepoint back and is re-raised, so the file stays
-    at version 16 as it was and the next open runs the upgrade again; the
+    at version 17 as it was and the next open runs the upgrade again; the
     in_transaction check covers an error that has already ended the
-    transaction. The RELEASE commits the five steps; a stop after it and
-    before the version write leaves a converted version 16 file, on which
-    the next open returns at the guard.
+    transaction.
     """
-    stop.begin_step("migrate_v17_storage")
-    if not _close_on_recorded(conn):
-        raise RuntimeError(_CLOSE_OFF_REFUSAL)
     secure_delete = int(conn.execute("PRAGMA secure_delete").fetchone()[0])
     logger.info(
-        "v17 upgrade: secure_delete is %d; set to 0 for the drops", secure_delete
+        "v18 upgrade: secure_delete is %d; set to 0 for the deletes", secure_delete
     )
     conn.execute("PRAGMA secure_delete = 0")
     try:
-        if not _table_exists(conn, "forecast_pairs"):
-            logger.info("v17 upgrade: already converted")
-            return
-        conn.execute("SAVEPOINT migrate_v17")
+        conn.execute("SAVEPOINT migrate_v18")
         try:
-            stop.begin_step("v17_date_map")
-            sites = _v17_date_map(conn)
-            stop.begin_step("v17_convert_pre_close")
-            _v17_convert_pre_close(conn, sites)
-            stop.begin_step("v17_copy_close_pairs")
-            _v17_copy_close_pairs(conn)
-            stop.begin_step("v17_delete_removed_jobs_keys")
-            _v17_delete_removed_jobs_keys(conn)
-            stop.begin_step("v17_drop_tables")
-            _v17_drop_tables(conn)
+            conn.execute("PRAGMA user_version = 18")
         except BaseException:
             if conn.in_transaction:
-                conn.execute("ROLLBACK TO migrate_v17")
-                conn.execute("RELEASE migrate_v17")
+                conn.execute("ROLLBACK TO migrate_v18")
+                conn.execute("RELEASE migrate_v18")
             raise
-        conn.execute("RELEASE migrate_v17")
+        conn.execute("RELEASE migrate_v18")
     finally:
         restored = "FAST" if secure_delete == 2 else str(secure_delete)
         conn.execute(f"PRAGMA secure_delete = {restored}")
-
-
-def _v17_date_map(conn: sqlite3.Connection) -> list[_V17Site]:
-    """Step 1: fill the TEMP table ``v17_dates``; return each site's source.
-
-    For each site, in id order, with ``core.stop.check`` once per site: its
-    ``published`` time zone generation (the highest id, should it have
-    several) and its bound, its first record's ``day_start_utc`` as
-    ``isoformat_utc`` text. Each distinct ``valid_at`` of the site's
-    ``forecast_pairs`` rows of that generation below the bound, compared as
-    text, gets its local date in the generation's zone. A site with no
-    ``published`` generation has no source.
-
-    Raises ``RuntimeError`` at the first site, in id order, whose zone does
-    not load (the message names the site and the zone), or any of whose
-    ``valid_at`` stamps do not parse (the message names the site, how many
-    do not parse, and the lowest of them as text). Every hour is mapped or
-    the upgrade is refused: `migrate_v17_storage` rolls the savepoint back,
-    so the file stays at version 16.
-    """
-    started = time.perf_counter()
-    conn.execute(
-        "CREATE TEMP TABLE v17_dates ("
-        " site_id INTEGER NOT NULL, valid_at TEXT NOT NULL,"
-        " local_date TEXT NOT NULL, PRIMARY KEY (site_id, valid_at))"
-    )
-    site_ids = [
-        int(row[0])
-        for row in conn.execute("SELECT id FROM sites ORDER BY id").fetchall()
-    ]
-    sites: list[_V17Site] = []
-    hours = 0
-    for site_id in site_ids:
-        stop.check()
-        generation = conn.execute(
-            "SELECT id, timezone FROM timezone_generations"
-            " WHERE site_id = ? AND state = 'published'"
-            " ORDER BY id DESC LIMIT 1",
-            (site_id,),
-        ).fetchone()
-        if generation is None:
-            continue
-        first = conn.execute(
-            "SELECT day_start_utc FROM site_days WHERE site_id = ?"
-            " ORDER BY local_date LIMIT 1",
-            (site_id,),
-        ).fetchone()
-        site = _V17Site(
-            site_id=site_id,
-            generation_id=int(generation[0]),
-            bound=None if first is None else isoformat_utc(parse_utc(str(first[0]))),
-        )
-        sites.append(site)
-        zone_name = str(generation[1])
-        try:
-            zone = ZoneInfo(zone_name)
-        except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise RuntimeError(
-                f"v17 upgrade: site {site_id}: zone {zone_name!r} does not load;"
-                " the upgrade is refused and the file stays at version 16"
-            ) from exc
-        dates: list[tuple[int, str, str]] = []
-        unparsed: list[str] = []
-        for row in conn.execute(
-            "SELECT DISTINCT valid_at FROM forecast_pairs"
-            " WHERE site_id = :site_id AND tz_generation_id = :generation_id"
-            " AND (:bound IS NULL OR valid_at < :bound)",
-            _v17_site_binds(site),
-        ).fetchall():
-            valid_at = str(row[0])
-            try:
-                local = parse_utc(valid_at).astimezone(zone).date()
-            except ValueError:
-                unparsed.append(valid_at)
-                continue
-            dates.append((site_id, valid_at, local.isoformat()))
-        if unparsed:
-            raise RuntimeError(
-                f"v17 upgrade: site {site_id}: {len(unparsed)} valid_at"
-                f" stamp(s) do not parse, for example {min(unparsed)!r}; the"
-                " upgrade is refused and the file stays at version 16"
-            )
-        conn.executemany(
-            "INSERT INTO v17_dates (site_id, valid_at, local_date) VALUES (?, ?, ?)",
-            dates,
-        )
-        hours += len(dates)
-    logger.info(
-        "v17 upgrade: v17_date_map: %d hour(s) of %d site(s), %d ms",
-        hours,
-        len(sites),
-        _elapsed_ms(started),
-    )
-    return sites
-
-
-def _v17_convert_pre_close(conn: sqlite3.Connection, sites: list[_V17Site]) -> None:
-    """Step 2: each site's pre-close forecasts into ``forecast_history``.
-
-    The source of a site (`_v17_date_map`): its ``forecast_pairs`` rows of
-    its ``published`` generation with ``valid_at`` below its bound as text,
-    persistence left out, joined to ``v17_dates`` for ``local_date``. Per key
-    (site, feed, variable, day ahead, ``valid_at``) one row: the earliest
-    run, ordered by ``julianday(issued_at)``, then ``issued_at``, then
-    ``id``, so two text forms of one instant tie on the instant. ``value`` is
-    the stored forecast; ``day_ahead``, ``lead_hours``, ``issued_at`` and
-    ``contributors`` (the mean's) are copied as stored.
-    """
-    started = time.perf_counter()
-    written = 0
-    for site in sites:
-        written += conn.execute(
-            f"""
-            INSERT INTO forecast_history
-                (site_id, feed_id, variable, day_ahead, valid_at, local_date,
-                 value, lead_hours, issued_at, contributors)
-            SELECT site_id, feed_id, variable, day_ahead, valid_at, local_date,
-                   forecast, lead_hours, issued_at, contributors
-            FROM (
-                SELECT fp.site_id, fp.feed_id, fp.variable, fp.day_ahead,
-                       fp.valid_at, d.local_date, fp.forecast, fp.lead_hours,
-                       fp.issued_at, fp.contributors,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY fp.site_id, fp.feed_id, fp.variable,
-                                        fp.day_ahead, fp.valid_at
-                           ORDER BY julianday(fp.issued_at), fp.issued_at, fp.id
-                       ) AS pick
-                FROM forecast_pairs fp
-                JOIN v17_dates d
-                  ON d.site_id = fp.site_id AND d.valid_at = fp.valid_at
-                WHERE fp.site_id = :site_id
-                  AND fp.tz_generation_id = :generation_id
-                  AND (:bound IS NULL OR fp.valid_at < :bound)
-                  AND fp.feed_id NOT IN ({_V17_PERSISTENCE_FEEDS_SQL})
-            )
-            WHERE pick = 1
-            """,
-            _v17_site_binds(site),
-        ).rowcount
-    logger.info(
-        "v17 upgrade: v17_convert_pre_close: %d row(s) written, %d ms",
-        written,
-        _elapsed_ms(started),
-    )
-
-
-def _v17_site_binds(site: _V17Site) -> dict[str, object]:
-    """The named binds of one site's source reads."""
-    return {
-        "site_id": site.site_id,
-        "generation_id": site.generation_id,
-        "bound": site.bound,
-    }
-
-
-def _v17_copy_close_pairs(conn: sqlite3.Connection) -> None:
-    """Step 3: copy the ``close_pairs`` rows into ``forecast_history``.
-
-    Every row as it is, persistence left out: ``value`` is the stored
-    forecast, the other columns of the history are copied. A plain INSERT,
-    so a key clash fails the upgrade rather than being skipped.
-    """
-    started = time.perf_counter()
-    copied = conn.execute(
-        f"""
-        INSERT INTO forecast_history
-            (site_id, feed_id, variable, day_ahead, valid_at, local_date,
-             value, lead_hours, issued_at, contributors)
-        SELECT site_id, feed_id, variable, day_ahead, valid_at, local_date,
-               forecast, lead_hours, issued_at, contributors
-        FROM close_pairs
-        WHERE feed_id NOT IN ({_V17_PERSISTENCE_FEEDS_SQL})
-        """
-    ).rowcount
-    logger.info(
-        "v17 upgrade: v17_copy_close_pairs: %d row(s), %d ms",
-        copied,
-        _elapsed_ms(started),
-    )
-
-
-def _v17_delete_removed_jobs_keys(conn: sqlite3.Connection) -> None:
-    """Step 4: delete the jobs, keys and setting of removed code.
-
-    ``jobs`` keeps only ``_V17_KEPT_JOBS_SQL``'s rows, in any status, less
-    the ``day_publish`` rows of stage 8 (`_publish_stage`). ``runtime_state``
-    loses every key beginning ``verification_`` (compared case-sensitively,
-    no LIKE) and ``import_rebuild_state``; ``settings`` loses
-    ``verification_publish_hold``.
-    """
-    started = time.perf_counter()
-    jobs = conn.execute(f"DELETE FROM jobs WHERE NOT ({_V17_KEPT_JOBS_SQL})").rowcount
-    stage_jobs = [
-        (int(row[0]),)
-        for row in conn.execute(
-            "SELECT id, job_key FROM jobs WHERE type = 'day_publish'"
-        ).fetchall()
-        if _publish_stage(row[1]) == _V17_REMOVED_PUBLISH_STAGE
-    ]
-    conn.executemany("DELETE FROM jobs WHERE id = ?", stage_jobs)
-    keys = conn.execute(
-        "DELETE FROM runtime_state WHERE substr(key, 1, ?) = ? OR key = ?",
-        (len(_V17_REMOVED_KEY_PREFIX), _V17_REMOVED_KEY_PREFIX, _V17_REMOVED_KEY),
-    ).rowcount
-    settings = conn.execute(
-        "DELETE FROM settings WHERE key = ?", (_V17_REMOVED_SETTING,)
-    ).rowcount
-    logger.info(
-        "v17 upgrade: v17_delete_removed_jobs_keys: %d job(s), %d stage-%d"
-        " publish job(s), %d key(s), %d setting(s), %d ms",
-        jobs,
-        len(stage_jobs),
-        _V17_REMOVED_PUBLISH_STAGE,
-        keys,
-        settings,
-        _elapsed_ms(started),
-    )
-
-
-def _publish_stage(job_key: object) -> int | None:
-    """The stage of a ``day_publish`` key ``publish:<site>:<stage>``, read as
-    the close chain reads it (both numbers through ``int``); None when the
-    key does not read."""
-    if not isinstance(job_key, str):
-        return None
-    parts = job_key.split(":")
-    if len(parts) != 3 or parts[0] != "publish":
-        return None
-    try:
-        _site, stage = int(parts[1]), int(parts[2])
-    except ValueError:
-        return None
-    return stage
-
-
-def _v17_drop_tables(conn: sqlite3.Connection) -> None:
-    """Step 5: ``DROP TABLE IF EXISTS`` each table of ``V17_DROP_ORDER``, in
-    that order, then the TEMP table ``v17_dates``. The INFO line gives each
-    drop's milliseconds."""
-    started = time.perf_counter()
-    timings: list[str] = []
-    dropped = 0
-    for table in V17_DROP_ORDER:
-        if _table_exists(conn, table):
-            dropped += 1
-        table_started = time.perf_counter()
-        conn.execute(f"DROP TABLE IF EXISTS {table}")
-        timings.append(f"{table} {_elapsed_ms(table_started)} ms")
-    conn.execute("DROP TABLE IF EXISTS temp.v17_dates")
-    logger.info(
-        "v17 upgrade: v17_drop_tables: %d table(s) dropped (%s), %d ms",
-        dropped,
-        ", ".join(timings),
-        _elapsed_ms(started),
-    )
-
-
-def _close_on_recorded(conn: sqlite3.Connection) -> bool:
-    """Whether ``runtime_state`` holds ``DAILY_CLOSE_ON_KEY``. Read-only; a
-    file with no ``runtime_state`` table holds no key."""
-    if not _table_exists(conn, "runtime_state"):
-        return False
-    row = conn.execute(
-        "SELECT 1 FROM runtime_state WHERE key = ?", (DAILY_CLOSE_ON_KEY,)
-    ).fetchone()
-    return row is not None
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -1826,8 +1478,3 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
     ).fetchone()
     return row is not None
-
-
-def _elapsed_ms(started: float) -> int:
-    """Whole milliseconds since ``started``, a ``time.perf_counter`` value."""
-    return int((time.perf_counter() - started) * 1000)

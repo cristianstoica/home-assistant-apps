@@ -1,4 +1,4 @@
--- Schema of a fresh wxverify 0.16.15 database (user_version 16), dumped from sqlite_master.
+-- Schema of a fresh wxverify 0.16.17 database (user_version 17), dumped from sqlite_master.
 
 CREATE TABLE api_budget (
             source TEXT NOT NULL REFERENCES sources(source) ON DELETE RESTRICT,
@@ -28,34 +28,6 @@ CREATE TABLE close_attempts (
             CHECK((outcome = 'failed') = (failed_stage IS NOT NULL)),
             CHECK(outcome <> 'closed' OR (last_stage = 6 AND truth_version IS NOT NULL))
         );
-
-CREATE TABLE close_pairs (
-            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-            local_date TEXT NOT NULL,
-            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
-            variable TEXT NOT NULL,
-            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
-            valid_at TEXT NOT NULL,
-            lead_hours INTEGER NOT NULL,
-            forecast REAL NOT NULL,
-            observed REAL NOT NULL,
-            error REAL,
-            abs_error REAL,
-            sq_error REAL,
-            cat_hit INTEGER,
-            cat_false INTEGER,
-            cat_miss INTEGER,
-            cat_correct_neg INTEGER,
-            rain_threshold_mm REAL,
-            ref_sq_error REAL,
-            download_id INTEGER,
-            download_date TEXT,
-            issued_at TEXT,
-            fetched_at TEXT,
-            contributors INTEGER,
-            PRIMARY KEY (site_id, local_date, feed_id, variable, day_ahead,
-                         valid_at, lead_hours)
-        ) WITHOUT ROWID;
 
 CREATE TABLE close_publications (
             site_id INTEGER NOT NULL,
@@ -249,82 +221,19 @@ CREATE TABLE forecast_downloads (
             labels TEXT NOT NULL
         );
 
-CREATE TABLE forecast_of_record (
-            id INTEGER PRIMARY KEY,
-            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-            tz_generation_id INTEGER NOT NULL
-                REFERENCES timezone_generations(id),
-            timezone TEXT NOT NULL,
-            tz_rebuild_in_progress INTEGER NOT NULL DEFAULT 0
-                CHECK(tz_rebuild_in_progress IN (0,1)),
-            snapshot_local_date TEXT NOT NULL,
-            snapshot_local_time TEXT NOT NULL,
-            snapshot_utc TEXT NOT NULL,
-            target_local_date TEXT NOT NULL,
-            variable TEXT NOT NULL
-                CHECK(variable IN ('temperature','wind','precip')),
-            display_lead INTEGER NOT NULL
-                CHECK(display_lead BETWEEN 0 AND 7),
-            status TEXT NOT NULL CHECK(status IN ('recorded','missed')),
-            missed_reason TEXT,
-            write_path TEXT
-                CHECK(write_path IS NULL
-                      OR write_path IN ('on_time','late_reconstruction')),
-            write_latency_seconds INTEGER,
-            policy TEXT,
-            methodology_version INTEGER NOT NULL,
-            app_version TEXT NOT NULL,
-            candidates TEXT,
-            selected_feed_ids TEXT,
-            feed_weights TEXT,
-            effective_cells TEXT,
-            source_runs TEXT,
-            hourly_values TEXT,
-            daily_quantities TEXT,
-            leaderboard_status TEXT,
-            created_at TEXT NOT NULL
-                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            -- the publication the record used: plain values with no foreign key
-            publication_id INTEGER,
-            publication_cutoff TEXT,
-            publication_age_days INTEGER,
-            CHECK(
-                (status = 'missed'
-                 AND missed_reason IS NOT NULL AND write_path IS NULL)
-                OR (status = 'recorded'
-                    AND missed_reason IS NULL AND write_path IS NOT NULL)
-            ),
-            UNIQUE(site_id, tz_generation_id, snapshot_local_date,
-                   variable, target_local_date)
-        );
-
-CREATE TABLE forecast_pairs (
-            id INTEGER PRIMARY KEY,
+CREATE TABLE forecast_history (
             site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
             feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
             variable TEXT NOT NULL,
-            issued_at TEXT NOT NULL,
-            valid_at TEXT NOT NULL,
-            lead_hours INTEGER NOT NULL CHECK(lead_hours >= 1),
             day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
-            forecast REAL NOT NULL,
-            observed REAL NOT NULL,
-            error REAL,
-            abs_error REAL,
-            sq_error REAL,
-            cat_hit INTEGER,
-            cat_false INTEGER,
-            cat_miss INTEGER,
-            cat_correct_neg INTEGER,
-            rain_threshold_mm REAL,
-            contributors INTEGER,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            first_known_at TEXT,
-            tz_generation_id INTEGER NOT NULL
-                REFERENCES timezone_generations(id),
-            UNIQUE(site_id, feed_id, variable, issued_at, valid_at,
-                   tz_generation_id)
-        );
+            valid_at TEXT NOT NULL,      -- the observations stamp, same text
+            local_date TEXT NOT NULL,    -- the day the hour belongs to
+            value REAL NOT NULL,         -- the forecast; for the mean, the mean
+            lead_hours INTEGER NOT NULL,
+            issued_at TEXT,              -- NULL only for a closed day's mean
+            contributors INTEGER,        -- the mean only
+            PRIMARY KEY (site_id, feed_id, variable, day_ahead, valid_at)
+        ) WITHOUT ROWID;
 
 CREATE TABLE forecast_samples (
             id INTEGER PRIMARY KEY,
@@ -370,35 +279,33 @@ CREATE TABLE forecast_value_changes (
             PRIMARY KEY (download_id, feed_id, variable)
         );
 
-CREATE TABLE "jobs" (
-                id INTEGER PRIMARY KEY,
-                type TEXT NOT NULL,
-                site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
-                job_key TEXT,
-                payload TEXT NOT NULL DEFAULT '{}',
-                status TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(status IN ('pending','running','completed','failed')),
-                next_attempt_at TEXT,
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                max_retries INTEGER NOT NULL DEFAULT 5,
-                last_error TEXT,
-                result TEXT,
-                created_at TEXT NOT NULL
-                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                updated_at TEXT NOT NULL
-                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                CHECK (
-                    (type = 'catchup' AND site_id IS NULL)
-                    OR (
-                        type IN ('fetch_feed','fetch_obs','fetch_current_obs',
-                                 'pair_and_score','backfill_site',
-                                 'forecast_record','record_gap_scan',
-                                 'verification_run','timezone_correction',
-                                 'day_close','day_publish')
-                        AND site_id IS NOT NULL
-                    )
+CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY,
+            type TEXT NOT NULL,
+            site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
+            job_key TEXT,
+            payload TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','running','completed','failed')),
+            next_attempt_at TEXT,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 5,
+            last_error TEXT,
+            result TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            CHECK (
+                (type = 'catchup' AND site_id IS NULL)
+                OR (
+                    type IN ('fetch_feed','fetch_obs','fetch_current_obs',
+                             'pair_and_score','backfill_site',
+                             'forecast_record','record_gap_scan',
+                             'verification_run','timezone_correction',
+                             'day_close','day_publish')
+                    AND site_id IS NOT NULL
                 )
-            );
+            )
+        );
 
 CREATE TABLE observations (
             id INTEGER PRIMARY KEY,
@@ -809,142 +716,6 @@ CREATE TABLE timezone_generations (
             provenance TEXT
         );
 
-CREATE TABLE verification_day_context (
-            id INTEGER PRIMARY KEY,
-            run_id INTEGER NOT NULL
-                REFERENCES verification_runs(id) ON DELETE CASCADE,
-            snapshot_local_date TEXT NOT NULL,
-            snapshot_utc TEXT NOT NULL,
-            knowability_exclusions TEXT NOT NULL,
-            null_availability_samples INTEGER NOT NULL,
-            UNIQUE(run_id, snapshot_local_date)
-        );
-
-CREATE TABLE verification_evidence (
-            id INTEGER PRIMARY KEY,
-            run_id INTEGER NOT NULL
-                REFERENCES verification_runs(id) ON DELETE CASCADE,
-            snapshot_local_date TEXT NOT NULL,
-            target_local_date TEXT NOT NULL,
-            lead INTEGER NOT NULL CHECK(lead BETWEEN 0 AND 7),
-            variable TEXT NOT NULL
-                CHECK(variable IN ('temperature','wind','precip')),
-            quantity TEXT NOT NULL CHECK(quantity IN
-                ('temperature_high','temperature_low','wind_max',
-                 'precip_total','precip_occurrence')),
-            entity_type TEXT NOT NULL CHECK(entity_type IN
-                ('depth','feed','baseline_persistence',
-                 'baseline_all_feed_mean','baseline_always_dry',
-                 'daily_rank_depth')),
-            entity_key TEXT NOT NULL,
-            predicted REAL,
-            forecast_eligible INTEGER NOT NULL
-                CHECK(forecast_eligible IN (0,1)),
-            forecast_exclusion_reason TEXT,
-            covered_hours INTEGER,
-            realized_contributors INTEGER,
-            truth_value REAL,
-            truth_eligible INTEGER NOT NULL CHECK(truth_eligible IN (0,1)),
-            truth_exclusion_reason TEXT,
-            truth_covered_hours INTEGER,
-            truth_wet_hours INTEGER,
-            truth_dry_hours INTEGER,
-            abs_error REAL,
-            occurrence_outcome TEXT
-                CHECK(occurrence_outcome IS NULL OR occurrence_outcome IN
-                    ('hit','miss','false_alarm','correct_negative')),
-            UNIQUE(run_id, snapshot_local_date, lead, variable, quantity,
-                   entity_type, entity_key)
-        );
-
-CREATE TABLE verification_results (
-            id INTEGER PRIMARY KEY,
-            run_id INTEGER NOT NULL
-                REFERENCES verification_runs(id) ON DELETE CASCADE,
-            variable TEXT NOT NULL,
-            lead INTEGER NOT NULL,
-            quantity TEXT NOT NULL,
-            entity_type TEXT NOT NULL,
-            entity_key TEXT NOT NULL,
-            headline INTEGER NOT NULL CHECK(headline IN (0,1)),
-            common_days INTEGER NOT NULL,
-            mae REAL,
-            bias REAL,
-            rmse REAL,
-            hits INTEGER,
-            misses INTEGER,
-            false_alarms INTEGER,
-            correct_negatives INTEGER,
-            ets REAL,
-            availability_rate REAL,
-            delta_vs_incumbent REAL,
-            detail TEXT,
-            UNIQUE(run_id, variable, lead, quantity, entity_type, entity_key)
-        );
-
-CREATE TABLE verification_run_inputs (
-            run_id INTEGER NOT NULL
-                REFERENCES verification_runs(id) ON DELETE CASCADE,
-            component TEXT NOT NULL,
-            value TEXT NOT NULL,
-            scope TEXT NOT NULL,
-            PRIMARY KEY (run_id, component)
-        );
-
-CREATE TABLE verification_runs (
-            id INTEGER PRIMARY KEY,
-            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-            tz_generation_id INTEGER NOT NULL
-                REFERENCES timezone_generations(id),
-            methodology_version INTEGER NOT NULL,
-            app_version TEXT NOT NULL,
-            state TEXT NOT NULL
-                CHECK(state IN ('running','published','failed')),
-            attempt INTEGER NOT NULL,
-            config_snapshot TEXT NOT NULL,
-            period_start TEXT,
-            period_end TEXT,
-            settled_through TEXT,
-            bootstrap_seed INTEGER NOT NULL,
-            bootstrap_resamples INTEGER NOT NULL,
-            input_fingerprint TEXT NOT NULL,
-            aggregate_state TEXT,
-            error TEXT,
-            created_at TEXT NOT NULL
-                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            published_at TEXT,
-            result_basis_fingerprint TEXT,
-            worksheet_kept INTEGER NOT NULL DEFAULT 1
-        );
-
-CREATE TABLE verification_trigger_decisions (
-            id INTEGER PRIMARY KEY,
-            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-            trigger_date TEXT NOT NULL,
-            decided_at TEXT NOT NULL
-                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            decision TEXT NOT NULL CHECK(decision IN
-                ('run_started','no_change_skip','suppressed_because_active',
-                 'skipped')),
-            reason TEXT,
-            input_fingerprint TEXT,
-            run_id INTEGER REFERENCES verification_runs(id)
-        );
-
-CREATE TABLE verification_verdicts (
-            id INTEGER PRIMARY KEY,
-            run_id INTEGER NOT NULL
-                REFERENCES verification_runs(id) ON DELETE CASCADE,
-            variable TEXT NOT NULL,
-            outcome TEXT NOT NULL CHECK(outcome IN
-                ('recommend','retain_incumbent','mixed_by_lead',
-                 'mixed_by_quantity','insufficient_evidence','skipped')),
-            recommended_depth INTEGER,
-            incumbent_depth INTEGER NOT NULL,
-            tested_family TEXT NOT NULL,
-            UNIQUE(run_id, variable)
-        );
-
 CREATE INDEX idx_close_stage_log_day
             ON close_stage_log(site_id, local_date, stage);
 
@@ -965,26 +736,15 @@ CREATE INDEX idx_forecast_downloads_day
             ON forecast_downloads(site_id, feed_id, local_date, ended_at, id);
 
 CREATE UNIQUE INDEX idx_jobs_active_dedupe
-                ON jobs(type, COALESCE(site_id, -1), job_key)
-                WHERE status IN ('pending','running') AND job_key IS NOT NULL;
+            ON jobs(type, COALESCE(site_id, -1), job_key)
+            WHERE status IN ('pending','running') AND job_key IS NOT NULL;
 
 CREATE INDEX idx_jobs_type_key_site
-                ON jobs(type, job_key, site_id, id);
-
-CREATE INDEX idx_pairs_cell
-            ON forecast_pairs(site_id, feed_id, variable, day_ahead, valid_at);
-
-CREATE INDEX idx_pairs_leaderboard
-            ON forecast_pairs(site_id, variable, day_ahead, valid_at);
-
-CREATE INDEX idx_pairs_winrate
-            ON forecast_pairs(site_id, variable, day_ahead, feed_id,
-                              valid_at, issued_at DESC, abs_error,
-                              tz_generation_id);
+            ON jobs(type, job_key, site_id, id);
 
 CREATE INDEX idx_samples_invalid ON forecast_samples(site_id, feed_id) WHERE (
-        (forecast_samples.variable='temperature' AND (forecast_samples.value < -90 OR forecast_samples.value > 70)) OR (forecast_samples.variable='wind' AND (forecast_samples.value < 0 OR forecast_samples.value > 150)) OR (forecast_samples.variable='precip' AND (forecast_samples.value < 0 OR forecast_samples.value > 500))
-        OR forecast_samples.variable NOT IN ('temperature', 'wind', 'precip')
+        (forecast_samples.variable='temperature' AND (forecast_samples.value < -90 OR forecast_samples.value > 70)) OR (forecast_samples.variable='wind' AND (forecast_samples.value < 0 OR forecast_samples.value > 150)) OR (forecast_samples.variable='precip' AND (forecast_samples.value < 0 OR forecast_samples.value > 500)) OR (forecast_samples.variable='cloud_cover' AND (forecast_samples.value < 0 OR forecast_samples.value > 100)) OR (forecast_samples.variable='wind_gust' AND (forecast_samples.value < 0 OR forecast_samples.value > 150)) OR (forecast_samples.variable='wind_direction' AND (forecast_samples.value < 0 OR forecast_samples.value > 360))
+        OR forecast_samples.variable NOT IN ('temperature', 'wind', 'precip', 'cloud_cover', 'wind_gust', 'wind_direction')
         OR forecast_samples.lead_hours < 1
         OR forecast_samples.issued_at NOT LIKE '____-__-__T__:__:__Z'
         OR forecast_samples.valid_at NOT LIKE '____-__-__T__:__:__Z'
@@ -1016,16 +776,6 @@ CREATE INDEX idx_station_changes_station
 CREATE INDEX idx_tz_generations_site
             ON timezone_generations(site_id, state);
 
-CREATE INDEX idx_verification_evidence_cell
-            ON verification_evidence(run_id, entity_type, quantity, lead,
-                                     target_local_date);
-
-CREATE INDEX idx_verification_runs_site
-            ON verification_runs(site_id, state, id);
-
-CREATE INDEX idx_verification_trigger_site_date
-            ON verification_trigger_decisions(site_id, trigger_date, id);
-
 CREATE TRIGGER trg_sites_backfill_status_insert_check
         BEFORE INSERT ON sites
         FOR EACH ROW
@@ -1051,4 +801,3 @@ CREATE TRIGGER trg_sites_backfill_status_update_check
         BEGIN
             SELECT RAISE(ABORT, 'invalid backfill_status');
         END;
-
