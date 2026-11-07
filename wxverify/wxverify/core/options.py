@@ -36,6 +36,9 @@ class RuntimeOptions(BaseModel):
     min_interval_seconds: int | None = Field(default=None, ge=60, le=1800)
     max_backoff_seconds: int | None = Field(default=None, ge=60, le=86400)
     request_timeout_seconds: int | None = Field(default=None, ge=1, le=300)
+    wind_constant_hours: int | None = Field(default=None, ge=2, le=48)
+    wind_constant_other_stations: int | None = Field(default=None, ge=1, le=10)
+    wind_constant_median_ms: int | None = Field(default=None, ge=0, le=20)
     # Explicit non-None default: set_source_cap no-ops on daily_call_limit is
     # None, so a None here would leave the seeded 1000 weathercom cap in force on
     # any boot path that omits the key — below the measured demand of about
@@ -114,6 +117,9 @@ def _from_env() -> RuntimeConfig:
             min_interval_seconds=_env_int("WXV_MIN_INTERVAL_SECONDS"),
             max_backoff_seconds=_env_int("WXV_MAX_BACKOFF_SECONDS"),
             request_timeout_seconds=_env_int("WXV_REQUEST_TIMEOUT_SECONDS"),
+            wind_constant_hours=_env_int("WXV_WIND_CONSTANT_HOURS"),
+            wind_constant_other_stations=_env_int("WXV_WIND_CONSTANT_OTHER_STATIONS"),
+            wind_constant_median_ms=_env_int("WXV_WIND_CONSTANT_MEDIAN_MS"),
             weathercom_daily_call_limit=_env_int("WXV_WEATHERCOM_DAILY_CALL_LIMIT")
             or 3000,
             monitor_pipeline=_env_bool("WXV_MONITOR_PIPELINE") is not False,
@@ -155,6 +161,9 @@ def _from_options_json(path: Path) -> RuntimeConfig:
             min_interval_seconds=options.get("min_interval_seconds"),
             max_backoff_seconds=options.get("max_backoff_seconds"),
             request_timeout_seconds=options.get("request_timeout_seconds"),
+            wind_constant_hours=options.get("wind_constant_hours"),
+            wind_constant_other_stations=options.get("wind_constant_other_stations"),
+            wind_constant_median_ms=options.get("wind_constant_median_ms"),
             weathercom_daily_call_limit=options.get("weathercom_daily_call_limit")
             or 3000,
             monitor_pipeline=options.get("monitor_pipeline", True),

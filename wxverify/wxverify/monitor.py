@@ -891,6 +891,32 @@ def _pipeline_conditions(
                 silent.detail or "",
             )
         )
+    # wind_station_constant:<station>: one failing row per open stuck-wind
+    # episode of an enabled station of an enabled site, built with the close
+    # on and off; a station with no episode has no row, so its id enters the
+    # failing list when its episode opens and leaves it when it clears.
+    for row in conn.execute(
+        """
+        SELECT st.pws_station_id, w.speed_kmh, w.since, w.state
+        FROM station_wind_constant w
+        JOIN stations st ON st.id = w.station_id
+        JOIN sites s ON s.id = st.site_id
+        WHERE st.enabled = 1 AND s.enabled = 1
+        ORDER BY st.id
+        """
+    ).fetchall():
+        pws = str(row["pws_station_id"])
+        cant_assess = " (can't assess)" if row["state"] == "cant_assess" else ""
+        conditions.append(
+            _cond(
+                f"wind_station_constant:{pws}",
+                True,
+                None,
+                "suspected: constant reading while other stations report wind:"
+                f" station {pws} {row['speed_kmh']} km/h since {row['since']}"
+                f"{cant_assess}",
+            )
+        )
     # Each close alert as a pipeline row, severity warning, through `_cond`,
     # so the start-up grace holds for it as for every pipeline row (§5.1);
     # alert 7 through its own builder, which keeps its recovered line.

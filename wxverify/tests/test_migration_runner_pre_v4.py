@@ -70,5 +70,6 @@ def test_o10_run_migrations_on_empty_matches_create_schema_plus_triggers() -> No
     # storage release: +1 forecast_history, -15 for forecast_pairs,
     # close_pairs and the seven verification_* tables and their own
     # indexes, all dropped (3.1, 4.1); 68 with card 29; 67 with the health
-    # release (`score_cache` dropped).
-    assert len(fresh_names) == 67
+    # release (`score_cache` dropped), 68 with the health release's
+    # `station_wind_constant` (Part A).
+    assert len(fresh_names) == 68

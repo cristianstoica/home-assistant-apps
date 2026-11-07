@@ -31,6 +31,12 @@ configuration:
     name: Maximum backoff (seconds)
   request_timeout_seconds:
     name: Request timeout (seconds)
+  wind_constant_hours:
+    name: "Stuck wind station: hours"
+  wind_constant_other_stations:
+    name: "Stuck wind station: other stations"
+  wind_constant_median_ms:
+    name: "Stuck wind station: others' median (m/s)"
   weathercom_daily_call_limit:
     name: Weather.com daily call limit
   monitor_pipeline:

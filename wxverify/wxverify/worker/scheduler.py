@@ -8,6 +8,7 @@ from datetime import timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
+from wxverify.db.constant_wind import assess_constant_wind
 from wxverify.db.queue import (
     LATEST_JOB_SQL,
     enqueue_if_absent_with_cooldown,
@@ -54,6 +55,8 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
     now = utc_now()
     enqueue_due_round_tries(conn, now_utc=now)
     enqueue_due_daytime_downloads(conn, now_utc=now)
+    # The stuck wind station check: at most once an hour, in this write.
+    assess_constant_wind(conn, now_utc=now)
     _enqueue_due_wind_days(conn)
     # The close's chain: scores are written only by its stage 5.
     enqueue_due_close_work(conn, now_utc=utc_now())

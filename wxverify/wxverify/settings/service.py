@@ -51,5 +51,17 @@ async def apply_plain_settings(options: RuntimeOptions) -> None:
             set_setting(
                 conn, "request_timeout_seconds", str(options.request_timeout_seconds)
             )
+        if options.wind_constant_hours is not None:
+            set_setting(conn, "wind_constant_hours", str(options.wind_constant_hours))
+        if options.wind_constant_other_stations is not None:
+            set_setting(
+                conn,
+                "wind_constant_other_stations",
+                str(options.wind_constant_other_stations),
+            )
+        if options.wind_constant_median_ms is not None:
+            set_setting(
+                conn, "wind_constant_median_ms", str(options.wind_constant_median_ms)
+            )
 
     await get_db().write(_apply)

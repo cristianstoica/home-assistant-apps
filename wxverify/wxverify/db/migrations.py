@@ -320,6 +320,13 @@ def create_tables(conn: sqlite3.Connection) -> None:
                       AND (pause_evidence_count = 0) = (pause_reason IS NULL))
         );
 
+        CREATE TABLE IF NOT EXISTS station_wind_constant (
+            station_id INTEGER PRIMARY KEY REFERENCES stations(id) ON DELETE CASCADE,
+            speed_kmh REAL NOT NULL,
+            since TEXT NOT NULL,   -- canonical UTC stamp of the run's first hour
+            state TEXT NOT NULL CHECK(state IN ('suspected','cant_assess'))
+        );
+
         CREATE TABLE IF NOT EXISTS station_current_obs (
             station_id INTEGER PRIMARY KEY REFERENCES stations(id) ON DELETE CASCADE,
             obs_time_utc TEXT,

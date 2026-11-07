@@ -91,6 +91,22 @@ def _all_table_rows(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ..
     }
 
 
+def _with_empty_station_wind_constant(
+    rows: dict[str, list[tuple[object, ...]]],
+) -> dict[str, list[tuple[object, ...]]]:
+    """``rows`` plus an empty ``station_wind_constant`` table.
+
+    ``create_tables`` makes ``station_wind_constant`` (Part A, §1 A2) on
+    every open, unconditionally and ahead of the version-17 savepoint, so
+    even a run that stops or is denied before `migrate_v18` does anything
+    still leaves this one empty table behind on a v17 file that never had
+    it. A before/after row comparison taken around such a run must expect
+    exactly this one addition, nothing else -- any other difference still
+    fails.
+    """
+    return {**rows, "station_wind_constant": []}
+
+
 # ---------------------------------------------------------------------------
 # UT1 (adapted): a fresh file and an upgraded v17 file produce the same
 # table and index names, and the same table_xinfo for every table. BT9's
@@ -437,14 +453,20 @@ def test_ut2_the_score_cache_table_and_only_its_key_go(
     after = _all_table_rows(conn)
     after_sets = {table: set(rows) for table, rows in after.items()}
 
-    assert set(after_sets) == set(before_sets) - {"score_cache"}, (
-        "exactly score_cache must disappear from the schema"
+    assert set(after_sets) == (
+        set(before_sets) - {"score_cache"} | {"station_wind_constant"}
+    ), (
+        "exactly score_cache must disappear from the schema, and the empty"
+        " station_wind_constant table create_tables always makes must appear"
     )
     assert after_sets["runtime_state"] == before_sets["runtime_state"] - {
         removed_row
     }, "exactly the download_record_since row must disappear from runtime_state"
+    assert after_sets["station_wind_constant"] == set(), (
+        "station_wind_constant must be empty -- this sub-step seeds no episode"
+    )
     for table, rows in after_sets.items():
-        if table == "runtime_state":
+        if table in ("runtime_state", "station_wind_constant"):
             continue
         assert rows == before_sets[table], (
             f"table {table!r} changed, but this sub-step touches only"
@@ -496,7 +518,7 @@ def test_ut3_a_stop_at_the_sub_step_leaves_everything_as_it_was(
         " their own instead of rolling back with the rest of the savepoint"
     )
     assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
-    assert _all_table_rows(conn) == before
+    assert _all_table_rows(conn) == _with_empty_station_wind_constant(before)
 
     monkeypatch.setattr(stop_module, "begin_step", real_begin_step)
     migrations.run_migrations(conn)
@@ -584,7 +606,7 @@ def test_ut3_a_denied_runtime_state_delete_rolls_back_the_drop_too(
         " columns would survive this rollback"
     )
     assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
-    assert _all_table_rows(conn) == before
+    assert _all_table_rows(conn) == _with_empty_station_wind_constant(before)
 
     migrations.run_migrations(conn)
     _assert_sub_step_done(conn)
@@ -772,7 +794,7 @@ def test_ut3_a_stop_at_poll_pause_leaves_everything_as_it_was(
     )
     assert not _has_pause_columns(conn)
     assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
-    assert _all_table_rows(conn) == before
+    assert _all_table_rows(conn) == _with_empty_station_wind_constant(before)
 
     monkeypatch.setattr(stop_module, "begin_step", real_begin_step)
     migrations.run_migrations(conn)
@@ -951,8 +973,9 @@ def test_ut2_prune_wind_history_deletes_only_the_done_sites_old_null_rows(
         for table, rows in _all_table_rows(conn).items()
         if table not in excluded
     }
-    assert after == before, (
-        "the prune must not touch any table besides station_wind_records"
+    assert after == _with_empty_station_wind_constant(before), (
+        "the prune must not touch any table besides station_wind_records,"
+        " beyond the empty station_wind_constant table create_tables always makes"
     )
 
     assert any(
@@ -1012,7 +1035,7 @@ def test_ut3_a_stop_at_prune_wind_history_leaves_everything_as_it_was(
         "the old row must survive a stop before this sub-step runs"
     )
     assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
-    assert _all_table_rows(conn) == before, (
+    assert _all_table_rows(conn) == _with_empty_station_wind_constant(before), (
         "a stop at v18_prune_wind_history runs after v18_poll_pause and"
         " v18_drop_unused_write_state, so this also fails if either of"
         " those committed on its own instead of rolling back with the rest"
@@ -1225,7 +1248,7 @@ def test_ut3_a_stop_at_drop_bad_display_values_leaves_everything_as_it_was(
         " before this sub-step and must roll back with it"
     )
     assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
-    assert _all_table_rows(conn) == before
+    assert _all_table_rows(conn) == _with_empty_station_wind_constant(before)
 
     monkeypatch.setattr(stop_module, "begin_step", real_begin_step)
     migrations.run_migrations(conn)
@@ -1330,7 +1353,7 @@ def test_ut3_a_denied_forecast_samples_delete_rolls_back_the_wind_prune_too(
         is not None
     )
     assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
-    assert _all_table_rows(conn) == before
+    assert _all_table_rows(conn) == _with_empty_station_wind_constant(before)
     assert not _has_pause_columns(conn)
 
     migrations.run_migrations(conn)

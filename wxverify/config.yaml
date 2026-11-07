@@ -49,6 +49,9 @@ options:
   min_interval_seconds: 300
   max_backoff_seconds: 86400
   request_timeout_seconds: 30
+  wind_constant_hours: 6
+  wind_constant_other_stations: 3
+  wind_constant_median_ms: 1
   weathercom_daily_call_limit: 3000
   monitor_pipeline: true
   monitor_budget: true
@@ -73,6 +76,9 @@ schema:
   min_interval_seconds: int(60,1800)
   max_backoff_seconds: int(60,86400)
   request_timeout_seconds: int(1,300)
+  wind_constant_hours: int(2,48)
+  wind_constant_other_stations: int(1,10)
+  wind_constant_median_ms: int(0,20)
   weathercom_daily_call_limit: int(1,20000)
   monitor_pipeline: bool
   monitor_budget: bool
