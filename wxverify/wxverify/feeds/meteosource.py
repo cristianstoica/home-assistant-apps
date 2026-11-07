@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from typing import Final
+from typing import Annotated, Final
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from wxverify.core.timeutil import isoformat_utc, lead_hours
 from wxverify.feeds.parse_cap_probe import emit_parse_cap_probe
 from wxverify.feeds.seam import (
     CostEstimate,
+    DisplayFloat,
     FetchResult,
     ForecastRequest,
     NormalizedSample,
+    display_mapping,
 )
 from wxverify.feeds.synthetic_run import snap_run
 
@@ -28,12 +30,23 @@ class MeteosourceWind(BaseModel):
     model_config = ConfigDict(extra="allow", frozen=True)
 
     speed: float | None = None
+    # Display only (card 7): degrees, "180° means wind from the south".
+    # ``dir`` (compass text) is not used.
+    angle: DisplayFloat = None
 
 
 class MeteosourcePrecipitation(BaseModel):
     model_config = ConfigDict(extra="allow", frozen=True)
 
     total: float | None = None
+
+
+class MeteosourceCloudCover(BaseModel):
+    """Display only (card 7): the total cloud cover in %."""
+
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    total: DisplayFloat = None
 
 
 class MeteosourceHour(BaseModel):
@@ -43,6 +56,9 @@ class MeteosourceHour(BaseModel):
     temperature: float | None = None
     wind: MeteosourceWind | None = None
     precipitation: MeteosourcePrecipitation | None = None
+    cloud_cover: Annotated[
+        MeteosourceCloudCover | None, BeforeValidator(display_mapping)
+    ] = None
 
 
 def _no_hours() -> list[MeteosourceHour]:
@@ -137,11 +153,16 @@ def _hour_samples(
 ) -> list[NormalizedSample]:
     wind_speed = None if hour.wind is None else hour.wind.speed
     precip_total = None if hour.precipitation is None else hour.precipitation.total
-    # Meteosource metric wind is already m/s, so no conversion.
+    wind_angle = None if hour.wind is None else hour.wind.angle
+    cloud_total = None if hour.cloud_cover is None else hour.cloud_cover.total
+    # Meteosource metric wind is already m/s, so no conversion. The reply
+    # has no gust key, so Meteosource gives no gust.
     specs: tuple[tuple[str, float | None, str], ...] = (
         ("temperature", hour.temperature, "C"),
         ("wind", wind_speed, "m/s"),
         ("precip", precip_total, "mm"),
+        ("cloud_cover", cloud_total, "%"),
+        ("wind_direction", wind_angle, "deg"),
     )
     out: list[NormalizedSample] = []
     for variable, raw_value, unit in specs:

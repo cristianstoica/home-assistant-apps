@@ -176,15 +176,14 @@ def enqueue_if_absent_with_cooldown(
 
     ``success_cooldown``, when given, additionally suppresses while the
     latest job is a *completed* row inside it — for a due-check whose
-    predicate legitimately stays true after a successful run (the record
-    due-check, whose completeness gate stays false all day on an ordinary
-    partial day). It fails CLOSED on an unreadable ``updated_at``, unlike
-    the failure cooldown beside it: the asymmetry is deliberate. Fail-open
-    on the failure cooldown costs one extra job; fail-open here costs an
-    unbounded tier-0 loop that re-runs the full record builder at worker
-    loop cadence and starves every other job type. The suppression is not
-    self-healing, and what bounds it is the date-scoped ``job_key`` — at
-    most one site-day, never a lane.
+    predicate legitimately stays true after a successful run (the wind
+    lane's, spaced by ``WIND_DAYS_SPACING``). It fails CLOSED on an
+    unreadable ``updated_at``, unlike the failure cooldown beside it: the
+    asymmetry is deliberate. Fail-open on the failure cooldown costs one
+    extra job; fail-open here costs an unbounded tier-0 loop that re-runs
+    the job at worker loop cadence and starves every other job type. The
+    suppression is not self-healing, so the wind lane's due-check reads the
+    stamp first and passes no ``success_cooldown`` when it is unreadable.
     """
     active = conn.execute(ACTIVE_JOB_SQL, (job_type, job_key, site_id)).fetchone()
     if active is None:
@@ -280,7 +279,7 @@ _CHAIN_TYPES_SQL: Final = "()"
 _CLAIM_ORDER_BY: Final = f"""
     ORDER BY
         CASE
-            WHEN type IN ('forecast_record','record_gap_scan','day_close','day_publish')
+            WHEN type IN ('day_close','day_publish')
                  OR (type = 'fetch_obs' AND job_key = 'wind-days')
                  OR (type = 'fetch_feed' AND job_key LIKE 'round:%') THEN 0
             WHEN type IN {_CHAIN_TYPES_SQL}
@@ -318,11 +317,11 @@ def _claim(conn: sqlite3.Connection, type_clause: str) -> Job | None:
     dispatcher.
 
     Ordering is a type-priority tier, then FIFO by ``created_at, id`` within
-    the tier (§14; the SQL is ``_CLAIM_ORDER_BY``). ``forecast_record`` /
-    ``record_gap_scan``, the daily close's ``day_close`` / ``day_publish``,
-    the wind lane's ``fetch_obs`` job keyed ``wind-days`` and the scored
-    round's ``fetch_feed`` tries keyed ``round:{feed_id}`` (tier 0) still
-    claim ahead of everything. A resumable chain chunk (a kind listed in
+    the tier (§14; the SQL is ``_CLAIM_ORDER_BY``). The daily close's
+    ``day_close`` / ``day_publish``, the wind lane's ``fetch_obs`` job keyed
+    ``wind-days`` and the scored round's ``fetch_feed`` tries keyed
+    ``round:{feed_id}`` (tier 0) still claim ahead of everything. A
+    resumable chain chunk (a kind listed in
     ``_CHAIN_TYPES_SQL``, which is empty today) would claim after all other
     work for its first ``CHAIN_PROMOTION_AGE`` (5 minutes), then in tier 1,
     FIFO by ``created_at`` with the rest, its age running from

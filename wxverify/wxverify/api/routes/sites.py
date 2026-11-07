@@ -13,10 +13,9 @@ from wxverify.api.errors import ApiError
 from wxverify.api.schemas import SiteCreate, SiteOut, SiteUpdate
 from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import get_db
-from wxverify.db.runtime_state import delete_runtime_state
 from wxverify.db.site_days import daily_close_on, start_site_days
 from wxverify.db.switch import ensure_site_generation
-from wxverify.verification.record import SNAPSHOT_TIME_KEY, gap_scan_failures_key
+from wxverify.verification.snapshot_time import SNAPSHOT_TIME_KEY
 
 router = APIRouter(prefix="/api/sites", tags=["sites"])
 
@@ -73,8 +72,8 @@ async def create_site(request: Request, body: SiteCreate) -> SiteOut | HTMLRespo
         site_id = int(row["id"])
         # A reused id may still carry keys a pre-0.16.7 delete left behind.
         _clear_site_state(conn, site_id)
-        # The site's one time zone generation, which every pair, truth and
-        # 07:00 record row of the site carries as its key.
+        # The site's one time zone generation, which every pair and truth
+        # row of the site carries as its key.
         ensure_site_generation(conn, site_id)
         # While the daily close is on, a new site starts fresh at its next
         # local date. It has no record yet, so its current local date is
@@ -138,12 +137,11 @@ async def update_site(
 
 
 def _clear_site_state(conn: sqlite3.Connection, site_id: int) -> None:
-    """Drop every runtime_state/settings row keyed by ``site_id``.
+    """Drop the settings row keyed by ``site_id``.
 
-    Site ids are reused (INTEGER PRIMARY KEY, no AUTOINCREMENT) and neither
-    table has a foreign key, so the sites cascade never reaches these rows.
+    Site ids are reused (INTEGER PRIMARY KEY, no AUTOINCREMENT) and the
+    settings table has no foreign key, so the sites cascade never reaches it.
     """
-    delete_runtime_state(conn, gap_scan_failures_key(site_id))
     conn.execute(
         "DELETE FROM settings WHERE key = ?", (f"{SNAPSHOT_TIME_KEY}:{site_id}",)
     )

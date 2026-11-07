@@ -407,17 +407,17 @@ def test_null_scope_columns_are_scopes() -> None:
     site_b = asof_make_site(conn_b, "S")
     _insert_job(
         conn_b,
-        job_type="record_gap_scan",
+        job_type="pair_and_score",
         site_id=site_b,
-        job_key="gapscan",
+        job_key="pair",
         status="failed",
         updated_at=_AGED,
     )
     _insert_job(
         conn_b,
-        job_type="record_gap_scan",
+        job_type="pair_and_score",
         site_id=site_b,
-        job_key="gapscan",
+        job_key="pair",
         status="completed",
         updated_at=_LATER,
         result="ok",
@@ -542,9 +542,6 @@ def test_alternating_failure_and_success_never_leaves_unresolved_row() -> None:
             False,
             id="tzcorr-membership-pin",
         ),
-        pytest.param(
-            "record_gap_scan", True, "gapscan:cont:1", 1, False, id="record_gap_scan"
-        ),
         pytest.param("fetch_feed", True, "fetch:1", 0, True, id="fetch_feed"),
         pytest.param("fetch_obs", True, "obs", 0, True, id="fetch_obs"),
         pytest.param(
@@ -554,14 +551,6 @@ def test_alternating_failure_and_success_never_leaves_unresolved_row() -> None:
         # (the pipeline it dispatched is gone), so a failed row now counts
         # by age alone, like the chain types above -- never superseded.
         pytest.param("pair_and_score", True, "score", 1, False, id="pair_and_score"),
-        pytest.param(
-            "forecast_record",
-            True,
-            "record:2026-07-06",
-            0,
-            True,
-            id="forecast_record",
-        ),
         pytest.param(
             "day_close",
             True,

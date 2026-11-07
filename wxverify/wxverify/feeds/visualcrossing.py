@@ -14,6 +14,7 @@ from wxverify.core.units import kmh_to_ms
 from wxverify.feeds.parse_cap_probe import emit_parse_cap_probe
 from wxverify.feeds.seam import (
     CostEstimate,
+    DisplayFloat,
     FetchResult,
     ForecastRequest,
     NormalizedSample,
@@ -35,6 +36,10 @@ class VisualCrossingHour(BaseModel):
     temp: float | None = None
     windspeed: float | None = None
     precip: float | None = None
+    # Display only (card 7): %, km/h ("may be empty"), degrees.
+    cloudcover: DisplayFloat = None
+    windgust: DisplayFloat = None
+    winddir: DisplayFloat = None
 
 
 def _no_hours() -> list[VisualCrossingHour]:
@@ -125,6 +130,9 @@ def _hour_samples(
         ("temperature", hour.temp, "C", False),
         ("wind", hour.windspeed, "km/h", True),
         ("precip", hour.precip, "mm", False),
+        ("cloud_cover", hour.cloudcover, "%", False),
+        ("wind_gust", hour.windgust, "km/h", True),
+        ("wind_direction", hour.winddir, "deg", False),
     )
     out: list[NormalizedSample] = []
     for variable, raw_value, unit, convert in specs:

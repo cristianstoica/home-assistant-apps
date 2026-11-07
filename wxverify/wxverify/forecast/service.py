@@ -15,7 +15,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Final, Literal
+from typing import Final, Literal, cast
 from zoneinfo import ZoneInfo
 
 from wxverify.core.timeutil import (
@@ -55,11 +55,16 @@ from wxverify.forecast.selection import (
     CellCandidate,
     CellSelection,
     confident_order_key,
+    ladder_order,
     representative_day_ahead,
     select_cell_feeds,
 )
 from wxverify.scoring.publication import RainRanks, published_rain_ranks
-from wxverify.settings.depth import DEPTH_VARIABLES, effective_blend_depths
+from wxverify.settings.depth import (
+    DEPTH_VARIABLES,
+    EffectiveDepth,
+    effective_blend_depths,
+)
 from wxverify.web.context import feed_label
 
 DAY_COUNT = 8
@@ -223,6 +228,105 @@ _RankCache = dict[tuple[str, int], ForecastRanking]
 _Cell = tuple[CellMeta, CellSelection, dict[int, list[float]]]
 
 
+@dataclass(frozen=True)
+class PageInputs:
+    """Everything the Forecast view and its hourly days read, loaded once.
+
+    :func:`load_page_inputs` reads it; :func:`build_view` and every
+    :func:`hourly_day` compute from it, so a page that shows both runs the
+    code that serves each. ``samples`` start at today's local midnight and
+    are served feeds only; ``grouped`` is them by variable, display day and
+    feed. ``stale_ids`` and ``unknown_ids`` come from ``freshness``.
+    ``rank_cache`` is shared: the builders fill it as they select.
+    """
+
+    site_id: int
+    timezone: str
+    at: datetime
+    today: date
+    samples: list[FutureSampleRow]
+    fingerprint: str
+    grouped: _Grouped
+    freshness: dict[int, FeedFreshness]
+    stale_ids: set[int]
+    unknown_ids: set[int]
+    depths: dict[str, EffectiveDepth]
+    rank_cache: _RankCache
+    close_on: bool
+    serving: wind_blend.WindServing
+    rain_ranks: dict[int, RainRanks]
+
+
+@dataclass(frozen=True)
+class HourlyDay:
+    """One display day's served hourly values (:func:`hourly_day`).
+
+    ``payload`` is the ``/api/forecast/hourly`` JSON without ``"feeds"``,
+    which :func:`build_hourly` adds. ``selections`` are the per-variable
+    blend sets the tile used, ``wind_weights`` the served wind weights by
+    feed and ``rain`` the tile's rain winner. ``ladder`` maps each variable
+    to every candidate feed id in the ladder's order (:func:`ladder_order`).
+    """
+
+    payload: dict[str, object]
+    selections: dict[str, CellSelection]
+    wind_weights: dict[int, float]
+    rain: _RainChoice
+    ladder: dict[str, list[int]]
+
+
+def load_page_inputs(
+    conn: sqlite3.Connection, *, site_id: int, timezone: str, at: datetime
+) -> PageInputs:
+    """Read the Forecast page's inputs for one site, once, at ``at``.
+
+    The sample window starts at today's local midnight in ``timezone``, with
+    served feeds only. The reads run in :func:`build_forecast`'s order:
+    samples, fingerprint, freshness, depths, the daily-close switch, wind
+    serving, then the published rain ranks.
+    """
+    samples = load_future_samples(
+        conn,
+        site_id=site_id,
+        since_valid_at=isoformat_utc(local_day_start(at, timezone)),
+        served_only=True,
+    )
+    fingerprint = forecast_fingerprint(conn, site_id=site_id)
+    grouped = _group_samples(samples, timezone=timezone, now=at)
+    freshness = load_feed_freshness(conn, site_id=site_id, now=at)
+    stale_ids = {feed_id for feed_id, row in freshness.items() if row.stale}
+    unknown_ids = {
+        feed_id for feed_id, row in freshness.items() if row.fetch_state == "unknown"
+    }
+    depths = effective_blend_depths(conn)
+    # One switch per read (9.1): the substitute flag is computed only with
+    # the close on, and stays False otherwise (11.3).
+    close_on = daily_close_on(conn)
+    today = at.astimezone(ZoneInfo(timezone)).date()
+    serving = wind_blend.load_wind_serving(
+        conn, site_id=site_id, timezone=timezone, today=today
+    )
+    # Rain follows the published rain ranking (rain release, C4), read once.
+    rain_ranks = published_rain_ranks(conn, site_id)
+    return PageInputs(
+        site_id=site_id,
+        timezone=timezone,
+        at=at,
+        today=today,
+        samples=samples,
+        fingerprint=fingerprint,
+        grouped=grouped,
+        freshness=freshness,
+        stale_ids=stale_ids,
+        unknown_ids=unknown_ids,
+        depths=depths,
+        rank_cache={},
+        close_on=close_on,
+        serving=serving,
+        rain_ranks=rain_ranks,
+    )
+
+
 def build_forecast(
     conn: sqlite3.Connection,
     *,
@@ -233,52 +337,56 @@ def build_forecast(
 ) -> ForecastView:
     """Build the full 8-tile Forecast view model for one site.
 
-    The sample window starts at today's local midnight, so day 0 is the
-    "forecast of record": each elapsed hour shows the freshest run that
-    covered it, and the daily aggregate spans the full local day. As a
-    consequence, a site with only elapsed-today samples renders tiles (with
-    stale badges) instead of the empty state until local midnight — intended
-    forecast-of-record behavior.
+    The sample window starts at today's local midnight, so day 0 covers the
+    whole local day: each elapsed hour shows the freshest run that covered
+    it, and the daily aggregate spans the full local day. As a consequence,
+    a site with only elapsed-today samples renders tiles (with stale badges)
+    instead of the empty state until local midnight — intended behavior.
 
     Rain does not go through the selection ladder: each tile shows the rain
     of its day ahead's rain winner from the published rain ranking
     (rain release, C4; :class:`PrecipCell`).
+
+    It is :func:`build_view` over :func:`load_page_inputs`.
     """
     at = now or utc_now()
-    samples = load_future_samples(
+    return build_view(
         conn,
-        site_id=site_id,
-        since_valid_at=isoformat_utc(local_day_start(at, timezone)),
-        served_only=True,
+        load_page_inputs(conn, site_id=site_id, timezone=timezone, at=at),
+        rain_threshold_mm=rain_threshold_mm,
     )
-    fingerprint = forecast_fingerprint(conn, site_id=site_id)
-    if not samples:
+
+
+def build_view(
+    conn: sqlite3.Connection, inputs: PageInputs, *, rain_threshold_mm: float
+) -> ForecastView:
+    """The 8-tile Forecast view model from one load of the page's inputs.
+
+    :func:`build_forecast`'s rules: the empty view with no sample, else one
+    tile per display day. Rankings are read through ``inputs.rank_cache``.
+    """
+    if not inputs.samples:
         return ForecastView(
             empty=True,
             tiles=[],
             updated_at=None,
             updated_ago=None,
-            fingerprint=fingerprint,
+            fingerprint=inputs.fingerprint,
         )
-    grouped = _group_samples(samples, timezone=timezone, now=at)
-    freshness = load_feed_freshness(conn, site_id=site_id, now=at)
-    stale_ids = {feed_id for feed_id, row in freshness.items() if row.stale}
-    unknown_ids = {
-        feed_id for feed_id, row in freshness.items() if row.fetch_state == "unknown"
-    }
-    depths = effective_blend_depths(conn)
-    rank_cache: _RankCache = {}
-    # One switch per read (9.1): the substitute flag is computed only with
-    # the close on, and stays False otherwise (11.3).
-    close_on = daily_close_on(conn)
-
-    tz = ZoneInfo(timezone)
-    today = at.astimezone(tz).date()
-    serving = wind_blend.load_wind_serving(
-        conn, site_id=site_id, timezone=timezone, today=today, as_of=None
-    )
-    # Rain follows the published rain ranking (rain release, C4), read once.
-    rain_ranks = published_rain_ranks(conn, site_id)
+    site_id = inputs.site_id
+    timezone = inputs.timezone
+    at = inputs.at
+    today = inputs.today
+    grouped = inputs.grouped
+    freshness = inputs.freshness
+    stale_ids = inputs.stale_ids
+    unknown_ids = inputs.unknown_ids
+    depths = inputs.depths
+    rank_cache = inputs.rank_cache
+    close_on = inputs.close_on
+    serving = inputs.serving
+    rain_ranks = inputs.rain_ranks
+    fingerprint = inputs.fingerprint
     # Per day: the cells, the rain choice, then the wind weights and note
     # for _build_tile.
     day_cells: list[
@@ -440,34 +548,90 @@ def build_hourly(
     rain ranks), all null with no winner; ``precip_aggregate`` names it and
     ``states["precip"]`` is the tile's (``normal``, or ``not_available``
     with no winner).
-    Per-feed series, drawn from ``feeds`` for every variable, ride along for
-    the "show individual feeds" toggle.
+    Per-feed series, drawn from ``feeds`` for every variable, ride along in
+    the ``/api/forecast/hourly`` payload for API clients that want each
+    feed beside the blend; the Forecast page does not read them.
 
-    The sample window starts at today's local midnight, so day 0 is the
-    "forecast of record": each elapsed hour shows the freshest run that
-    covered it. A site with only elapsed-today samples thus yields hourly
-    data (with stale badges) instead of an empty payload until local
-    midnight — intended forecast-of-record behavior.
+    The sample window starts at today's local midnight, so day 0 covers the
+    whole local day: each elapsed hour shows the freshest run that covered
+    it. A site with only elapsed-today samples thus yields hourly data (with
+    stale badges) instead of an empty payload until local midnight —
+    intended behavior.
 
     The wind line is the per-hour weighted mean of the eligible feeds (which
     join the hour axis and ``feeds``), ``states["wind"]`` ignores the ranking
     rebuild, and the payload carries ``weights`` and ``notes``.
+
+    It is :func:`hourly_day` over :func:`load_page_inputs`, plus ``feeds``:
+    every feed of any variable's selection, in first-selected order, with
+    its series for each variable on the hour axis.
     """
     at = now or utc_now()
-    samples = load_future_samples(
-        conn,
-        site_id=site_id,
-        since_valid_at=isoformat_utc(local_day_start(at, timezone)),
-        served_only=True,
-    )
-    grouped = _group_samples(samples, timezone=timezone, now=at)
-    depths = effective_blend_depths(conn)
-    rank_cache: _RankCache = {}
-    tz = ZoneInfo(timezone)
-    today = at.astimezone(tz).date()
-    serving = wind_blend.load_wind_serving(
-        conn, site_id=site_id, timezone=timezone, today=today, as_of=None
-    )
+    inputs = load_page_inputs(conn, site_id=site_id, timezone=timezone, at=at)
+    view = hourly_day(conn, inputs, day)
+    # hourly_day sets "hours" to the sorted hour axis, a list of stamps.
+    hours = cast(list[str], view.payload["hours"])
+    index = {valid_at: i for i, valid_at in enumerate(hours)}
+
+    feed_order: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for variable in VARIABLES:
+        for candidate in view.selections[variable].feeds:
+            if candidate.feed_id not in seen:
+                seen.add(candidate.feed_id)
+                feed_order.append(
+                    (candidate.feed_id, feed_label(candidate.source, candidate.model))
+                )
+    feeds = [
+        {
+            "feed_id": feed_id,
+            "label": label,
+            "temp_c": _feed_series(
+                inputs.grouped,
+                variable="temperature",
+                day=day,
+                feed_id=feed_id,
+                index=index,
+            ),
+            "wind_kmh": _feed_series(
+                inputs.grouped, variable="wind", day=day, feed_id=feed_id, index=index
+            ),
+            "precip_mm": _feed_series(
+                inputs.grouped,
+                variable="precip",
+                day=day,
+                feed_id=feed_id,
+                index=index,
+            ),
+        }
+        for feed_id, label in feed_order
+    ]
+    # "feeds" goes back between "precip_aggregate" and "states", so the JSON
+    # keeps its key order.
+    payload: dict[str, object] = {}
+    for key, value in view.payload.items():
+        payload[key] = value
+        if key == "precip_aggregate":
+            payload["feeds"] = feeds
+    return payload
+
+
+def hourly_day(conn: sqlite3.Connection, inputs: PageInputs, day: int) -> HourlyDay:
+    """One display day's served hourly values, from the page's one load.
+
+    :func:`build_hourly`'s rules without its per-feed ``feeds`` list: the
+    same selections, rain winner, hour axis, blend lines, ``states``,
+    ``weights`` and ``notes``. ``ladder`` orders each variable's candidates
+    for the day by :func:`ladder_order`, over the rankings the selections
+    cached in ``inputs.rank_cache``.
+    """
+    site_id = inputs.site_id
+    timezone = inputs.timezone
+    today = inputs.today
+    grouped = inputs.grouped
+    depths = inputs.depths
+    rank_cache = inputs.rank_cache
+    serving = inputs.serving
     wind_note: str | None = None
     wind_weights: dict[int, float] = {}
 
@@ -499,10 +663,27 @@ def build_hourly(
             rank_cache=rank_cache,
         )
 
+    # The ranked grid's order (card 7): every candidate of each variable,
+    # over the rankings the selections above cached.
+    ladder = {
+        variable: ladder_order(
+            _candidates(
+                conn,
+                site_id=site_id,
+                variable=variable,
+                timezone=timezone,
+                local_date=today + timedelta(days=day),
+                feeds_samples=grouped.get(variable, {}).get(day, {}),
+                rank_cache=rank_cache,
+            )[0]
+        )
+        for variable in VARIABLES
+    }
+
     # The hourly rain line is the tile's rain winner only (rain release, C4).
     precip_samples = grouped.get("precip", {}).get(day, {})
     rain = _rain_choice(
-        published_rain_ranks(conn, site_id).get(day),
+        inputs.rain_ranks.get(day),
         precip_samples,
         local_date=today + timedelta(days=day),
         timezone=timezone,
@@ -524,19 +705,15 @@ def build_hourly(
     hours = sorted(hour_set)
     index = {valid_at: i for i, valid_at in enumerate(hours)}
 
-    def series_for(variable: str, feed_id: int) -> list[float | None]:
-        feeds_samples = grouped.get(variable, {}).get(day, {})
-        out: list[float | None] = [None] * len(hours)
-        for sample in feeds_samples.get(feed_id, []):
-            value = sample.value
-            if variable == "wind":
-                value = ms_to_kmh(value)
-            out[index[sample.valid_at]] = value
-        return out
-
     def blend_series(variable: str) -> list[float | None]:
         per_feed = [
-            series_for(variable, candidate.feed_id)
+            _feed_series(
+                grouped,
+                variable=variable,
+                day=day,
+                feed_id=candidate.feed_id,
+                index=index,
+            )
             for candidate in selections[variable].feeds
         ]
         out: list[float | None] = []
@@ -544,16 +721,6 @@ def build_hourly(
             values = [s[i] for s in per_feed if s[i] is not None]
             out.append(blend_mean([v for v in values if v is not None]))
         return out
-
-    feed_order: list[tuple[int, str]] = []
-    seen: set[int] = set()
-    for variable in VARIABLES:
-        for candidate in selections[variable].feeds:
-            if candidate.feed_id not in seen:
-                seen.add(candidate.feed_id)
-                feed_order.append(
-                    (candidate.feed_id, feed_label(candidate.source, candidate.model))
-                )
 
     def wind_line() -> list[float | None]:
         wind_samples = grouped.get("wind", {}).get(day, {})
@@ -608,23 +775,42 @@ def build_hourly(
                 else EXTREMA_COVERAGE_INSUFFICIENT
             ),
         },
-        "feeds": [
-            {
-                "feed_id": feed_id,
-                "label": label,
-                "temp_c": series_for("temperature", feed_id),
-                "wind_kmh": series_for("wind", feed_id),
-                "precip_mm": series_for("precip", feed_id),
-            }
-            for feed_id, label in feed_order
-        ],
         "states": states,
     }
     payload["weights"] = {
         "wind": {str(feed_id): weight for feed_id, weight in wind_weights.items()}
     }
     payload["notes"] = {"wind": wind_note}
-    return payload
+    return HourlyDay(
+        payload=payload,
+        selections=selections,
+        wind_weights=wind_weights,
+        rain=rain,
+        ladder=ladder,
+    )
+
+
+def _feed_series(
+    grouped: _Grouped,
+    *,
+    variable: str,
+    day: int,
+    feed_id: int,
+    index: Mapping[str, int],
+) -> list[float | None]:
+    """One feed's hourly values for a display day on an hour axis.
+
+    ``index`` maps each axis ``valid_at`` to its column. Wind is in km/h;
+    a column the feed has no sample for is null.
+    """
+    feeds_samples = grouped.get(variable, {}).get(day, {})
+    out: list[float | None] = [None] * len(index)
+    for sample in feeds_samples.get(feed_id, []):
+        value = sample.value
+        if variable == "wind":
+            value = ms_to_kmh(value)
+        out[index[sample.valid_at]] = value
+    return out
 
 
 def _state_of(

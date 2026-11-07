@@ -4,10 +4,10 @@
 Site and timezone generation ids are reused (``INTEGER PRIMARY KEY``, no
 ``AUTOINCREMENT``), and the ``runtime_state`` and ``settings`` rows keyed by
 them have no foreign key, so the ``sites`` cascade never reaches them. A
-delete drops the site's gap-scan failures and per-site snapshot time, and
-leaves every other site's rows and the shared auth hold intact; a create
-clears whatever a pre-fix delete left on the reused id before seeding the
-new site. A failed cleanup rolls the whole delete back.
+delete drops the site's per-site snapshot time, and leaves every other
+site's rows and the shared auth hold intact; a create clears whatever a
+pre-fix delete left on the reused id before seeding the new site. A failed
+cleanup rolls the whole delete back.
 
 Isolation: a real tmp-file SQLite DB via ``init_db``/``close_db`` + an idle
 worker + ``TestClient`` (mirrors ``tests/test_forecast_routes.py`` /
@@ -21,7 +21,6 @@ Synthetic fixtures only — fake site names and station ids.
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -38,12 +37,7 @@ from wxverify.db.runtime_state import (
 )
 from wxverify.db.switch import ensure_site_generation, site_generation_id
 from wxverify.settings.keys import get_setting, set_setting
-from wxverify.verification.record import (
-    SNAPSHOT_TIME_KEY,
-    gap_scan_degraded_sites,
-    gap_scan_failures_key,
-    snapshot_wall_clock,
-)
+from wxverify.verification.snapshot_time import SNAPSHOT_TIME_KEY, snapshot_wall_clock
 
 # ---------------------------------------------------------------------------
 # Harness (mirrors tests/test_forecast_routes.py).
@@ -88,10 +82,6 @@ def _make_site(conn: sqlite3.Connection, name: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _site_keys(site_id: int) -> tuple[str, ...]:
-    return (gap_scan_failures_key(site_id),)
-
-
 def _post_create(client: Any, headers: dict[str, str], name: str) -> Any:
     return client.post(
         "/api/sites",
@@ -125,25 +115,7 @@ def test_delete_site_drops_all_site_state_and_a_reused_id_starts_fresh(
     gen_x = ensure_site_generation(conn, site_x)
     assert gen_y == 1 and gen_x == 2
 
-    for site, stamp, snap in (
-        (site_y, "2026-03-08T07:00:00Z", "06:15"),
-        (site_x, "2026-03-09T07:00:00Z", "05:45"),
-    ):
-        set_runtime_state(
-            conn,
-            gap_scan_failures_key(site),
-            json.dumps(
-                {
-                    "as_of": stamp,
-                    "dates": {
-                        "2026-03-08": {
-                            "error": "synthetic",
-                            "last_failed_at": stamp,
-                        }
-                    },
-                }
-            ),
-        )
+    for site, snap in ((site_y, "06:15"), (site_x, "05:45")):
         set_setting(conn, f"{SNAPSHOT_TIME_KEY}:{site}", snap)
 
     set_setting(conn, SNAPSHOT_TIME_KEY, "05:00")
@@ -160,30 +132,23 @@ def test_delete_site_drops_all_site_state_and_a_reused_id_starts_fresh(
 
         # 1. Positive controls before the delete.
         assert site_generation_id(conn, site_x) == gen_x
-        assert gap_scan_degraded_sites(conn) == (2, "2026-03-09T07:00:00Z")
 
         # 2. Delete.
         response = client.delete(f"/api/sites/{site_x}", headers=headers)
         assert response.status_code == 200
 
         # 3. Before the recreate.
-        for key in _site_keys(site_x):
-            assert get_runtime_state(conn, key) is None, key
         assert get_setting(conn, f"{SNAPSHOT_TIME_KEY}:{site_x}") is None
-        for key in _site_keys(site_y):
-            assert get_runtime_state(conn, key) is not None, key
         assert snapshot_wall_clock(conn, site_y) == "06:15"
         assert get_setting(conn, SNAPSHOT_TIME_KEY) == "05:00"
         assert get_runtime_state(conn, hold_key) == "held"
-        assert gap_scan_degraded_sites(conn) == (1, "2026-03-08T07:00:00Z")
 
         # Paired negative: deleting a nonexistent site 404s and touches no
         # state at all.
         missing_id = site_x + 1000
         missing_resp = client.delete(f"/api/sites/{missing_id}", headers=headers)
         assert missing_resp.status_code == 404
-        for key in _site_keys(site_y):
-            assert get_runtime_state(conn, key) is not None, key
+        assert snapshot_wall_clock(conn, site_y) == "06:15"
         assert get_runtime_state(conn, hold_key) == "held"
 
         # 4. Recreate.
@@ -218,38 +183,8 @@ def test_create_site_clears_keys_a_pre_fix_delete_left_on_the_reused_id(
     conn = _init_tmp_db(tmp_path)
     site_y = _make_site(conn, "Testsite Y")
     gen_y = ensure_site_generation(conn, site_y)
-    set_runtime_state(
-        conn,
-        gap_scan_failures_key(site_y),
-        json.dumps(
-            {
-                "as_of": "2026-03-08T07:00:00Z",
-                "dates": {
-                    "2026-03-08": {
-                        "error": "synthetic",
-                        "last_failed_at": "2026-03-08T07:00:00Z",
-                    }
-                },
-            }
-        ),
-    )
 
     orphan = site_y + 1
-    set_runtime_state(
-        conn,
-        gap_scan_failures_key(orphan),
-        json.dumps(
-            {
-                "as_of": "2026-03-09T07:00:00Z",
-                "dates": {
-                    "2026-03-09": {
-                        "error": "synthetic",
-                        "last_failed_at": "2026-03-09T07:00:00Z",
-                    }
-                },
-            }
-        ),
-    )
     set_setting(conn, f"{SNAPSHOT_TIME_KEY}:{orphan}", "05:45")
 
     app = _make_app(monkeypatch)
@@ -259,10 +194,7 @@ def test_create_site_clears_keys_a_pre_fix_delete_left_on_the_reused_id(
         csrf = client.get("/api/csrf").json()["csrf_token"]
         headers = {"Origin": "http://testserver", "X-CSRF-Token": csrf}
 
-        # 1. Before the create, the orphan (no site row yet) is ignored.
-        assert gap_scan_degraded_sites(conn) == (1, "2026-03-08T07:00:00Z")
-
-        # 2. Create; the new site must reuse the orphan's id.
+        # Create; the new site must reuse the orphan's id.
         create_resp = _post_create(client, headers, "Testsite Z")
         assert create_resp.status_code == 200
         new_id = create_resp.json()["id"]
@@ -271,7 +203,7 @@ def test_create_site_clears_keys_a_pre_fix_delete_left_on_the_reused_id(
             "-- rebuild, don't weaken"
         )
 
-        # 3. After the create.
+        # After the create.
         pointer = site_generation_id(conn, new_id)
         assert pointer is not None
         gen_row = conn.execute(
@@ -279,7 +211,6 @@ def test_create_site_clears_keys_a_pre_fix_delete_left_on_the_reused_id(
             (pointer,),
         ).fetchone()
         assert tuple(gen_row) == (new_id, "initial", "published")
-        assert gap_scan_degraded_sites(conn) == (1, "2026-03-08T07:00:00Z")
         assert get_setting(conn, f"{SNAPSHOT_TIME_KEY}:{new_id}") is None
         assert site_generation_id(conn, site_y) == gen_y
 
@@ -300,7 +231,7 @@ def test_delete_site_rolls_back_entirely_when_the_state_cleanup_fails(
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("synthetic cleanup failure")
 
-    monkeypatch.setattr("wxverify.api.routes.sites.delete_runtime_state", _boom)
+    monkeypatch.setattr("wxverify.api.routes.sites._clear_site_state", _boom)
 
     app = _make_app(monkeypatch)
     with TestClient(app, raise_server_exceptions=False) as client:

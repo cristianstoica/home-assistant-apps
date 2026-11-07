@@ -8,11 +8,9 @@ daily total and a wet-hour count need one value per hour, not merely "at
 least one" the way an extremum does. ``wet_hours`` replaces the old
 percentage-based ``wet_share``/``chance_pct`` with a plain count.
 
-G-T29 through G-T31 (the forecast-of-record's precipitation
-``hourly_values``) live in ``tests/test_record_oracles.py`` beside the
-Item G record oracles that share their fixture. G-T14/G-T15 (``wet_hours``'s
-own arithmetic) live in ``tests/test_forecast_aggregate.py``, the successors
-to the deleted ``wet_share``/``predicted_wet_hour_share`` tests.
+G-T14/G-T15 (``wet_hours``'s own arithmetic) live in
+``tests/test_forecast_aggregate.py``, the successors to the deleted
+``wet_share``/``predicted_wet_hour_share`` tests.
 
 All fixtures are synthetic and offline (the autouse ``_deny_network`` fixture
 in ``conftest.py`` fails any test that opens a socket): site timezone UTC
@@ -25,7 +23,7 @@ document.
 
 from __future__ import annotations
 
-import json
+import re
 import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
@@ -38,7 +36,6 @@ from tests.helpers import (
 )
 from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc
 from wxverify.db.migrations import run_migrations
-from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.aggregate import (
     EXTREMA_COVERAGE_COMPLETE,
     EXTREMA_COVERAGE_INSUFFICIENT,
@@ -46,6 +43,14 @@ from wxverify.forecast.aggregate import (
     covers_local_day,
     covers_local_day_exactly,
     displayed_daily,
+)
+from wxverify.forecast.page import (
+    LOW_CONFIDENCE_TEXT,
+    NO_RAIN_TEXT,
+    RANKING_UPDATING_TEXT,
+    STALE_TEXT,
+    ForecastPage,
+    build_forecast_page,
 )
 from wxverify.forecast.selection import CellCandidate, select_cell_feeds
 from wxverify.forecast.service import (
@@ -55,7 +60,6 @@ from wxverify.forecast.service import (
 from wxverify.scoring.metrics import MetricResult, MetricSums, metrics_from_sums
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.settings.keys import get_number_setting, set_setting
-from wxverify.verification.record import build_forecast_record, resolve_snapshot_utc
 from wxverify.web.render import env as jinja_env
 
 # ---------------------------------------------------------------------------
@@ -279,11 +283,51 @@ def _seed_uniform(
     )
 
 
-def _render_tiles(*, site_id: int, view: object) -> str:
+def _build_page(
+    conn: sqlite3.Connection, *, now: datetime, selected_day: int = 0
+) -> ForecastPage:
+    """``build_forecast_page`` with this file's fixed site params (mirrors
+    ``tests/test_forecast_extrema_coverage.py``'s identically-named
+    helper)."""
+    return build_forecast_page(
+        conn,
+        site_id=1,
+        timezone="UTC",
+        rain_threshold_mm=0.2,
+        selected_day=selected_day,
+        now=now,
+    )
+
+
+def _render_tiles(*, site_id: int, page: ForecastPage) -> str:
     tmpl = jinja_env.get_template("forecast/_tiles.html")
     return tmpl.render(
-        url=lambda p: str(p), site=SimpleNamespace(id=site_id), view=view
+        url=lambda p: str(p),
+        site=SimpleNamespace(id=site_id),
+        page=page,
+        day=page.selected_day,
     )
+
+
+def _day0_header_html(html: str) -> str:
+    """Today's (day index 0) day-header fragment (mirrors
+    ``tests/test_forecast_extrema_coverage.py``'s identically-named
+    helper)."""
+    return html.split('class="dh-cell ds"')[1]
+
+
+def _precip_day_text(html: str) -> str:
+    """The Precipitation grid's top-row day-column text (``page.rain_text``)
+    -- card 7's replacement for the old tile row's "Rain" ``<strong>``.
+    Scoped to the Precipitation ``<table>`` (the selected day's only)."""
+    section = html.split("Precipitation <span>mm/h</span>")[1]
+    section = section.split("</table>")[0]
+    start = section.index('<td class="day">') + len('<td class="day">')
+    end = section.index("</td>", start)
+    # The cell's visible text only -- the rain winner's markup (C4) wraps it
+    # in a <small> and, with an agreement percentage, a
+    # <span title="Agreement">: strip every tag, keep what a reader sees.
+    return re.sub(r"<[^>]+>", "", section[start:end]).strip()
 
 
 def _candidate(
@@ -601,10 +645,10 @@ def test_all_dry_complete_day_renders_differently_from_insufficient_coverage() -
     assert dry.total_mm == 0.0
     assert dry.wet_hours == 0
     assert dry.meta.state == "normal"
-    dry_html = _render_tiles(site_id=1, view=dry_view)
-    dry_row = dry_html.split("Rain</span>")[1].split("</div>")[0]
-    assert "No rain forecast" not in dry_row
-    assert "0.0 mm" in dry_row
+    dry_page = _build_page(conn, now=now)
+    dry_text = _precip_day_text(_render_tiles(site_id=1, page=dry_page))
+    assert dry_text != NO_RAIN_TEXT
+    assert dry_text == "0.0 mm · 0 h"
 
     empty_conn = _make_db()
     empty_view = build_forecast(
@@ -645,10 +689,11 @@ def test_all_dry_complete_day_renders_differently_from_insufficient_coverage() -
     assert partial.total_mm is None
     assert partial.wet_hours is None
     assert partial.meta.state == "not_available"
-    partial_html = _render_tiles(site_id=1, view=partial_view)
-    partial_row = partial_html.split("Rain</span>")[1].split("</div>")[0]
-    assert "No rain forecast" in partial_row
-    assert " mm" not in partial_row
+    partial_text = _precip_day_text(
+        _render_tiles(site_id=1, page=_build_page(partial_conn, now=now))
+    )
+    assert partial_text == NO_RAIN_TEXT
+    assert " mm" not in partial_text
     # A forecast of no rain must never look the same as insufficient coverage.
     assert (dry.total_mm, dry.wet_hours) != (partial.total_mm, partial.wet_hours)
 
@@ -675,11 +720,10 @@ def test_all_dry_complete_day_renders_differently_from_insufficient_coverage() -
     no_precip = no_precip_view.tiles[0].precip
     assert no_precip.meta.state == "not_available"
     assert no_precip.total_mm is None
-    no_precip_html = _render_tiles(site_id=1, view=no_precip_view)
-    assert (
-        "No rain forecast"
-        in (no_precip_html.split("Rain</span>")[1].split("</div>")[0])
+    no_precip_text = _precip_day_text(
+        _render_tiles(site_id=1, page=_build_page(no_precip_conn, now=now))
     )
+    assert no_precip_text == NO_RAIN_TEXT
 
 
 # ===========================================================================
@@ -1096,203 +1140,6 @@ def test_temperature_reconciliation_is_not_generalised() -> None:
 
 
 # ===========================================================================
-# G-T19 -- G-T20: the persisted row for a complete/suppressed day.
-# ===========================================================================
-
-_RECORD_DAY = date(2035, 6, 15)
-
-
-def _record_conn() -> sqlite3.Connection:
-    return _make_db()
-
-
-def _record_snapshot_t(local_date: date = _RECORD_DAY) -> datetime:
-    return resolve_snapshot_utc("UTC", local_date, "07:00")
-
-
-_RECORD_PUBLICATION_WINDOW_DAYS = 30
-_RECORD_PUBLICATION_WINDOW_KEY = f"w:{_RECORD_PUBLICATION_WINDOW_DAYS}"
-
-
-def _ensure_record_publication(conn: sqlite3.Connection) -> int:
-    """This connection's one site-1 publication, active at T
-    (:func:`_record_snapshot_t`), created on first use.
-
-    Unlike :func:`_ensure_test_publication` (the page-side helper, whose
-    far-future ``published_at`` is only ever read against a far-future
-    ``now``), the record's own ``_record_ranking`` reads the publication
-    active at T -- a publication published AFTER T is never active there,
-    so this seeds one published before T instead.
-    """
-    row = conn.execute(
-        "SELECT id FROM publications WHERE site_id = 1 ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    if row is not None:
-        return int(row["id"])
-    return seed_active_publication(
-        conn,
-        site_id=1,
-        cutoff=_RECORD_DAY - timedelta(days=1),
-        published_at=_record_snapshot_t() - timedelta(hours=1),
-        window_days=_RECORD_PUBLICATION_WINDOW_DAYS,
-        min_n=3,
-    )
-
-
-def _seed_record_score_cache(
-    conn: sqlite3.Connection,
-    *,
-    day_ahead: int,
-    pairs: dict[int, tuple[float | Sequence[float], float | Sequence[float]]],
-) -> None:
-    """:func:`_seed_score_cache` for a record-side connection: seeds the
-    publication active at T (:func:`_ensure_record_publication`) instead
-    of the page-side far-future one.
-    """
-    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-    pub_id = _ensure_record_publication(conn)
-    for feed_id, (forecast, observed) in pairs.items():
-        result = _precip_metric_result(
-            forecast=forecast, observed=observed, min_n=min_n
-        )
-        seed_publication_ranking(
-            conn,
-            publication_id=pub_id,
-            feed_id=feed_id,
-            variable="precip",
-            day_ahead=day_ahead,
-            window_key=_RECORD_PUBLICATION_WINDOW_KEY,
-            result=result,
-        )
-
-
-def _record_insert_day(
-    conn: sqlite3.Connection,
-    *,
-    feed_id: int,
-    local_date: date,
-    issued_at: str,
-    valid_ats: list[datetime],
-    value: float,
-    variable: str = "precip",
-) -> None:
-    issued = parse_utc(issued_at)
-    for valid in valid_ats:
-        lead = max(1, int((valid - issued).total_seconds() // 3600))
-        _insert_sample(
-            conn,
-            feed_id=feed_id,
-            variable=variable,
-            issued_at=issued_at,
-            valid_at=isoformat_utc(valid),
-            lead_hours=lead,
-            value=value,
-        )
-
-
-def test_persisted_row_complete_day() -> None:
-    conn = _record_conn()
-    ensure_site_generation(conn, 1)
-    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    full_ats = [
-        datetime(_RECORD_DAY.year, _RECORD_DAY.month, _RECORD_DAY.day, h, tzinfo=UTC)
-        for h in range(24)
-    ]
-    _record_insert_day(
-        conn,
-        feed_id=feed_id,
-        local_date=_RECORD_DAY,
-        issued_at="2035-06-14T20:00:00Z",
-        valid_ats=full_ats,
-        value=0.5,
-    )
-    conn.commit()
-    t = _record_snapshot_t()
-    build_forecast_record(conn, 1, _RECORD_DAY.isoformat(), now=t)
-    # Rain release, C4: the tile follows the published rain ranking (read
-    # with the daily close on), seeded after the record build so the record
-    # is built as before. With one feed, the winner's own total and hours
-    # match the record's one-feed figures.
-    seed_rain_ranks(conn, site_id=1, published_at=t, ranked={0: [feed_id]})
-    conn.commit()
-    view = build_forecast(conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=t)
-    tile = view.tiles[0]
-    assert tile.precip.total_mm == 12.0  # fixture guard: the tile has a winner
-
-    row = conn.execute(
-        """
-        SELECT * FROM forecast_of_record
-        WHERE site_id = 1 AND variable = 'precip' AND display_lead = 0
-        """
-    ).fetchone()
-    assert row is not None
-    displayed = json.loads(str(row["daily_quantities"]))["displayed"]
-    assert displayed["total_mm"] == tile.precip.total_mm
-    wet_hours_raw = displayed["wet_hours"]
-    assert isinstance(wet_hours_raw, float)
-    assert round(wet_hours_raw) == tile.precip.wet_hours
-    assert displayed["extrema_feed_ids"] == [feed_id]
-    assert displayed["extrema_coverage"] == EXTREMA_COVERAGE_COMPLETE
-    selection = select_cell_feeds(
-        [
-            CellCandidate(
-                feed_id=feed_id,
-                source="open-meteo",
-                model="ecmwf_ifs",
-                confident=False,
-                skill_score=None,
-                pair_n=0,
-                mae=None,
-                future_sample_count=24,
-                covered_hours=24,
-                extrema_eligible=True,
-            )
-        ],
-        blend_depth=2,
-        extrema_coverage_required=True,
-    )
-    assert displayed["extrema_low_confidence"] == selection.extrema_low_confidence
-    assert "chance" not in displayed
-
-
-def test_persisted_row_suppressed_day() -> None:
-    conn = _record_conn()
-    ensure_site_generation(conn, 1)
-    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    partial_ats = [
-        datetime(_RECORD_DAY.year, _RECORD_DAY.month, _RECORD_DAY.day, h, tzinfo=UTC)
-        for h in range(20)
-    ]
-    _record_insert_day(
-        conn,
-        feed_id=feed_id,
-        local_date=_RECORD_DAY,
-        issued_at="2035-06-14T20:00:00Z",
-        valid_ats=partial_ats,
-        value=0.5,
-    )
-    conn.commit()
-    t = _record_snapshot_t()
-    build_forecast_record(conn, 1, _RECORD_DAY.isoformat(), now=t)
-
-    row = conn.execute(
-        """
-        SELECT * FROM forecast_of_record
-        WHERE site_id = 1 AND variable = 'precip' AND display_lead = 0
-        """
-    ).fetchone()
-    assert row is not None
-    displayed = json.loads(str(row["daily_quantities"]))["displayed"]
-    assert displayed["total_mm"] is None
-    assert displayed["wet_hours"] is None
-    assert displayed["extrema_feed_ids"] == []
-    assert displayed["extrema_coverage"] == EXTREMA_COVERAGE_INSUFFICIENT
-    assert displayed["extrema_low_confidence"] is None
-    assert displayed["total_mm"] != 0
-    assert displayed["wet_hours"] != 0
-
-
-# ===========================================================================
 # G-T22 -- a partial-only day is never summed into a purported complete total.
 # ===========================================================================
 
@@ -1360,12 +1207,6 @@ _AB_STALE_ISSUED = "2026-07-20T02:00:00Z"
 # The fixtures below stamp each feed's last usable fetch at the issued_at they
 # are given, so "fresh"/"stale" above are fetch ages (the stale badge's basis)
 # as well as run ages.
-_STALE_BADGE = (
-    '<span class="badge warn" title="At least one feed used for this day has '
-    "gone more than twice its scheduled fetch interval without a usable "
-    "download, or its fetch interval is unknown. The age of the forecast "
-    "itself doesn't count.\">stale</span>"
-)
 
 
 def _stamp_usable_fetch(conn: sqlite3.Connection, *, feed_id: int, at: str) -> None:
@@ -1462,8 +1303,10 @@ def test_stale_union_for_precipitation() -> None:
     assert [ref.feed_id for ref in today.precip.meta.feeds] == [feed_b]
     assert today.precip.meta.stale is True
     assert today.stale is True
-    html = _render_tiles(site_id=1, view=view)
-    assert _STALE_BADGE in html
+    page = _build_page(conn, now=_AB_NOW)
+    assert STALE_TEXT in page.headers[0].warnings
+    html = _render_tiles(site_id=1, page=page)
+    assert STALE_TEXT in _day0_header_html(html)
 
     # Case 2: only A is stale. A is no contributor (no full day), so the
     # rain is not stale; A is the selected model, though, and B stands in
@@ -1514,16 +1357,17 @@ def test_stale_union_for_precipitation() -> None:
     assert [ref.feed_id for ref in precip3.meta.feeds] == [feed_b3]
     assert precip3.agreement_pct is not None  # fixture guard: C is a member
     assert precip3.meta.stale is True
-    assert _STALE_BADGE in _render_tiles(site_id=1, view=view3)
+    page3 = _build_page(conn3, now=_AB_NOW)
+    assert STALE_TEXT in page3.headers[0].warnings
+    html3 = _render_tiles(site_id=1, page=page3)
+    assert STALE_TEXT in _day0_header_html(html3)
 
 
 def test_confident_blend_set_with_unscored_precip_extrema_set() -> None:
     """Tile half, rain release C4: the rain cell has one feed set, the
     winner, and no leaderboard verdict. B (no precipitation pairs, the old
     unscored extrema set) is the winner of a settled rain ranking: both of
-    the cell's states read normal, and no confidence badge shows. The record
-    half (``build_forecast_record``, unchanged by C4) still flags its
-    extrema set low-confidence.
+    the cell's states read normal, and no confidence badge shows.
 
     ``seed_rain_ranks`` runs BEFORE ``_seed_ab_precip_fixture`` for the same
     reason given in ``test_stale_union_for_precipitation``: both create a
@@ -1545,69 +1389,22 @@ def test_confident_blend_set_with_unscored_precip_extrema_set() -> None:
     assert today.precip.meta.extrema_state == "normal"
     assert today.state == "normal"
     assert today.confidence_state == "normal"
-    html = _render_tiles(site_id=1, view=view)
-    assert '<article class="tile state-normal">' in html
-    assert '<span class="badge warn">low confidence</span>' not in html
-    assert '<span class="badge muted">ranking updating</span>' not in html
-
-    record_conn = _record_conn()
-    ensure_site_generation(record_conn, 1)
-    set_setting(record_conn, "min_n", "3")
-    rec_a = _feed_id(record_conn, "open-meteo", "ecmwf_ifs")
-    rec_b = _feed_id(record_conn, "open-meteo", "gfs_global")
-    full_ats = [
-        datetime(_RECORD_DAY.year, _RECORD_DAY.month, _RECORD_DAY.day, h, tzinfo=UTC)
-        for h in range(24)
-    ]
-    partial_ats = full_ats[:20]
-    _record_insert_day(
-        record_conn,
-        feed_id=rec_a,
-        local_date=_RECORD_DAY,
-        issued_at="2035-06-15T06:00:00Z",
-        valid_ats=partial_ats,
-        value=0.1,
-    )
-    _record_insert_day(
-        record_conn,
-        feed_id=rec_b,
-        local_date=_RECORD_DAY,
-        issued_at="2035-06-15T06:00:00Z",
-        valid_ats=full_ats,
-        value=0.15,
-    )
-    persistence_id = _feed_id(record_conn, "virtual", "_persistence")
-    _seed_record_score_cache(
-        record_conn,
-        day_ahead=0,
-        pairs={
-            persistence_id: (_PRECIP_POOR_FORECAST, _PRECIP_MIXED_OBSERVED),
-            rec_a: (_PRECIP_ACCURATE_FORECAST, _PRECIP_MIXED_OBSERVED),
-        },
-    )
-    t = _record_snapshot_t()
-    build_forecast_record(
-        record_conn, 1, _RECORD_DAY.isoformat(), now=t + timedelta(minutes=5)
-    )
-    row = record_conn.execute(
-        """
-        SELECT * FROM forecast_of_record
-        WHERE site_id = 1 AND variable = 'precip' AND display_lead = 0
-        """
-    ).fetchone()
-    assert row is not None
-    displayed = json.loads(str(row["daily_quantities"]))["displayed"]
-    assert displayed["extrema_feed_ids"] == [rec_b]
-    assert displayed["extrema_low_confidence"] is True
-    assert displayed["low_confidence"] is False
+    page = _build_page(conn, now=_AB_NOW)
+    header = page.headers[0]
+    assert header.not_available is False
+    assert LOW_CONFIDENCE_TEXT not in header.warnings
+    assert RANKING_UPDATING_TEXT not in header.warnings
+    html = _render_tiles(site_id=1, page=page)
+    frag = _day0_header_html(html)
+    assert "state-not_available" not in frag
+    assert LOW_CONFIDENCE_TEXT not in frag
+    assert RANKING_UPDATING_TEXT not in frag
 
 
 def test_rebuilding_precedence_on_the_precip_extrema_set() -> None:
     """Tile half, rain release C4: a PROVISIONAL rain ranking whose winner
     is B shows as the rain cell's rebuilding extrema state: the tile stays
-    state-normal and shows "ranking updating", never "low confidence". The
-    leaderboard statuses below are the old fixture's and no longer reach
-    the rain cell; they stay as the record half's setup."""
+    state-normal and shows "ranking updating", never "low confidence"."""
     conn = _make_db()
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
@@ -1674,56 +1471,16 @@ def test_rebuilding_precedence_on_the_precip_extrema_set() -> None:
     assert today.precip.meta.extrema_state == "rebuilding"
     assert today.state == "normal"
     assert today.confidence_state == "rebuilding"
-    html = _render_tiles(site_id=1, view=view)
-    assert '<article class="tile state-normal">' in html
-    assert '<span class="badge muted">ranking updating</span>' in html
-    assert '<span class="badge warn">low confidence</span>' not in html
-
-    record_conn = _record_conn()
-    ensure_site_generation(record_conn, 1)
-    set_setting(record_conn, "min_n", "3")
-    rec_a = _feed_id(record_conn, "open-meteo", "ecmwf_ifs")
-    rec_b = _feed_id(record_conn, "open-meteo", "gfs_global")
-    full_ats = [
-        datetime(_RECORD_DAY.year, _RECORD_DAY.month, _RECORD_DAY.day, h, tzinfo=UTC)
-        for h in range(24)
-    ]
-    partial_ats = full_ats[:20]
-    _record_insert_day(
-        record_conn,
-        feed_id=rec_a,
-        local_date=_RECORD_DAY,
-        issued_at="2035-06-15T06:00:00Z",
-        valid_ats=partial_ats,
-        value=0.1,
-    )
-    _record_insert_day(
-        record_conn,
-        feed_id=rec_b,
-        local_date=_RECORD_DAY,
-        issued_at="2035-06-15T06:00:00Z",
-        valid_ats=full_ats,
-        value=0.15,
-    )
-    persistence_id_rec = _feed_id(record_conn, "virtual", "_persistence")
-    _seed_record_score_cache(
-        record_conn,
-        day_ahead=0,
-        pairs={persistence_id_rec: (8.0, 10.0), rec_a: (10.1, 10.0)},
-    )
-    t = _record_snapshot_t()
-    build_forecast_record(
-        record_conn, 1, _RECORD_DAY.isoformat(), now=t + timedelta(minutes=5)
-    )
-    row = record_conn.execute(
-        """
-        SELECT * FROM forecast_of_record
-        WHERE site_id = 1 AND variable = 'precip' AND display_lead = 0
-        """
-    ).fetchone()
-    assert row is not None
-    displayed = json.loads(str(row["daily_quantities"]))["displayed"]
-    assert displayed["extrema_low_confidence"] is True
+    page = _build_page(conn, now=_AB_NOW)
+    header = page.headers[0]
+    assert header.not_available is False
+    assert RANKING_UPDATING_TEXT in header.warnings
+    assert LOW_CONFIDENCE_TEXT not in header.warnings
+    html = _render_tiles(site_id=1, page=page)
+    frag = _day0_header_html(html)
+    assert "state-not_available" not in frag
+    assert RANKING_UPDATING_TEXT in frag
+    assert LOW_CONFIDENCE_TEXT not in frag
 
 
 def test_suppressed_precip_extrema_contribute_to_neither_warning() -> None:
@@ -1779,24 +1536,32 @@ def test_suppressed_precip_extrema_contribute_to_neither_warning() -> None:
             conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
         )
         today = view.tiles[0]
-        html = _render_tiles(site_id=1, view=view)
+        page = _build_page(conn, now=_AB_NOW)
+        header = page.headers[0]
+        html = _render_tiles(site_id=1, page=page)
+        frag = _day0_header_html(html)
         assert today.wind.meta.state == "normal"  # fixture guard: tile shows
         assert today.wind.meta.stale is False
         if full_day:
             assert [ref.feed_id for ref in today.precip.meta.feeds] == [feed_a]
             assert today.precip.meta.stale is True
             assert today.precip.meta.extrema_state == "rebuilding"
-            assert _STALE_BADGE in html
-            assert '<span class="badge muted">ranking updating</span>' in html
+            assert STALE_TEXT in header.warnings
+            assert RANKING_UPDATING_TEXT in header.warnings
+            assert STALE_TEXT in frag
+            assert RANKING_UPDATING_TEXT in frag
         else:
             assert today.precip.meta.state == "not_available"
             assert today.precip.meta.extrema_state == "not_available"
             assert today.precip.meta.stale is False
             assert today.stale is False
             assert today.confidence_state == "normal"
-            assert '<span class="badge warn">low confidence</span>' not in html
-            assert '<span class="badge muted">ranking updating</span>' not in html
-            assert _STALE_BADGE not in html
+            assert LOW_CONFIDENCE_TEXT not in header.warnings
+            assert RANKING_UPDATING_TEXT not in header.warnings
+            assert STALE_TEXT not in header.warnings
+            assert LOW_CONFIDENCE_TEXT not in frag
+            assert RANKING_UPDATING_TEXT not in frag
+            assert STALE_TEXT not in frag
 
 
 # ===========================================================================

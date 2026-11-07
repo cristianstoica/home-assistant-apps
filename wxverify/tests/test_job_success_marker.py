@@ -2,8 +2,9 @@
 
 O14-O16 drive the marker through the real worker loop -- run_worker,
 claim_next_job, dispatch, _fetch_feed, fetch_feed_once,
-_complete_and_continue / the JobCancelled branch -- with only the HTTP
-adapter and the loop's housekeeping stubbed. Every fixture is synthetic:
+run_claimed_job's own result='ok' write / the JobCancelled branch -- with
+only the HTTP adapter and the loop's housekeeping stubbed. Every fixture is
+synthetic:
 one site named 'PatchTest' (via tests.test_011_patch's helpers) at the
 test suite's placeholder coordinates, and the open-meteo feed already
 seeded by init.

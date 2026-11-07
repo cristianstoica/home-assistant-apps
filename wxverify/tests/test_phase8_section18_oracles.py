@@ -34,7 +34,6 @@ from wxverify.collection.forecast_validation import FORECAST_VARIABLES
 from wxverify.core.options import RuntimeOptions, depth_option_values
 from wxverify.forecast.service import VARIABLES as FORECAST_SERVICE_VARIABLES
 from wxverify.settings.depth import DEPTH_VARIABLES
-from wxverify.verification.record import RECORD_VARIABLES
 
 # ===========================================================================
 # Family 1 — NB-4: the depth roster is ONE tuple, pinned by equality.
@@ -65,7 +64,6 @@ class TestDepthRosterLockstep:
                 "wxverify.collection.forecast_validation:FORECAST_VARIABLES",
                 FORECAST_VARIABLES,
             ),
-            ("wxverify.verification.record:RECORD_VARIABLES", RECORD_VARIABLES),
         ],
     )
     def test_every_derived_roster_equals_the_canonical_tuple(

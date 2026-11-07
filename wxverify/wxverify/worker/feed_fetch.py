@@ -26,6 +26,10 @@ from wxverify.collection.forecast_fetcher import (
     persist_fetch_result,
     write_scored_values,
 )
+from wxverify.collection.forecast_validation import (
+    DISPLAY_VARIABLES,
+    FORECAST_VARIABLES,
+)
 from wxverify.core import timeutil
 from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.timeutil import isoformat_utc, parse_utc
@@ -178,7 +182,7 @@ async def fetch_feed_once(
         lat=target.lat,
         lon=target.lon,
         model=target.model,
-        variables=("temperature", "wind", "precip"),
+        variables=FORECAST_VARIABLES + DISPLAY_VARIABLES,
         max_lead_hours=target.max_lead_hours,
     )
     async with httpx.AsyncClient() as client:
@@ -824,15 +828,21 @@ def _reply_cells(
 ) -> dict[int, dict[str, dict[str, float]]]:
     """The reply's usable values as ``{feed_id: {variable: {valid_at: value}}}``.
 
-    A usable sample has a lead of at least 1 hour, as ``persist_fetch_result``
-    counts it; a value that is not finite is left out. Where two labels give
-    the same hour, the newer label's value, as ``persist_fetch_result``
-    writes it.
+    A usable sample is of the scored roster and has a lead of at least 1
+    hour, as ``persist_fetch_result`` counts it; a display sample (card 7)
+    and a value that is not finite are left out. Where two labels give the
+    same hour, the newer label's value, as ``persist_fetch_result`` writes
+    it.
     """
     newest: dict[tuple[int, str, str], tuple[str, float]] = {}
     for sample in result.samples:
         feed_id = feed_ids.get(sample.model)
-        if feed_id is None or sample.lead_hours < 1 or not math.isfinite(sample.value):
+        if (
+            feed_id is None
+            or sample.variable not in FORECAST_VARIABLES
+            or sample.lead_hours < 1
+            or not math.isfinite(sample.value)
+        ):
             continue
         key = (feed_id, sample.variable, sample.valid_at)
         prior = newest.get(key)

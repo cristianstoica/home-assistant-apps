@@ -13,6 +13,7 @@ from wxverify.core.timeutil import isoformat_utc, lead_hours
 from wxverify.core.units import kmh_to_ms
 from wxverify.feeds.seam import (
     CostEstimate,
+    DisplayFloat,
     FetchResult,
     ForecastRequest,
     NormalizedSample,
@@ -31,6 +32,10 @@ class WeatherApiHour(BaseModel):
     temp_c: float | None = None
     wind_kph: float | None = None
     precip_mm: float | None = None
+    # Display only (card 7): %, km/h, degrees.
+    cloud: DisplayFloat = None
+    gust_kph: DisplayFloat = None
+    wind_degree: DisplayFloat = None
 
 
 def _no_hours() -> list[WeatherApiHour]:
@@ -116,6 +121,9 @@ def _hour_samples(
         ("temperature", hour.temp_c, "C", False),
         ("wind", hour.wind_kph, "km/h", True),
         ("precip", hour.precip_mm, "mm", False),
+        ("cloud_cover", hour.cloud, "%", False),
+        ("wind_gust", hour.gust_kph, "km/h", True),
+        ("wind_direction", hour.wind_degree, "deg", False),
     )
     out: list[NormalizedSample] = []
     for variable, raw_value, unit, convert in specs:

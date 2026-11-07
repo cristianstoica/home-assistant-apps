@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
@@ -42,31 +42,6 @@ logger = logging.getLogger(__name__)
 # feed cannot retry faster than it would ever have been polled.
 _DUE_JOB_FAILURE_COOLDOWN = timedelta(hours=1)
 
-# How often an INCOMPLETE record day may be re-attempted while its
-# late-write window is open. A success-retry cadence, deliberately distinct
-# from _DUE_JOB_FAILURE_COOLDOWN above (same value today, different
-# decision, and they will drift apart): one hour is strictly finer than the
-# fastest cadence of the thing being waited on -- every seeded feed carries
-# fetch_interval_minutes >= 180 and the obs poll defaults to 180 -- so an
-# hourly retry never delays an arriving sample, while capping the day's
-# re-runs at 24 instead of one per worker-loop iteration.
-RECORD_RETRY_INTERVAL = timedelta(hours=1)
-
-
-def record_window_open(now: datetime, snapshot_utc: datetime) -> bool:
-    """Whether ``now`` is still inside the day's late-write window.
-
-    A fail-closed guard on the record re-enqueue, not an active filter: the
-    scheduler re-derives both instants from the same local day, so the two
-    normally lie less than 24 h apart. Its only reachable trigger is a site
-    whose snapshot wall clock is before 01:00 on a DST fall-back day. Past
-    window close the builder refuses outright and the gap scan owns the
-    day, so enqueuing there is pure churn.
-    """
-    from wxverify.verification.methodology import LATE_WRITE_WINDOW_HOURS
-
-    return now <= snapshot_utc + timedelta(hours=LATE_WRITE_WINDOW_HOURS)
-
 
 def scheduler_tick(conn: sqlite3.Connection) -> None:
     logger.debug("scheduler tick")
@@ -80,84 +55,8 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
     enqueue_due_round_tries(conn, now_utc=now)
     enqueue_due_daytime_downloads(conn, now_utc=now)
     _enqueue_due_wind_days(conn)
-    _enqueue_due_forecast_records(conn)
     # The close's chain: scores are written only by its stage 5.
     enqueue_due_close_work(conn, now_utc=utc_now())
-
-
-def _enqueue_due_forecast_records(conn: sqlite3.Connection) -> None:
-    """Enqueue the daily forecast_record job (and gap scan) per site (§14).
-
-    Due when the site's local time has reached today's snapshot time T and
-    no record/missed row exists yet for (site, current generation, today).
-    The date-scoped ``job_key`` plus ``idx_jobs_active_dedupe`` guarantees
-    one active job per day even across the doubled autumn hour. The gap
-    scan is enqueued once per local day after T; a completed jobs row for
-    the day's key gates re-enqueue.
-    """
-    from wxverify.db.switch import ensure_site_generation
-    from wxverify.verification.record import (
-        record_day_complete,
-        resolve_snapshot_utc,
-        snapshot_wall_clock,
-    )
-
-    now = utc_now()
-    rows = conn.execute("SELECT id, timezone FROM sites WHERE enabled = 1").fetchall()
-    for row in rows:
-        site_id = int(row["id"])
-        timezone = str(row["timezone"])
-        try:
-            tz = ZoneInfo(timezone)
-            local_today = now.astimezone(tz).date()
-            wall_clock = snapshot_wall_clock(conn, site_id)
-            snapshot_utc = resolve_snapshot_utc(timezone, local_today, wall_clock)
-        except (ZoneInfoNotFoundError, ValueError):
-            # Foreign/corrupt timezone or wall clock: fail closed (skip this
-            # site for this tick) -- inventing a snapshot instant would stamp
-            # records on an invented schedule. Every other site still runs.
-            logger.warning(
-                "scheduler: unusable snapshot config site=%s; skipping", site_id
-            )
-            continue
-        if now < snapshot_utc:
-            continue
-        day_iso = local_today.isoformat()
-        generation_id = ensure_site_generation(conn, site_id)
-        # Three conditions, not one: a completeness predicate stays false
-        # all day on an ordinary partial day, and scheduler_tick runs once
-        # per worker-loop iteration -- so the window guard and the
-        # success cooldown are what keep this from becoming a hot loop.
-        if not record_day_complete(
-            conn, site_id, generation_id, day_iso
-        ) and record_window_open(now, snapshot_utc):
-            enqueue_if_absent_with_cooldown(
-                conn,
-                "forecast_record",
-                site_id,
-                f"record:{day_iso}",
-                {"snapshot_local_date": day_iso},
-                cooldown=_DUE_JOB_FAILURE_COOLDOWN,
-                success_cooldown=RECORD_RETRY_INTERVAL,
-            )
-        gap_key = f"gapscan:{day_iso}"
-        done = conn.execute(
-            """
-            SELECT 1 FROM jobs
-            WHERE type = 'record_gap_scan' AND site_id = ? AND job_key = ?
-            LIMIT 1
-            """,
-            (site_id, gap_key),
-        ).fetchone()
-        if done is None:
-            enqueue_if_absent_with_cooldown(
-                conn,
-                "record_gap_scan",
-                site_id,
-                gap_key,
-                {},
-                cooldown=_DUE_JOB_FAILURE_COOLDOWN,
-            )
 
 
 def _enqueue_due_wind_days(conn: sqlite3.Connection) -> None:

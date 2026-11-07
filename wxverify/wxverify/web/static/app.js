@@ -257,10 +257,8 @@
     }
   }
 
-  // Wind is m/s here (/api/timeseries returns the raw stored value, no
-  // conversion) but km/h in the forecast-hourly table further below
-  // (build_hourly converts server-side) -- the two summaries deliberately
-  // use different wind units for that reason.
+  // Wind is m/s here: /api/timeseries returns the raw stored value, no
+  // conversion.
   var VARIABLE_UNITS = {
     temperature: "°C",
     precip: " mm",
@@ -586,262 +584,6 @@
     table.appendChild(tbody);
   }
 
-  // Shared between the chart's own series/legend labels and the summary
-  // table's column headers below, so the two can never drift apart.
-  var HOURLY_TEMP_LABEL = "Temp °C";
-  var HOURLY_PRECIP_LABEL = "Precip mm";
-  var HOURLY_WIND_LABEL = "Wind km/h";
-
-  // Blended hourly drill-down: temp line (left axis), precip bars (right
-  // axis), wind line (legend-only scale). Per-feed series are created hidden
-  // and toggled via the "Show individual feeds" checkbox.
-  function renderForecastHourly(el, payload) {
-    var hours = payload.hours || [];
-    var xs = [];
-    var keep = [];
-    hours.forEach(function (value, index) {
-      var t = parseTime(value);
-      if (t !== null) {
-        xs.push(t);
-        keep.push(index);
-      }
-    });
-    if (!window.uPlot || xs.length === 0) {
-      emptyChart(el, "No hourly data yet.");
-      return;
-    }
-    function pick(values) {
-      return keep.map(function (index) {
-        var v = (values || [])[index];
-        return v === undefined ? null : v;
-      });
-    }
-    var blend = payload.blend || {};
-    var series = [{}];
-    var data = [xs];
-    series.push({
-      label: HOURLY_TEMP_LABEL,
-      scale: "t",
-      stroke: cssVar("--chart-1"),
-      width: 2
-    });
-    data.push(pick(blend.temp_c));
-    series.push({
-      label: HOURLY_PRECIP_LABEL,
-      scale: "p",
-      stroke: cssVar("--chart-2"),
-      fill: cssVar("--chart-2"),
-      width: 1,
-      paths: uPlot.paths.bars({ size: [0.6, 100] }),
-      points: { show: false }
-    });
-    data.push(pick(blend.precip_mm));
-    series.push({
-      label: HOURLY_WIND_LABEL,
-      scale: "w",
-      stroke: cssVar("--chart-3"),
-      width: 2
-    });
-    data.push(pick(blend.wind_kmh));
-    var feedSeriesIdx = [];
-    (payload.feeds || []).forEach(function (feed, feedIndex) {
-      var color = cssVar(SKILL_PALETTE[feedIndex % SKILL_PALETTE.length]);
-      [
-        ["temp_c", "t", "temp"],
-        ["precip_mm", "p", "precip"],
-        ["wind_kmh", "w", "wind"]
-      ].forEach(function (spec) {
-        series.push({
-          label: feed.label + " " + spec[2],
-          scale: spec[1],
-          stroke: color,
-          width: 1,
-          show: false
-        });
-        data.push(pick(feed[spec[0]]));
-        feedSeriesIdx.push(series.length - 1);
-      });
-    });
-    var xAxis = themedAxis();
-    var tAxis = themedAxis();
-    tAxis.scale = "t";
-    tAxis.label = "°C";
-    var pAxis = themedAxis();
-    pAxis.scale = "p";
-    pAxis.side = 1;
-    pAxis.label = "mm";
-    el.innerHTML = "";
-    var chart = new uPlot({
-      width: Math.max(el.clientWidth, 320),
-      height: 300,
-      scales: {
-        x: { time: true },
-        p: {
-          range: function (u, min, max) {
-            return [0, Math.max(max || 0, 1)];
-          }
-        }
-      },
-      axes: [xAxis, tAxis, pAxis],
-      series: series
-    }, data, el);
-    labelChartCanvas(chart, "Hourly forecast chart");
-    el.uplotInstance = chart;
-    el.feedSeriesIdx = feedSeriesIdx;
-    var summary = summaryEl(el);
-    if (summary) {
-      renderForecastHourlySummary(summary, payload, xs, pick, el);
-    }
-  }
-
-  // Renders a site-local-time-of-day label for an epoch second, using the
-  // site's IANA zone (not the browser's -- this table's "day" is the site's
-  // local day per build_hourly, a different zone than the viewer's, which is
-  // exactly why every label here is explicit about whose clock it is on).
-  // Falls back to the browser's own local time if the zone is missing or
-  // Intl rejects it, rather than throwing.
-  function hourFormatter(timezone) {
-    if (!timezone) {
-      return null;
-    }
-    try {
-      return new Intl.DateTimeFormat("en-GB", {
-        timeZone: timezone,
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false
-      });
-    } catch (err) {
-      return null;
-    }
-  }
-
-  function dayDateText(epochSeconds, timezone) {
-    if (!timezone) {
-      return null;
-    }
-    try {
-      return new Intl.DateTimeFormat("en-CA", {
-        timeZone: timezone,
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit"
-      }).format(new Date(epochSeconds * 1000));
-    } catch (err) {
-      return null;
-    }
-  }
-
-  function formatHour(epochSeconds, formatter) {
-    var d = new Date(epochSeconds * 1000);
-    if (formatter) {
-      return formatter.format(d);
-    }
-    return pad2(d.getHours()) + ":" + pad2(d.getMinutes());
-  }
-
-  function formatCell(value, unit) {
-    return value === null || value === undefined ? "n/a" : value.toFixed(1) + unit;
-  }
-
-  // The accessible equivalent of the N faint per-feed lines the toggle
-  // reveals: how far apart the feeds are at this hour, not each one listed
-  // separately (that would be 3N columns instead of 3).
-  function spreadAt(feedArrays, key, index) {
-    var min = null;
-    var max = null;
-    feedArrays.forEach(function (feed) {
-      var v = feed[key][index];
-      if (v === null || v === undefined) {
-        return;
-      }
-      if (min === null || v < min) {
-        min = v;
-      }
-      if (max === null || v > max) {
-        max = v;
-      }
-    });
-    return { min: min, max: max };
-  }
-
-  function formatRange(range, unit) {
-    if (range.min === null) {
-      return "n/a";
-    }
-    if (range.min === range.max) {
-      return range.min.toFixed(1) + unit;
-    }
-    return range.min.toFixed(1) + "–" + range.max.toFixed(1) + unit;
-  }
-
-  // xs/pick are the exact closures renderForecastHourly built from this same
-  // payload (parseTime-filtered, keep-aligned), so the table can never show
-  // an hour the chart itself dropped or misalign a value to the wrong hour.
-  function renderForecastHourlySummary(summary, payload, xs, pick, el) {
-    var timezone = el.dataset.timezone || "";
-    var timeFormatter = hourFormatter(timezone);
-    var dateText = dayDateText(xs[0], timezone);
-
-    var captionText = payload.label || "Selected day";
-    if (dateText) {
-      captionText += " (" + dateText + ")";
-    }
-    if (timeFormatter) {
-      captionText += ", site time " + timezone;
-    } else {
-      captionText += ", browser local time";
-    }
-    captionText += ". " + xs.length + " hour" + (xs.length === 1 ? "" : "s") + ".";
-    // Plan §10: when too few feeds have a track record the hourly payload
-    // carries notes.wind; say why wind is blank.
-    if (payload.notes && typeof payload.notes.wind === "string" && payload.notes.wind) {
-      captionText += " Wind: " + payload.notes.wind;
-    }
-
-    summaryStatus(summary, captionText);
-    var detail = summaryDetail(summary);
-    var table = buildDetailsTable(detail, "Hourly data table", captionText);
-    var thead = document.createElement("thead");
-    var headRow = document.createElement("tr");
-    var hourHeader = document.createElement("th");
-    hourHeader.setAttribute("scope", "col");
-    hourHeader.textContent = "Hour";
-    headRow.appendChild(hourHeader);
-    appendColumnHeaders(headRow, [
-      HOURLY_TEMP_LABEL, HOURLY_WIND_LABEL, HOURLY_PRECIP_LABEL,
-      "Temp range", "Wind range", "Precip range"
-    ]);
-    thead.appendChild(headRow);
-    table.appendChild(thead);
-
-    var blend = payload.blend || {};
-    var blendTemp = pick(blend.temp_c);
-    var blendWind = pick(blend.wind_kmh);
-    var blendPrecip = pick(blend.precip_mm);
-    var feedPicked = (payload.feeds || []).map(function (feed) {
-      return {
-        temp_c: pick(feed.temp_c),
-        wind_kmh: pick(feed.wind_kmh),
-        precip_mm: pick(feed.precip_mm)
-      };
-    });
-
-    var tbody = document.createElement("tbody");
-    xs.forEach(function (t, index) {
-      var tr = document.createElement("tr");
-      appendCell(tr, formatHour(t, timeFormatter), true);
-      appendCell(tr, formatCell(blendTemp[index], "°C"));
-      appendCell(tr, formatCell(blendWind[index], " km/h"));
-      appendCell(tr, formatCell(blendPrecip[index], " mm"));
-      appendCell(tr, formatRange(spreadAt(feedPicked, "temp_c", index), "°C"));
-      appendCell(tr, formatRange(spreadAt(feedPicked, "wind_kmh", index), " km/h"));
-      appendCell(tr, formatRange(spreadAt(feedPicked, "precip_mm", index), " mm"));
-      tbody.appendChild(tr);
-    });
-    table.appendChild(tbody);
-  }
-
   // [data-chart] containers must never carry role="img" or aria-hidden: uPlot
   // mounts a real <table class="u-legend"> inside them, and role="img" is
   // children-presentational, so it would flatten that legend out of the
@@ -861,8 +603,6 @@
       .then(function (payload) {
         if (el.dataset.chart === "overlay") {
           renderOverlay(el, payload);
-        } else if (el.dataset.chart === "forecast-hourly") {
-          renderForecastHourly(el, payload);
         } else {
           renderSkill(el, payload);
         }
@@ -883,29 +623,159 @@
     bootCharts(event.target);
   });
 
-  // "Show individual feeds" checkbox: flips visibility of the hidden per-feed
-  // series registered on the chart element by renderForecastHourly.
+  // Forecast region (#forecast-tiles): the feed picker, the grids' scroll
+  // positions and the day warning tips. A poll or a day click swaps the whole
+  // region, so the picker's choice lives here and is applied again after
+  // every swap. hiddenFeeds holds the feed ids (data-f / data-feed) whose
+  // model rows are hidden.
+  var hiddenFeeds = new Set();
+  var FORECAST_SCROLLERS = [".tl-wrap", ".mm-wrap .panel"];
+  var savedScroll = null;
+
+  // Hides the rows of every hidden feed, ticks the picker to match, and names
+  // the choice on its summary and on its Select all / Clear all button.
+  function applyFeedPicker(root) {
+    root.querySelectorAll("tr[data-feed]").forEach(function (row) {
+      row.hidden = hiddenFeeds.has(row.dataset.feed);
+    });
+    var picker = root.querySelector("details.feed-picker");
+    if (!picker) {
+      return;
+    }
+    var boxes = picker.querySelectorAll("input[data-f]");
+    var shown = 0;
+    boxes.forEach(function (box) {
+      box.checked = !hiddenFeeds.has(box.dataset.f);
+      shown += box.checked ? 1 : 0;
+    });
+    var all = shown === boxes.length;
+    picker.querySelector("summary").textContent = all
+      ? "All feeds"
+      : shown === 0 ? "No feeds" : shown + " of " + boxes.length + " feeds";
+    var button = picker.querySelector("button.feed-all");
+    if (button) {
+      button.dataset.all = all ? "none" : "all";
+      button.textContent = all ? "Clear all" : "Select all";
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    applyFeedPicker(document);
+  });
+
   document.body.addEventListener("change", function (event) {
+    var box = event.target;
+    if (!box || !box.matches || !box.matches(".feed-picker input[data-f]")) {
+      return;
+    }
+    if (box.checked) {
+      hiddenFeeds.delete(box.dataset.f);
+    } else {
+      hiddenFeeds.add(box.dataset.f);
+    }
+    applyFeedPicker(document);
+  });
+
+  document.body.addEventListener("click", function (event) {
+    var button = event.target && event.target.closest
+      ? event.target.closest(".feed-picker button.feed-all")
+      : null;
+    if (!button) {
+      return;
+    }
+    var clear = button.dataset.all === "none";
+    button.closest(".feed-picker").querySelectorAll("input[data-f]").forEach(function (box) {
+      if (clear) {
+        hiddenFeeds.add(box.dataset.f);
+      } else {
+        hiddenFeeds.delete(box.dataset.f);
+      }
+    });
+    applyFeedPicker(document);
+  });
+
+  // A click outside an open picker closes it, and a click anywhere but on a
+  // warning mark closes any open tip; a click on a mark toggles its own tip.
+  document.addEventListener("click", function (event) {
     var target = event.target;
-    if (!target || !target.matches("input[data-feed-toggle]")) {
+    var warn = target && target.closest ? target.closest(".day-warn") : null;
+    document.querySelectorAll("details.feed-picker[open]").forEach(function (picker) {
+      if (!picker.contains(target)) {
+        picker.open = false;
+      }
+    });
+    document.querySelectorAll('.day-warn[aria-expanded="true"]').forEach(function (other) {
+      if (other !== warn) {
+        other.setAttribute("aria-expanded", "false");
+      }
+    });
+    if (warn) {
+      var open = warn.getAttribute("aria-expanded") === "true";
+      warn.setAttribute("aria-expanded", open ? "false" : "true");
+    }
+  });
+
+  // Esc closes every tip, including one shown by hover or focus: .tip-off
+  // holds a mark's tip closed until the pointer or focus comes back to it.
+  document.addEventListener("keydown", function (event) {
+    if (event.key !== "Escape") {
       return;
     }
-    var chartEl = document.getElementById(target.getAttribute("data-feed-toggle"));
-    if (!chartEl || !chartEl.uplotInstance || !chartEl.feedSeriesIdx) {
+    document.querySelectorAll(".day-warn").forEach(function (warn) {
+      warn.setAttribute("aria-expanded", "false");
+      warn.classList.add("tip-off");
+    });
+  });
+  ["mouseover", "focusin"].forEach(function (type) {
+    document.addEventListener(type, function (event) {
+      var warn = event.target;
+      if (warn && warn.classList && warn.classList.contains("day-warn")) {
+        warn.classList.remove("tip-off");
+      }
+    });
+  });
+
+  // beforeSwap fires on the old region and afterSettle on the new one, so
+  // the timeline's and each grid's scrollLeft are carried across the swap.
+  document.body.addEventListener("htmx:beforeSwap", function (event) {
+    var region = event.detail.target;
+    if (!region || region.id !== "forecast-tiles" || !event.detail.shouldSwap) {
       return;
     }
-    chartEl.feedSeriesIdx.forEach(function (index) {
-      chartEl.uplotInstance.setSeries(index, { show: target.checked });
+    savedScroll = FORECAST_SCROLLERS.map(function (selector) {
+      return Array.from(region.querySelectorAll(selector), function (el) {
+        return el.scrollLeft;
+      });
+    });
+  });
+
+  document.body.addEventListener("htmx:afterSettle", function (event) {
+    var region = event.target;
+    if (!region || region.id !== "forecast-tiles") {
+      return;
+    }
+    applyFeedPicker(region);
+    var saved = savedScroll;
+    savedScroll = null;
+    if (!saved) {
+      return;
+    }
+    FORECAST_SCROLLERS.forEach(function (selector, i) {
+      region.querySelectorAll(selector).forEach(function (el, j) {
+        if (j < saved[i].length) {
+          el.scrollLeft = saved[i][j];
+        }
+      });
     });
   });
 
   // Feed subscription toggles: progress text while a change applies, the
   // fragment guard, and the outcome when no fragment came back. Each Sites
-  // page toggle carries data-sub-toggle (data-feed-toggle is the chart
-  // checkbox above) and an hx-disabled-elt naming every button in its own
-  // section, so htmx locks that section while the request is in flight. A
-  // success swaps in a fresh section whose status line the server wrote; only
-  // the paths that leave the old section in place write the line here.
+  // page toggle carries data-sub-toggle and an hx-disabled-elt naming every
+  // button in its own section, so htmx locks that section while the request
+  // is in flight. A success swaps in a fresh section whose status line the
+  // server wrote; only the paths that leave the old section in place write
+  // the line here.
   var SUB_BUSY = "Applying the change. This can take several minutes; the buttons stay locked until it finishes.";
   var SUB_UNKNOWN = "No answer yet. The change may still be applying. Wait a few minutes, then reload the page to see the current state before clicking again.";
   var SUB_SESSION = "Session expired or request blocked — reload the page to continue";

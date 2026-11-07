@@ -201,10 +201,10 @@ def assert_summary_mount_not_nested_in_chart(html: str, *, summary_id: str) -> N
 
 # ---------------------------------------------------------------------------
 # As-of / outcome-knowability fixture builders (plan §6, §18.1, §18.6).
-# Shared by test_asof_leakage.py, test_asof_reconstruction.py, and other
-# files still exercising knowable-pair fixtures (e.g. test_record_oracles.py,
-# test_publication_readers.py) after the as-of ranking/leaderboard machinery
-# itself was removed with the daily close made permanent (W6b).
+# Shared by test_asof_reconstruction.py and other files still exercising
+# knowable-pair fixtures (e.g. test_publication_readers.py) after the as-of
+# ranking/leaderboard machinery itself was removed with the daily close made
+# permanent (W6b).
 # All values are synthetic (fake site names, fake source/model ids).
 # ---------------------------------------------------------------------------
 
@@ -589,13 +589,6 @@ _CLOSE_CLOCK_MODULES: Final[tuple[str, ...]] = (
     # never applies and a completed job is claimed again every tick
     # (TL7's record job claimed 500 times before this was added).
     "wxverify.db.queue",
-    # wxverify.verification.record imports utc_now BY NAME too (record.py:31)
-    # and uses it in compute_forecast_record's `at = now or utc_now()` default
-    # -- without this entry a build reads the real 2026 clock against a
-    # close-chain test's 2024 snapshot, so `at` lands far past
-    # snapshot_utc + LATE_WRITE_WINDOW_HOURS and the build raises
-    # JobCancelled on every record job.
-    "wxverify.verification.record",
     # wxverify.collection.budget imports utc_now BY NAME too (budget.py:15)
     # and uses it to check a feed's daily call budget -- without this entry
     # the round's tests cannot move the clock past the budget day boundary.
@@ -992,7 +985,6 @@ _NON_CLOSE_ENQUEUERS: Final[tuple[str, ...]] = (
     "enqueue_due_round_tries",
     "enqueue_due_daytime_downloads",
     "_enqueue_due_wind_days",
-    "_enqueue_due_forecast_records",
 )
 
 
@@ -1000,8 +992,7 @@ def disable_other_enqueuers(
     monkeypatch: pytest.MonkeyPatch, *, keep: Sequence[str] = ()
 ) -> None:
     """No-op every one of ``scheduler_tick``'s non-close enqueuers except
-    those named in ``keep`` (plan §15.1 "Other job kinds."; TL7 keeps
-    ``_enqueue_due_forecast_records``). ``_enqueue_due_obs``,
+    those named in ``keep`` (plan §15.1 "Other job kinds."). ``_enqueue_due_obs``,
     ``_enqueue_due_verification_runs`` and ``_enqueue_due_score_refresh``
     (the routine download's clock, the nightly replay trigger and the score
     backstop) are retired (R1, R12, R17) and no longer exist to no-op.
@@ -1480,57 +1471,6 @@ def install_test_source_domains(monkeypatch: pytest.MonkeyPatch) -> None:
 
     for source in ROUND_SCHEDULE_SOURCES.values():
         monkeypatch.setitem(SOURCE_DOMAINS, source, f"{source}.example.invalid")
-
-
-# ---------------------------------------------------------------------------
-# P4 §18.1
-#
-# Shared fixture for PD1's record half (tests/test_p4_dormant.py). The
-# replay-chain drivers that used to live here (``build_verification_replay_site``,
-# ``drive_verification_chain``, ``drive_verification_chain_until_phase``) left
-# with their last users, WC7 (tests/test_worksheet_cleanup.py) and PD4's
-# cleanup-after-a-replay-publish half (tests/test_p4_dormant.py), when R12
-# retired the replay chain (``worker/verification_run.py``). Append-only:
-# nothing above this line changes.
-# ---------------------------------------------------------------------------
-
-
-def build_record_site_with_sample(
-    conn: sqlite3.Connection, *, close_on: bool
-) -> tuple[int, int]:
-    """A site with one subscribed feed and one usable temperature sample
-    valid at D 06:00Z (day ahead 0 from D) -- for driving
-    ``build_forecast_record`` directly. Copied from
-    ``tests/test_record_publication.py``'s own ``_build_site_with_sample``
-    (that file is another agent's and is left untouched), since PD1's
-    record half (``tests/test_p4_dormant.py``) needs the identical shape
-    with the close off. Returns ``(site_id, feed_id)``.
-    """
-    site_id = day_close_site(conn, close_on=close_on, with_records=False)
-    cur = conn.execute(
-        "INSERT INTO feeds"
-        " (source, model, enabled, default_subscribed,"
-        "  fetch_interval_minutes, max_lead_hours, is_virtual)"
-        " VALUES ('synthetic-pd1-record', 'synthetic-pd1-record', 1, 0, 360, 168, 0)"
-    )
-    assert cur.lastrowid is not None
-    feed_id = int(cur.lastrowid)
-    conn.execute(
-        "INSERT INTO site_feed_state (site_id, feed_id, enabled, error_count)"
-        " VALUES (?, ?, 1, 0)",
-        (site_id, feed_id),
-    )
-    issued_at = f"{D.isoformat()}T00:00:00Z"
-    valid_at = f"{D.isoformat()}T06:00:00Z"
-    conn.execute(
-        "INSERT INTO forecast_samples"
-        " (site_id, feed_id, variable, issued_at, valid_at, lead_hours, value,"
-        "  source_raw, model_run_id, fetched_at)"
-        " VALUES (?, ?, 'temperature', ?, ?, 6, 12.0, 'synthetic', ?, ?)",
-        (site_id, feed_id, issued_at, valid_at, issued_at, issued_at),
-    )
-    conn.commit()
-    return site_id, feed_id
 
 
 # ---------------------------------------------------------------------------

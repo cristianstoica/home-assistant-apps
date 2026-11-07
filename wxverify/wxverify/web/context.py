@@ -1621,7 +1621,7 @@ def load_wind_weights(
     except (ZoneInfoNotFoundError, ValueError):
         return None
     serving = load_wind_serving(
-        conn, site_id=site.id, timezone=site.timezone, today=today, as_of=None
+        conn, site_id=site.id, timezone=site.timezone, today=today
     )
     at_lead = {
         feed_id: weight
@@ -1653,6 +1653,39 @@ def feed_label(source: str, model: str) -> str:
     if source == "virtual":
         return model.removeprefix("_").replace("_", " ").title()
     return f"{source} / {model}"
+
+
+#: The model names :func:`model_label` gives, by stored (source, model): the
+#: Open-Meteo models, and the single-model providers, whose one feed is their
+#: "blend" and is named after the provider.
+_MODEL_NAMES: Final[dict[tuple[str, str], str]] = {
+    ("open-meteo", "ecmwf_ifs"): "ECMWF IFS",
+    ("open-meteo", "gfs_global"): "GFS Global",
+    ("open-meteo", "icon_global"): "ICON Global",
+    ("open-meteo", "gem_global"): "GEM Global",
+    ("open-meteo", "meteofrance_arpege_world"): "ARPEGE World",
+    ("open-meteo", "jma_gsm"): "JMA GSM",
+    ("open-meteo", "ukmo_global_deterministic_10km"): "UKMO Global 10 km",
+    ("open-meteo", "icon_eu"): "ICON-EU",
+    ("visualcrossing", "blend"): "Visual Crossing",
+    ("openweathermap", "blend"): "OpenWeatherMap",
+    ("weatherapi", "blend"): "WeatherAPI",
+    ("meteosource", "blend"): "Meteosource",
+    ("google", "blend"): "Google",
+}
+
+
+def model_label(source: str, model: str) -> str:
+    """A feed's model name only, never "source / model" (the Forecast page).
+
+    The meteoblue package feed and the virtual feeds get :func:`feed_label`'s
+    text. A pair in ``_MODEL_NAMES`` gets its name there; any other pair,
+    such as a meteoblue package member, gets its stored ``model`` unchanged,
+    which is that provider's own model name.
+    """
+    if source == "virtual" or (source == "meteoblue" and model == "multimodel"):
+        return feed_label(source, model)
+    return _MODEL_NAMES.get((source, model), model)
 
 
 FEED_DESCRIPTIONS: dict[tuple[str, str], str] = {

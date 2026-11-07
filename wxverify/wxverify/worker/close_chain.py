@@ -34,11 +34,14 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from typing import Final, Literal, cast
+from zoneinfo import ZoneInfoNotFoundError
 
+from wxverify.collection.forecast_validation import DISPLAY_VARIABLES
 from wxverify.core import stop
 from wxverify.core.timeutil import (
     isoformat_utc,
     isoformat_utc_micro,
+    local_day_start,
     parse_utc,
     utc_now,
 )
@@ -1680,15 +1683,53 @@ _DELETE_OLD_SCORED_SQL: Final = (
     "DELETE FROM forecast_scored"
     " WHERE site_id = ? AND julianday(valid_at) < julianday(?)"
 )
+#: Card 7 (plan 4.4): one display variable's rows of one site for hours
+#: before the bound, the site's local midnight of today (the Forecast page's
+#: first hour). String comparison on ``valid_at``, as the display loader
+#: reads it, so ``idx_samples_site_var_valid`` serves the whole key. The
+#: variable is always bound to a display name, so scored rows are never
+#: touched.
+DELETE_PAST_DISPLAY_SAMPLES_SQL: Final = (
+    "DELETE FROM forecast_samples WHERE site_id = ? AND variable = ? AND valid_at < ?"
+)
+
+
+def _delete_past_display_samples(conn: sqlite3.Connection, now_utc: datetime) -> None:
+    """Delete the display rows (card 7) no longer shown, for every site
+    (enabled or not) whose zone loads (plan 4.4).
+
+    The bound is ``isoformat_utc(local_day_start(now_utc, sites.timezone))``,
+    so today's earlier hours keep theirs. A site whose zone does not load
+    keeps its rows (fail closed), with one WARNING; the zone error is caught
+    here and never reaches the caller's savepoint, where it would roll back
+    every retention delete of the run. A naive ``now_utc`` is read as UTC.
+    """
+    aware_now = now_utc if now_utc.tzinfo is not None else now_utc.replace(tzinfo=UTC)
+    for site_id, timezone in conn.execute(
+        "SELECT id, timezone FROM sites ORDER BY id"
+    ).fetchall():
+        try:
+            bound = isoformat_utc(local_day_start(aware_now, str(timezone)))
+        except (ZoneInfoNotFoundError, ValueError, OSError):
+            logger.warning(
+                "close retention: site %s timezone does not load; its display"
+                " rows are kept",
+                site_id,
+            )
+            continue
+        for variable in DISPLAY_VARIABLES:
+            conn.execute(DELETE_PAST_DISPLAY_SAMPLES_SQL, (site_id, variable, bound))
 
 
 def run_close_retention(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
-    """Prune raw readings, the old scored values and the close's two logs
-    (plan 8.4, 11.6; rain release Part B, B6).
+    """Prune raw readings, the old scored values, the past display rows and
+    the close's two logs (plan 8.4, 11.6; rain release Part B, B6; card 7).
 
     Runs P2's ``prune_raw_readings``, deletes the ``forecast_scored`` rows
-    of hours before each site's oldest day not yet done, and deletes the
-    stage-log and try-log rows older than ``CLOSE_LOG_KEEP_DAYS``, inside
+    of hours before each site's oldest day not yet done, deletes the display
+    rows of ``forecast_samples`` before each site's local midnight of today
+    (``_delete_past_display_samples``), and deletes the stage-log and
+    try-log rows older than ``CLOSE_LOG_KEEP_DAYS``, inside
     ``SAVEPOINT close_retention`` in the caller's transaction, for every
     site. An exception is re-raised when the transaction is gone or it is a
     database error (``_database_failing``); any other is rolled back to the
@@ -1700,6 +1741,7 @@ def run_close_retention(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
         prune_raw_readings(conn, now_utc=now_utc)
         for site_id, day_start in conn.execute(_OLDEST_UNDONE_STARTS_SQL).fetchall():
             conn.execute(_DELETE_OLD_SCORED_SQL, (site_id, day_start))
+        _delete_past_display_samples(conn, now_utc)
         cutoff = isoformat_utc_micro(now_utc - timedelta(days=CLOSE_LOG_KEEP_DAYS))
         conn.execute("DELETE FROM close_stage_log WHERE ended_at < ?", (cutoff,))
         conn.execute("DELETE FROM close_try_log WHERE tried_at < ?", (cutoff,))

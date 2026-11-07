@@ -210,8 +210,12 @@ def _commit_once(
     return counts
 
 
-_TOKEN_RE = re.compile(r'fingerprint=([0-9a-z-]*)"')
-_DEPTH_LINE_RE = re.compile(r'<p class="muted depth-line">(.*?)</p>', re.DOTALL)
+#: Card 7's region hx-get now reads "...&fingerprint=<token>&day=<n>" (no
+#: longer a closing quote right after the token), so the token is bounded by
+#: the following "&day=" rather than by '"'. Jinja autoescapes the attribute
+#: text, so the rendered HTML carries "&amp;" rather than a bare "&".
+_TOKEN_RE = re.compile(r"fingerprint=([0-9a-z-]*)&amp;day=")
+_ACTIVE_PILL_RE = re.compile(r'<a class="pill active"[^>]*>([^<]*)</a>')
 
 
 def _token(html: str) -> str:
@@ -220,14 +224,14 @@ def _token(html: str) -> str:
     return matches[0]
 
 
-def _depth_line(html: str) -> str:
-    match = _DEPTH_LINE_RE.search(html)
-    assert match is not None, "no depth-line paragraph found"
-    return " ".join(match.group(1).split())
-
-
-def _heading(name: str) -> str:
-    return f"<p>{name} - combined forecast from the best-performing feeds</p>"
+def _site_label(html: str) -> str:
+    """The active site pill's name -- card 7 dropped the per-site subtitle
+    ("<site> - combined forecast from the best-performing feeds") this used
+    to read; the site-picker pill is the one place a specific site's name
+    is still rendered, so it is the replacement site-identity check."""
+    match = _ACTIVE_PILL_RE.search(html)
+    assert match is not None, "no active site pill found"
+    return match.group(1)
 
 
 def _snapshot_records(
@@ -316,8 +320,6 @@ V2 = ["21° / 21°"]
 #: `forecast_fingerprint` always ends in `-p<id>` of that publication).
 T0 = "48-p1"
 T1 = "96-p1"
-D2 = "Blend depth: temperature 2 (global) · wind 2 (global) · precip 2 (global)"
-D1 = "Blend depth: temperature 1 (global) · wind 1 (global) · precip 1 (global)"
 
 
 # ---------------------------------------------------------------------------
@@ -335,10 +337,9 @@ def test_controls_stage_sequence_confirms_fixture_constants(
         # Stage 0.
         page0 = client.get(f"/forecast?site={seed.site_id}")
         assert page0.status_code == 200
-        assert _high_low_values(page0.text) == V0
+        assert _high_low_values(page0.text)[1:2] == V0
         assert _token(page0.text) == T0
-        assert _depth_line(page0.text) == D2
-        assert _heading("Synthetic Site A") in page0.text
+        assert _site_label(page0.text) == "Synthetic Site A"
 
         # Stage 1.
         poll1 = client.get(f"/forecast/tiles?site={seed.site_id}&fingerprint={T0}")
@@ -363,12 +364,12 @@ def test_controls_stage_sequence_confirms_fixture_constants(
         get_db().write_sync(lambda c: _write_r2(c, seed))
         page3 = client.get(f"/forecast?site={seed.site_id}")
         assert page3.status_code == 200
-        assert _high_low_values(page3.text) == V1
+        assert _high_low_values(page3.text)[1:2] == V1
         assert _token(page3.text) == T1
 
         poll_t0 = client.get(f"/forecast/tiles?site={seed.site_id}&fingerprint={T0}")
         assert poll_t0.status_code == 200
-        assert _high_low_values(poll_t0.text) == V1
+        assert _high_low_values(poll_t0.text)[1:2] == V1
         assert _token(poll_t0.text) == T1
 
         poll_t1 = client.get(f"/forecast/tiles?site={seed.site_id}&fingerprint={T1}")
@@ -378,8 +379,7 @@ def test_controls_stage_sequence_confirms_fixture_constants(
         get_db().write_sync(lambda c: set_setting(c, "forecast_blend_depth", "1"))
         page4 = client.get(f"/forecast?site={seed.site_id}")
         assert page4.status_code == 200
-        assert _high_low_values(page4.text) == V2
-        assert _depth_line(page4.text) == D1
+        assert _high_low_values(page4.text)[1:2] == V2
 
         hourly4 = client.get(f"/api/forecast/hourly?site={seed.site_id}&day=1")
         payload4 = hourly4.json()
@@ -409,13 +409,13 @@ def test_ta_page_commit_between_samples_and_token(
     with TestClient(app) as client:
         page = client.get(f"/forecast?site={seed.site_id}")
         assert page.status_code == 200
-        assert _high_low_values(page.text) == V0
+        assert _high_low_values(page.text)[1:2] == V0
         assert _token(page.text) == T0
 
         poll_t0 = client.get(f"/forecast/tiles?site={seed.site_id}&fingerprint={T0}")
         if write_mode == "commit":
             assert poll_t0.status_code == 200
-            assert _high_low_values(poll_t0.text) == V1
+            assert _high_low_values(poll_t0.text)[1:2] == V1
             assert _token(poll_t0.text) == T1
 
             poll_t1 = client.get(
@@ -446,13 +446,13 @@ def test_tb_poll_empty_token_first_request(
     with TestClient(app) as client:
         r1 = client.get(f"/forecast/tiles?site={seed.site_id}&fingerprint=")
         assert r1.status_code == 200
-        assert _high_low_values(r1.text) == V0
+        assert _high_low_values(r1.text)[1:2] == V0
         assert _token(r1.text) == T0
 
         r2 = client.get(f"/forecast/tiles?site={seed.site_id}&fingerprint={T0}")
         if write_mode == "commit":
             assert r2.status_code == 200
-            assert _high_low_values(r2.text) == V1
+            assert _high_low_values(r2.text)[1:2] == V1
             assert _token(r2.text) == T1
 
             r3 = client.get(f"/forecast/tiles?site={seed.site_id}&fingerprint={T1}")
@@ -485,21 +485,20 @@ def test_tc_two_commits_depth_and_token(
     )
     counts_depth = _commit_once(
         monkeypatch,
-        "wxverify.web.routes.effective_blend_depths",
+        "wxverify.forecast.service.effective_blend_depths",
         write_depth1,
         when="before",
     )
     with TestClient(app) as client:
         page = client.get(f"/forecast?site={seed.site_id}")
         assert page.status_code == 200
-        assert _high_low_values(page.text) == V0
+        assert _high_low_values(page.text)[1:2] == V0
         assert _token(page.text) == T0
-        assert _depth_line(page.text) == D2
 
         poll_t0 = client.get(f"/forecast/tiles?site={seed.site_id}&fingerprint={T0}")
         if write_mode == "commit":
             assert poll_t0.status_code == 200
-            assert _high_low_values(poll_t0.text) == V2
+            assert _high_low_values(poll_t0.text)[1:2] == V2
             assert _token(poll_t0.text) == T1
 
             poll_t1 = client.get(
@@ -507,9 +506,11 @@ def test_tc_two_commits_depth_and_token(
             )
             assert poll_t1.status_code == 204
 
-            fresh_page = client.get(f"/forecast?site={seed.site_id}")
-            assert fresh_page.status_code == 200
-            assert _depth_line(fresh_page.text) == D1
+            # The depth-1 value (V2 above) already proves the blend-depth
+            # write landed together with the fingerprint-moving write in
+            # the SAME read; there is no separate depth indicator left on
+            # the page to check a second time (card 7 dropped the
+            # depth-line paragraph).
         else:
             assert poll_t0.status_code == 204
 
@@ -535,32 +536,32 @@ def test_td_commit_before_build_mixes_heading_and_tiles(
 
     write = _write if write_mode == "commit" else None
     counts = _commit_once(
-        monkeypatch, "wxverify.web.routes.build_forecast", write, when="before"
+        monkeypatch, "wxverify.web.routes.build_forecast_page", write, when="before"
     )
     with TestClient(app) as client:
         page = client.get(f"/forecast?site={seed.site_id}")
         assert page.status_code == 200
-        assert _heading("Synthetic Site A") in page.text
-        assert _high_low_values(page.text) == V0
+        assert _site_label(page.text) == "Synthetic Site A"
+        assert _high_low_values(page.text)[1:2] == V0
         assert _token(page.text) == T0
 
         poll_t0 = client.get(f"/forecast/tiles?site={seed.site_id}&fingerprint={T0}")
         if write_mode == "commit":
             assert poll_t0.status_code == 200
-            assert _high_low_values(poll_t0.text) == V1
+            assert _high_low_values(poll_t0.text)[1:2] == V1
             assert _token(poll_t0.text) == T1
 
             fresh_page = client.get(f"/forecast?site={seed.site_id}")
             assert fresh_page.status_code == 200
-            assert _heading("Synthetic Site B") in fresh_page.text
-            assert _high_low_values(fresh_page.text) == V1
+            assert _site_label(fresh_page.text) == "Synthetic Site B"
+            assert _high_low_values(fresh_page.text)[1:2] == V1
             assert _token(fresh_page.text) == T1
         else:
             assert poll_t0.status_code == 204
 
             fresh_page = client.get(f"/forecast?site={seed.site_id}")
             assert fresh_page.status_code == 200
-            assert _heading("Synthetic Site A") in fresh_page.text
+            assert _site_label(fresh_page.text) == "Synthetic Site A"
 
     assert counts["reached"] >= 1, "wrapper not reached"
     assert counts["fired"] == (1 if write_mode == "commit" else 0)
@@ -580,13 +581,13 @@ def test_te1_commit_right_after_early_check(
     with TestClient(app) as client:
         r1 = client.get(f"/forecast/tiles?site={seed.site_id}&fingerprint=")
         assert r1.status_code == 200
-        assert _high_low_values(r1.text) == V0
+        assert _high_low_values(r1.text)[1:2] == V0
         assert _token(r1.text) == T0
 
         r2 = client.get(f"/forecast/tiles?site={seed.site_id}&fingerprint={T0}")
         if write_mode == "commit":
             assert r2.status_code == 200
-            assert _high_low_values(r2.text) == V1
+            assert _high_low_values(r2.text)[1:2] == V1
             assert _token(r2.text) == T1
         else:
             assert r2.status_code == 204
@@ -615,7 +616,7 @@ def test_te2_commit_after_check_not_lost_when_token_matches(
         r2 = client.get(f"/forecast/tiles?site={seed.site_id}&fingerprint={T0}")
         if write_mode == "commit":
             assert r2.status_code == 200
-            assert _high_low_values(r2.text) == V1
+            assert _high_low_values(r2.text)[1:2] == V1
             assert _token(r2.text) == T1
         else:
             assert r2.status_code == 204
@@ -760,28 +761,39 @@ def test_ti_cancellation_mid_snapshot_rolls_back_cleanly(
 ) -> None:
     """_read_forecast_context is imported INSIDE this test body: a
     module-level import would make the whole file fail to collect on
-    57456a0, and the red run could no longer show which cases pass there."""
-    from wxverify.web import routes as routes_module
+    57456a0, and the red run could no longer show which cases pass there.
+    The blocking rendezvous point is retargeted to
+    ``wxverify.forecast.service.effective_blend_depths`` -- the module that
+    actually calls it from inside ``load_page_inputs`` (:func:`page.py's
+    build_forecast_page` -> ``load_page_inputs`` -> ``effective_blend_depths``);
+    ``routes.py`` no longer imports that name itself."""
+    from wxverify.forecast import service as service_module
+    from wxverify.settings.depth import EffectiveDepth
     from wxverify.web.routes import _read_forecast_context
 
     db = Database(str(tmp_path / "t_i.db"))
     try:
+        # A site must exist, or _load_forecast_context never calls
+        # build_forecast_page -- and so never reaches effective_blend_depths,
+        # the blocking rendezvous below -- leaving `entered` unset forever.
+        _make_site(db._conn, "T-I Site")  # noqa: SLF001
+        db._conn.commit()  # noqa: SLF001
         entered = threading.Event()
         release = threading.Event()
         finished = threading.Event()
         recorded: list[bool] = []
-        original_depths = routes_module.effective_blend_depths
+        original_depths = service_module.effective_blend_depths
 
-        def _blocking_depths(conn: sqlite3.Connection) -> dict[str, object]:
+        def _blocking_depths(conn: sqlite3.Connection) -> dict[str, EffectiveDepth]:
             recorded.append(conn.in_transaction)
             entered.set()
             assert release.wait(timeout=2.0)
             return original_depths(conn)
 
-        monkeypatch.setattr(routes_module, "effective_blend_depths", _blocking_depths)
+        monkeypatch.setattr(service_module, "effective_blend_depths", _blocking_depths)
 
         def _cb(conn: sqlite3.Connection) -> dict[str, object]:
-            result = _read_forecast_context(conn, None, label="forecast_page")
+            result = _read_forecast_context(conn, None, 1, label="forecast_page")
             finished.set()
             return result
 
@@ -888,8 +900,8 @@ def test_tk_guard_refuses_without_snapshot(tmp_path: Path) -> None:
     with pytest.raises(
         RuntimeError, match="_load_forecast_context needs the caller's read snapshot"
     ):
-        _load_forecast_context(conn, None)
+        _load_forecast_context(conn, None, 1)
 
     with read_snapshot(conn, label="t_k"):
-        result = _load_forecast_context(conn, None)
-    assert set(result) == {"sites", "site", "view", "depths"}
+        result = _load_forecast_context(conn, None, 1)
+    assert set(result) == {"sites", "site", "page", "day"}

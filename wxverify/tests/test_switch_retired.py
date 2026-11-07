@@ -472,14 +472,12 @@ def test_re5_no_file_imports_verification_run_module_or_function() -> None:
 
 # ---------------------------------------------------------------------------
 # RE6: ast scan of every enqueue_if_absent / enqueue_if_absent_with_cooldown
-# / JobContinuation call -- each job type is a literal of a kept kind.
+# call -- each job type is a literal of a kept kind.
 # ---------------------------------------------------------------------------
 
 _KEPT_KINDS = {
     "fetch_feed",
     "fetch_current_obs",
-    "forecast_record",
-    "record_gap_scan",
     "fetch_obs",
     "day_close",
     "day_publish",
@@ -487,13 +485,12 @@ _KEPT_KINDS = {
 # pair_and_score: the kind and its close-off enqueues stay in 0.16.14
 # (plan 8.1's table, R17): enqueue_scoring_run, enqueue_score_rescore.
 _RE6_ALLOWED_KINDS = _KEPT_KINDS | {"pair_and_score"}
-# Plan RE6 names the two forwarders by file, enclosing function and argument,
+# Plan RE6 names its one forwarder by file, enclosing function and argument,
 # never by line. Compared as a sorted list, so a second non-literal call in
 # the same function still fails.
 _RE6_KNOWN_FORWARDERS = sorted(
     [
         ("db/queue.py", "enqueue_if_absent_with_cooldown", "job_type"),
-        ("worker/processor.py", "_complete_and_continue", "continuation.job_type"),
     ]
 )
 _WIND_DAYS_KEY_FORMS = {"'wind-days'", "WIND_DAYS_JOB_KEY"}
@@ -558,15 +555,13 @@ def test_re6_every_enqueue_and_continuation_names_a_kept_kind() -> None:
             name = _call_target_name(node)
             if name in ("enqueue_if_absent", "enqueue_if_absent_with_cooldown"):
                 type_arg, key_arg = _arg(node, 1, "job_type"), _arg(node, 3, "job_key")
-            elif name == "JobContinuation":
-                type_arg, key_arg = _arg(node, 0, "job_type"), _arg(node, 2, "job_key")
             else:
                 continue
             where = f"{rel}:{node.lineno} ({func}) {name}()"
             literal = _literal_str(type_arg)
             if literal is None:
                 shown = None if type_arg is None else ast.unparse(type_arg)
-                if name != "JobContinuation" and shown is not None:
+                if shown is not None:
                     forwarders.append((rel, func, shown))
                 else:
                     offenders.append(f"{where}: non-literal type {shown!r}")

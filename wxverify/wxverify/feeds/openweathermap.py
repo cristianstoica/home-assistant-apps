@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from wxverify.core.timeutil import isoformat_utc, lead_hours
 from wxverify.feeds.seam import (
     CostEstimate,
+    DisplayFloat,
     FetchResult,
     ForecastRequest,
     NormalizedSample,
@@ -37,6 +38,10 @@ class OwmHour(BaseModel):
     temp: float | None = None
     wind_speed: float | None = None
     rain: OwmRain | None = None
+    # Display only (card 7): %, m/s ("where available"), degrees.
+    clouds: DisplayFloat = None
+    wind_gust: DisplayFloat = None
+    wind_deg: DisplayFloat = None
 
 
 def _no_hours() -> list[OwmHour]:
@@ -103,12 +108,15 @@ def _hour_samples(
     precip = 0.0
     if hour.rain is not None and hour.rain.one_hour is not None:
         precip = hour.rain.one_hour
-    # OWM metric wind_speed is already m/s, so no conversion. Precip is always
-    # emitted (absent `rain.1h` resolves to 0.0 mm).
+    # OWM metric wind_speed (and wind_gust) is already m/s, so no conversion.
+    # Precip is always emitted (absent `rain.1h` resolves to 0.0 mm).
     specs: tuple[tuple[str, float | None, str], ...] = (
         ("temperature", hour.temp, "C"),
         ("wind", hour.wind_speed, "m/s"),
         ("precip", precip, "mm"),
+        ("cloud_cover", hour.clouds, "%"),
+        ("wind_gust", hour.wind_gust, "m/s"),
+        ("wind_direction", hour.wind_deg, "deg"),
     )
     out: list[NormalizedSample] = []
     for variable, raw_value, unit in specs:

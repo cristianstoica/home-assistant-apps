@@ -480,27 +480,29 @@ def test_member_with_no_full_day_forecast_counts_in_neither_k_nor_q() -> None:
     assert precip.agreement_pct == 50
 
 
-def _rain_row_html(response_text: str) -> str:
-    """Pull just the rendered content of the Rain row's ``<strong>`` out of
-    a ``/forecast`` page's HTML -- scoped to day_ahead 0's tile (the first
-    "Rain" row in document order), so assertions never pick up another
-    tile's or row's markup.
+def _precip_day_text(response_text: str) -> str:
+    """The Precipitation grid's top-row day-column text (``page.rain_text``)
+    out of a rendered ``/forecast`` page -- card 7's replacement for the old
+    tile row's "Rain" ``<strong>``. Scoped to the Precipitation ``<table>``
+    (the selected day's only), so it never picks up another grid's day cell.
     """
-    match = re.search(
-        r"<span>Rain</span>\s*<strong[^>]*>(.*?)</strong>", response_text, re.DOTALL
-    )
-    assert match is not None, "no rendered Rain row found in the response"
-    return match.group(1)
+    section = response_text.split("Precipitation <span>mm/h</span>")[1]
+    section = section.split("</table>")[0]
+    start = section.index('<td class="day">') + len('<td class="day">')
+    end = section.index("</td>", start)
+    # The cell's visible text only -- the rain winner's markup (C4) wraps it
+    # in a <small> and, with an agreement percentage, a
+    # <span title="Agreement">: strip every tag, keep what a reader sees.
+    return re.sub(r"<[^>]+>", "", section[start:end]).strip()
 
 
-def test_forecast_page_rain_tile_hides_the_word_agreement_but_shows_the_tooltip(
+def test_forecast_page_rain_tile_shows_the_agreement_tooltip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The template half of C4: the rendered ``/forecast`` page's Rain row
-    must show the agreement percentage without the visible word
-    "Agreement" -- the percentage sits inside an element whose ``title``
-    attribute is exactly "Agreement".
-    """
+    """The template half of C4: the rendered ``/forecast`` page's
+    Precipitation row shows the agreement percentage the fixture computes
+    (67%, two of three ranked members wet), inside the
+    ``<span title="Agreement">`` tooltip card 7 brought back."""
     close_db()
     db_path = tmp_path / "wxverify.db"
     config.db_path = str(db_path)
@@ -552,26 +554,32 @@ def test_forecast_page_rain_tile_hides_the_word_agreement_but_shows_the_tooltip(
     conn.commit()
 
     monkeypatch.setattr("wxverify.forecast.service.utc_now", lambda: _FIXED_NOW)
+    # build_forecast_page's own `now or utc_now()` reads page.py's own import
+    # of utc_now, a separate binding from service.utc_now above -- both must
+    # be pinned to the same instant or the page renders against the real
+    # wall-clock date instead of _FIXED_NOW.
+    monkeypatch.setattr("wxverify.forecast.page.utc_now", lambda: _FIXED_NOW)
     monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
     app = create_app(root_path="")
     with TestClient(app) as client:
-        response = client.get(f"/forecast?site={site_id}")
+        # Card 7 shows only the SELECTED day's grids (day=1, tomorrow, by
+        # default) -- day_ahead 0, where this fixture's ranking lives, needs
+        # an explicit day=0.
+        response = client.get(f"/forecast?site={site_id}&day=0")
     assert response.status_code == 200
 
-    row_html = _rain_row_html(response.text)
-    visible_row_text = re.sub(r"<[^>]+>", " ", row_html)
-    assert "67%" in visible_row_text
-    assert "Agreement" not in visible_row_text
-    assert re.search(r'title="Agreement"[^>]*>\s*67%\s*<', row_html) is not None
+    row_text = _precip_day_text(response.text)
+    assert "67%" in row_text
+    assert '<span title="Agreement">67%</span>' in response.text
 
 
-def test_forecast_page_rain_tile_with_no_agreement_has_no_tooltip_or_percent(
+def test_forecast_page_rain_tile_with_no_agreement_shows_no_percent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Paired negative: with only one ranked feed, ``agreement_pct`` is
     ``None`` (C4's ``test_single_ranked_feed_shows_no_agreement_pct``), so
-    the rendered Rain row must carry neither the "Agreement" tooltip nor
-    any agreement percentage -- today and after the change alike.
+    the rendered Precipitation row's day text must carry no percentage --
+    today and after the change alike.
     """
     close_db()
     db_path = tmp_path / "wxverify.db"
@@ -615,16 +623,19 @@ def test_forecast_page_rain_tile_with_no_agreement_has_no_tooltip_or_percent(
     conn.commit()
 
     monkeypatch.setattr("wxverify.forecast.service.utc_now", lambda: _FIXED_NOW)
+    # build_forecast_page's own `now or utc_now()` reads page.py's own import
+    # of utc_now, a separate binding from service.utc_now above -- both must
+    # be pinned to the same instant or the page renders against the real
+    # wall-clock date instead of _FIXED_NOW.
+    monkeypatch.setattr("wxverify.forecast.page.utc_now", lambda: _FIXED_NOW)
     monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
     app = create_app(root_path="")
     with TestClient(app) as client:
-        response = client.get(f"/forecast?site={site_id}")
+        response = client.get(f"/forecast?site={site_id}&day=0")
     assert response.status_code == 200
 
-    row_html = _rain_row_html(response.text)
-    assert 'title="Agreement"' not in row_html
-    visible_row_text = re.sub(r"<[^>]+>", " ", row_html)
-    assert "%" not in visible_row_text
+    row_text = _precip_day_text(response.text)
+    assert "%" not in row_text
 
 
 # --- C5: a missing forecast never shows as dry ------------------------------
@@ -770,12 +781,19 @@ def test_forecast_page_shows_ranking_updating_badge_and_no_rain_forecast_text(
     conn.commit()
 
     monkeypatch.setattr("wxverify.forecast.service.utc_now", lambda: _FIXED_NOW)
+    # build_forecast_page's own `now or utc_now()` reads page.py's own import
+    # of utc_now, a separate binding from service.utc_now above -- both must
+    # be pinned to the same instant or the page renders against the real
+    # wall-clock date instead of _FIXED_NOW.
+    monkeypatch.setattr("wxverify.forecast.page.utc_now", lambda: _FIXED_NOW)
     monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
     app = create_app(root_path="")
     with TestClient(app) as client:
         response = client.get(f"/forecast?site={site_id}")
     assert response.status_code == 200
-    assert "ranking updating" in response.text
+    # Card 7's day-warning text is sentence-cased ("Ranking updating"), not
+    # the old lowercase CSS-badge wording.
+    assert "Ranking updating" in response.text
     assert "No rain forecast" in response.text
 
 

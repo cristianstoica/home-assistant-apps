@@ -1059,7 +1059,7 @@ def test_ad3_per_site_snapshot_time() -> None:
     08:00 (M34)."""
     from wxverify.close_monitor import close_alerts
     from wxverify.settings.keys import set_setting
-    from wxverify.verification.record import SNAPSHOT_TIME_KEY
+    from wxverify.verification.snapshot_time import SNAPSHOT_TIME_KEY
 
     conn = asof_conn()
     site_id = _ad_start(conn)

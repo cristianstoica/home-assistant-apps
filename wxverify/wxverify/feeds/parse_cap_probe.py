@@ -4,9 +4,13 @@ adapters.
 Re-parses a response the adapter already holds with the lead-hour cap lifted
 and logs, per model, how far its usable hours reach past the cap. A record
 holds only the source literal, an allowlisted model name, the request's
-variable names, integer counts and lead hours, ``none``, or, on failure, an
-exception class name. The re-parse is discarded once summarized, so nothing
-it produces is returned or stored.
+scored variable names, integer counts and lead hours, ``none``, or, on
+failure, an exception class name. The re-parse is discarded once
+summarized, so nothing it produces is returned or stored.
+
+The re-parse and its counts cover the scored roster only: the display
+variables (card 7) are left out, so an hour holding only display values
+never counts as a forecast hour and each record keeps its fields.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from datetime import timedelta
 from itertools import pairwise
 from typing import Final
 
+from wxverify.collection.forecast_validation import FORECAST_VARIABLES
 from wxverify.core.timeutil import parse_utc
 from wxverify.feeds.seam import FetchResult, ForecastRequest, NormalizedSample
 
@@ -170,14 +175,21 @@ def emit_parse_cap_probe(
     """Log one record per model for an uncapped re-parse of the same payload.
 
     Every record is built before any is written. Any failure is reduced to a
-    single ``status=error`` record naming the exception class only.
+    single ``status=error`` record naming the exception class only. The
+    shadow request and the summaries keep the request's scored variables
+    only (``FORECAST_VARIABLES``), in the request's order.
     """
     try:
-        shadow = reparse(req.model_copy(update={"max_lead_hours": sys.maxsize}))
+        variables = tuple(v for v in req.variables if v in FORECAST_VARIABLES)
+        shadow = reparse(
+            req.model_copy(
+                update={"max_lead_hours": sys.maxsize, "variables": variables}
+            )
+        )
         summaries = summarize_parse_cap(
             shadow.samples,
             models=models,
-            variables=req.variables,
+            variables=variables,
             cap=req.max_lead_hours,
         )
         lines = [

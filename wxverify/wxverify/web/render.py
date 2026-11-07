@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse
 from wxverify import __version__, config
 from wxverify.api.csrf import issue_csrf_pair, set_csrf_cookie
 from wxverify.web.context import feed_label, variable_label_for
+from wxverify.web.scales import ink_class, rain_color, temp_color, wind_color
 
 _WEB_DIR = Path(__file__).resolve().parent
 _TEMPLATE_DIR = _WEB_DIR / "templates"
@@ -34,6 +35,24 @@ _template_globals["variable_label_for"] = variable_label_for
 # cache-first and ignores query strings — only a path change busts it).
 # Templates compose url('/static/' ~ static_version ~ '/<asset>').
 _template_globals["static_version"] = __version__
+# The Forecast templates' cell fills and their text ink (web/scales.py). As
+# globals, any render of forecast/_tiles.html works without extra context.
+_template_globals["temp_color"] = temp_color
+_template_globals["wind_color"] = wind_color
+_template_globals["rain_color"] = rain_color
+_template_globals["ink_class"] = ink_class
+
+
+def whole_degrees(value: float) -> str:
+    """``value`` rounded to a whole number, for the Forecast page's degrees.
+
+    ``round`` is half to even, as ``'%.0f'`` is, so the two agree everywhere
+    except between -0.5 and 0, where ``'%.0f'`` prints ``-0`` and this ``0``.
+    """
+    return str(round(value))
+
+
+env.filters["whole"] = whole_degrees
 
 
 def static_dir() -> Path:

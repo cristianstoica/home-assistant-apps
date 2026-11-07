@@ -29,7 +29,7 @@ from __future__ import annotations
 import ast
 import json
 import sqlite3
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -37,20 +37,6 @@ import pytest
 
 import wxverify
 from tests.helpers import close_off
-from tests.test_forecast_record import (
-    _DAY,
-    _insert_full_grid,
-    _snapshot_t,
-)
-from tests.test_forecast_record import (
-    _conn as _record_conn,
-)
-from tests.test_forecast_record import (
-    _make_feed as _record_make_feed,
-)
-from tests.test_forecast_record import (
-    _make_site as _record_make_site,
-)
 from tests.test_forecast_service import (
     _feed_id,
     _hours,
@@ -63,11 +49,9 @@ from tests.test_forecast_service import (
 from wxverify.db.migrations import run_migrations, seed_default_sources
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.forecast.service import build_forecast, build_hourly
-from wxverify.forecast.wind_blend import WIND_METHOD
 from wxverify.monitor import _wind_history_trips  # noqa: PLC2701
 from wxverify.obs.pws_adapter import observations_from_payload
 from wxverify.scoring.consensus import insert_station_observation, materialize_consensus
-from wxverify.verification.record import build_forecast_record
 from wxverify.web.context import (
     load_site,
     load_station_trust,
@@ -225,7 +209,7 @@ def test_d2_materialize_admits_the_pair_max_row_regardless_of_the_key(
 
 
 # ---------------------------------------------------------------------------
-# D4 -- forecast/hourly wind blend and the record policy's wind fields.
+# D4 -- forecast/hourly wind blend.
 # ---------------------------------------------------------------------------
 
 
@@ -314,37 +298,6 @@ def test_d4_forecast_wind_daily_high_is_weighted_regardless_of_the_key() -> None
     # mean of the two feeds' daily highs is 5.5 m/s = 19.8 km/h.
     assert today.wind.max_kmh == pytest.approx(18.0)
     assert today.wind.note is None
-
-
-def test_d4_record_policy_pins_pair_max_wind_fields_regardless_of_the_key() -> None:
-    """``verification/record.py``'s ``compute_forecast_record`` writes
-    ``policy["wind_method"]``/``policy["wind_basis"]`` from the kept
-    ``WIND_METHOD`` constant and the literal "pair_max" unconditionally.
-    Base instead writes ``_POLICY_WIND_METHOD[wind_serving.mode]`` and
-    ``wind_serving.state``, which under the "staging" key are neither
-    ``WIND_METHOD`` nor "pair_max"."""
-    conn = _record_conn()
-    site_id = _record_make_site(conn, "site-record")
-    feed_id = _record_make_feed(conn, "model-a")
-    set_runtime_state(conn, f"wind_basis:{site_id}", "staging")
-    _insert_full_grid(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        start_date=_DAY,
-        issued_at="2035-06-15T06:00:00Z",
-        fetched_at="2035-06-15T06:05:00Z",
-    )
-    t = _snapshot_t()
-    build_forecast_record(conn, site_id, _DAY.isoformat(), now=t + timedelta(minutes=5))
-
-    row = conn.execute(
-        "SELECT policy FROM forecast_of_record WHERE site_id = ? LIMIT 1",
-        (site_id,),
-    ).fetchone()
-    policy = json.loads(str(row["policy"]))
-    assert policy["wind_method"] == WIND_METHOD
-    assert policy["wind_basis"] == "pair_max"
 
 
 # ---------------------------------------------------------------------------

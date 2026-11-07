@@ -408,18 +408,15 @@ def test_m5_fresh_install_reads_the_sentinel_with_no_rescore_job(
 
 
 # ---------------------------------------------------------------------------
-# M8 -- the loader, live and as-of
+# M8 -- the loader
 # ---------------------------------------------------------------------------
 
 
 def test_m8_loader_gate_sits_before_the_row_number_pick() -> None:
     # The eligibility clause must sit before load_future_samples' row-number
-    # pick, and count_null_availability_samples must apply it too.
+    # pick.
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
-    from wxverify.forecast.data import (
-        count_null_availability_samples,
-        load_future_samples,
-    )
+    from wxverify.forecast.data import load_future_samples
 
     conn = _make_db()
     # Two labels in one hour exist only in a file below v16 (the rain
@@ -478,17 +475,6 @@ def test_m8_loader_gate_sits_before_the_row_number_pick() -> None:
         value=0.5,
         fetched_at="2026-01-01T07:00:00Z",
     )
-    # Slot 3: Google rain with NULL fetched_at.
-    _insert_sample(
-        conn,
-        feed_id=google,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-04T00:00:00Z",
-        value=0.5,
-        fetched_at=None,
-    )
-
     live = load_future_samples(
         conn,
         site_id=1,
@@ -505,23 +491,6 @@ def test_m8_loader_gate_sits_before_the_row_number_pick() -> None:
     assert len(live_om_rain) == 1
     assert live_om_rain[0].value == 1.0
 
-    as_of = load_future_samples(
-        conn,
-        site_id=1,
-        since_valid_at="2026-01-01T00:00:00Z",
-        served_only=False,
-        as_of="2026-01-01T14:00:00Z",
-    )
-    as_of_om_rain = [
-        s
-        for s in as_of
-        if s.feed_id == om
-        and s.variable == "precip"
-        and s.valid_at == "2026-01-02T00:00:00Z"
-    ]
-    assert len(as_of_om_rain) == 1
-    assert as_of_om_rain[0].value == 1.0
-
     assert not any(
         s.feed_id == om
         and s.variable == "precip"
@@ -530,13 +499,6 @@ def test_m8_loader_gate_sits_before_the_row_number_pick() -> None:
     )
     assert any(s.feed_id == om and s.variable == "temperature" for s in live)
     assert any(s.feed_id == google and s.variable == "precip" for s in live)
-
-    null_count = count_null_availability_samples(
-        conn,
-        site_id=1,
-        since_valid_at="2026-01-01T00:00:00Z",
-    )
-    assert null_count == 1
 
 
 # ---------------------------------------------------------------------------

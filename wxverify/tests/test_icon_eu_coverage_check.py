@@ -408,6 +408,7 @@ _ALLOWED_WXVERIFY_MODULES = {
     "wxverify.feeds.open_meteo",
     "wxverify.feeds.seam",
     "wxverify.core.timeutil",
+    "wxverify.collection.forecast_validation",
 }
 
 
@@ -585,7 +586,10 @@ def test_d1_t6_forward_request_matches_production_fetch_feed_once(
 
     params = dict(script_request.url.params)
     assert params["models"] == "icon_eu"
-    assert params["hourly"] == "temperature_2m,wind_speed_10m,precipitation"
+    assert params["hourly"] == (
+        "temperature_2m,wind_speed_10m,precipitation,cloud_cover,"
+        "wind_gusts_10m,wind_direction_10m"
+    )
     assert params["timezone"] == "UTC"
     assert params["forecast_hours"] == "120"
 

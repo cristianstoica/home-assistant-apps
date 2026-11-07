@@ -1,13 +1,12 @@
 """Per-variable blend-depth resolution with provenance (§15).
 
-The Forecast page and the forecast-of-record builder resolve depth
-through this ONE helper, so consumers reading the same settings state get
-the same depth under the same precedence rule. That is a rule guarantee,
-not a pinning one: a record snapshot stores the depths it resolved, so
-once settings move the live page and those stored values legitimately
-differ. An override key (``forecast_blend_depth_<variable>``) wins when it
-parses to 1..6; anything else — absent, foreign, out of range — falls
-through to the existing global ``forecast_blend_depth`` setting.
+Only :func:`~wxverify.forecast.service.load_page_inputs` resolves depth
+through this ONE helper, and the Forecast page and the hourly forecast
+API both take their depths from that load, so consumers reading the same
+settings state get the same depth under the same precedence rule. An
+override key (``forecast_blend_depth_<variable>``) wins when it parses to
+1..6; anything else — absent, foreign, out of range — falls through to the
+existing global ``forecast_blend_depth`` setting.
 """
 
 from __future__ import annotations
@@ -19,9 +18,9 @@ from typing import Literal
 from wxverify.settings.keys import get_number_setting, get_setting
 
 #: The variables that accept a per-variable depth override (§15), and the
-#: CANONICAL forecast-variable roster: the forecast page, sample validation
-#: and the record builder all derive their own tuples from this one (NB-4)
-#: so the set can never drift between them.
+#: CANONICAL forecast-variable roster: the forecast page and sample
+#: validation both derive their own tuples from this one (NB-4) so the set
+#: can never drift between them.
 DEPTH_VARIABLES: tuple[str, ...] = ("temperature", "wind", "precip")
 
 DEPTH_MIN = 1

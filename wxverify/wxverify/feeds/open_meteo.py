@@ -7,8 +7,9 @@ from datetime import timedelta
 from typing import Final, cast
 
 import httpx
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
+from wxverify.collection.forecast_validation import DISPLAY_VARIABLES
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.core.units import kmh_to_ms
 from wxverify.feeds.seam import (
@@ -17,6 +18,7 @@ from wxverify.feeds.seam import (
     ForecastRequest,
     GridProvenance,
     NormalizedSample,
+    display_float,
     precip_hour_start,
 )
 
@@ -37,7 +39,14 @@ VARIABLE_MAP: Final[dict[str, str]] = {
     "temperature": "temperature_2m",
     "wind": "wind_speed_10m",
     "precip": "precipitation",
+    # Display only (card 7): %, km/h ("maximum of the preceding hour",
+    # kept under the provider's own hour label), degrees the wind comes from.
+    "cloud_cover": "cloud_cover",
+    "wind_gust": "wind_gusts_10m",
+    "wind_direction": "wind_direction_10m",
 }
+#: The ``hourly`` names of the display variables, read leniently.
+_DISPLAY_HOURLY_NAMES: Final = frozenset(VARIABLE_MAP[v] for v in DISPLAY_VARIABLES)
 TRACE_NEGATIVE_PRECIP_MIN: Final = -0.1
 _METERED_REFERENCE_VARIABLES: Final = 10
 _METERED_REFERENCE_DAYS: Final = 14
@@ -52,6 +61,28 @@ class OpenMeteoResponse(BaseModel):
     longitude: float
     elevation: float | None = None
     hourly: dict[str, list[str | int | float | None]]
+
+    @field_validator("hourly", mode="before")
+    @classmethod
+    def _lenient_display_arrays(cls, value: object) -> object:
+        """Read the display arrays (card 7) leniently, before validation.
+
+        A display array that is not a list is dropped, and each entry
+        ``float()`` cannot read becomes ``None``, so a bad display array
+        never rejects the reply. The scored arrays are validated as before.
+        """
+        if not isinstance(value, dict):
+            return value
+        hourly = dict(cast(dict[object, object], value))
+        for name in _DISPLAY_HOURLY_NAMES:
+            if name not in hourly:
+                continue
+            raw = hourly[name]
+            if isinstance(raw, list):
+                hourly[name] = [display_float(item) for item in cast(list[object], raw)]
+            else:
+                del hourly[name]
+        return hourly
 
 
 def _run_shape(model: str) -> tuple[int, int]:
@@ -164,10 +195,18 @@ def _samples_from_hourly(
         if not isinstance(values, list):
             continue
         sample_values = cast(list[object], values)
+        display = variable in DISPLAY_VARIABLES
         for idx, raw_time in enumerate(time_values):
             if idx >= len(sample_values) or sample_values[idx] is None:
                 continue
             raw_obj = sample_values[idx]
+            if display:
+                display_sample = _display_sample(
+                    model, issued_at, variable, raw_time, raw_obj
+                )
+                if display_sample is not None:
+                    out.append(display_sample)
+                continue
             if not isinstance(raw_obj, str | int | float):
                 continue
             valid_at = isoformat_utc(parse_utc(str(raw_time)))
@@ -195,8 +234,39 @@ def _samples_from_hourly(
     return out
 
 
+def _display_sample(
+    model: str, issued_at: str, variable: str, raw_time: object, raw_obj: object
+) -> NormalizedSample | None:
+    """One display sample (card 7), or ``None``; never raises.
+
+    A value ``float()`` cannot read, or an hour label that does not parse,
+    stores nothing. The value keeps the provider's hour label (a gust is
+    not relabelled as rain is); a gust is converted from km/h to m/s.
+    """
+    raw_value = display_float(raw_obj)
+    if raw_value is None:
+        return None
+    try:
+        valid_at = isoformat_utc(parse_utc(str(raw_time)))
+        lead = int((parse_utc(valid_at) - parse_utc(issued_at)).total_seconds() // 3600)
+    except ValueError:
+        return None
+    if lead < 1:
+        return None
+    return NormalizedSample(
+        model=model,
+        variable=variable,
+        issued_at=issued_at,
+        valid_at=valid_at,
+        lead_hours=lead,
+        value=_normalized_value(variable, raw_value),
+        source_raw=f"{raw_value}",
+        model_run_id=f"{model}:{issued_at}",
+    )
+
+
 def _normalized_value(variable: str, raw_value: float) -> float:
-    if variable == "wind":
+    if variable in ("wind", "wind_gust"):
         return kmh_to_ms(raw_value)
     if variable == "precip" and TRACE_NEGATIVE_PRECIP_MIN <= raw_value < 0.0:
         # Open-Meteo can emit tiny negative JMA GSM precipitation artifacts

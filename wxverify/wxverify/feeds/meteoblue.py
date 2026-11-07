@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Final
+from typing import Final, cast
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from wxverify.core.timeutil import isoformat_utc, lead_hours, parse_utc
 from wxverify.core.units import kmh_to_ms
@@ -17,6 +17,7 @@ from wxverify.feeds.seam import (
     ForecastRequest,
     GridProvenance,
     NormalizedSample,
+    display_float,
     precip_hour_start,
 )
 
@@ -24,6 +25,10 @@ VARIABLE_MAP: Final[dict[str, tuple[str, str]]] = {
     "temperature": ("temperature", "C"),
     "wind": ("windspeed", "km/h"),
     "precip": ("precipitation", "mm"),
+    # Display only (card 7), from the same multimodel-1h reply; it has no
+    # gust key, so meteoblue gives no gust.
+    "cloud_cover": ("cloudcover", "%"),
+    "wind_direction": ("winddirection", "degree"),
 }
 METEOBLUE_MULTIMODEL_PACKAGE: Final = "multimodel-1h"
 
@@ -44,6 +49,21 @@ def _empty_matrix() -> list[list[float | None]]:
     return []
 
 
+def _display_matrix(value: object) -> list[list[float | None]]:
+    """A display matrix (card 7), read so it never rejects the reply: a
+    matrix that is not a list is empty, a row that is not a list is empty,
+    and each entry ``float()`` cannot read is ``None``."""
+    if not isinstance(value, list):
+        return []
+    rows: list[list[float | None]] = []
+    for row in cast(list[object], value):
+        if isinstance(row, list):
+            rows.append([display_float(item) for item in cast(list[object], row)])
+        else:
+            rows.append([])
+    return rows
+
+
 class MeteoblueData1h(BaseModel):
     model_config = ConfigDict(extra="allow", frozen=True)
 
@@ -51,6 +71,13 @@ class MeteoblueData1h(BaseModel):
     temperature: list[list[float | None]] = Field(default_factory=_empty_matrix)
     windspeed: list[list[float | None]] = Field(default_factory=_empty_matrix)
     precipitation: list[list[float | None]] = Field(default_factory=_empty_matrix)
+    cloudcover: list[list[float | None]] = Field(default_factory=_empty_matrix)
+    winddirection: list[list[float | None]] = Field(default_factory=_empty_matrix)
+
+    @field_validator("cloudcover", "winddirection", mode="before")
+    @classmethod
+    def _lenient_display(cls, value: object) -> list[list[float | None]]:
+        return _display_matrix(value)
 
 
 class MeteoblueMultimodel(BaseModel):
@@ -91,6 +118,8 @@ class MeteoblueAdapter:
                 "windspeed": "kmh",
                 "temperature": "C",
                 "precipitationamount": "mm",
+                # Degrees, not a compass text, for the display direction.
+                "windDirectionUnit": "degree",
             },
             timeout=httpx.Timeout(15.0, connect=5.0),
         )
@@ -131,6 +160,8 @@ def _to_fetch_result(req: ForecastRequest, payload: MeteoblueResponse) -> FetchR
         "temperature": data_1h.temperature,
         "windspeed": data_1h.windspeed,
         "precipitation": data_1h.precipitation,
+        "cloudcover": data_1h.cloudcover,
+        "winddirection": data_1h.winddirection,
     }
     for model_index, model in enumerate(metadata.models):
         issued_at = isoformat_utc(parse_utc(metadata.modelrun_utc[model_index]))

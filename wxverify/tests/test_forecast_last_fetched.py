@@ -44,6 +44,7 @@ from wxverify.db.connection import close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations
 from wxverify.feeds.seam import FetchResult, NormalizedSample
 from wxverify.forecast.data import forecast_fingerprint, samples_fingerprint
+from wxverify.forecast.page import build_forecast_page
 from wxverify.forecast.service import build_forecast
 from wxverify.web.render import env as jinja_env
 from wxverify.worker.feed_fetch import FeedFetchTarget, mark_feed_error
@@ -145,10 +146,24 @@ def _stamp_usable_fetch(
     )
 
 
-def _render_tiles(*, site_id: int, view: object) -> str:
+def _render_tiles(*, site_id: int, conn: sqlite3.Connection, now: datetime) -> str:
+    """Renders the Forecast region from a real :func:`build_forecast_page`
+    page (card 7's template reads ``page``, not the raw ``view`` the old
+    template took) -- ``now`` is passed straight through to
+    ``build_forecast_page``, so no ``utc_now`` monkeypatch is needed even
+    though ``forecast/page.py`` reads its own ``utc_now`` binding when
+    ``now`` is omitted."""
+    page = build_forecast_page(
+        conn,
+        site_id=site_id,
+        timezone="UTC",
+        rain_threshold_mm=0.2,
+        selected_day=1,
+        now=now,
+    )
     tmpl = jinja_env.get_template("forecast/_tiles.html")
     return tmpl.render(
-        url=lambda p: str(p), site=SimpleNamespace(id=site_id), view=view
+        url=lambda p: str(p), site=SimpleNamespace(id=site_id), page=page
     )
 
 
@@ -229,11 +244,11 @@ def test_fetch_age_label_and_title() -> None:
     )
     assert view.updated_ago == "40 min ago"
 
-    html = _render_tiles(site_id=1, view=view)
+    html = _render_tiles(site_id=1, conn=conn, now=now)
     assert "Last fetched: 40 min ago" in html
     assert (
         'title="The most recent usable download from any feed contributing '
-        "to these forecast tiles; other feeds may have been fetched "
+        "to this forecast; other feeds may have been fetched "
         "earlier. It isn't when you loaded the page or how old the forecast "
         'is."'
     ) in html
@@ -268,7 +283,7 @@ def test_unknown_fallback_no_stamp_omits_data_updated_at() -> None:
     assert view.updated_at is None
     assert view.updated_ago is None
 
-    html = _render_tiles(site_id=1, view=view)
+    html = _render_tiles(site_id=1, conn=conn, now=now)
     assert "Last fetched: unknown" in html
     assert "data-updated-at" not in html
 
@@ -305,7 +320,7 @@ def test_unparseable_stamp_alone_reads_as_unknown_and_fingerprint_ignores_it() -
     assert view.updated_at is None
     assert view.updated_ago is None
 
-    html = _render_tiles(site_id=1, view=view)
+    html = _render_tiles(site_id=1, conn=conn, now=now)
     assert "Last fetched: unknown" in html
     assert "data-updated-at" not in html
 
@@ -732,7 +747,13 @@ def test_route_duplicates_only_serves_moved_label_and_drops_unknown_badge(
 
         tiles_before = client.get(f"/forecast/tiles?site={site_id}&fingerprint=")
         assert tiles_before.status_code == 200
-        assert "fetch time unknown" in tiles_before.text  # sanity: starts unknown
+        # sanity: starts unknown -- card 7 moved this badge into the day
+        # header's warning tooltip text (day_warnings in forecast/page.py),
+        # rather than a per-tile "fetch time unknown" label.
+        assert (
+            "Fetch time unknown: a model has no recorded download yet"
+            in tiles_before.text
+        )
         assert "Last fetched: unknown" in tiles_before.text
 
         old_fp = _current_fingerprint(site_id)
@@ -776,7 +797,9 @@ def test_route_duplicates_only_serves_moved_label_and_drops_unknown_badge(
         assert moved.status_code != 204
         assert 'id="forecast-tiles"' in moved.text
         assert f'data-updated-at="{recent}"' in moved.text
-        assert "fetch time unknown" not in moved.text
+        assert (
+            "Fetch time unknown: a model has no recorded download yet" not in moved.text
+        )
         assert "Last fetched: unknown" not in moved.text
 
 

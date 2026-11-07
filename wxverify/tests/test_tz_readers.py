@@ -15,11 +15,10 @@ retention half (``forecast_pairs`` pruned by generation,
 ``keep_read_generations``) is gone too, both the table and the function
 deleted (storage release). TZ4 (the timeseries stored-pairs reader, G12)
 is retired the same way -- its one reader, ``_stored_pairs``, is gone.
-``wxverify.db.switch`` is imported at module level above. TZ5 adds
-the gap scan's origin resolver (G18, ``_current_
-generation``, the writer-path twin of ``current_generation_readonly`` it
-also calls) to the record readers (G17); TZ7 imports new
-``wxverify.db.switch`` names. TZ6 needs no such import: it calls the
+``wxverify.db.switch`` is imported at module level above. TZ5 (the gap
+scan's origin resolver and the 07:00 record readers) was removed with the
+daily forecast record (card 29). TZ7 imports new ``wxverify.db.switch``
+names. TZ6 needs no such import: it calls the
 EXISTING function ``write_close_truth`` after directly deleting the site's
 ``tz_generation_published:`` pointer key -- exactly what A4 does (plan
 §8.4) -- which breaks it today, since it does not yet resolve the
@@ -44,7 +43,7 @@ from pathlib import Path
 import pytest
 
 from wxverify.db.migrations import run_migrations
-from wxverify.db.runtime_state import delete_runtime_state, set_runtime_state
+from wxverify.db.runtime_state import delete_runtime_state
 from wxverify.db.site_days import begin_close, day_record
 from wxverify.db.switch import site_generation_id
 from wxverify.verification.coverage import local_day_bounds
@@ -82,33 +81,6 @@ def _insert_site(conn: sqlite3.Connection, name: str = "tz-site") -> int:
     return int(cur.lastrowid)
 
 
-def _insert_feed(conn: sqlite3.Connection, model: str = "tz_feed") -> int:
-    cur = conn.execute(
-        "INSERT INTO feeds (source, model, fetch_interval_minutes,"
-        " max_lead_hours, default_subscribed) VALUES"
-        " ('open-meteo', ?, 60, 168, 1)",
-        (model,),
-    )
-    assert cur.lastrowid is not None
-    return int(cur.lastrowid)
-
-
-def _insert_generation(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    state: str,
-    effective_to: str | None = None,
-) -> int:
-    cur = conn.execute(
-        "INSERT INTO timezone_generations (site_id, timezone, mode, state,"
-        " effective_to) VALUES (?, 'UTC', 'initial', ?, ?)",
-        (site_id, state, effective_to),
-    )
-    assert cur.lastrowid is not None
-    return int(cur.lastrowid)
-
-
 # ---------------------------------------------------------------------------
 # TZ2 and TZ4 -- both retired. TZ2's live readers (metrics aggregation, the
 # leaderboard, the composite, the win rate) are gone with the daily close
@@ -118,105 +90,6 @@ def _insert_generation(
 # one reader, the timeseries stored-pairs reader (G12, ``_stored_pairs``),
 # is gone the same way. Nothing from either row survives to test.
 # ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# TZ5 -- the 07:00 record readers always resolve the site's one kept
-# generation: a day recorded under a now-retired generation reads as
-# having no row; a day under the kept generation reads complete. M36.
-# ---------------------------------------------------------------------------
-
-
-def test_tz5_record_readers_bind_the_kept_generation_not_the_instant() -> None:
-    conn = _conn()
-    site_id = _insert_site(conn)
-    g1 = _insert_generation(
-        conn, site_id=site_id, state="published", effective_to="2029-06-01T00:00:00Z"
-    )
-    g2 = _insert_generation(conn, site_id=site_id, state="published")
-    set_runtime_state(conn, _pointer_key(site_id), str(g2))
-
-    conn.execute(
-        """
-        INSERT INTO forecast_of_record
-            (site_id, tz_generation_id, timezone, snapshot_local_date,
-             snapshot_local_time, snapshot_utc, target_local_date, variable,
-             display_lead, status, missed_reason, methodology_version,
-             app_version)
-        VALUES (?, ?, 'UTC', '2029-05-01', '07:00:00',
-                '2029-05-01T07:00:00Z', '2029-05-01', 'temperature', 0,
-                'missed', 'no_data', 4, 'test')
-        """,
-        (site_id, g1),
-    )
-    conn.execute(
-        """
-        INSERT INTO forecast_of_record
-            (site_id, tz_generation_id, timezone, snapshot_local_date,
-             snapshot_local_time, snapshot_utc, target_local_date, variable,
-             display_lead, status, missed_reason, methodology_version,
-             app_version)
-        VALUES (?, ?, 'UTC', '2030-06-01', '07:00:00',
-                '2030-06-01T07:00:00Z', '2030-06-01', 'temperature', 0,
-                'missed', 'no_data', 4, 'test')
-        """,
-        (site_id, g2),
-    )
-
-    from wxverify.verification.record import (
-        current_generation_readonly,
-        record_day_has_any_row,
-    )
-
-    # Today's resolver still honours the OLD generation's effective interval
-    # for an instant inside it, which finds the g1-dated row -- the exact
-    # bug this row pins against.
-    old_instant_generation = current_generation_readonly(
-        conn, site_id, "2029-05-01T07:00:00Z"
-    )
-    has_old_row = record_day_has_any_row(
-        conn, site_id, old_instant_generation, "2029-05-01"
-    )
-    assert has_old_row is False, (
-        "M36 -> at this assertion: correct = False (the old-generation day "
-        "reads as having no row once the resolver always binds the site's "
-        f"ONE kept generation, g2={g2}), mutant/today's resolver = "
-        f"{has_old_row!r} (resolves to g1={g1} via the per-instant interval "
-        "and finds the row there)"
-    )
-
-    new_instant_generation = current_generation_readonly(
-        conn, site_id, "2030-06-01T07:00:00Z"
-    )
-    has_new_row = record_day_has_any_row(
-        conn, site_id, new_instant_generation, "2030-06-01"
-    )
-    assert has_new_row is True, (
-        "M36 -> at this assertion: correct = True for the g2-dated day "
-        f"(same answer with or without the fix), mutant = {has_new_row!r}"
-    )
-
-    # run_record_gap_scan's origin (plan G18) reads
-    # "MIN(snapshot_local_date) FROM forecast_of_record WHERE
-    # tz_generation_id = ?" with that generation_id resolved by
-    # _current_generation (verification/record.py:263) -- the SAME
-    # per-instant resolver used above, and the writer-path twin of
-    # current_generation_readonly. Once it always binds the site's one
-    # kept generation (G18's fix), the origin's generation is the same
-    # whatever instant triggered the scan; today it still varies with the
-    # instant via the old generation's effective interval, which is the
-    # exact defect this pins.
-    from wxverify.verification.record import _current_generation
-
-    origin_gen_old_instant = _current_generation(conn, site_id, "2029-05-01T07:00:00Z")
-    origin_gen_new_instant = _current_generation(conn, site_id, "2030-06-01T07:00:00Z")
-    assert origin_gen_old_instant == origin_gen_new_instant == g2, (
-        "M36 -> at this assertion: correct = "
-        f"g2={g2} for BOTH instants (the gap scan's origin always binds "
-        "the site's one kept generation, so its answer is unchanged "
-        f"across the switch), mutant/today's resolver = old={origin_gen_old_instant!r} "
-        f"new={origin_gen_new_instant!r} (the old instant still resolves to g1)"
-    )
 
 
 # ---------------------------------------------------------------------------

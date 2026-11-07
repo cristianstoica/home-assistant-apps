@@ -70,7 +70,6 @@ from wxverify.worker.current_obs_poller import (
     run_current_obs_poller,
 )
 from wxverify.worker.processor import (
-    _complete_and_continue,  # noqa: PLC2701
     _persist_poll_result_and_refund,  # noqa: PLC2701
     _record_current_obs_backoff,  # noqa: PLC2701
     _reserve_current_obs_call,  # noqa: PLC2701
@@ -568,7 +567,7 @@ def test_w_current_obs_lane_write_set_stays_within_its_allowlist(
         _seed_current_obs_job(conn, site_id, station_id, key="curobs:disposition")
         job = claim_next_current_obs_job(conn)
         assert job is not None
-        _complete_and_continue(conn, job.id, None)
+        complete(conn, job.id, result="ok")
 
         _seed_current_obs_job(conn, site_id, station_id, key="curobs:defer")
         deferred = claim_next_current_obs_job(conn)

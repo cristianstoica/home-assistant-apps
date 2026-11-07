@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.16.17
+
+Every page has a new look, and the Forecast page is rebuilt: a day
+timeline on top, then hour-by-hour grids for temperature, wind and rain
+with one row per model, ordered by ranking; a feed picker; and warnings
+per day. The Forecast grids now widen with the browser's text-only
+zoom.
+
+Cloud cover, wind gust and wind direction are now downloaded with no
+extra provider calls (meteoblue and Meteosource give cloud and
+direction, no gust). They are shown only and never scored.
+
+The Ops sample counts now include these rows.
+
+The invalid-sample index is rebuilt once at first start, with its time
+written to the log.
+
+The daily forecast record is removed: its job, its gap scan and its two
+alerts, and its table is dropped at first start.
+
+A poll for an unknown site now answers "Site not found." instead of an
+empty reply.
+
 ## 0.16.16
 
 The database keeps far less. Each closed day now stores one scored

@@ -41,7 +41,7 @@ from wxverify.settings.depth import (
 )
 from wxverify.settings.keys import get_setting, set_setting
 from wxverify.settings.service import apply_plain_settings
-from wxverify.verification.record import SNAPSHOT_TIME_KEY, parse_wall_clock
+from wxverify.verification.snapshot_time import SNAPSHOT_TIME_KEY, parse_wall_clock
 
 # ---------------------------------------------------------------------------
 # Harness (mirrors tests/test_web_ui.py / tests/test_db_transfer.py).
@@ -281,6 +281,22 @@ def test_snapshot_time_setter_endpoint(
 # ---------------------------------------------------------------------------
 
 
+def _precip_day_text(response_text: str) -> str:
+    """The Precipitation grid's top-row day-column text (``page.rain_text``)
+    out of a rendered ``/forecast`` page -- card 7's replacement for the old
+    tile row's "Rain" ``<strong>``. Scoped to the Precipitation ``<table>``
+    (the selected day's only), so it never picks up another grid's day cell.
+    """
+    section = response_text.split("Precipitation <span>mm/h</span>")[1]
+    section = section.split("</table>")[0]
+    start = section.index('<td class="day">') + len('<td class="day">')
+    end = section.index("</td>", start)
+    # The cell's visible text only -- the rain winner's markup (C4) wraps it
+    # in a <small> and, with an agreement percentage, a
+    # <span title="Agreement">: strip every tag, keep what a reader sees.
+    return re.sub(r"<[^>]+>", "", section[start:end]).strip()
+
+
 def test_forecast_page_ride_alongs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -294,9 +310,15 @@ def test_forecast_page_ride_alongs(
     # rollover and seed one local day while the handler renders another.
     fixed_now = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
     monkeypatch.setattr("wxverify.forecast.service.utc_now", lambda: fixed_now)
-    # A real tile is required to reach the Rain tile-row's tooltip markup at
-    # all; an empty-state site (zero samples) never renders "tile-row" or
-    # "Rain", so the tooltip assertion below would silently never execute.
+    # build_forecast_page's own `now or utc_now()` reads page.py's own import
+    # of utc_now, a separate binding from service.utc_now above -- both must
+    # be pinned to the same instant or the page renders against the real
+    # wall-clock date instead of fixed_now.
+    monkeypatch.setattr("wxverify.forecast.page.utc_now", lambda: fixed_now)
+    # A real tile is required to reach the Precipitation grid's rendered
+    # row at all; an empty-state site (zero samples) never renders a
+    # "Precipitation" grid, so the assertion below would silently never
+    # execute.
     _seed_full_day_precip(conn, site_id, now=fixed_now)
     # Rain release, C4: the rain row shows the published rain ranking's
     # winner, so the seeded feed is ranked for today (day ahead 0).
@@ -311,37 +333,24 @@ def test_forecast_page_ride_alongs(
         ranked={0: [int(precip_feed["id"])]},
     )
     conn.commit()
-    # The override must arrive via options.json: startup's
-    # apply_plain_settings CLEARS any depth-override row whose key is
-    # absent from the applied options (the §15 clearing rule), so a
-    # DB-seeded override would be wiped by the app lifespan.
-    (tmp_path / "options.json").write_text(
-        json.dumps({"forecast_blend_depth_wind": 4}), encoding="utf-8"
-    )
 
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
-        page = client.get("/forecast")
+        # Card 7 shows only the SELECTED day's grids (day=1, tomorrow, by
+        # default) -- today (day=0) is where this fixture's precip lives.
+        page = client.get("/forecast?day=0")
         assert page.status_code == 200
-        assert "Blend depth" in page.text
-        assert "wind 4 (override)" in page.text
-        assert "temperature 2 (global)" in page.text
         # Relabel: the old "Chance of rain" copy is gone entirely (G.5).
         assert "Chance of rain" not in page.text
-        # Fixture guard: the tile actually rendered, so the assertion below
+        # Fixture guard: the grid actually rendered, so the assertion below
         # is not vacuous.
-        assert "tile-row" in page.text
-        assert "Rain" in page.text
-        # Rain release, C4: the row's tooltip names the winner (it was the
-        # "Wet hours:" definition).
-        assert "the best rain record for this day ahead." in page.text
-        # Wording regression (0.16.3): the rain row dropped the "wet"
-        # qualifier and the "~" approximation glyph from the wet-hours
-        # figure, leaving a bare "<n> h".
-        assert "h wet" not in page.text, "stale ' h wet' wording still rendered"
-        assert "&middot; ~" not in page.text, (
-            "stale '~' approximation glyph still rendered"
-        )
-        assert re.search(r"0\.0 mm &middot; 0 h\s*</strong>", page.text), (
+        assert "Precipitation" in page.text
+        row_text = _precip_day_text(page.text)
+        # Wording regression (0.16.3): the rain row must never regain the
+        # "wet" qualifier or the "~" approximation glyph on the wet-hours
+        # figure -- a bare "<n> h" only.
+        assert "h wet" not in row_text, "stale ' h wet' wording still rendered"
+        assert "~" not in row_text, "stale '~' approximation glyph still rendered"
+        assert row_text == "0.0 mm · 0 h", (
             "rain row did not render the bare '<n> h' wet-hours figure"
         )

@@ -12,7 +12,10 @@ from typing import Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify.collection.budget import reserve_budget
-from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
+from wxverify.collection.forecast_validation import (
+    FORECAST_VARIABLES,
+    invalid_forecast_sample_sql,
+)
 from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.site_days import daily_close_on
 from wxverify.feeds.seam import FetchResult, GridProvenance, NormalizedSample
@@ -88,16 +91,18 @@ SCORED_DAYS_AHEAD: Final = range(8)
 class PersistOutcome:
     """What :func:`persist_fetch_result` stored.
 
-    ``usable_sample_count`` counts samples with ``lead_hours >= 1`` the fetch
-    produced (the forward-path no-op predicate); ``inserted_count`` counts
-    the ``forecast_samples`` rows written, new or changed (an identical
-    re-fetch writes 0 while still being usable).
+    ``usable_sample_count`` counts the scored-roster samples
+    (``FORECAST_VARIABLES``) with ``lead_hours >= 1`` the fetch produced (the
+    forward-path no-op predicate); a display sample (card 7) is never
+    usable. ``inserted_count`` counts the ``forecast_samples`` rows written,
+    new or changed, display rows included (an identical re-fetch writes 0
+    while still being usable).
 
     ``labels`` maps each feed whose samples the reply carried (a meteoblue
     package's members under their own feed ids) to the sorted, distinct run
     labels (``issued_at``) of its usable samples; a feed the reply carried
-    with no usable sample maps to an empty tuple. The download record
-    stores it (daily-close P4 plan 4.2).
+    with no usable sample, display samples only included, maps to an empty
+    tuple. The download record stores it (daily-close P4 plan 4.2).
 
     ``samples`` maps each feed to the reply's sample for each hour it
     upserted, one per hour, whether or not the row changed; the fetch path
@@ -154,6 +159,11 @@ def persist_fetch_result(
     (the later one on a tie). A NaN value cannot be stored (it binds as
     NULL) and is skipped, as the old ``INSERT OR IGNORE`` skipped it, so the
     hour keeps its stored row. Then the feed state is stamped.
+
+    Display samples (card 7) are upserted like any other, but only
+    scored-roster samples count in ``usable`` and ``labels``, so a
+    display-only change moves neither the no-op stamp nor the download
+    record.
     """
     usable = 0
     has_valid = False
@@ -165,10 +175,11 @@ def persist_fetch_result(
         feed_labels = labels.setdefault(feed_id, set())
         if sample.lead_hours < 1:
             continue
-        usable += 1
-        feed_labels.add(sample.issued_at)
-        if not has_valid:
-            has_valid = _sample_is_valid(conn, sample)
+        if sample.variable in FORECAST_VARIABLES:
+            usable += 1
+            feed_labels.add(sample.issued_at)
+            if not has_valid:
+                has_valid = _sample_is_valid(conn, sample)
         if math.isnan(sample.value):
             continue
         key = (feed_id, sample.variable, sample.valid_at)

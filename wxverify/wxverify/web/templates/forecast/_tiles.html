@@ -1,78 +1,217 @@
+{#- The Forecast region: the 8-day timeline, the title row and the selected
+    day's three grids. It polls every 300 s and a day click swaps it through
+    /forecast/day. Fills come from web/scales.py (temp_color, wind_color,
+    rain_color, ink_class), Jinja globals set in web/render.py, which also
+    registers the `whole` filter every degree here prints through. -#}
+{%- macro fill_attrs(classes, color) -%}
+  {%- if color is none -%}
+    class="{{ classes }}"
+  {%- else -%}
+    {%- set inked = ink_class(color) -%}
+    class="{{ classes }} {{ inked.ink }}" style="background-color:{{ inked.fill }}"
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro arrow(deg) -%}
+  <i class="arrow" style="--r:{{ deg|whole }}deg" role="img" aria-label="from {{ deg|whole }}°">↓</i>
+{%- endmacro -%}
+{%- macro grid_cells(variable, values, directions) -%}
+  {%- for value in values -%}
+    {%- set deg = directions[loop.index0] if directions is not none else none -%}
+    {%- set mark = arrow(deg) if deg is not none else '' -%}
+    {%- if variable == 'temperature' -%}
+      {%- if value is none -%}
+        <td class="v e">·</td>
+      {%- else -%}
+        <td {{ fill_attrs('v', temp_color(value)) }}>{{ value|whole }}</td>
+      {%- endif -%}
+    {%- elif variable == 'precip' -%}
+      {%- set color = rain_color(value) if value is not none else none -%}
+      {%- if color is none -%}
+        <td class="v e">·</td>
+      {%- else -%}
+        <td {{ fill_attrs('v', color) }}>{{ '%.1f'|format(value) }}</td>
+      {%- endif -%}
+    {%- else -%}
+      {%- if value is none -%}
+        <td class="v e">{{ mark }}·</td>
+      {%- else -%}
+        {%- set color = wind_color(value) -%}
+        <td {{ fill_attrs('v' if color is not none else 'v e', color) }}>{{ mark }}{{ '%.0f'|format(value) }}</td>
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endmacro -%}
+{%- macro day_cell(variable, row) -%}
+  {%- if row.day_text is not none -%}
+    {{ row.day_text }}
+  {%- elif variable == 'temperature' -%}
+    {%- if row.day_high is not none and row.day_low is not none -%}
+      {{ row.day_high|whole }}° / {{ row.day_low|whole }}°
+    {%- else -%}
+      —
+    {%- endif -%}
+  {%- elif variable == 'precip' -%}
+    {%- if row.day_total is not none -%}
+      {{ '%.1f'|format(row.day_total) }} mm
+    {%- else -%}
+      —
+    {%- endif -%}
+  {%- else -%}
+    {%- if row.day_high is not none -%}
+      {{ '%.0f'|format(row.day_high) }}
+    {%- else -%}
+      —
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro rain_cell(precip) -%}
+  {#- The rain top row's day summary with a winner: rain_text's parts under
+      its conditions, in the agreed mock-up's markup (a <small> and the
+      agreement's "Agreement" tooltip). The visible text is rain_text's. -#}
+  {{ '%.1f'|format(precip.total_mm) }} mm<small>
+  {%- if precip.wet_hours is not none %} · {{ precip.wet_hours }} h{% endif -%}
+  {%- if precip.icon is not none %} {{ {'light': '\U0001f327', 'heavy': '☔'}[precip.icon] }}{% endif -%}
+  {%- if precip.agreement_pct is not none %} · <span title="Agreement">{{ precip.agreement_pct }}%</span>{% endif -%}
+  </small>
+{%- endmacro -%}
+{%- macro grid_section(grid, title, unit, last, columns, directions, note) -%}
+  <section class="panel">
+    <div class="mm-head"><h3>{{ title }} <span>{{ unit }}</span></h3></div>
+    {%- if note %}
+    <p class="muted" data-field="wind-note">{{ note }}</p>
+    {%- endif %}
+    <table class="mm">
+      <thead>
+        <tr>
+          <th class="feed"></th>
+          {%- for column in columns %}
+          <th><time datetime="{{ column.key }}">{{ column.label }}</time></th>
+          {%- endfor %}
+          <th class="day">{{ last }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="blend">
+          <th class="feed"><div class="fn">{% if grid.blend_labels %}<span title="{{ grid.blend_labels|join(', ') }}">{{ grid.top.label }}</span>{% else %}{{ grid.top.label }}{% endif %}</div></th>
+          {%- if grid.variable == 'precip' and grid.top.day_total is none %}
+          {% for column in columns %}<td class="v e"></td>{% endfor %}
+          {%- else %}
+          {{ grid_cells(grid.variable, grid.top.values, directions) }}
+          {%- endif %}
+          <td class="day">{% if grid.variable == 'precip' and page.detail.tile.precip.total_mm is not none %}{{ rain_cell(page.detail.tile.precip) }}{% else %}{{ day_cell(grid.variable, grid.top) }}{% endif %}</td>
+        </tr>
+        <tr class="sep"><th></th><td colspan="{{ columns|length + 1 }}"></td></tr>
+        {%- for row in grid.rows %}
+        <tr data-feed="{{ row.feed_id }}">
+          <th class="feed"><div class="fn">{{ row.label }}</div></th>
+          {{ grid_cells(grid.variable, row.values, none) }}
+          <td class="day">{{ day_cell(grid.variable, row) }}</td>
+        </tr>
+        {%- endfor %}
+      </tbody>
+    </table>
+  </section>
+{%- endmacro -%}
+{%- if site is none or page is none %}
+<div id="forecast-tiles">
+  <p class="empty">Site not found.</p>
+</div>
+{%- else %}
 <div
   id="forecast-tiles"
-  hx-get="{{ url('/forecast/tiles?site=' ~ site.id ~ '&fingerprint=' ~ view.fingerprint) }}"
+  hx-get="{{ url('/forecast/tiles?site=' ~ site.id ~ '&fingerprint=' ~ page.fingerprint ~ '&day=' ~ page.selected_day) }}"
   hx-trigger="every 300s"
   hx-swap="outerHTML">
-  {% if view.empty %}
+  {% if page.empty %}
     <p class="empty">Still collecting forecasts — check back shortly.</p>
   {% else %}
-    <p class="muted forecast-updated" {% if view.updated_at %}data-updated-at="{{ view.updated_at }}" {% endif %}title="The most recent usable download from any feed contributing to these forecast tiles; other feeds may have been fetched earlier. It isn't when you loaded the page or how old the forecast is.">Last fetched: {{ view.updated_ago or "unknown" }}</p>
-    <div class="tile-grid">
-      {% for tile in view.tiles %}
-        <article class="tile state-{{ tile.state }}">
-          <header class="tile-head">
-            <h3>{{ tile.label }}</h3>
-            <span class="muted">{{ tile.date_iso }}</span>
-          </header>
-          {% if tile.state == 'not_available' %}
-            <p class="empty">Not available yet</p>
-          {% else %}
-            <div class="tile-rows">
-              <div class="tile-row" {% if tile.temp.meta.available and not tile.temp.meta.extrema_unavailable %}title="Feeds: {{ tile.temp.meta.feed_labels }}"{% endif %}>
-                <span>High / Low</span>
-                {% if tile.temp.meta.extrema_unavailable %}
-                  <strong class="muted">Daily high/low unavailable &mdash; partial coverage</strong>
-                {% elif tile.temp.meta.available and tile.temp.high_c is not none and tile.temp.low_c is not none %}
-                  <strong>{{ '%.0f'|format(tile.temp.high_c) }}° / {{ '%.0f'|format(tile.temp.low_c) }}°</strong>
-                {% else %}
-                  <strong class="muted">&mdash;</strong>
-                {% endif %}
-              </div>
-              <div class="tile-row" {% if tile.wind.meta.available %}title="Feeds: {{ tile.wind.meta.feed_labels }}"{% endif %}>
-                <span>Wind max</span>
-                {% if tile.wind.meta.available and tile.wind.max_kmh is not none %}
-                  <strong>{{ '%.0f'|format(tile.wind.max_kmh) }} km/h</strong>
-                {% else %}
-                  <strong class="muted">&mdash;</strong>
-                {% endif %}
-              </div>
-              {% if tile.wind.max_kmh is none and tile.wind.note %}
-                <p class="muted" data-field="wind-note">{{ tile.wind.note }}</p>
-              {% endif %}
-              <div class="tile-row" {% if tile.precip.feed_label %}title="Rain from {{ tile.precip.feed_label }}, the best rain record for this day ahead."{% endif %}>
-                <span>Rain</span>
-                {% if tile.precip.total_mm is not none %}
-                  <strong>
-                    {{ '%.1f'|format(tile.precip.total_mm) }} mm
-                    {%- if tile.precip.wet_hours is not none %} &middot; {{ tile.precip.wet_hours }} h{% endif %}
-                    {%- if tile.precip.icon == 'light' %} &#127783;{% elif tile.precip.icon == 'heavy' %} &#9748;{% endif %}
-                    {%- if tile.precip.agreement_pct is not none %} &middot; <span title="Agreement">{{ tile.precip.agreement_pct }}%</span>{% endif %}
-                  </strong>
-                {% else %}
-                  <strong class="muted">No rain forecast</strong>
-                {% endif %}
-              </div>
-            </div>
-            {% set rain_provisional = tile.precip.meta.extrema_state == 'rebuilding' %}
-            {% if tile.confidence_state == 'low_confidence' or tile.confidence_state == 'rebuilding' or rain_provisional or tile.stale or tile.substitute or tile.fetch_unknown or tile.partial %}
-              <div class="tile-badges">
-                {% if tile.confidence_state == 'low_confidence' %}<span class="badge warn">low confidence</span>{% endif %}
-                {% if tile.confidence_state == 'rebuilding' or rain_provisional %}<span class="badge muted">ranking updating</span>{% endif %}
-                {% if tile.stale %}<span class="badge warn" title="At least one feed used for this day has gone more than twice its scheduled fetch interval without a usable download, or its fetch interval is unknown. The age of the forecast itself doesn't count.">stale</span>{% endif %}
-                {% if tile.substitute %}<span class="badge muted" title="A feed this day would normally use has stopped updating, so the next-ranked feed stands in.">substitute</span>{% endif %}
-                {% if tile.fetch_unknown and not tile.stale %}<span class="badge muted" title="The app has no recorded time yet for a usable download from at least one feed used for this day. Each feed's time is recorded after its next usable download.">fetch time unknown</span>{% endif %}
-                {% if tile.partial %}<span class="badge muted">partial</span>{% endif %}
-              </div>
-            {% endif %}
-            <button
-              type="button"
-              class="tile-expand"
-              hx-get="{{ url('/forecast/day?site=' ~ site.id ~ '&day=' ~ tile.day_index) }}"
-              hx-target="#forecast-day-detail"
-              hx-swap="innerHTML">Hourly</button>
-          {% endif %}
-        </article>
-      {% endfor %}
+    {%- set icon_labels = {'sun': 'Sunny', 'partly': 'Sun and cloud', 'cloud': 'Cloudy', 'rain': 'Rain', 'heavy': 'Heavy rain'} %}
+    <div class="tl-wrap">
+      <div class="tl">
+        <div class="lbl"></div>
+        {%- for header in page.headers %}
+        <div class="dh-cell ds">
+          <button
+            type="button"
+            class="dh{{ ' selected' if header.selected else '' }}{{ ' state-not_available' if header.not_available else '' }}"
+            hx-get="{{ url('/forecast/day?site=' ~ site.id ~ '&day=' ~ header.day_index) }}"
+            hx-target="#forecast-tiles"
+            hx-swap="outerHTML"
+            hx-replace-url="{{ url('/forecast?site=' ~ site.id ~ '&day=' ~ header.day_index) }}"
+            aria-pressed="{{ 'true' if header.selected else 'false' }}">
+            <b>{{ header.short_label }} <time datetime="{{ header.date_iso }}">{{ header.date_dm }}</time></b>
+            <span>{% if not header.extrema_unavailable and header.high_c is not none and header.low_c is not none %}{{ header.high_c|whole }}° / {{ header.low_c|whole }}°{% else %}—{% endif %}</span>
+          </button>
+          {%- if header.warnings %}
+          <button type="button" class="day-warn" aria-label="Warnings: {{ header.warnings|join('; ') }}" aria-describedby="warn-{{ header.day_index }}" aria-expanded="false">⚠</button>
+          <span role="tooltip" id="warn-{{ header.day_index }}" class="warn-tip">{% for text in header.warnings %}{% if not loop.first %}<br>{% endif %}{{ text }}{% endfor %}</span>
+          {%- endif %}
+        </div>
+        {%- endfor %}
+        <div class="lbl">Time</div>
+        {%- for cell in page.timeline %}
+        <div class="hr{{ ' ds' if cell.block == 0 else '' }}">{{ cell.label }}</div>
+        {%- endfor %}
+        <div class="lbl">Weather</div>
+        {%- for cell in page.timeline %}
+        <div class="cell ic-cell{{ ' ds' if cell.block == 0 else '' }}">{% if cell.icon is not none %}<span class="ic sm ic-{{ cell.icon }}" role="img" aria-label="{{ icon_labels[cell.icon] }}"></span>{% endif %}</div>
+        {%- endfor %}
+        <div class="lbl">Temp °C</div>
+        {%- for cell in page.timeline %}
+        {%- set ds = ' ds' if cell.block == 0 else '' %}
+        {%- if cell.temp_c is none %}
+        <div class="cell temp q{{ ds }}">·</div>
+        {%- else %}
+        <div {{ fill_attrs('cell temp' ~ ds, temp_color(cell.temp_c)) }}>{{ cell.temp_c|whole }}°</div>
+        {%- endif %}
+        {%- endfor %}
+        <div class="lbl">Rain mm/6h</div>
+        {%- for cell in page.timeline %}
+        {%- set ds = ' ds' if cell.block == 0 else '' %}
+        {%- set mm = cell.rain_mm %}
+        <div class="cell rain{{ ' q' if mm is none or mm < 0.1 else '' }}{{ ds }}" style="--h:{{ '%.1f'|format([100, mm / 6 * 100]|min) if mm is not none else '0' }}%">{{ '%.1f'|format(mm) if mm is not none and mm >= 0.1 else '·' }}</div>
+        {%- endfor %}
+        <div class="lbl">Wind km/h</div>
+        {%- for cell in page.timeline %}
+        {%- set ds = ' ds' if cell.block == 0 else '' %}
+        {%- set mark = arrow(cell.direction_deg) if cell.direction_deg is not none else '' %}
+        {%- if cell.wind_kmh is none %}
+        <div class="cell wind q{{ ds }}">{{ mark }}·</div>
+        {%- else %}
+        <div {{ fill_attrs('cell wind' ~ ds, wind_color(cell.wind_kmh)) }}>{{ mark }}{{ '%.0f'|format(cell.wind_kmh) }}</div>
+        {%- endif %}
+        {%- endfor %}
+        <div class="lbl">Gust km/h</div>
+        {%- for cell in page.timeline %}
+        <div class="cell gust q{{ ' ds' if cell.block == 0 else '' }}">{{ '%.0f'|format(cell.gust_kmh) if cell.gust_kmh is not none else '·' }}</div>
+        {%- endfor %}
+      </div>
     </div>
+    {%- set detail = page.detail %}
+    {%- if detail is not none %}
+    {%- set selected = page.headers[page.selected_day] %}
+    <div class="title-row">
+      <h2>{{ selected.label }}, <time datetime="{{ selected.date_iso }}">{{ selected.date_dm }}</time></h2>
+      {%- if detail.feeds %}
+      <details class="feed-picker">
+        <summary>All feeds</summary>
+        <div class="feed-menu">
+          <button type="button" class="feed-all" data-all="none">Clear all</button>
+          {%- for feed in detail.feeds %}
+          <label><input type="checkbox" data-f="{{ feed.feed_id }}" checked><span class="fn">{{ feed.label }}</span></label>
+          {%- endfor %}
+        </div>
+      </details>
+      {%- endif %}
+    </div>
+    <div class="mm-wrap">
+      {{ grid_section(detail.temperature, 'Temperature', '°C', 'Max/Min', detail.columns, none, none) }}
+      {{ grid_section(detail.precip, 'Precipitation', 'mm/h', 'Total', detail.columns, none, none) }}
+      {{ grid_section(detail.wind, 'Wind', 'km/h', 'Max', detail.columns, detail.directions, detail.tile.wind.note if detail.tile.wind.max_kmh is none else none) }}
+    </div>
+    {%- endif %}
+    <p class="panel-hint">Models are ordered by ranking.</p>
+    <p class="muted forecast-updated" {% if page.updated_at %}data-updated-at="{{ page.updated_at }}" {% endif %}title="The most recent usable download from any feed contributing to this forecast; other feeds may have been fetched earlier. It isn't when you loaded the page or how old the forecast is.">Last fetched: {{ page.updated_ago or "unknown" }}</p>
   {% endif %}
 </div>
+{%- endif %}

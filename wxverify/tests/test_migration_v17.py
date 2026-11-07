@@ -729,8 +729,6 @@ def test_jobs_allowlist_keeps_exactly_the_listed_kinds(tmp_path: Path) -> None:
     kept_ids = [
         _insert_job(conn, site_id=site_id, job_type="fetch_current_obs", job_key="k1"),
         _insert_job(conn, site_id=site_id, job_type="fetch_feed", job_key="k2"),
-        _insert_job(conn, site_id=site_id, job_type="forecast_record", job_key="k3"),
-        _insert_job(conn, site_id=site_id, job_type="record_gap_scan", job_key="k4"),
         _insert_job(
             conn, site_id=site_id, job_type="day_close", job_key="close:1:2035-01-01:2"
         ),
@@ -748,7 +746,12 @@ def test_jobs_allowlist_keeps_exactly_the_listed_kinds(tmp_path: Path) -> None:
             status="failed",
         ),
     ]
+    # card 29: forecast_record and record_gap_scan left _V17_KEPT_JOBS_SQL
+    # along with the jobs themselves, so the 16->17 upgrade now deletes them
+    # too, same as every other non-allowlisted type.
     removed_ids = [
+        _insert_job(conn, site_id=site_id, job_type="forecast_record", job_key="k3"),
+        _insert_job(conn, site_id=site_id, job_type="record_gap_scan", job_key="k4"),
         _insert_job(conn, site_id=site_id, job_type="pair_and_score", job_key="p1"),
         _insert_job(conn, site_id=None, job_type="catchup", job_key=None),
         _insert_job(conn, site_id=site_id, job_type="backfill_site", job_key="b1"),

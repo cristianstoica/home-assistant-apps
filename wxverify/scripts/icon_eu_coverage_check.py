@@ -48,6 +48,10 @@ from typing import Final, Literal, cast
 
 import httpx
 
+from wxverify.collection.forecast_validation import (
+    DISPLAY_VARIABLES,
+    FORECAST_VARIABLES,
+)
 from wxverify.config import OPEN_METEO_MAX_LEAD_HOURS
 from wxverify.core.timeutil import floor_hour, parse_utc, utc_now
 from wxverify.feeds.open_meteo import VARIABLE_MAP, OpenMeteoAdapter
@@ -82,13 +86,16 @@ Reason = Literal[
 ]
 
 MODEL: Final = "icon_eu"
-#: The variable tuple a regular fetch sends (``worker.feed_fetch``).
-VARIABLES: Final[tuple[str, ...]] = ("temperature", "wind", "precip")
-#: The forward response's hourly names, in ``VARIABLE_MAP`` order.
+#: The variable tuple a regular fetch sends (``worker.feed_fetch``): the
+#: scored variables, then the display variables.
+VARIABLES: Final[tuple[str, ...]] = FORECAST_VARIABLES + DISPLAY_VARIABLES
+#: The forward response's hourly names the rules judge, in ``VARIABLE_MAP``
+#: order: the scored variables only. A missing display value (a null gust
+#: hour, say) never changes a verdict, as it never fails a regular fetch.
 FORWARD_NAMES: Final[tuple[str, ...]] = tuple(
     provider_name
     for variable, provider_name in VARIABLE_MAP.items()
-    if variable in VARIABLES
+    if variable in FORECAST_VARIABLES
 )
 MIN_FORWARD_STEPS: Final = 120
 MIN_FORWARD_VALUES: Final = 96

@@ -2,16 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True)
-class JobContinuation:
-    job_type: str
-    site_id: int | None
-    job_key: str
-    payload: dict[str, object]
-
 
 class JobControl(Exception):
     """Base class for expected worker control flow."""
@@ -30,5 +20,5 @@ class JobCancelled(JobControl):
     adapter that cannot be built, a malformed payload, a write window that
     has closed, or a chain that a later state has superseded -- the list is
     open. The worker completes the row WITHOUT the ``result='ok'`` success
-    marker -- see ``_complete_and_continue`` in ``wxverify.worker.processor``.
+    marker -- see ``run_claimed_job`` in ``wxverify.worker.processor``.
     """

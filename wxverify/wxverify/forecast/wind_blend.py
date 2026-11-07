@@ -37,8 +37,6 @@ DAY_AHEADS: Final = range(8)
 WIND_METHOD: Final = "inverse_mae_daily_high_v1"
 
 NOT_ENOUGH_FEEDS_NOTE: Final = "Not enough feeds with a wind track record yet"
-#: ``displayed.fallback_reason`` values in the forecast record (§11.5).
-FALLBACK_NOT_ENOUGH_FEEDS: Final = "not_enough_feeds"
 
 
 @dataclass(frozen=True)
@@ -78,7 +76,7 @@ class WindChoice:
 
 @dataclass(frozen=True)
 class WindServing:
-    """What one request (or one record build) serves for wind."""
+    """What one request serves for wind."""
 
     weights: WindWeights
 
@@ -201,17 +199,15 @@ def load_wind_serving(
     site_id: int,
     timezone: str,
     today: date,
-    as_of: str | None,
 ) -> WindServing:
     """The wind weights of the active publication (9.4, 12).
 
-    The one active at ``as_of`` for a record build, for the feeds switched
-    on now; ``{}`` with no publication, or with the daily close off, which
-    wind serving reads as "not enough feeds". ``timezone`` and ``today`` are
-    not read.
+    The latest publication's, for the feeds switched on now; ``{}`` with no
+    publication, or with the daily close off, which wind serving reads as
+    "not enough feeds". ``timezone`` and ``today`` are not read.
     """
     # Deferred: the publication module imports this one.
     from wxverify.scoring.publication import published_wind_serving
 
-    published = published_wind_serving(conn, site_id=site_id, as_of=as_of)
+    published = published_wind_serving(conn, site_id=site_id, as_of=None)
     return WindServing(weights={} if published is None else published)

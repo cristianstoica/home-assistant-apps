@@ -34,10 +34,6 @@ from wxverify.core.timeutil import isoformat_utc, local_day_start, parse_utc
 from wxverify.db.queue import MAIN_LANE_TYPE_SQL
 from wxverify.db.site_days import daily_close_on
 from wxverify.settings.keys import get_number_setting
-from wxverify.verification.record import (
-    gap_scan_degraded_sites,
-    sites_with_record_gap,
-)
 from wxverify.worker.access_hold import (
     ACCESS_KIND_LABELS,
     AccessRecord,
@@ -145,17 +141,14 @@ _ELIGIBLE_OBS_WHERE = """
 # type. The NOT IN list is the ALLOWLIST of single-row job types -- the ones
 # for which the worker's dispatch returns None, so one job row is one unit
 # of work and a later GENUINE success in the scope is a real recovery. A
-# genuine success is a completed row carrying result='ok', which only
-# _complete_and_continue writes, on a normal dispatch return; the worker's
+# genuine success is a completed row carrying result='ok', which the worker
+# writes only on a normal dispatch return; the worker's
 # JobCancelled branch (target deleted or disabled, a feed adapter that cannot
 # be built, or an hourly cycle stopped by a refused-access hold) completes
 # with result NULL, as did every completion before the marker existed, and
 # none of those rows resolves anything.
-# The chain type record_gap_scan is deliberately absent:
-# _complete_and_continue completes every finished chunk under the chain's own
-# key, so a later completed row there is a chunk, not a resolution, and its
-# scopes count by age alone. The v17 upgrade deletes the rows of every job
-# type dispatch does not run, so no other type is left to classify.
+# Start-up deletes the rows of every job type dispatch does not run, so no
+# other type is left to classify.
 # The daily close's two kinds are classified apart (daily-close P3 9.6). A
 # failed day_close stage is left out of the arm: the day's state and attempt
 # record report it, and its scope (close:{site_id}:{local_date}:{stage}) is
@@ -185,8 +178,7 @@ FAILED_SCOPES_SQL = """
         WHERE j.status = 'failed' AND j.updated_at <= ?
           AND j.type != 'day_publish'
           AND j.type != 'day_close'
-          AND (j.type NOT IN ('fetch_feed', 'fetch_obs', 'fetch_current_obs',
-                              'forecast_record')
+          AND (j.type NOT IN ('fetch_feed', 'fetch_obs', 'fetch_current_obs')
                OR NOT EXISTS (
                    SELECT 1 FROM jobs AS k
                    WHERE k.type = j.type
@@ -708,15 +700,11 @@ def _pipeline_conditions(
     # LATEST_JOB_SQL and idx_jobs_active_dedupe -- that hold an unresolved
     # terminal failure older than FAILED_JOB_AGE_HOURS. For the single-row job
     # types listed in FAILED_SCOPES_SQL a later completed row in the same scope
-    # that carries the success marker (result='ok', written only by
-    # _complete_and_continue on a normal dispatch return) supersedes the
-    # failure, but only a genuine success: a cancelled or unavailable
-    # completion, and every row written before the marker existed, has result
-    # NULL and resolves nothing.
-    # For the chain types every finished chunk leaves a marked completed row
-    # under the chain's key (_complete_and_continue), so a chunk's completion
-    # proves nothing about the chain and those types count by age alone. The
-    # daily close's failed day_close stages and failed day_publish jobs (its
+    # that carries the success marker (result='ok', written only on a normal
+    # dispatch return) supersedes the failure, but only a genuine success: a
+    # cancelled or unavailable completion, and every row written before the
+    # marker existed, has result NULL and resolves nothing.
+    # The daily close's failed day_close stages and failed day_publish jobs (its
     # last stage 7, key publish:{site_id}:7) are left out of the arm: the
     # day's state and attempt record, or the publication record's state,
     # report them, and a stale job's failure its WARNING line. The failed
@@ -771,21 +759,6 @@ def _pipeline_conditions(
         (stuck_cutoff, pending_cutoff),
     )
     problem_jobs_n = failed_scopes_n + inflight_n
-
-    # forecast_record_gap (§16): enabled sites whose record log has begun
-    # but which have no record/missed row for the most recent expected
-    # snapshot day under the current published generation.
-    record_gap_n = sites_with_record_gap(
-        conn, now, slack=timedelta(minutes=PENDING_OVERDUE_MINUTES)
-    )
-
-    # record_gap_scan_degraded (§4 change 7): sites whose gap scan could not
-    # assess one or more dates. Trips on PRESENCE, with no freshness window
-    # -- the scan runs once per local day, so an `as_of` window would blank a
-    # standing failure for half of every day, and the key is deleted the
-    # moment its dates clear. It does not wait on FAILED_JOB_AGE_HOURS: the
-    # job completes, by design, so the failure is only visible here.
-    gap_scan_failed_n, gap_scan_newest = gap_scan_degraded_sites(conn)
 
     # obs_collection_delayed (D1.3): enabled stations of enabled sites whose
     # current-obs poll is overdue. Reads schedule and job rows only, never the
@@ -895,19 +868,6 @@ def _pipeline_conditions(
             problem_jobs_n,
             f"{failed_scopes_n} unresolved failed scopes,"
             f" {inflight_n} stuck/overdue jobs",
-        ),
-        _cond(
-            "forecast_record_gap",
-            record_gap_n > 0,
-            record_gap_n,
-            f"{record_gap_n} sites missing the latest forecast record",
-        ),
-        _cond(
-            "record_gap_scan_degraded",
-            gap_scan_failed_n > 0,
-            gap_scan_failed_n,
-            f"{gap_scan_failed_n} sites with unassessed record gap-scan dates"
-            f" (newest failure {gap_scan_newest})",
         ),
         *_retired("obs_station_history_failing"),
         _cond(
@@ -1214,8 +1174,8 @@ def _grace_active(conn: sqlite3.Connection, now: datetime) -> bool:
 
 
 # The pipeline group's skipped list while monitor_pipeline is off (daily-close
-# plan P5 §5.1). With the close off: today's eleven ids plus
-# station_silent_today. With it on: the seven kept pipeline ids,
+# plan P5 §5.1). With the close off: today's nine ids plus
+# station_silent_today. With it on: the five kept pipeline ids,
 # station_silent_today and close_alerts' seven ids, none of the four retired.
 _PIPELINE_SKIPPED_CLOSE_OFF: Final[tuple[str, ...]] = (
     "feed_stale",
@@ -1223,8 +1183,6 @@ _PIPELINE_SKIPPED_CLOSE_OFF: Final[tuple[str, ...]] = (
     "fetch_obs_live",
     "fetch_feed_live",
     "problem_jobs",
-    "forecast_record_gap",
-    "record_gap_scan_degraded",
     "obs_station_history_failing",
     "obs_collection_delayed",
     "main_worker_liveness",
@@ -1235,8 +1193,6 @@ _PIPELINE_SKIPPED_CLOSE_ON: Final[tuple[str, ...]] = (
     "feed_stale",
     "fetch_feed_live",
     "problem_jobs",
-    "forecast_record_gap",
-    "record_gap_scan_degraded",
     "obs_collection_delayed",
     "main_worker_liveness",
     "station_silent_today",

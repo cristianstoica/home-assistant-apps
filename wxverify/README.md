@@ -443,33 +443,109 @@ Virtual feeds can appear beside provider feeds:
   lead. It is created only when at least two active real models contribute. It
   is not an external provider call.
 
-### Forecast page: daily high, low and rainfall
+### Forecast page
 
-A Forecast tile shows a temperature `High / Low` only when at least one of the
-feeds behind it covers every hour of that local day, from local midnight to the
-next local midnight — 24 hourly values, or 23 or 25 on a daylight-saving change
-day. Each feed is checked on its own. Two feeds that each cover part of the day
-do not add up to a covered day, because a feed's high and low only describe the
-hours that feed supplied. Among the feeds that qualify, the usual skill ranking
-and blend depth decide which ones are blended.
+The Forecast page shows one site at a time; the buttons under the heading
+switch sites. All times are the site's local time.
 
-When no feed covers the whole day, the row reads
-`Daily high/low unavailable — partial coverage` instead of a number. A high and
-low worked out from part of a day is never shown under the `High / Low` label.
+**The timeline** covers today and the next 7 days, each day in four 6-hour
+steps starting at 00, 06, 12 and 18. Its rows are the weather icon, the
+temperature, the rain over the 6 hours, the wind with an arrow for the
+direction it comes from, and the gusts. Each day's header shows the day's
+high and low, and a ⚠ when the day has warnings (listed below).
+
+**The day grids.** Click a day's header to see that day hour by hour in three
+grids: temperature, precipitation and wind. The page opens on Tomorrow.
+Adding `&day=<n>` to the page address (`0` is today, `7` is 7 days ahead)
+opens that day; a number outside 0-7 is taken as the nearest end. Clicking a
+day changes the address, but inside Home Assistant, reloading the page always
+returns to Tomorrow.
+
+In each grid the first row is the forecast the app serves:
+
+- for temperature and wind, `BLEND`, the blend of the selected models (hover
+  over `BLEND` to see which ones);
+- for precipitation, the model whose rain is served, named in the row (the
+  rain rules are below).
+
+Below it come the models, each shown by its model name, in that weather
+type's ranking for the day ahead. Models without a ranking come last, and the
+served rain model is not listed twice. `·` means no value for that hour or,
+for rain, less than 0.1 mm. The last column is the day's `Max/Min`, `Total`
+or `Max`. On a model's row it shows `—` unless that model covers the day:
+every hour for temperature and rain, and at least 18 hours for wind. The
+feeds menu hides and shows model rows; each grid's first row always stays.
+The page refreshes itself every 5 minutes and keeps the selected day and the
+feeds menu choice.
+
+#### How the timeline and grids are worked out
+
+- The `BLEND` rows are the served blend and the first precipitation row is the
+  served rain model. The page works out none of these values afresh.
+- A timeline step's temperature and wind are the served values at the step's
+  first hour. Its rain is the served rain model's total over the 6 hours,
+  shown as `·` below 0.1 mm. Its gust is the highest served gust in the
+  6 hours.
+- The served gust at an hour mixes the wind models' gusts with the weights of
+  the served wind, over the models that have a gust at that hour. It is never
+  shown below the served wind speed for that hour, and it is empty when no
+  model has a gust. meteoblue and Meteosource give no gusts.
+- The direction arrows come from one model per day: the most heavily weighted
+  wind model that has a direction for that day. An hour that model lacks shows
+  no arrow; no other model fills it in.
+- The weather icon shows rain when the 6-hour rain forecasts rain (0.2 mm or
+  more, the rule a day's rain symbol uses), and heavy rain when its wettest
+  hour is above 1 mm. Otherwise it shows the sky from one cloud model's
+  average cloud cover over the 6 hours: above 75% cloudy, above 35% sun and
+  cloud, sunny below that. The cloud model is the served rain model or, when
+  that has no cloud cover for the day, the next model in the rain ranking that
+  has some. A step with no cloud cover shows no icon, never "sunny". A day
+  with no served rain model still shows the sky icon where it has cloud cover.
+- Cloud cover, gusts and wind direction come in the same downloads as the
+  other values, at no extra cost. They are for display only: they are never
+  scored, and values for days before today are deleted at the daily close and
+  at each start.
+
+#### Warnings
+
+A ⚠ beside a day's header lists that day's warnings; hover over it, tap it or
+move to it with the keyboard to read them. They appear in this order:
+
+- `Low confidence`
+- `Ranking updating`
+- `Stale: a model has not updated on time`
+- `Substitute: a model stands in for one that stopped updating`
+- `Fetch time unknown: a model has no recorded download yet`
+- `Partial: the day is not fully covered`
+
+`Fetch time unknown` is not listed when `Stale` is. `Partial` means that none
+of the selected temperature feeds covers at least 18 hours of that day. It is
+never set for wind or rain.
+
+#### Daily high, low and rainfall
+
+A day shows a temperature high and low, in its header and in the `BLEND`
+`Max/Min` cell, only when at least one of the feeds behind it covers every
+hour of that local day, from local midnight to the next local midnight —
+24 hourly values, or 23 or 25 on a daylight-saving change day. Each feed is
+checked on its own. Two feeds that each cover part of the day do not add up
+to a covered day, because a feed's high and low only describe the hours that
+feed supplied. Among the feeds that qualify, the usual skill ranking and
+blend depth decide which ones are blended.
+
+When no feed covers the whole day, both places show `—` instead of a
+number. A high and low worked out from part of a day is never shown.
 Everything else stays as it was:
 
-- The day's hourly chart still plots every selected feed, including feeds that
-  cover only part of the day.
-- The `partial` badge keeps its meaning: for temperature or rain, none
-  of the selected feeds covers at least 18 hours of that day. It can appear
-  with or without the unavailable label, because it answers a different
-  question.
-- `Wind max` is not affected by this rule. `Wind max` is the weighted mean of
-  the feeds' daily maxima (see [Station wind](#station-wind)), and the `partial`
-  badge is never set for wind. `Rain` has a stricter rule of its own, described
-  below.
+- The day's grids still show every feed, including feeds that cover only
+  part of the day.
+- The `Partial` warning answers a different question, so it can appear with
+  or without the `—`.
+- The wind `Max` is not affected by this rule. It is the weighted mean of the
+  feeds' daily maxima (see [Station wind](#station-wind)). Rain has a
+  stricter rule of its own, described below.
 
-The `Today` tile normally shows a high and low too: a feed fetched before
+`Today` normally shows a high and low too: a feed fetched before
 today began normally has all of today's hours. Earlier forecast runs are not
 fetched, and regular fetches supply hours from the hour they run. A feed can
 lack some of today's hours, and then cannot cover `Today`, when:
@@ -478,17 +554,17 @@ lack some of today's hours, and then cannot cover `Today`, when:
   and so may lack today's hours before that fetch;
 - the provider returned an hour without a value.
 
-The label appears only when none of the feeds with forecasts for that day
+The `—` appears only when none of the feeds with forecasts for that day
 covers it, so a feed added later never blanks a day another feed already
 covers. Regular fetches never fill the hours before their own forecast run: a
 fetch keeps only hours at least an hour after its forecast run was issued, and
 Open-Meteo's regular fetches start at the hour they run. So when no feed covers
-today, `Today` shows the label for the rest of the date, unless a later fetch
+today, `Today` shows `—` for the rest of the date, unless a later fetch
 returns a value for an hour an earlier one left without one. At local midnight
 the next date becomes `Today`, and it shows a high and low only if a feed
 covers that whole date: the change of day fills in no missing hours.
 
-The `Rain` row shows one model's rain: the model with the best rain record for
+The served rain is one model's rain: the model with the best rain record for
 that day ahead. Each closed day records whether it rained nearby (at least
 0.2 mm at two of the site's counted stations, or at least 0.5 mm at one) and
 each model's forecast daily total for every day ahead. Over the last 60 closed
@@ -496,8 +572,8 @@ days, each model is scored per day ahead on the days where both are known: a
 missed rainy day costs 2 points and a false alarm 1, and the lowest score
 wins. Once two models have 20 counted days, only models with 20 or more take
 part, and the shown model changes only when another one beats it by 3 points
-or more. Until then the ranking is provisional and the tile shows `ranking
-updating`. The rain ranking needs the daily close.
+or more. Until then the ranking is provisional and the day's warnings list
+`Ranking updating`. The rain ranking needs the daily close.
 
 A station's gauge stops counting for rain when it reads exactly zero while the
 other stations report rain, on 3 days spread over 2 wet spells within 30 days.
@@ -511,45 +587,30 @@ hour, an hour given twice, or a value that falls between two hours rules it out
 for that date, and the next ranked model is shown instead. The reasons above
 why a feed can lack some of `Today`'s hours apply to rain too.
 
-The row then shows the winner's rainfall and wet hours, for example
-`3.1 mm · 5 h`. The rainfall is shown to one decimal place. An hour is wet when
-its forecast rain is at or above the site's `rain_threshold_mm`. At 0.2 mm or
-more a rain symbol follows: a rain cloud when the wettest hour is at most
-1 mm, an umbrella above that. `Agreement N%` follows when two or more models
-are ranked: the share of the top-ranked group (about three-quarters of the
-ranked models) whose own daily total is 0.2 mm or more. Hovering over the row
-names the model. The rain bars on the day's hourly chart are the winner's.
+The precipitation grid's `Total` for the served rain model then shows the
+rainfall and wet hours, for example `3.1 mm · 5 h`. The rainfall is shown to
+one decimal place. An hour is wet when its forecast rain is at or above the
+site's `rain_threshold_mm`. At 0.2 mm or more a rain symbol follows: a rain
+cloud when the wettest hour is at most 1 mm, an umbrella above that. An
+agreement percentage follows when two or more models are ranked (hover over
+it for its name): the share of the top-ranked group (about three-quarters of
+the ranked models) whose own daily total is 0.2 mm or more.
 
 `No rain forecast` means no ranked model has a full day of rain forecasts for
 that date; it never means a dry forecast.
 
-A tile's `low confidence`, `ranking updating` and `stale` badges also cover the
-feeds its daily high and low come from, and the rain winner and its agreement
-group, which can differ from the selected feeds its hourly chart plots.
-`ranking updating` also shows whenever the rain ranking is provisional, even
-beside `low confidence`.
+A day's `Low confidence`, `Ranking updating` and `Stale` warnings also cover
+the feeds its daily high and low come from, and the rain winner and its
+agreement group. `Ranking updating` also shows whenever the rain ranking is
+provisional, even beside `Low confidence`.
 
-A feed counts as `stale` when the app has not completed a successful forecast
+A feed counts as stale when the app has not completed a successful forecast
 download for it within twice its fetch interval. Only a download that returned
 usable forecast values counts; a download that returned values already stored
-counts too. `fetch time unknown` means no such download has been recorded yet,
+counts too. `Fetch time unknown` means no such download has been recorded yet,
 for example right after an upgrade.
 
-The daily forecast record stores what the tile showed: when the label appears,
-the recorded `high_c` and `low_c` are empty (`null`) and `extrema_coverage` is
-`insufficient`, next to the `extrema_feed_ids` that were used (an empty list in
-that case) and `extrema_low_confidence` (also `null`, because there is no set of
-feeds to judge). For rain it records `total_mm` and `wet_hours` (the average
-before rounding) with the same three fields. When the rainfall label appears,
-both are `null`, never `0`, and the three fields read `insufficient`, an empty
-list and `null`. For rain, the record's `hourly_values` are the chart's rain
-bars: for each time, the average of the feeds the daily figures come from,
-`null` where one of them has no value, and `null` throughout when no feed
-qualifies. Rain records written before this rule have no `extrema_feed_ids`:
-they store `chance` (a 0-to-1 share of wet hours) instead of `wet_hours`, and
-their `hourly_values` average whichever selected feeds had a value at each
-time. Verification scoring is unchanged — this decides what is displayed, not
-what is scored.
+The page decides only what is displayed; scoring is unchanged by it.
 
 ## CLI
 

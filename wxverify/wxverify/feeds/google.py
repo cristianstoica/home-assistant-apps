@@ -21,24 +21,27 @@ from __future__ import annotations
 import logging
 import math
 from datetime import datetime, timedelta
-from typing import Final
+from typing import Annotated, Final
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from wxverify.core.timeutil import isoformat_utc, lead_hours, parse_utc
 from wxverify.core.units import kmh_to_ms
 from wxverify.feeds.seam import (
     CostEstimate,
+    DisplayFloat,
     FetchResult,
     ForecastRequest,
     NormalizedSample,
+    display_mapping,
 )
 from wxverify.feeds.synthetic_run import snap_run
 
 _ENDPOINT: Final = "https://weather.googleapis.com/v1/forecast/hours:lookup"
 
-# Google self-describes each value's unit; a non-metric unit is a hard error.
+# Google self-describes each value's unit; a non-metric unit on a scored
+# value is a hard error. A display gust (card 7) in another unit is skipped.
 _EXPECTED_TEMPERATURE_UNIT: Final = "CELSIUS"
 _EXPECTED_SPEED_UNIT: Final = "KILOMETERS_PER_HOUR"
 _EXPECTED_PRECIP_UNIT: Final = "MILLIMETERS"
@@ -92,10 +95,41 @@ class GoogleSpeed(BaseModel):
     unit: str
 
 
+def _display_text(value: object) -> str | None:
+    """A display unit (card 7) as given when it is text, else ``None``."""
+    return value if isinstance(value, str) else None
+
+
+class GoogleGust(BaseModel):
+    """A wind gust, display only (card 7).
+
+    Its own model, never ``GoogleSpeed``, whose required ``value`` would
+    reject the reply: a gust with no value or unit, or a value ``float()``
+    cannot read, reads as missing instead.
+    """
+
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    value: DisplayFloat = None
+    unit: Annotated[str | None, BeforeValidator(_display_text)] = None
+
+
+class GoogleWindDirection(BaseModel):
+    """Display only (card 7): degrees, "the angle it is coming from"."""
+
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    degrees: DisplayFloat = None
+
+
 class GoogleWind(BaseModel):
     model_config = ConfigDict(extra="allow", frozen=True)
 
     speed: GoogleSpeed
+    gust: Annotated[GoogleGust | None, BeforeValidator(display_mapping)] = None
+    direction: Annotated[
+        GoogleWindDirection | None, BeforeValidator(display_mapping)
+    ] = None
 
 
 class GoogleQpf(BaseModel):
@@ -118,6 +152,9 @@ class GoogleForecastHour(BaseModel):
     temperature: GoogleTemperature | None = None
     wind: GoogleWind | None = None
     precipitation: GooglePrecipitation | None = None
+    # Display only (card 7): an int 0-100 in Google's reference, read as a
+    # float so a decimal never rejects the reply.
+    cloudCover: DisplayFloat = None
 
 
 def _no_hours() -> list[GoogleForecastHour]:
@@ -242,12 +279,25 @@ def _to_fetch_result(
     req: ForecastRequest, hours: list[GoogleForecastHour], issued_at: str
 ) -> FetchResult:
     samples: list[NormalizedSample] = []
+    wrong_gust_units: list[str | None] = []
     for hour in hours:
         valid_at = isoformat_utc(parse_utc(hour.interval.startTime))
         lead = lead_hours(issued_at, valid_at)
         if lead < 1 or lead > req.max_lead_hours:
             continue
         samples.extend(_hour_samples(req, issued_at, valid_at, lead, hour))
+        samples.extend(
+            _display_samples(req, issued_at, valid_at, lead, hour, wrong_gust_units)
+        )
+    if wrong_gust_units:
+        first = wrong_gust_units[0]
+        logger.warning(
+            "google: skipped %d wind gust value(s) whose unit is not %s"
+            " (first unit %r)",
+            len(wrong_gust_units),
+            _EXPECTED_SPEED_UNIT,
+            None if first is None else first[:32],
+        )
     return FetchResult(samples=samples, grid=None)
 
 
@@ -330,4 +380,61 @@ def _hour_samples(
                 f"{qpf.quantity} {qpf.unit}",
             )
         )
+    return out
+
+
+def _display_samples(
+    req: ForecastRequest,
+    issued_at: str,
+    valid_at: str,
+    lead: int,
+    hour: GoogleForecastHour,
+    wrong_gust_units: list[str | None],
+) -> list[NormalizedSample]:
+    """The hour's display samples (card 7); never raises.
+
+    Cloud cover (%) and wind direction (degrees, from) are stored as given.
+    A gust is stored, in m/s, only when its unit is the expected km/h; a gust
+    in another unit, or with none, is skipped and its unit appended to
+    ``wrong_gust_units``, which the caller logs as one WARNING per reply. A
+    missing value stores nothing.
+    """
+    out: list[NormalizedSample] = []
+    cloud = hour.cloudCover
+    if "cloud_cover" in req.variables and cloud is not None:
+        out.append(
+            _sample(req, "cloud_cover", issued_at, valid_at, lead, cloud, f"{cloud} %")
+        )
+    wind = hour.wind
+    if wind is None:
+        return out
+    degrees = None if wind.direction is None else wind.direction.degrees
+    if "wind_direction" in req.variables and degrees is not None:
+        out.append(
+            _sample(
+                req,
+                "wind_direction",
+                issued_at,
+                valid_at,
+                lead,
+                degrees,
+                f"{degrees} deg",
+            )
+        )
+    gust = wind.gust
+    if "wind_gust" in req.variables and gust is not None and gust.value is not None:
+        if gust.unit == _EXPECTED_SPEED_UNIT:
+            out.append(
+                _sample(
+                    req,
+                    "wind_gust",
+                    issued_at,
+                    valid_at,
+                    lead,
+                    kmh_to_ms(gust.value),
+                    f"{gust.value} {gust.unit}",
+                )
+            )
+        else:
+            wrong_gust_units.append(gust.unit)
     return out

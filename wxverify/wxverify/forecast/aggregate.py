@@ -81,6 +81,25 @@ def covered_hours(valid_ats: Iterable[str]) -> int:
     return len(hours)
 
 
+def local_day_hour_instants(local_date: date, timezone: str) -> list[datetime]:
+    """The on-the-hour UTC instants of one local day, in order (23, 24 or 25).
+
+    Every on-the-hour UTC instant from the first one at or after the day's
+    ``start`` up to, but not including, its ``end``
+    (:func:`wxverify.core.timeutil.local_day_slots`). The Forecast page's
+    hour columns and both coverage predicates use this list.
+    """
+    start, end, _ = local_day_slots(local_date, timezone)
+    slot = start.replace(minute=0, second=0, microsecond=0)
+    if slot < start:
+        slot += timedelta(hours=1)
+    instants: list[datetime] = []
+    while slot < end:
+        instants.append(slot)
+        slot += timedelta(hours=1)
+    return instants
+
+
 def covers_local_day(
     valid_ats: Iterable[str], *, local_date: date, timezone: str
 ) -> bool:
@@ -91,21 +110,15 @@ def covers_local_day(
     only inside the day's own ``[start, end)`` window, so a sample either
     side of a boundary cannot stand in for a missing hour inside it.
 
-    The required hours are enumerated explicitly: every on-the-hour UTC
-    instant from the first one at or after ``start`` up to, but not
-    including, ``end``. They are not counted from the window's floored
-    duration, because the two need not agree: a 24.5-hour window that starts
-    on the hour, as on a half-hour DST shift, holds 25 on-the-hour instants
-    but floors to 24.
+    The required hours are enumerated explicitly
+    (:func:`local_day_hour_instants`): every on-the-hour UTC instant from
+    the first one at or after ``start`` up to, but not including, ``end``.
+    They are not counted from the window's floored duration, because the
+    two need not agree: a 24.5-hour window that starts on the hour, as on a
+    half-hour DST shift, holds 25 on-the-hour instants but floors to 24.
     """
     start, end, _ = local_day_slots(local_date, timezone)
-    slot = start.replace(minute=0, second=0, microsecond=0)
-    if slot < start:
-        slot += timedelta(hours=1)
-    required: set[datetime] = set()
-    while slot < end:
-        required.add(slot)
-        slot += timedelta(hours=1)
+    required = set(local_day_hour_instants(local_date, timezone))
     hours = {
         instant
         for instant in (
@@ -132,14 +145,7 @@ def covers_local_day_exactly(
     compared UNTRUNCATED, so an off-hour sample fails the rule rather than
     being silently folded onto the hour it is nearest.
     """
-    start, end, _ = local_day_slots(local_date, timezone)
-    slot = start.replace(minute=0, second=0, microsecond=0)
-    if slot < start:
-        slot += timedelta(hours=1)
-    required: set[datetime] = set()
-    while slot < end:
-        required.add(slot)
-        slot += timedelta(hours=1)
+    required = set(local_day_hour_instants(local_date, timezone))
     instants = [parse_utc(valid_at) for valid_at in valid_ats]
     return len(instants) == len(set(instants)) and set(instants) == required
 
@@ -214,9 +220,8 @@ def clearing_subset(
     Feeds clearing the >= 18-hour coverage guard aggregate alone; when NO
     selected feed clears it, ALL selected feeds still aggregate (the tile
     stays populated) and the cell carries the orthogonal ``partial`` badge.
-    Shared by the Forecast page and the forecast-of-record builder so the
-    two cannot drift. On the Forecast page and in the record's ``displayed``
-    block, neither a temperature cell's high/low nor a precipitation cell's
+    The Forecast page's cells use it (``wxverify.forecast.service``). There,
+    neither a temperature cell's high/low nor a precipitation cell's
     total and wet-hour count aggregate over this subset — the selection's
     extrema set does, decided per feed by :func:`covers_local_day` for
     temperature and by :func:`covers_local_day_exactly` for precipitation —
@@ -243,8 +248,8 @@ def displayed_daily(
     set; an empty sequence yields ``None`` values). Native units throughout
     (wind in m/s; wet hours as a count of hours, unrounded) — unit conversion
     and the rounding of that count are presentational, done once in
-    ``_build_tile``. Shared by the Forecast page and the forecast-of-record
-    builder so the two cannot drift.
+    ``_build_tile``, the Forecast page's tile builder and this function's
+    one caller.
     """
     if variable == "temperature":
         return {

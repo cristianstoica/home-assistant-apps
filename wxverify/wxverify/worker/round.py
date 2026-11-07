@@ -47,7 +47,8 @@ _ROUND_DEFAULT: Final = (0, 10)  # ROUND_DEFAULT_LOCAL_TIME as (hour, minute)
 # The setting's range, 00:05 to 05:00 local, in minutes after midnight: after
 # the evening collection, which ends at 23:59, and early enough that the
 # close's first attempt, which waits for the round's bound, can publish
-# before the 07:00 record (4.4).
+# before the 07:00 default snapshot time, the deadline of alert 4,
+# publication_late (4.4).
 _ROUND_EARLIEST_MINUTES: Final = 5
 _ROUND_LATEST_MINUTES: Final = 5 * 60
 

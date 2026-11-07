@@ -25,11 +25,6 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.helpers import (
-    assert_summary_mount_not_nested_in_chart,
-    assert_summary_status_pre_mounted_empty,
-    collect_tags,
-)
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.timeutil import floor_hour, isoformat_utc, utc_now
@@ -159,14 +154,20 @@ def test_forecast_tiles_204_when_fingerprint_matches_fragment_when_it_differs(
     assert fresh.text == ""
 
 
-def test_forecast_tiles_unknown_site_yields_204(
+def test_forecast_tiles_unknown_site_yields_200_not_found_region(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Renamed from "...yields_204": an unknown site now answers 200 with
+    the "Site not found." region, which carries no ``hx-get`` so the
+    auto-poll stops instead of looping against a site that no longer
+    exists."""
     _init_tmp_db(tmp_path)
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
         response = client.get("/forecast/tiles?site=999999&fingerprint=")
-    assert response.status_code == 204
+    assert response.status_code == 200
+    assert "Site not found." in response.text
+    assert "hx-get" not in response.text
 
 
 # ---------------------------------------------------------------------------
@@ -222,9 +223,14 @@ def test_api_forecast_hourly_in_range_day_passes_through_unclamped(
 # ---------------------------------------------------------------------------
 
 
-def test_forecast_day_clamps_and_embeds_clamped_day_in_chart_src(
+def test_forecast_day_clamps_and_embeds_clamped_day_in_poll_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Renamed from "...embeds_clamped_day_in_chart_src": card 7 removed
+    the per-day hourly chart /forecast/day used to embed, so the clamp is
+    now pinned through the region's own auto-poll URL, which always
+    carries the day it was built for (``&day=<n>``), rather than through a
+    chart data-src that no longer exists."""
     conn = _init_tmp_db(tmp_path)
     site_id = _make_site(conn)
     app = _make_app(monkeypatch)
@@ -232,7 +238,9 @@ def test_forecast_day_clamps_and_embeds_clamped_day_in_chart_src(
         response = client.get(f"/forecast/day?site={site_id}&day=99")
     assert response.status_code == 200
     # Jinja autoescapes the literal `&` in the query string to `&amp;`.
-    assert f"/api/forecast/hourly?site={site_id}&amp;day=7" in response.text
+    assert f"/forecast/tiles?site={site_id}&amp;fingerprint=0-p0&amp;day=7" in (
+        response.text
+    )
     assert "day=99" not in response.text
 
 
@@ -322,14 +330,16 @@ def test_forecast_degrades_to_rebuilding_without_score_cache_no_enqueue(
     with TestClient(app) as client:
         tiles_resp = client.get(f"/forecast/tiles?site={site_id}&fingerprint=")
         assert tiles_resp.status_code == 200
-        # O5: the rendered tile surface carries the state class and badge
-        # that production now returns with no publication -- and NEVER the
-        # old "ranking updating" wording, retired with the per-cell
-        # "rebuilding" leaderboard status it depended on.
+        # O5: the rendered tile surface carries the warning that production
+        # now returns with no publication -- and NEVER the old "ranking
+        # updating" wording, retired with the per-cell "rebuilding"
+        # leaderboard status it depended on. Card 7 dropped the per-tile
+        # "state-<state>" CSS class, so the low-confidence signal is now
+        # observable only through the day header's warning tooltip text
+        # (day_warnings in forecast/page.py).
         rendered = " ".join(tiles_resp.text.split())
-        assert "state-low_confidence" in rendered
-        assert "low confidence" in rendered
-        assert "ranking updating" not in rendered
+        assert "Low confidence" in rendered
+        assert "Ranking updating" not in rendered
 
         hourly_resp = client.get(f"/api/forecast/hourly?site={site_id}&day=1")
         assert hourly_resp.status_code == 200
@@ -421,55 +431,16 @@ def test_forecast_partial_coverage_rebuilding_agrees_across_both_surfaces(
 
 
 # ---------------------------------------------------------------------------
-# Chart accessibility: fallback SVG hidden, summary mount outside container.
+# DELETED: test_forecast_hourly_chart_fallback_svg_hidden_and_summary_mount_
+# outside_container pinned the per-day hourly uPlot chart's fallback <svg>
+# and its [data-chart]/[data-summary] mounts on /forecast/day. Card 7
+# replaced the whole Day Detail view with _tiles.html's table grids, so
+# /forecast/day no longer renders a chart, an svg, or a data-summary mount
+# at all -- there is nothing left on this route for the test's subject to
+# pin, and no table-grid counterpart needs the same accessibility contract
+# (no canvas, no uPlot instance, nothing JS mounts into). This lines up
+# with tests/test_app_js_chart_a11y.py's app.js-level pin that the number of
+# ``new uPlot(...)`` instantiations dropped from 3 to 2 (owned by the
+# parallel test writer on this plan) -- the third chart this test exercised
+# is the one that was removed.
 # ---------------------------------------------------------------------------
-
-
-def test_forecast_hourly_chart_fallback_svg_hidden_and_summary_mount_outside_container(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    conn = _init_tmp_db(tmp_path)
-    # Non-UTC so a template that hardcoded "UTC" (or read the wrong field)
-    # cannot pass the data-timezone assertion below by accident -- it must
-    # observe this SITE's configured zone, not any default.
-    site_id = _make_site(conn, "Hourly Chart Site", timezone="America/Denver")
-    conn.commit()
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        response = client.get(f"/forecast/day?site={site_id}&day=0")
-    assert response.status_code == 200
-    html = response.text
-
-    svgs = collect_tags(html, "svg")
-    assert len(svgs) == 1, (
-        f"expected exactly one <svg> on /forecast/day, found {len(svgs)}"
-    )
-    assert svgs[0].get("aria-hidden") == "true"
-    assert "aria-label" not in svgs[0]
-    assert "role" not in svgs[0]
-
-    chart_divs = [
-        a for a in collect_tags(html, "div") if a.get("data-chart") == "forecast-hourly"
-    ]
-    assert len(chart_divs) == 1
-    assert "role" not in chart_divs[0], (
-        "the [data-chart] container must carry no ARIA role -- it flattens "
-        "uPlot's own legend table out of the accessibility tree"
-    )
-    # Same reasoning as the role check above, for aria-hidden: uPlot mounts
-    # its own canvas + legend INSIDE this container, so hiding the container
-    # itself would defeat the whole point of leaving it role-less.
-    assert "aria-hidden" not in chart_divs[0]
-    # A typo'd data-summary (e.g. "forecast-hourly-sumary") would make the
-    # client's summaryEl() -> getElementById(id) return null and silently
-    # disable the whole feature with no error -- pin the attribute's VALUE,
-    # not just the existence of a same-named div (checked below).
-    assert chart_divs[0].get("data-summary") == "forecast-hourly-summary"
-    # hourFormatter() reads el.dataset.timezone to format every hour label in
-    # the SITE's local time; a missing/wrong value silently degrades every
-    # label to the BROWSER's local time with no error. Must equal the site's
-    # actual configured zone, not merely be present.
-    assert chart_divs[0].get("data-timezone") == "America/Denver"
-
-    assert_summary_mount_not_nested_in_chart(html, summary_id="forecast-hourly-summary")
-    assert_summary_status_pre_mounted_empty(html, summary_id="forecast-hourly-summary")

@@ -3,11 +3,40 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Protocol
+from typing import Annotated, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, BeforeValidator, ConfigDict
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc
+
+
+def display_float(value: object) -> float | None:
+    """A display field's value (card 7) as a float, or ``None``.
+
+    Anything ``float()`` cannot read (text such as ``"N/A"``, a list, an
+    object, an integer too large for a float) is ``None``, so it stores
+    nothing. Never raises: a bad display field must never fail a reply's
+    validation and cost its scored values.
+    """
+    if not isinstance(value, int | float | str):
+        return None
+    try:
+        return float(value)
+    except (ValueError, OverflowError):
+        return None
+
+
+def display_mapping(value: object) -> object:
+    """A display container (card 7) as given when it is an object, else
+    ``None``, so a malformed container never fails a reply's validation."""
+    if isinstance(value, dict | BaseModel):
+        return cast(object, value)
+    return None
+
+
+#: Every display leaf of every adapter model: ``float | None``, defaulting
+#: to ``None``, read leniently by :func:`display_float`.
+DisplayFloat = Annotated[float | None, BeforeValidator(display_float)]
 
 
 class GridProvenance(BaseModel):

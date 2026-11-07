@@ -69,5 +69,5 @@ def test_o10_run_migrations_on_empty_matches_create_schema_plus_triggers() -> No
     # rain_forecast_days, rain_picks and publication_rain_ranks; 69 with the
     # storage release: +1 forecast_history, -15 for forecast_pairs,
     # close_pairs and the seven verification_* tables and their own
-    # indexes, all dropped (3.1, 4.1).
-    assert len(fresh_names) == 69
+    # indexes, all dropped (3.1, 4.1); 68 with card 29.
+    assert len(fresh_names) == 68

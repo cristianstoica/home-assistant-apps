@@ -29,8 +29,6 @@ _TODAY_PIPELINE_IDS = (
     "fetch_obs_live",
     "fetch_feed_live",
     "problem_jobs",
-    "forecast_record_gap",
-    "record_gap_scan_degraded",
     "obs_station_history_failing",
     "obs_collection_delayed",
     "main_worker_liveness",
@@ -46,8 +44,6 @@ _KEPT_PIPELINE_IDS = (
     "feed_stale",
     "fetch_feed_live",
     "problem_jobs",
-    "forecast_record_gap",
-    "record_gap_scan_degraded",
     "obs_collection_delayed",
     "main_worker_liveness",
 )
@@ -118,7 +114,7 @@ def test_rt1_switch_off_pipeline_ids_and_skipped_list() -> None:
     ids = _condition_ids(on)
     pipeline_ids = [c for c in ids if c in _TODAY_PIPELINE_IDS]
     assert pipeline_ids == list(_TODAY_PIPELINE_IDS), (
-        "M1/M2 -> at this assertion: correct = today's twelve pipeline ids in"
+        "M1/M2 -> at this assertion: correct = today's nine pipeline ids in"
         f" today's order, mutant = {pipeline_ids!r}"
     )
     assert "station_silent_today" in ids, (
@@ -196,7 +192,7 @@ def test_rt3_close_on_pipeline_disabled_skipped_list() -> None:
     )
     assert skipped == expected, (
         f"M5 -> at this assertion: correct = {expected!r}, mutant ="
-        f" {skipped!r} (the close-on skipped list keeps today's twelve ids)"
+        f" {skipped!r} (the close-on skipped list keeps today's kept ids)"
     )
     for retired_id in _RETIRED_IDS:
         assert retired_id not in skipped, (

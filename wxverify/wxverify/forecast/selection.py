@@ -200,38 +200,61 @@ def _rank(pool: Sequence[CellCandidate]) -> tuple[list[CellCandidate], bool]:
     """
     confident = [c for c in pool if c.confident]
     if confident:
-        ranked = sorted(
-            confident,
-            key=lambda c: confident_order_key(c.skill_score, c.source, c.model),
-        )
+        ranked = sorted(confident, key=_confident_key)
         return ranked, False
 
     scored = [c for c in pool if c.pair_n > 0]
     if scored:
-        ranked = sorted(
-            scored,
-            key=lambda c: (
-                -c.pair_n,
-                c.mae if c.mae is not None else _MAE_NONE_LAST,
-                c.source,
-                c.model,
-            ),
-        )
+        ranked = sorted(scored, key=_scored_key)
         return ranked, True
 
-    ranked = sorted(
-        pool,
-        key=lambda c: (-c.future_sample_count, c.source, c.model),
-    )
+    ranked = sorted(pool, key=_sample_count_key)
     return ranked, True
+
+
+def ladder_order(candidates: Sequence[CellCandidate]) -> list[int]:
+    """Every candidate's feed id in the ladder's order, none twice.
+
+    :func:`_rank`'s three rungs concatenated, each sorted by its own key:
+    the confident feeds, then the scored ones (pairs but not confident),
+    then the rest by future sample count. Unlike ``_rank``, which returns
+    only its first non-empty rung, each rung here lists only the feeds no
+    earlier rung placed, so a ranked grid lists every model once.
+    """
+    confident = [c for c in candidates if c.confident]
+    scored = [c for c in candidates if not c.confident and c.pair_n > 0]
+    rest = [c for c in candidates if not c.confident and c.pair_n <= 0]
+    ordered = (
+        sorted(confident, key=_confident_key)
+        + sorted(scored, key=_scored_key)
+        + sorted(rest, key=_sample_count_key)
+    )
+    return [c.feed_id for c in ordered]
+
+
+def _confident_key(c: CellCandidate) -> tuple[float, str, str]:
+    return confident_order_key(c.skill_score, c.source, c.model)
+
+
+def _scored_key(c: CellCandidate) -> tuple[int, float, str, str]:
+    return (
+        -c.pair_n,
+        c.mae if c.mae is not None else _MAE_NONE_LAST,
+        c.source,
+        c.model,
+    )
+
+
+def _sample_count_key(c: CellCandidate) -> tuple[int, str, str]:
+    return (-c.future_sample_count, c.source, c.model)
 
 
 def confident_order_key(
     skill_score: float | None, source: str, model: str
 ) -> tuple[float, str, str]:
     """The ladder's order among confident feeds: skill descending, then
-    source and model. Defined once, for ``_rank`` and the substitute flag's
-    choice (11.3)."""
+    source and model. Defined once, for ``_rank``, :func:`ladder_order` and
+    the substitute flag's choice (11.3)."""
     return (-_skill_or_zero(skill_score), source, model)
 
 

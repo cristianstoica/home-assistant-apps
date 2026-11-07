@@ -33,7 +33,6 @@ from wxverify.db.queue import (
     claim_next_job,
     complete,
     defer_job,
-    enqueue_if_absent,
     fail,
     purge_failed_jobs_older_than,
     reclaim_all_stale,
@@ -51,11 +50,6 @@ from wxverify.obs.pws_adapter import (
     fetch_current_observation,
 )
 from wxverify.settings.keys import get_number_setting
-from wxverify.verification.record import (
-    compute_forecast_record_readonly,
-    persist_forecast_record,
-    run_record_gap_scan,
-)
 from wxverify.worker.access_hold import (
     AccessHeld,
     check_access_hold,
@@ -68,7 +62,7 @@ from wxverify.worker.close_chain import (
     run_day_close,
     run_day_publish,
 )
-from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
+from wxverify.worker.control import JobCancelled, JobDeferred
 from wxverify.worker.current_obs import (
     Health,
     PollOutcome,
@@ -333,14 +327,13 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
     )
     outcome = "completed"
     try:
-        continuation = await dispatch(db, writer, job)
-        # Complete + continuation in ONE write transaction: a
-        # crash between the two would otherwise drop a resumable
-        # chain (the chunk completes but its continuation is
-        # never enqueued).
+        await dispatch(db, writer, job)
+        # result='ok' is the success marker, written only here, on a normal
+        # dispatch return. FAILED_SCOPES_SQL (wxverify.monitor) treats only a
+        # marked row as resolving an earlier failure of its scope.
         recorded = await writer.write(
-            lambda conn, j=job, cont=continuation: _record_outcome(
-                conn, j, lambda c: _complete_and_continue(c, j.id, cont)
+            lambda conn, j=job: _record_outcome(
+                conn, j, lambda c: complete(c, j.id, result="ok")
             )
         )
         if recorded is _Dropped.OUTCOME:
@@ -373,7 +366,7 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
     except JobCancelled:
         outcome = "cancelled"
         # No success marker: a cancelled job resolved nothing
-        # (the marker is written only by _complete_and_continue).
+        # (the marker is written only on the normal return above).
         recorded = await writer.write(
             lambda conn, j=job: _record_outcome(conn, j, lambda c: complete(c, j.id))
         )
@@ -482,33 +475,6 @@ def _record_outcome[T](
     return record(conn)
 
 
-def _complete_and_continue(
-    conn: sqlite3.Connection, job_id: int, continuation: JobContinuation | None
-) -> None:
-    """Complete the job row and, atomically, enqueue its continuation.
-
-    ``complete`` runs first so the finished row is no longer 'running' when
-    ``enqueue_if_absent`` dedupes -- a chain's continuation must never be
-    swallowed by its own just-finished chunk.
-
-    ``result='ok'`` is the success marker. This is the ONLY path that writes
-    it, and it means "dispatch returned normally" -- for a chain type that
-    is one chunk, not the chain. The JobCancelled branch of run_claimed_job
-    completes WITHOUT it, so a cancelled or unavailable job leaves result
-    NULL, and FAILED_SCOPES_SQL (wxverify.monitor) treats only a marked row
-    as resolving an earlier failure of its scope.
-    """
-    complete(conn, job_id, result="ok")
-    if continuation is not None:
-        enqueue_if_absent(
-            conn,
-            continuation.job_type,
-            continuation.site_id,
-            continuation.job_key,
-            continuation.payload,
-        )
-
-
 def _fail_job(conn: sqlite3.Connection, job: Job, error: str) -> FailDisposition | None:
     """Record the failure.
 
@@ -559,9 +525,7 @@ async def _maybe_stamp_runtime_heartbeat(
     return now
 
 
-async def dispatch(
-    db: Database, writer: FencedWriter, job: Job
-) -> JobContinuation | None:
+async def dispatch(db: Database, writer: FencedWriter, job: Job) -> None:
     logger.debug("dispatch type=%s site=%s", job.type, job.site_id)
     if job.type == "fetch_obs" and job.job_key == WIND_DAYS_JOB_KEY:
         # The wind lane is the one fetch_obs job left; any other key is the
@@ -589,36 +553,6 @@ async def dispatch(
             raise JobCancelled()
         await _fetch_feed(db, writer, site_id, feed_id, payload=job.payload)
         return None
-    if job.type == "forecast_record":
-        site_id = job.site_id
-        if site_id is None:
-            raise JobCancelled()
-        snapshot_local_date = job.payload.get("snapshot_local_date")
-        if not isinstance(snapshot_local_date, str):
-            raise JobCancelled()
-        # The build reads and ranks on a read snapshot, never under the write
-        # lock; only its insert of at most 24 rows takes the lock.
-        await _run_forecast_record(db, writer, job, site_id, snapshot_local_date)
-        return None
-    if job.type == "record_gap_scan":
-        site_id = job.site_id
-        if site_id is None:
-            raise JobCancelled()
-
-        # One chunk of dates per write transaction; the continuation
-        # re-enqueues the scan so record-tier chunks interleave with other
-        # job types instead of holding the write lock across a long gap.
-        def _scan(conn: sqlite3.Connection) -> dict[str, object] | None:
-            if not _still_claimed(conn, job):
-                raise JobCancelled()
-            return run_record_gap_scan(conn, site_id, job.payload)
-
-        remainder = await writer.write(_scan)
-        if remainder is None:
-            return None
-        return JobContinuation(
-            "record_gap_scan", site_id, f"gapscan:cont:{site_id}", remainder
-        )
     if job.type == "day_close":
         await run_day_close(db, writer, job)
         return None
@@ -626,30 +560,6 @@ async def dispatch(
         await run_day_publish(db, writer, job)
         return None
     raise RuntimeError(f"unknown job type {job.type}")
-
-
-async def _run_forecast_record(
-    db: Database,
-    writer: FencedWriter,
-    job: Job,
-    site_id: int,
-    snapshot_local_date: str,
-) -> None:
-    """Build the day's record on a read snapshot; lock only for the insert."""
-    build = await db.read(
-        lambda conn: compute_forecast_record_readonly(
-            conn, site_id, snapshot_local_date
-        )
-    )
-    if build is None:
-        return
-
-    def _persist(conn: sqlite3.Connection) -> None:
-        if not _still_claimed(conn, job):
-            raise JobCancelled()
-        persist_forecast_record(conn, build)
-
-    await writer.write(_persist)
 
 
 async def _fetch_current_obs(

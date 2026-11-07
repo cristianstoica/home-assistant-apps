@@ -133,13 +133,17 @@ def _count_load_sites_calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     return calls
 
 
-_HIGH_LOW_RE = re.compile(r"High / Low</span>\s*<strong[^>]*>(.*?)</strong>", re.DOTALL)
+#: Each day header's High/Low span sits right after its <b> label
+#: ("<b>Today</b><span>13° / 13°</span>"), card 7's rebuild of the markup
+#: the old "High / Low</span><strong>" pair used to carry.
+_HIGH_LOW_RE = re.compile(r"<b>.*?</b>\s*<span>([^<]*)</span>", re.DOTALL)
 
 
 def _high_low_values(text: str) -> list[str]:
-    """Rendered temperature High/Low strings, one per tile, in document
-    order -- used to prove a tile body genuinely differs (not the whole
-    page, which also carries a wall-clock-derived "Last fetched ..." line)."""
+    """Rendered temperature High/Low strings, one per day header, in
+    document order -- used to prove a tile body genuinely differs (not the
+    whole page, which also carries a wall-clock-derived "Last fetched ..."
+    line)."""
     return _HIGH_LOW_RE.findall(text)
 
 
@@ -157,10 +161,10 @@ def test_tiles_returns_204_without_building_the_view(
 
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise AssertionError(
-            "build_forecast must not run when the fingerprint already matches"
+            "build_forecast_page must not run when the fingerprint already matches"
         )
 
-    monkeypatch.setattr("wxverify.web.routes.build_forecast", _boom)
+    monkeypatch.setattr("wxverify.web.routes.build_forecast_page", _boom)
     current_fp = _current_fingerprint(site_id)
     with TestClient(app) as client:
         response = client.get(
@@ -194,14 +198,20 @@ def test_tiles_renders_fragment_when_fingerprint_changed(
     assert f"fingerprint={new_fp}" in response.text
 
 
-def test_tiles_204_for_unknown_site(
+def test_tiles_200_not_found_region_for_unknown_site(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """An unknown site now answers 200 with the "Site not found." region,
+    which carries no ``hx-get`` -- so the auto-poll stops on its own rather
+    than looping against a site that no longer exists. Renamed from
+    "...204_for_unknown_site": that status no longer holds."""
     _init_tmp_db(tmp_path)
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
         response = client.get("/forecast/tiles?site=999999&fingerprint=")
-    assert response.status_code == 204
+    assert response.status_code == 200
+    assert "Site not found." in response.text
+    assert "hx-get" not in response.text
 
 
 def test_tiles_disabled_site_resolves_like_the_page(
@@ -367,8 +377,8 @@ def test_tiles_204_when_only_non_sample_state_changed(
         # against a build that ignores forecast_blend_depth entirely.
         depth_one_page = client.get(f"/forecast?site={site_id}")
         assert depth_one_page.status_code == 200
-        assert _high_low_values(depth_two_page.text) == ["13° / 13°"]
-        assert _high_low_values(depth_one_page.text) == ["11° / 11°"]
+        assert _high_low_values(depth_two_page.text)[1:2] == ["13° / 13°"]
+        assert _high_low_values(depth_one_page.text)[1:2] == ["11° / 11°"]
 
 
 # ---------------------------------------------------------------------------
@@ -477,15 +487,19 @@ def test_explicit_site_id_resolves_disabled_site_via_page_and_poll(
 ) -> None:
     """An EXPLICIT site_id resolves through ``load_site``, which does not
     filter on ``enabled`` -- pinned on both the page and the poll, the two
-    call sites the fix touches."""
+    call sites the fix touches. Card 7 dropped the per-site subtitle that
+    used to carry the site's own name and "- paused" wording, so a disabled
+    site resolving normally is now pinned by the "Paused" indicator firing
+    instead of the page falling back to "No sites configured.", which is
+    what an unresolved site_id would show."""
     conn = _init_tmp_db(tmp_path)
     site_id = _make_site(conn, "Paused Village", enabled=0)
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
         page = client.get(f"/forecast?site={site_id}")
         assert page.status_code == 200
-        assert "Paused Village" in page.text
-        assert "- paused" in page.text
+        assert "No sites configured." not in page.text
+        assert '<p class="muted">Paused</p>' in page.text
 
         tiles = client.get(f"/forecast/tiles?site={site_id}&fingerprint=")
         assert tiles.status_code == 200

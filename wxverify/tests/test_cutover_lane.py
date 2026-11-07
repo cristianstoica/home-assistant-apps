@@ -64,11 +64,10 @@ def test_ga2_scheduler_tick_returns_immediately_while_the_key_is_absent(
     conn = db._conn  # noqa: SLF001
     close_off(conn)
     _make_site(conn, timezone="UTC")
-    # After 07:00 local (methodology.SNAPSHOT_LOCAL_TIME, the default
-    # snapshot time): _enqueue_due_forecast_records' gap-scan branch has no
-    # daily_close_on guard of its own and needs no feed or station, so it
-    # enqueues the moment scheduler_tick's own early return is bypassed --
-    # the condition this test exists to rule out.
+    # scheduler_tick's own enqueuers have no daily_close_on guard of their
+    # own, so any one of them would enqueue the moment scheduler_tick's
+    # early return is bypassed -- the condition this test exists to rule
+    # out.
     now = datetime(2025, 1, 2, 8, 0, 0, tzinfo=UTC)
     monkeypatch.setattr(scheduler_module, "utc_now", lambda: now)
 

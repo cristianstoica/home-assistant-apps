@@ -2,11 +2,10 @@
 
 Every constant is pre-declared and versioned here — one module, one
 ``METHODOLOGY_VERSION`` — and is never tuned after viewing scores. The
-daily record (``record.py``), the daily close's scoring and publication
-(``scoring/close_scores.py``, ``scoring/publication.py``), the
-truth-coverage rules (``coverage.py``) and the scheduler
-import from this module, so the whole methodology is auditable in one
-place.
+snapshot-time default (``snapshot_time.py``), the daily close's scoring
+and publication (``scoring/close_scores.py``, ``scoring/publication.py``)
+and the truth-coverage rules (``coverage.py``) import from this module, so
+the whole methodology is auditable in one place.
 
 Every public constant here is either consumed by a non-test module or
 named in ``DECLARATIVE_ONLY`` — published for the audit trail but wired to
@@ -30,8 +29,7 @@ DECLARATIVE_ONLY: frozenset[str] = frozenset()
 # equally when what a scored quantity MEANS changes — the date set a
 # comparison is computed on, for instance — because a score made under the
 # new rule is not comparable with one made under the old, whatever the
-# constants say; each publication and forecast record stores the version it
-# was made under.
+# constants say; each publication stores the version it was made under.
 # 3: the served wind became the accuracy-weighted daily high (0.16.6).
 # 4: forecast rain is labelled by the start of its hour.
 # 5: scores come only from the daily close's scored round and its publications.
@@ -40,11 +38,6 @@ METHODOLOGY_VERSION = 5
 # Canonical snapshot time (default): the daily decision instant T, expressed
 # as site-local wall-clock time.
 SNAPSHOT_LOCAL_TIME = "07:00"
-
-# Late-write window for record reconstruction: hours after T during which a
-# missing record may still be reconstructed; later => `missed` (gap-scan
-# write, §14).
-LATE_WRITE_WINDOW_HOURS = 24
 
 # Truth coverage gate (temp high/low): minimum distinct covered hours in the
 # local day, plus REQUIRED coverage inside the peak windows (local hours).

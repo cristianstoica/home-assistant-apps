@@ -10,7 +10,7 @@ from typing import Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify import config
-from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
+from wxverify.collection.forecast_validation import invalid_stored_sample_sql
 from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
 from wxverify.core import stop
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
@@ -269,55 +269,6 @@ def create_tables(conn: sqlite3.Connection) -> None:
                 CHECK(admission_basis IS NULL
                       OR admission_basis IN ('complete','deadline')),
             UNIQUE(site_id, quantity, local_date, tz_generation_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS forecast_of_record (
-            id INTEGER PRIMARY KEY,
-            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-            tz_generation_id INTEGER NOT NULL
-                REFERENCES timezone_generations(id),
-            timezone TEXT NOT NULL,
-            tz_rebuild_in_progress INTEGER NOT NULL DEFAULT 0
-                CHECK(tz_rebuild_in_progress IN (0,1)),
-            snapshot_local_date TEXT NOT NULL,
-            snapshot_local_time TEXT NOT NULL,
-            snapshot_utc TEXT NOT NULL,
-            target_local_date TEXT NOT NULL,
-            variable TEXT NOT NULL
-                CHECK(variable IN ('temperature','wind','precip')),
-            display_lead INTEGER NOT NULL
-                CHECK(display_lead BETWEEN 0 AND 7),
-            status TEXT NOT NULL CHECK(status IN ('recorded','missed')),
-            missed_reason TEXT,
-            write_path TEXT
-                CHECK(write_path IS NULL
-                      OR write_path IN ('on_time','late_reconstruction')),
-            write_latency_seconds INTEGER,
-            policy TEXT,
-            methodology_version INTEGER NOT NULL,
-            app_version TEXT NOT NULL,
-            candidates TEXT,
-            selected_feed_ids TEXT,
-            feed_weights TEXT,
-            effective_cells TEXT,
-            source_runs TEXT,
-            hourly_values TEXT,
-            daily_quantities TEXT,
-            leaderboard_status TEXT,
-            created_at TEXT NOT NULL
-                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            -- the publication the record used: plain values with no foreign key
-            publication_id INTEGER,
-            publication_cutoff TEXT,
-            publication_age_days INTEGER,
-            CHECK(
-                (status = 'missed'
-                 AND missed_reason IS NOT NULL AND write_path IS NULL)
-                OR (status = 'recorded'
-                    AND missed_reason IS NULL AND write_path IS NOT NULL)
-            ),
-            UNIQUE(site_id, tz_generation_id, snapshot_local_date,
-                   variable, target_local_date)
         );
 
         CREATE TABLE IF NOT EXISTS score_cache (
@@ -942,12 +893,14 @@ SAMPLES_SLOT_INDEX_DDL: Final = (
 
 def invalid_sample_index_ddl() -> str:
     """DDL for the partial invalid-sample index, generated from the live
-    validation predicate so index and query stay the same string by
-    construction."""
+    stored-sample predicate (both rosters, card 7) so index and query
+    (``provider_ops.bad_sample_count_sql``) stay the same string by
+    construction. A file built with an older predicate is rebuilt once, at
+    the next start, by ``_sync_forecast_sample_index``."""
     return (
         "CREATE INDEX IF NOT EXISTS idx_samples_invalid "
         "ON forecast_samples(site_id, feed_id) "
-        f"WHERE {invalid_forecast_sample_sql('forecast_samples')}"
+        f"WHERE {invalid_stored_sample_sql('forecast_samples')}"
     )
 
 
@@ -1356,11 +1309,11 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     Refused with ``RuntimeError`` before anything is written: a file above
     17; a file at 1 to 15 (or below 0); a file at 16 whose daily close is
     off (no ``DAILY_CLOSE_ON_KEY``). Then, in order: `create_tables`; at 16
-    only, `migrate_v17_storage`; `create_indexes`; the four one-shot
-    corrections, the three seeds and the rain-label boundary; at 0 only, the
-    fresh file's three keys (`_record_fresh_build_keys`); last,
-    ``user_version`` 17. A file already at 17 runs the same steps less the
-    upgrade and the fresh keys.
+    only, `migrate_v17_storage`; on every start, `drop_forecast_record`;
+    `create_indexes`; the four one-shot corrections, the three seeds and the
+    rain-label boundary; at 0 only, the fresh file's three keys
+    (`_record_fresh_build_keys`); last, ``user_version`` 17. A file already
+    at 17 runs the same steps less the upgrade and the fresh keys.
 
     A stop is checked before each step (``core.stop.begin_step``), which
     also names the step for ``Database._open``'s log line. A step that does
@@ -1386,6 +1339,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     logger.debug("migrations tables ensured")
     if current == UPGRADE_FROM_USER_VERSION:
         migrate_v17_storage(conn)
+    stop.begin_step("drop_forecast_record")
+    drop_forecast_record(conn)
     stop.begin_step("create_indexes")
     create_indexes(conn)
     logger.debug("migrations indexes ensured")
@@ -1431,6 +1386,54 @@ def _record_fresh_build_keys(conn: sqlite3.Connection) -> None:
             set_runtime_state(conn, key, value)
 
 
+# The runtime_state key prefix of the removed record's gap scan, matched
+# exactly (no LIKE, which reads ``_`` as a wildcard).
+_RECORD_GAP_SCAN_KEY_PREFIX: Final = "record_gap_scan_failures:"
+
+
+def drop_forecast_record(conn: sqlite3.Connection) -> None:
+    """Delete what is left of the removed daily forecast record.
+
+    `run_migrations` calls it on every start, just after
+    `migrate_v17_storage` (which runs at version 16 only). One SAVEPOINT
+    holds three statements, in this order: ``DROP TABLE IF EXISTS
+    forecast_of_record``; a DELETE of the ``forecast_record`` and
+    ``record_gap_scan`` jobs, in any status; a DELETE of the
+    ``runtime_state`` keys beginning ``record_gap_scan_failures:``. Nothing
+    references the table, so the drop cascades nowhere. Every other job,
+    key, setting and table is left as it is. One INFO line gives the three
+    counts; on a file already done they are all 0.
+
+    Any error rolls the savepoint back and is re-raised, so the table, jobs
+    and keys stay as they were and the next start runs the step again; the
+    in_transaction check covers an error that has already ended the
+    transaction.
+    """
+    tables = 1 if _table_exists(conn, "forecast_of_record") else 0
+    conn.execute("SAVEPOINT drop_forecast_record")
+    try:
+        conn.execute("DROP TABLE IF EXISTS forecast_of_record")
+        jobs = conn.execute(
+            "DELETE FROM jobs WHERE type IN ('forecast_record', 'record_gap_scan')"
+        ).rowcount
+        keys = conn.execute(
+            "DELETE FROM runtime_state WHERE substr(key, 1, length(?1)) = ?1",
+            (_RECORD_GAP_SCAN_KEY_PREFIX,),
+        ).rowcount
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK TO drop_forecast_record")
+            conn.execute("RELEASE drop_forecast_record")
+        raise
+    conn.execute("RELEASE drop_forecast_record")
+    logger.info(
+        "drop_forecast_record: %d table(s) dropped, %d job(s), %d key(s)",
+        tables,
+        jobs,
+        keys,
+    )
+
+
 # ---------------------------------------------------------------------------
 # The version 17 upgrade: one forecast history
 # ---------------------------------------------------------------------------
@@ -1455,8 +1458,7 @@ V17_DROP_ORDER: Final[tuple[str, ...]] = (
 # and fetch_obs only under the key wind-days. IS, not =, so a NULL job_key
 # compares as a value.
 _V17_KEPT_JOBS_SQL: Final = """
-    type IN ('fetch_current_obs', 'fetch_feed', 'forecast_record',
-             'record_gap_scan', 'day_close', 'day_publish')
+    type IN ('fetch_current_obs', 'fetch_feed', 'day_close', 'day_publish')
     OR (type = 'fetch_obs' AND job_key IS 'wind-days')
 """
 # The persistence yardstick's feed id, left out of the forecast history.

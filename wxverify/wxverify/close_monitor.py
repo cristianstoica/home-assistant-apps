@@ -41,7 +41,10 @@ from wxverify.db.site_days import (
 from wxverify.db.station_readings import last_five_minute_store, next_five_minute_try
 from wxverify.scoring.publication import Publication, active_publication
 from wxverify.settings.keys import get_number_setting
-from wxverify.verification.record import resolve_snapshot_utc, snapshot_wall_clock
+from wxverify.verification.snapshot_time import (
+    resolve_snapshot_utc,
+    snapshot_wall_clock,
+)
 from wxverify.worker.access_hold import AccessKind, AccessRecord, refused_kinds
 from wxverify.worker.close_chain import (
     CLOSE_LOG_KEEP_DAYS,

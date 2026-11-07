@@ -15,7 +15,7 @@ from wxverify.collection.budget import (
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.collection.forecast_validation import (
     FORECAST_VARIABLES,
-    invalid_forecast_sample_sql,
+    invalid_stored_sample_sql,
 )
 from wxverify.core.options import SECRET_ENV
 from wxverify.core.secrets import key_status
@@ -486,13 +486,15 @@ def bad_sample_count_sql(placeholders: str) -> str:
     statistics, and an unpinned planner could pick a non-partial index
     instead, turning this into an O(history) scan for the same zero-row
     result. The unaliased `forecast_samples` form keeps this predicate
-    textually identical to the one in the index DDL.
+    textually identical to the one in the index DDL. Both use the
+    stored-sample predicate, so a valid display row (card 7) is not a bad
+    sample.
     """
     return f"""
         SELECT COUNT(*) AS bad_sample_count
         FROM forecast_samples INDEXED BY idx_samples_invalid
         WHERE site_id=? AND feed_id IN ({placeholders})
-          AND {invalid_forecast_sample_sql("forecast_samples")}
+          AND {invalid_stored_sample_sql("forecast_samples")}
         """
 
 

@@ -14,6 +14,9 @@ incidentally via intersections):
 
 The sample loader adds one more: feeds not served at the site, through
 ``served_only`` on :func:`load_future_samples` (:func:`served_feed_ids`).
+The display loader (:func:`load_display_samples`, card 7) reads the display
+roster instead, so it drops invalid rows by
+:func:`invalid_stored_sample_sql` and always drops unserved feeds.
 """
 
 from __future__ import annotations
@@ -22,12 +25,14 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Literal, cast
+from typing import Final, Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify.collection.forecast_validation import (
+    DISPLAY_VARIABLES,
     FORECAST_VARIABLES,
     invalid_forecast_sample_sql,
+    invalid_stored_sample_sql,
 )
 from wxverify.collection.precip_labels import precip_label_eligible_sql
 from wxverify.core.timeutil import day_ahead as issue_day_ahead
@@ -45,10 +50,6 @@ from wxverify.worker.cadence import parse_fetch_interval_minutes
 EXCLUDED_FEEDS_SQL = (
     "f.is_virtual = 0 AND NOT (f.source = 'meteoblue' AND f.model = 'multimodel')"
 )
-
-# Recorded exclusion reason (plan §6): a forecast run whose availability
-# timestamp is NULL cannot be placed on the as-of timeline.
-SAMPLE_EXCLUDE_NULL_FETCHED_AT = "null_fetched_at"
 
 
 @dataclass(frozen=True)
@@ -136,7 +137,6 @@ def load_future_samples(
     site_id: int,
     since_valid_at: str,
     served_only: bool,
-    as_of: str | None = None,
 ) -> list[FutureSampleRow]:
     """Load the latest-run future samples for a site.
 
@@ -147,17 +147,14 @@ def load_future_samples(
     ``issued_at = (SELECT MAX(...))`` form selected -- with no ties possible and
     no correlated rescan per row. The validity predicate is applied before the
     window function, so an invalid sample from a newer run still cannot shadow a
-    valid older one. ``variable IN (...)`` is implied by ``NOT invalid`` and is
-    stated only to make idx_samples_site_var_valid's valid_at range reachable.
+    valid older one. The statement names idx_samples_site_var_valid with
+    ``INDEXED BY``, so the read seeks the site's samples from
+    ``since_valid_at`` on; without the hint the planner picks
+    idx_samples_slot to skip the window's sort, which walks the site's whole
+    history. ``variable IN (...)``, implied by ``NOT invalid``, is still
+    stated so that index's key reaches ``valid_at``.
     The rain-label boundary (:func:`precip_label_eligible_sql`) is applied there
     too, so an excluded newer run cannot hide an eligible older one.
-
-    ``as_of`` (plan §6): restrict to runs available at T — ``issued_at <= T``
-    AND ``fetched_at <= T`` — applied BEFORE the latest-run pick, so the
-    newest run *at T* wins, not today's newest. Rows with NULL ``fetched_at``
-    are excluded (count them via :func:`count_null_availability_samples` and
-    record :data:`SAMPLE_EXCLUDE_NULL_FETCHED_AT`). With ``as_of=None`` the
-    statement is byte-identical to the production one.
 
     ``served_only`` has no default so each caller states its policy: when
     True, rows whose feed is not in :func:`served_feed_ids` are dropped after
@@ -165,54 +162,20 @@ def load_future_samples(
     passes False because it filters to its pinned roster.
 
     With the daily close on (9.5) each row also carries ``download_date``
-    (:func:`_download_dates`), read with ``as_of`` as the read time; the
-    statement then also selects ``fetched_at``. With the close off the
-    statement is unchanged and ``download_date`` stays None.
+    (:func:`_download_dates`); the statement then also selects
+    ``fetched_at``. With the close off the
+    statement is unchanged and ``download_date`` stays None. The statement
+    is :func:`future_samples_sql`'s.
     """
-    invalid = invalid_forecast_sample_sql("fs")
-    eligible = precip_label_eligible_sql("fs", "f")
-    variables = ", ".join(f"'{variable}'" for variable in FORECAST_VARIABLES)
-    asof_clause = ""
-    asof_params: tuple[object, ...] = ()
-    if as_of is not None:
-        asof_clause = (
-            "AND fs.fetched_at IS NOT NULL "
-            "AND julianday(fs.fetched_at) <= julianday(?) "
-            "AND julianday(fs.issued_at) <= julianday(?)"
-        )
-        asof_params = (as_of, as_of)
     close_on = daily_close_on(conn)
-    outer_extra = ", fetched_at" if close_on else ""
-    inner_extra = ", fs.fetched_at" if close_on else ""
     rows = conn.execute(
-        f"""
-        SELECT feed_id, source, model, variable, issued_at, valid_at, value{outer_extra}
-        FROM (
-            SELECT fs.feed_id, f.source, f.model, fs.variable, fs.issued_at,
-                   fs.valid_at, fs.value{inner_extra},
-                   ROW_NUMBER() OVER (
-                       PARTITION BY fs.feed_id, fs.variable, fs.valid_at
-                       ORDER BY fs.issued_at DESC
-                   ) AS rn
-            FROM forecast_samples fs
-            JOIN feeds f ON f.id = fs.feed_id
-            WHERE fs.site_id = ?
-              AND fs.variable IN ({variables})
-              AND fs.valid_at >= ?
-              AND {EXCLUDED_FEEDS_SQL}
-              AND NOT {invalid}
-              AND {eligible}
-              {asof_clause}
-        )
-        WHERE rn = 1
-        ORDER BY valid_at, feed_id
-        """,
-        (site_id, since_valid_at, *asof_params),
+        future_samples_sql(close_on=close_on),
+        (site_id, since_valid_at),
     ).fetchall()
     served = served_feed_ids(conn, site_id=site_id) if served_only else None
     kept = [row for row in rows if served is None or int(row["feed_id"]) in served]
     download_dates = (
-        _download_dates(conn, site_id=site_id, rows=kept, as_of=as_of)
+        _download_dates(conn, site_id=site_id, rows=kept)
         if close_on
         else [None] * len(kept)
     )
@@ -231,13 +194,98 @@ def load_future_samples(
     ]
 
 
+def future_samples_sql(*, close_on: bool) -> str:
+    """The statement :func:`load_future_samples` runs, for one close state.
+
+    Module-level so a query-plan test plans the text that ships. With
+    ``close_on`` both select lists also carry ``fetched_at`` (9.5); the
+    rest of the text is the same for both states.
+    """
+    invalid = invalid_forecast_sample_sql("fs")
+    eligible = precip_label_eligible_sql("fs", "f")
+    variables = ", ".join(f"'{variable}'" for variable in FORECAST_VARIABLES)
+    outer_extra = ", fetched_at" if close_on else ""
+    inner_extra = ", fs.fetched_at" if close_on else ""
+    return f"""
+        SELECT feed_id, source, model, variable, issued_at, valid_at, value{outer_extra}
+        FROM (
+            SELECT fs.feed_id, f.source, f.model, fs.variable, fs.issued_at,
+                   fs.valid_at, fs.value{inner_extra},
+                   ROW_NUMBER() OVER (
+                       PARTITION BY fs.feed_id, fs.variable, fs.valid_at
+                       ORDER BY fs.issued_at DESC
+                   ) AS rn
+            FROM forecast_samples fs INDEXED BY idx_samples_site_var_valid
+            JOIN feeds f ON f.id = fs.feed_id
+            WHERE fs.site_id = ?
+              AND fs.variable IN ({variables})
+              AND fs.valid_at >= ?
+              AND {EXCLUDED_FEEDS_SQL}
+              AND NOT {invalid}
+              AND {eligible}
+        )
+        WHERE rn = 1
+        ORDER BY valid_at, feed_id
+        """
+
+
+_DISPLAY_VARIABLES_SQL: Final = ", ".join(
+    f"'{variable}'" for variable in DISPLAY_VARIABLES
+)
+
+#: The display rows (card 7) :func:`load_display_samples` reads. One row per
+#: slot (``idx_samples_slot``), so there is no latest-run pick, no rain-label
+#: rule and no download date. Module-level so a query-plan test plans the
+#: text that ships.
+DISPLAY_SAMPLES_SQL: Final = f"""
+    SELECT fs.feed_id, f.source, f.model, fs.variable, fs.issued_at,
+           fs.valid_at, fs.value
+    FROM forecast_samples fs
+    JOIN feeds f ON f.id = fs.feed_id
+    WHERE fs.site_id = ?
+      AND fs.variable IN ({_DISPLAY_VARIABLES_SQL})
+      AND fs.valid_at >= ?
+      AND {EXCLUDED_FEEDS_SQL}
+      AND NOT {invalid_stored_sample_sql("fs")}
+    ORDER BY fs.valid_at, fs.feed_id
+    """
+
+
+def load_display_samples(
+    conn: sqlite3.Connection, *, site_id: int, since_valid_at: str
+) -> list[FutureSampleRow]:
+    """Load a site's display samples (card 7) valid at or after a stamp.
+
+    Runs :data:`DISPLAY_SAMPLES_SQL`: cloud cover, gust and wind direction,
+    valid rows only (:func:`invalid_stored_sample_sql`), with the shared feed
+    exclusions, ordered by ``valid_at`` then feed. Rows whose feed is not in
+    :func:`served_feed_ids` are then dropped in Python, as
+    :func:`load_future_samples` does with ``served_only``. ``download_date``
+    stays None: display rows are never scored or looked up by day ahead.
+    """
+    rows = conn.execute(DISPLAY_SAMPLES_SQL, (site_id, since_valid_at)).fetchall()
+    served = served_feed_ids(conn, site_id=site_id)
+    return [
+        FutureSampleRow(
+            feed_id=int(row["feed_id"]),
+            source=str(row["source"]),
+            model=str(row["model"]),
+            variable=str(row["variable"]),
+            issued_at=str(row["issued_at"]),
+            valid_at=str(row["valid_at"]),
+            value=float(row["value"]),
+        )
+        for row in rows
+        if int(row["feed_id"]) in served
+    ]
+
+
 def sample_day_ahead(sample: FutureSampleRow, timezone: str) -> int:
     """The day ahead a sample is looked up at (9.5).
 
     From its ``download_date`` when it has one (the close on): the days from
     that date to the sample's local valid date in ``timezone``. Otherwise the
-    issue-time day ahead, from its run label. The served forecast and the
-    record share it.
+    issue-time day ahead, from its run label. The served forecast reads it.
     """
     if sample.download_date is None:
         return issue_day_ahead(sample.issued_at, sample.valid_at, timezone)
@@ -250,7 +298,6 @@ def _download_dates(
     *,
     site_id: int,
     rows: list[sqlite3.Row],
-    as_of: str | None,
 ) -> list[date | None]:
     """Each row's download date (9.5), in ``rows``' order.
 
@@ -258,8 +305,7 @@ def _download_dates(
     the site (by ``ended_at``, then ``id``) whose labels for the sample's
     feed include its ``issued_at``; a meteoblue member's labels sit in its
     package's row under the member's key, so every row of the site is
-    looked at. With ``as_of`` set only rows that ended by then count; with
-    ``as_of`` None no row ends after the read, so no upper bound is needed.
+    looked at. No row ends after the read, so no upper bound is needed.
     No download can carry a label before its run was issued, so rows that
     ended before the earliest ``issued_at`` are not read. A label no row
     carries counts from the local date of the sample's ``fetched_at`` in the
@@ -272,21 +318,16 @@ def _download_dates(
     for row in rows:
         pending.setdefault(str(int(row["feed_id"])), set()).add(str(row["issued_at"]))
     earliest = min(str(row["issued_at"]) for row in rows)
-    upper_clause = "" if as_of is None else "AND julianday(ended_at) <= julianday(?)"
-    params: tuple[object, ...] = (
-        (site_id, earliest) if as_of is None else (site_id, earliest, as_of)
-    )
     downloads = conn.execute(
-        f"""
+        """
         SELECT local_date, labels
         FROM forecast_downloads
         WHERE site_id = ?
           AND outcome = 'stored'
           AND julianday(ended_at) >= julianday(?)
-          {upper_clause}
         ORDER BY ended_at DESC, id DESC
         """,
-        params,
+        (site_id, earliest),
     ).fetchall()
     found: dict[tuple[str, str], date] = {}
     for download in downloads:
@@ -351,39 +392,6 @@ def _local_fetch_date(fetched_at: object, zone: ZoneInfo | None) -> date | None:
         return parse_utc(str(fetched_at)).astimezone(zone).date()
     except ValueError:
         return None
-
-
-def count_null_availability_samples(
-    conn: sqlite3.Connection, *, site_id: int, since_valid_at: str
-) -> int:
-    """Count otherwise-eligible samples excluded for NULL ``fetched_at``.
-
-    The as-of path (:func:`load_future_samples` with ``as_of``) cannot place
-    a NULL-availability run on the timeline; plan §6 requires the exclusion
-    to be recorded, not silent. Same eligibility predicates as the loader
-    (variables, valid_at floor, feed exclusions, validity, rain-label boundary)
-    so the count is exactly the rows the as-of restriction dropped for this
-    reason.
-    """
-    invalid = invalid_forecast_sample_sql("fs")
-    eligible = precip_label_eligible_sql("fs", "f")
-    variables = ", ".join(f"'{variable}'" for variable in FORECAST_VARIABLES)
-    row = conn.execute(
-        f"""
-        SELECT COUNT(*) AS n
-        FROM forecast_samples fs
-        JOIN feeds f ON f.id = fs.feed_id
-        WHERE fs.site_id = ?
-          AND fs.variable IN ({variables})
-          AND fs.valid_at >= ?
-          AND {EXCLUDED_FEEDS_SQL}
-          AND NOT {invalid}
-          AND {eligible}
-          AND fs.fetched_at IS NULL
-        """,
-        (site_id, since_valid_at),
-    ).fetchone()
-    return int(row["n"])
 
 
 def load_feed_freshness(

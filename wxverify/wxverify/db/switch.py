@@ -1,8 +1,8 @@
 """The one time zone generation of a site, its first record, and the
 one-time prune of the wind history.
 
-``daily_truth`` and ``forecast_of_record`` carry ``tz_generation_id`` as a
-key. :func:`site_generation_id` reads the site's one ``published``
+``daily_truth`` carries ``tz_generation_id`` as a key.
+:func:`site_generation_id` reads the site's one ``published``
 generation and :func:`ensure_site_generation` makes it for a site that has
 none.
 

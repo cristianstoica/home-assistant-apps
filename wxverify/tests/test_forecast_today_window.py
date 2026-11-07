@@ -1,10 +1,9 @@
 """Regression tests for the today-window fix: ``build_forecast``/``build_hourly``
 now load samples from today's LOCAL MIDNIGHT (``local_day_start``) instead of
-``floor_hour(now)``. Day 0 becomes the "forecast of record": elapsed hours of
-today are included (each resolved to the freshest run covering it), so the
-daily high/max is the real full-day value and the >=18-distinct-local-hour
-coverage guard can clear after local morning, ending the permanent "partial"
-badge.
+``floor_hour(now)``. Elapsed hours of today are included (each resolved to the
+freshest run covering it), so Day 0's daily high/max is the real full-day
+value and the >=18-distinct-local-hour coverage guard can clear after local
+morning, ending the permanent "partial" badge.
 
 Fixture idioms (DB setup, ``_hours``, sample seeding) mirror
 ``test_forecast_service.py``; unlike that file's day-0 fixtures (which

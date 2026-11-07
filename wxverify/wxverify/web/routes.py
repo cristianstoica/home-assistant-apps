@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import sqlite3
+from typing import Literal
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import HTMLResponse
 
 from wxverify.db.connection import get_db, pinned_read_snapshot
 from wxverify.forecast.data import forecast_fingerprint
-from wxverify.forecast.service import ForecastView, build_forecast
-from wxverify.settings.depth import effective_blend_depths
+from wxverify.forecast.page import ForecastPage, build_forecast_page
+from wxverify.forecast.service import DAY_COUNT
 from wxverify.web.context import (
     SiteView,
     load_dashboard,
@@ -22,6 +23,11 @@ from wxverify.web.context import (
 from wxverify.web.render import render, render_fragment
 
 router = APIRouter(include_in_schema=False)
+
+
+def _clamp_day(day: int) -> int:
+    """A requested Forecast day clamped to 0-7 (0 is today)."""
+    return max(0, min(DAY_COUNT - 1, day))
 
 
 def _resolve_site(
@@ -53,75 +59,76 @@ def _resolve_site(
 
 
 def _load_forecast_context(
-    conn: sqlite3.Connection, site_id: int | None
+    conn: sqlite3.Connection, site_id: int | None, day: int
 ) -> dict[str, object]:
-    """Resolve the site (first enabled when unspecified) and build the view.
+    """Resolve the site (first enabled when unspecified) and build its page.
 
-    Every read here, and the fingerprint the view carries, must come from one
-    database state, so the caller must already hold a read snapshot on
-    ``conn``: ``_read_forecast_context``, or the tiles poll's own snapshot.
-    Raises RuntimeError when no transaction is open.
+    The page (:func:`build_forecast_page`) opens day ``day``. Every read
+    here, and the fingerprint the page carries, must come from one database
+    state, so the caller must already hold a read snapshot on ``conn``:
+    ``_read_forecast_context``, or the tiles poll's own snapshot. Raises
+    RuntimeError when no transaction is open.
     """
     if not conn.in_transaction:
         raise RuntimeError("_load_forecast_context needs the caller's read snapshot")
     sites = load_sites(conn, include_disabled=False)
     site = _resolve_site(conn, site_id, enabled_sites=sites)
-    view: ForecastView | None = None
+    page: ForecastPage | None = None
     if site is not None:
-        view = build_forecast(
+        page = build_forecast_page(
             conn,
             site_id=site.id,
             timezone=site.timezone,
             rain_threshold_mm=site.rain_threshold_mm,
+            selected_day=day,
         )
-    # §15 ride-along: per-variable effective blend depth + provenance,
-    # resolved through the same helper the blend and the record use.
-    return {
-        "sites": sites,
-        "site": site,
-        "view": view,
-        "depths": effective_blend_depths(conn),
-    }
+    return {"sites": sites, "site": site, "page": page, "day": day}
 
 
 def _read_forecast_context(
-    conn: sqlite3.Connection, site_id: int | None, *, label: str
+    conn: sqlite3.Connection, site_id: int | None, day: int, *, label: str
 ) -> dict[str, object]:
     """Run ``_load_forecast_context`` inside one read snapshot on ``conn``.
 
     The page's reads (site list, site, samples, fingerprint, freshness, depths
     and rankings) then describe one database state, so the fingerprint in the
-    page's poll URL is the one its tiles were built from.
+    page's poll URL is the one its region was built from.
     """
     with pinned_read_snapshot(conn, label=label):
-        return _load_forecast_context(conn, site_id)
+        return _load_forecast_context(conn, site_id, day)
 
 
 @router.get("/", response_class=HTMLResponse)
-async def index(request: Request, site: int | None = None) -> HTMLResponse:
+async def index(
+    request: Request, site: int | None = None, day: int = 1
+) -> HTMLResponse:
+    day = _clamp_day(day)
     context = await get_db().read(
-        lambda conn: _read_forecast_context(conn, site, label="forecast_page")
+        lambda conn: _read_forecast_context(conn, site, day, label="forecast_page")
     )
     return render(request, "forecast/show.html", **context)
 
 
 @router.get("/forecast", response_class=HTMLResponse)
-async def forecast_page(request: Request, site: int | None = None) -> HTMLResponse:
+async def forecast_page(
+    request: Request, site: int | None = None, day: int = 1
+) -> HTMLResponse:
+    day = _clamp_day(day)
     context = await get_db().read(
-        lambda conn: _read_forecast_context(conn, site, label="forecast_page")
+        lambda conn: _read_forecast_context(conn, site, day, label="forecast_page")
     )
     return render(request, "forecast/show.html", **context)
 
 
 @router.get("/forecast/tiles")
 async def forecast_tiles(
-    request: Request, site: int, fingerprint: str = ""
+    request: Request, site: int, fingerprint: str = "", day: int = 1
 ) -> Response:
     """Auto-poll target: 204 (no swap) unless the site's forecast fingerprint moved.
 
-    The fingerprint is compared BEFORE the view is built, and the comparison
+    The fingerprint is compared BEFORE the page is built, and the comparison
     and the build run inside one read snapshot, so the fingerprint a rebuilt
-    fragment carries is the one its tiles were built from. It is
+    fragment carries is the one its region was built from. It is
     :func:`forecast_fingerprint`, which moves when a new sample is stored for
     the site or one of its last-usable-fetch stamps moves to another whole
     second. A stamp move within the same second leaves it unchanged, and stamp
@@ -131,39 +138,50 @@ async def forecast_tiles(
     unchanged fingerprint is answered without paying for a build whose result
     would be discarded. On a 204 htmx leaves the DOM untouched -- including
     the hx-get that carries the old fingerprint, which retains the token for
-    subsequent comparisons. When a changed fingerprint causes a rebuild, the
-    outerHTML swap replaces only #forecast-tiles, so an open day detail (a
-    sibling element) is left intact across a tile poll.
+    subsequent comparisons. A rebuilt region opens day ``day`` (clamped to
+    0-7), the day the region's own poll URL carries. A site that no longer
+    exists answers 200 with the "Site not found." region, which has no
+    hx-get, so the poll stops.
     """
+    day = _clamp_day(day)
 
-    def _poll(conn: sqlite3.Connection) -> dict[str, object] | None:
+    def _poll(
+        conn: sqlite3.Connection,
+    ) -> Literal["unknown", "unchanged"] | dict[str, object]:
         with pinned_read_snapshot(conn, label="forecast_tiles"):
             site_view = _resolve_site(conn, site)
             if site_view is None:
-                return None
+                return "unknown"
             if forecast_fingerprint(conn, site_id=site_view.id) == fingerprint:
-                return None
-            return _load_forecast_context(conn, site)
+                return "unchanged"
+            return _load_forecast_context(conn, site, day)
 
-    context = await get_db().read(_poll)
-    view = context.get("view") if context is not None else None
-    if (
-        context is None
-        or not isinstance(view, ForecastView)
-        or view.fingerprint == fingerprint
-    ):
+    outcome = await get_db().read(_poll)
+    if outcome == "unknown":
+        return render_fragment(
+            request, "forecast/_tiles.html", site=None, page=None, day=day
+        )
+    if outcome == "unchanged":
         return Response(status_code=204)
-    return render_fragment(request, "forecast/_tiles.html", **context)
+    page = outcome.get("page")
+    if not isinstance(page, ForecastPage) or page.fingerprint == fingerprint:
+        return Response(status_code=204)
+    return render_fragment(request, "forecast/_tiles.html", **outcome)
 
 
 @router.get("/forecast/day", response_class=HTMLResponse)
 async def forecast_day(request: Request, site: int, day: int) -> HTMLResponse:
-    """Inline hourly drill-down fragment for one tile."""
-    day = max(0, min(7, day))
-    site_view = await get_db().read(lambda conn: load_site(conn, site))
-    return render_fragment(
-        request, "forecast/_day_detail.html", site=site_view, day=day
+    """The whole Forecast region with day ``day`` (clamped to 0-7) open.
+
+    A day click swaps it in for ``#forecast-tiles``; it is built in one read
+    snapshot, as the page is. An unknown site gets the "Site not found."
+    region.
+    """
+    day = _clamp_day(day)
+    context = await get_db().read(
+        lambda conn: _read_forecast_context(conn, site, day, label="forecast_day")
     )
+    return render_fragment(request, "forecast/_tiles.html", **context)
 
 
 @router.get("/sites", response_class=HTMLResponse)

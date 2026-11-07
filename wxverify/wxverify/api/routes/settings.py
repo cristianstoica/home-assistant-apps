@@ -1,10 +1,11 @@
-"""Settings API: forecast-of-record snapshot wall-clock time (§15).
+"""Settings API: the snapshot wall-clock time (§15).
 
 Sets or clears ``record_snapshot_local_time`` — the global default or a
-per-site override (key ``record_snapshot_local_time:<site_id>``). The
-record builder resolves per-site first, then global, then the
-methodology default, skipping unparseable values, so writes here are
-validated with the same parser the reader uses.
+per-site override (key ``record_snapshot_local_time:<site_id>``). The time
+sets alert 4's deadline (``publication_late``, ``wxverify.close_monitor``).
+Its reader resolves per-site first, then global, then the methodology
+default, skipping unparseable values, so writes here are validated with the
+same parser the reader uses.
 """
 
 from __future__ import annotations
@@ -17,13 +18,13 @@ from pydantic import BaseModel
 from wxverify.api.errors import ApiError
 from wxverify.db.connection import get_db
 from wxverify.settings.keys import set_setting
-from wxverify.verification.record import SNAPSHOT_TIME_KEY, parse_wall_clock
+from wxverify.verification.snapshot_time import SNAPSHOT_TIME_KEY, parse_wall_clock
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 
 class SnapshotTimeIn(BaseModel):
-    """Payload for setting the record snapshot wall-clock time."""
+    """Payload for setting the snapshot wall-clock time."""
 
     time: str
     site_id: int | None = None

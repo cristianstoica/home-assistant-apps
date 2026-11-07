@@ -953,9 +953,7 @@ def test_rd6_wind_serving_filters_by_subscription_then_empty() -> None:
     )
     conn.commit()
 
-    serving = load_wind_serving(
-        conn, site_id=site_id, timezone="UTC", today=D, as_of=None
-    )
+    serving = load_wind_serving(conn, site_id=site_id, timezone="UTC", today=D)
     keys = set(serving.weights.keys())
     assert (x, 1) in keys and (y, 1) in keys, (
         f"both feeds expected before disabling Y -- got {keys!r}"
@@ -963,9 +961,7 @@ def test_rd6_wind_serving_filters_by_subscription_then_empty() -> None:
 
     _set_enabled(conn, site_id, y, 0)
     conn.commit()
-    serving_off = load_wind_serving(
-        conn, site_id=site_id, timezone="UTC", today=D, as_of=None
-    )
+    serving_off = load_wind_serving(conn, site_id=site_id, timezone="UTC", today=D)
     keys_off = set(serving_off.weights.keys())
     assert (y, 1) not in keys_off, (
         "M84 -> at this assertion: correct = Y's key absent once switched"
@@ -979,7 +975,7 @@ def test_rd6_wind_serving_filters_by_subscription_then_empty() -> None:
     empty_site = day_close_site(conn2, close_on=True, with_records=True)
     conn2.commit()
     serving_empty = load_wind_serving(
-        conn2, site_id=empty_site, timezone="UTC", today=D, as_of=None
+        conn2, site_id=empty_site, timezone="UTC", today=D
     )
     assert serving_empty.weights == {}, (
         "with no active publication, load_wind_serving must answer with no"
@@ -1283,7 +1279,6 @@ def test_rd9_download_date_counts_from_the_round_not_the_label() -> None:
         site_id=site_id,
         since_valid_at=f"{D.isoformat()}T00:00:00Z",
         served_only=True,
-        as_of=f"{D.isoformat()}T08:00:00Z",
     )
     row = next(r for r in rows if r.feed_id == x)
     got = getattr(row, "download_date", None)
@@ -1716,7 +1711,6 @@ def test_rd16_download_date_from_the_later_round_not_the_earlier_sample_fetch() 
         site_id=site_id,
         since_valid_at=f"{D.isoformat()}T00:00:00Z",
         served_only=True,
-        as_of=f"{D.isoformat()}T08:00:00Z",
     )
     row = next(r for r in rows if r.feed_id == x)
     assert getattr(row, "download_date", None) == D, (
