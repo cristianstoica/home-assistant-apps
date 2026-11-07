@@ -62,7 +62,6 @@ class WriteKind(StrEnum):
     DAY_SCORES = "day_scores"
     CLOSE_RECORD = "close_record"
     RAW_PRUNE = "raw_prune"
-    HISTORY_PRUNE = "history_prune"
 
 
 # Value: the switch time, a canonical UTC ``...Z`` stamp.
@@ -216,14 +215,6 @@ def _require_site_timezone(conn: sqlite3.Connection, site_id: int) -> str:
 def _latest_record(conn: sqlite3.Connection, site_id: int) -> DayRecord | None:
     row = conn.execute(
         f"{_SELECT_DAY} WHERE site_id = ? ORDER BY local_date DESC LIMIT 1",
-        (site_id,),
-    ).fetchone()
-    return None if row is None else _record_from_row(row)
-
-
-def _first_record(conn: sqlite3.Connection, site_id: int) -> DayRecord | None:
-    row = conn.execute(
-        f"{_SELECT_DAY} WHERE site_id = ? ORDER BY local_date ASC LIMIT 1",
         (site_id,),
     ).fetchone()
     return None if row is None else _record_from_row(row)
@@ -1010,10 +1001,9 @@ def filter_day_writes(
     While the close is off, all of them for ``READING``, ``HOURLY`` and
     ``TRUTH`` and none otherwise. While it is on, creates the
     site's missing records, then allows an instant only when table 5.2
-    allows ``kind`` for the record whose bounds hold it; ``HISTORY_PRUNE``
-    is allowed for an instant before the site's first record. An instant
-    that does not parse is refused. Each day is decided once. Never raises
-    for a refusal.
+    allows ``kind`` for the record whose bounds hold it. An instant that
+    does not parse is refused. Each day is decided once. Never raises for a
+    refusal.
     """
     items = list(instants)
     now = _as_utc(now_utc)
@@ -1040,8 +1030,6 @@ def filter_day_writes(
     )
     starts = [record.day_start_utc for record in records]
     verdicts: dict[date, bool] = {}
-    first_start: datetime | None = None
-    first_looked_up = False
     allowed: set[str] = set()
     refused_days: list[date] = []
     for item, instant in parsed.items():
@@ -1051,12 +1039,6 @@ def filter_day_writes(
             record = None
         if record is None:
             ok = False
-            if kind == WriteKind.HISTORY_PRUNE:
-                if not first_looked_up:
-                    first = _first_record(conn, site_id)
-                    first_start = None if first is None else first.day_start_utc
-                    first_looked_up = True
-                ok = first_start is not None and instant < first_start
         else:
             verdict = verdicts.get(record.local_date)
             if verdict is None:
@@ -1103,20 +1085,14 @@ def check_date_write(
 
     Creates the site's missing records, then follows table 5.2 for the
     record dated ``local_date``; ``RAW_PRUNE`` on a done day follows rule
-    5.4, and with no record only ``HISTORY_PRUNE`` before the site's first
-    record is allowed. This holds whether or not ``DAILY_CLOSE_ON_KEY`` is
-    present (storage-release plan 3.2). Never raises for a refusal.
+    5.4, and with no record nothing is allowed. This holds whether or not
+    ``DAILY_CLOSE_ON_KEY`` is present (storage-release plan 3.2). Never
+    raises for a refusal.
     """
     now = _as_utc(now_utc)
     _ensure(conn, site_id, now)
     record = day_record(conn, site_id, local_date)
-    if record is None:
-        allowed = False
-        if kind == WriteKind.HISTORY_PRUNE:
-            first = _first_record(conn, site_id)
-            allowed = first is not None and local_date < first.local_date
-    else:
-        allowed = _record_allows(conn, record, kind, now)
+    allowed = False if record is None else _record_allows(conn, record, kind, now)
     if not allowed:
         _log_declined(site_id, kind, (local_date,), 1)
     return allowed

@@ -4,12 +4,13 @@ version 18 upgrade runs under `migrate_v18`; UT1, UT4, UT5 and UT6 below do
 not depend on which of its sub-steps are wired in, and stay correct as
 later steps add more. Of U4's four sub-steps (``_v18_poll_pause``,
 ``_v18_drop_unused_write_state``, ``_v18_prune_wind_history``,
-``_v18_drop_bad_display_values``), ``_v18_poll_pause`` (Part B) and
-``_v18_drop_unused_write_state`` (Part D) are wired in as of this file; UT1
-now also checks BT9's ``CHECK`` table (the two poll-pause columns) on a
-fresh file and on an upgraded one, and BT9's own carry-over test lives
-here too. UT2 and UT3 below cover those two sub-steps only -- the other
-two sub-steps' own UT2/UT3 pieces land with the steps that add them.
+``_v18_drop_bad_display_values``), ``_v18_poll_pause`` (Part B),
+``_v18_drop_unused_write_state`` (Part D) and ``_v18_prune_wind_history``
+(Part G) are wired in as of this file; UT1 now also checks BT9's ``CHECK``
+table (the two poll-pause columns) on a fresh file and on an upgraded one,
+and BT9's own carry-over test lives here too. UT2 and UT3 below cover
+those three sub-steps only -- the remaining sub-step's own UT2/UT3 pieces
+land with the step that adds it.
 
 Fixture: ``tests/fixtures/v17_schema.sql`` and ``v17_seed.sql``, dumped
 from a fresh 0.16.17 (``6f49f1a``) file the same way the version-16 pair
@@ -36,10 +37,12 @@ import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Final
 
 import pytest
 
 from wxverify.core import stop as stop_module
+from wxverify.core.timeutil import isoformat_utc
 from wxverify.db import migrations
 
 _SCHEMA_SQL = (Path(__file__).parent / "fixtures" / "v17_schema.sql").read_text(
@@ -775,3 +778,249 @@ def test_ut3_a_stop_at_poll_pause_leaves_everything_as_it_was(
     monkeypatch.setattr(stop_module, "begin_step", real_begin_step)
     migrations.run_migrations(conn)
     _assert_sub_step_done(conn)
+
+
+# ---------------------------------------------------------------------------
+# U4's third wired-in sub-step: _v18_prune_wind_history (plan §7 Part G).
+# ---------------------------------------------------------------------------
+
+_UT2_WIND_MARGIN_S: Final = 1200  # MAX_PAIR_GAP_SECONDS (obs/wind_pairs.py:17)
+
+
+def _insert_bare_wind_site(conn: sqlite3.Connection, name: str) -> int:
+    cur = conn.execute(
+        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+        " timezone) VALUES (?, 1.0, 1.0, 1.0, 'UTC')",
+        (name,),
+    )
+    return int(cur.lastrowid)
+
+
+def _insert_bare_wind_station(
+    conn: sqlite3.Connection, site_id: int, pws_id: str
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m)"
+        " VALUES (?, ?, 1.0, 1.0, 1.0)",
+        (site_id, pws_id),
+    )
+    return int(cur.lastrowid)
+
+
+def _insert_bare_site_days_record(
+    conn: sqlite3.Connection,
+    site_id: int,
+    local_date: str,
+    day_start_utc: str,
+    day_end_utc: str,
+    *,
+    done: bool,
+) -> None:
+    """One ``site_days`` row, open or closed, with every CHECK-required
+    column filled in directly (no ``start_site_days``/``begin_close``/
+    ``finish_close`` call -- those live in ``wxverify.db.site_days``, which
+    this migration-only fixture does not otherwise need)."""
+    conn.execute(
+        "INSERT INTO site_days (site_id, local_date, state, day_start_utc,"
+        " day_end_utc, timezone, zone_changeover, attempts, created_at,"
+        " state_changed_at, done_at) VALUES (?, ?, ?, ?, ?, 'UTC', 0, ?, ?, ?, ?)",
+        (
+            site_id,
+            local_date,
+            "closed" if done else "open",
+            day_start_utc,
+            day_end_utc,
+            1 if done else 0,
+            day_start_utc,
+            day_start_utc,
+            day_start_utc if done else None,
+        ),
+    )
+
+
+def _insert_wind_history_row(
+    conn: sqlite3.Connection,
+    station_id: int,
+    obs_at: datetime,
+    *,
+    fetched_at: datetime | None,
+) -> None:
+    conn.execute(
+        "INSERT INTO station_wind_records"
+        " (station_id, obs_at, source, local_date, speed_kmh, fetched_at)"
+        " VALUES (?, ?, 'five_minute', ?, 5.0, ?)",
+        (
+            station_id,
+            isoformat_utc(obs_at),
+            obs_at.date().isoformat(),
+            None if fetched_at is None else isoformat_utc(fetched_at),
+        ),
+    )
+
+
+def _wind_history_row_exists(
+    conn: sqlite3.Connection, station_id: int, obs_at: datetime
+) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM station_wind_records WHERE station_id = ? AND obs_at = ?",
+        (station_id, isoformat_utc(obs_at)),
+    ).fetchone()
+    return row is not None
+
+
+def test_ut2_prune_wind_history_deletes_only_the_done_sites_old_null_rows(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """UT2 for the ``v18_prune_wind_history`` sub-step (plan §7 G1; §9 UT2).
+
+    One made-up site whose first ``site_days`` record is closed (done), one
+    whose first record is open (not done); each with one station and four
+    ``station_wind_records`` rows (old/boundary/near/``fetched_at``-set).
+    Catches: `_v18_prune_wind_history` not wired into `migrate_v18` (the old
+    rows would survive the upgrade untouched); the delete reaching the
+    not-done site's rows (its rows, and the ``kept_sites`` id, would then be
+    wrong); the margin bound off by one second (the boundary row, exactly
+    F's start minus 1200 s, would be deleted instead of kept); the sub-step
+    reaching a row outside ``station_wind_records``.
+    """
+    conn = _v17_connect(tmp_path / "ut2-wind-prune.db")
+
+    f_start = datetime(2026, 11, 7, tzinfo=UTC)
+    f_end = f_start + timedelta(days=1)
+
+    done_site = _insert_bare_wind_site(conn, "UT2 wind-prune done site")
+    done_station = _insert_bare_wind_station(conn, done_site, "<WPA>")
+    _insert_bare_site_days_record(
+        conn,
+        done_site,
+        f_start.date().isoformat(),
+        isoformat_utc(f_start),
+        isoformat_utc(f_end),
+        done=True,
+    )
+
+    open_site = _insert_bare_wind_site(conn, "UT2 wind-prune open site")
+    open_station = _insert_bare_wind_station(conn, open_site, "<WPB>")
+    _insert_bare_site_days_record(
+        conn,
+        open_site,
+        f_start.date().isoformat(),
+        isoformat_utc(f_start),
+        isoformat_utc(f_end),
+        done=False,
+    )
+
+    old = f_start - timedelta(seconds=_UT2_WIND_MARGIN_S + 800)
+    boundary = f_start - timedelta(seconds=_UT2_WIND_MARGIN_S)
+    near = f_start - timedelta(seconds=600)
+    fetched_set_at = f_start - timedelta(seconds=5000)
+
+    for station_id in (done_station, open_station):
+        _insert_wind_history_row(conn, station_id, old, fetched_at=None)
+        _insert_wind_history_row(conn, station_id, boundary, fetched_at=None)
+        _insert_wind_history_row(conn, station_id, near, fetched_at=None)
+        _insert_wind_history_row(
+            conn, station_id, fetched_set_at, fetched_at=fetched_set_at
+        )
+    conn.commit()
+
+    excluded = {"station_wind_records", "score_cache", "runtime_state"}
+    before = {
+        table: rows
+        for table, rows in _all_table_rows(conn).items()
+        if table not in excluded
+    }
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="wxverify.db.migrations"):
+        migrations.run_migrations(conn)
+
+    _assert_sub_step_done(conn)
+
+    assert not _wind_history_row_exists(conn, done_station, old)
+    assert _wind_history_row_exists(conn, done_station, boundary)
+    assert _wind_history_row_exists(conn, done_station, near)
+    assert _wind_history_row_exists(conn, done_station, fetched_set_at)
+
+    assert _wind_history_row_exists(conn, open_station, old)
+    assert _wind_history_row_exists(conn, open_station, boundary)
+    assert _wind_history_row_exists(conn, open_station, near)
+    assert _wind_history_row_exists(conn, open_station, fetched_set_at)
+
+    after = {
+        table: rows
+        for table, rows in _all_table_rows(conn).items()
+        if table not in excluded
+    }
+    assert after == before, (
+        "the prune must not touch any table besides station_wind_records"
+    )
+
+    assert any(
+        "wind history prune: 1 row(s) deleted" in r.getMessage()
+        and f"kept at sites [{open_site}]" in r.getMessage()
+        for r in caplog.records
+    ), "the INFO line must report the deleted count and the one kept site id"
+
+
+def test_ut3_a_stop_at_prune_wind_history_leaves_everything_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """UT3 for the ``v18_prune_wind_history`` sub-step, the stop half.
+    Catches: the sub-step's ``DELETE`` running ahead of the
+    ``stop.begin_step("v18_prune_wind_history")`` check, which would leave
+    the old row gone even though `run_migrations` never finished; the
+    earlier sub-steps (poll-pause, drop-unused-write-state) committing on
+    their own instead of rolling back with this one's stop."""
+    real_begin_step = stop_module.begin_step
+
+    def _fake_begin_step(name: str) -> None:
+        if name == "v18_prune_wind_history":
+            raise stop_module.StopRequested
+        real_begin_step(name)
+
+    monkeypatch.setattr(stop_module, "begin_step", _fake_begin_step)
+
+    conn = _v17_connect(tmp_path / "ut3-stop-wind-prune.db")
+    f_start = datetime(2026, 11, 7, tzinfo=UTC)
+    f_end = f_start + timedelta(days=1)
+    done_site = _insert_bare_wind_site(conn, "UT3 wind-prune stop site")
+    done_station = _insert_bare_wind_station(conn, done_site, "<WPC>")
+    _insert_bare_site_days_record(
+        conn,
+        done_site,
+        f_start.date().isoformat(),
+        isoformat_utc(f_start),
+        isoformat_utc(f_end),
+        done=True,
+    )
+    old = f_start - timedelta(seconds=_UT2_WIND_MARGIN_S + 800)
+    _insert_wind_history_row(conn, done_station, old, fetched_at=None)
+    conn.execute("PRAGMA secure_delete = 1")
+    conn.commit()
+    before = _all_table_rows(conn)
+
+    with pytest.raises(stop_module.StopRequested):
+        migrations.run_migrations(conn)
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 17, (
+        "a stop before the wind-history-prune sub-step runs must leave the"
+        " version at 17"
+    )
+    assert _wind_history_row_exists(conn, done_station, old), (
+        "the old row must survive a stop before this sub-step runs"
+    )
+    assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+    assert _all_table_rows(conn) == before, (
+        "a stop at v18_prune_wind_history runs after v18_poll_pause and"
+        " v18_drop_unused_write_state, so this also fails if either of"
+        " those committed on its own instead of rolling back with the rest"
+        " of the savepoint"
+    )
+
+    monkeypatch.setattr(stop_module, "begin_step", real_begin_step)
+    migrations.run_migrations(conn)
+    _assert_sub_step_done(conn)
+    assert not _wind_history_row_exists(conn, done_station, old), (
+        "the next open, with no fault, must finish the sub-step it stopped short of"
+    )

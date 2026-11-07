@@ -14,6 +14,7 @@ from wxverify.core import stop
 from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.db.site_days import DAILY_CLOSE_ON_KEY
+from wxverify.db.switch import prune_wind_history
 
 logger = logging.getLogger(__name__)
 
@@ -1285,11 +1286,12 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     ``install 0.16.17 first``. Then, in order: `create_tables`; on every
     start, `drop_forecast_record`; `create_indexes`; at 17 only,
     `migrate_v18` (the station poll-pause columns and their carry-over,
-    then the drop of the unused write state, in one savepoint); the four
-    one-shot corrections, the three seeds and the rain-label boundary; at
-    0 only, the fresh file's two keys (`_record_fresh_build_keys`); last,
-    ``user_version`` 18. A file already at 18 runs the same steps less the
-    upgrade and the fresh keys.
+    the drop of the unused write state, then the one-time prune of the old
+    wind history, in one savepoint); the four one-shot corrections, the
+    three seeds and the rain-label boundary; at 0 only, the fresh file's
+    two keys (`_record_fresh_build_keys`); last, ``user_version`` 18. A
+    file already at 18 runs the same steps less the upgrade and the fresh
+    keys.
 
     A stop is checked before each step (``core.stop.begin_step``), which
     also names the step for ``Database._open``'s log line; `migrate_v18`
@@ -1426,6 +1428,7 @@ def migrate_v18(conn: sqlite3.Connection) -> None:
     One SAVEPOINT holds the upgrade, each sub-step under a stop check of
     its own name: `_v18_poll_pause` (``v18_poll_pause``), then
     `_v18_drop_unused_write_state` (``v18_drop_unused_write_state``), then
+    `_v18_prune_wind_history` (``v18_prune_wind_history``), then
     ``user_version`` 18. The version
     sits in the file header, which the savepoint rolls back with everything
     else. `create_tables`'s ``executescript`` has already committed any
@@ -1450,6 +1453,8 @@ def migrate_v18(conn: sqlite3.Connection) -> None:
             _v18_poll_pause(conn)
             stop.begin_step("v18_drop_unused_write_state")
             _v18_drop_unused_write_state(conn)
+            stop.begin_step("v18_prune_wind_history")
+            _v18_prune_wind_history(conn)
             conn.execute("PRAGMA user_version = 18")
         except BaseException:
             if conn.in_transaction:
@@ -1555,6 +1560,28 @@ def _v18_drop_unused_write_state(conn: sqlite3.Connection) -> None:
         dropped,
         rows,
         removed,
+        _elapsed_ms(started),
+    )
+
+
+def _v18_prune_wind_history(conn: sqlite3.Connection) -> None:
+    """Delete the old wind history from before each site's first closed day.
+
+    A sub-step of `migrate_v18`, run inside its savepoint: one call of
+    `wxverify.db.switch.prune_wind_history`, whose statements are plain
+    ``conn.execute`` only, so nothing here ends the transaction. One INFO
+    line gives the rows deleted, the ids of the sites kept because their
+    first day is missing or not done (as plain integers inside brackets,
+    ``[]`` when none), and the time taken.
+    """
+    started = time.perf_counter()
+    result = prune_wind_history(conn)
+    kept = "[" + ", ".join(str(site_id) for site_id in result.kept_sites) + "]"
+    logger.info(
+        "v18 upgrade: wind history prune: %d row(s) deleted; "
+        "kept at sites %s (first day not done), %d ms",
+        result.deleted,
+        kept,
         _elapsed_ms(started),
     )
 

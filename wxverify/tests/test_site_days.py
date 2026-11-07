@@ -70,7 +70,6 @@ _ALL_KINDS: tuple[WriteKind, ...] = (
     WriteKind.DAY_SCORES,
     WriteKind.CLOSE_RECORD,
     WriteKind.RAW_PRUNE,
-    WriteKind.HISTORY_PRUNE,
 )
 
 # Table 5.2, state-keyed. RAW_PRUNE's "yes" case (a done day whose next day
@@ -89,7 +88,6 @@ _TABLE_5_2: dict[str, dict[WriteKind, bool]] = {
         WriteKind.DAY_SCORES: False,
         WriteKind.CLOSE_RECORD: False,
         WriteKind.RAW_PRUNE: False,
-        WriteKind.HISTORY_PRUNE: False,
     },
     "closing": {
         WriteKind.READING: False,
@@ -99,14 +97,15 @@ _TABLE_5_2: dict[str, dict[WriteKind, bool]] = {
         WriteKind.DAY_SCORES: True,
         WriteKind.CLOSE_RECORD: True,
         WriteKind.RAW_PRUNE: False,
-        WriteKind.HISTORY_PRUNE: False,
     },
     "retry_due": dict.fromkeys(_ALL_KINDS, False),
     "closed": dict.fromkeys(_ALL_KINDS, False),
     "missed": dict.fromkeys(_ALL_KINDS, False),
-    # Before the first record only HISTORY_PRUNE is allowed, and only with
-    # the close on (4.8, 7.1, plan row :919).
-    "no_record": {**dict.fromkeys(_ALL_KINDS, False), WriteKind.HISTORY_PRUNE: True},
+    # With no record, every kind is refused (health-release plan 2026-11-07
+    # §7 Part G: the only write kind this state used to allow is gone, and
+    # check_date_write now hard-codes "with no record nothing is allowed"
+    # rather than branching on kind).
+    "no_record": dict.fromkeys(_ALL_KINDS, False),
     "close_off": {
         WriteKind.READING: True,
         WriteKind.GAP_FILL: False,
@@ -115,7 +114,6 @@ _TABLE_5_2: dict[str, dict[WriteKind, bool]] = {
         WriteKind.DAY_SCORES: False,
         WriteKind.CLOSE_RECORD: False,
         WriteKind.RAW_PRUNE: False,
-        WriteKind.HISTORY_PRUNE: False,
     },
 }
 
@@ -256,34 +254,6 @@ def test_ds8_unparseable_instant_refused_for_every_kind() -> None:
         assert (
             check_day_write(conn, site_id, "not-an-instant", kind, now_utc=NOW) is False
         )
-
-
-def test_ds8_history_prune_before_first_record_needs_close_on() -> None:
-    before_first = isoformat_utc(
-        datetime(D.year, D.month, D.day, tzinfo=UTC) - timedelta(days=100)
-    )
-
-    conn_on = asof_conn()
-    site_on = day_close_site(conn_on)
-    assert check_day_write(
-        conn_on, site_on, before_first, WriteKind.HISTORY_PRUNE, now_utc=NOW
-    )
-    for kind in _ALL_KINDS:
-        if kind is WriteKind.HISTORY_PRUNE:
-            continue
-        assert (
-            check_day_write(conn_on, site_on, before_first, kind, now_utc=NOW) is False
-        )
-
-    conn_off = asof_conn()
-    close_off(conn_off)
-    site_off = day_close_site(conn_off, close_on=False, with_records=False)
-    assert (
-        check_day_write(
-            conn_off, site_off, before_first, WriteKind.HISTORY_PRUNE, now_utc=NOW
-        )
-        is False
-    )
 
 
 def test_ds1_ensure_site_days_current_local_day_in_gmt_minus_14() -> None:

@@ -371,9 +371,11 @@ _GW17_ALLOWLIST: Final = frozenset(
         # which wrote it below v15, are both deleted, storage-release plan
         # 4.1/table 1.B).
         ("wxverify.db.site_days", "*"),
-        # P6 12.5: the owner's one-time wind-history prune, before each
-        # site's first record, through P1's guard (WriteKind.HISTORY_PRUNE).
-        ("wxverify.db.switch", "prune_station_history"),
+        # health-release plan 2026-11-07 §7 Part G: the owner's one-time
+        # wind history prune, run once in the version 18 upgrade, through
+        # no guard of its own (the bound is always before the site's first
+        # record, so the old write-kind guard case is gone).
+        ("wxverify.db.switch", "prune_wind_history"),
         # _invalidate_consensus_dependents and _delete_future_persistence_pairs
         # (7.3) were removed with B6 (storage-release plan W5): neither
         # writes a guarded table any longer. wxverify.scoring.multimodel,

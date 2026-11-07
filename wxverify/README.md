@@ -635,8 +635,6 @@ python -m wxverify --db /path/to/wxverify.db providers enable --site-id <site_id
 python -m wxverify --db /path/to/wxverify.db providers fetch --site-id <site_id> --source visualcrossing
 python -m wxverify --db /path/to/wxverify.db providers smoke --site-id <site_id> --all-new
 python -m wxverify --db /path/to/wxverify.db timezone change --site-id <site_id> --timezone <IANA zone> [--json]
-python -m wxverify --db /path/to/wxverify.db wind-history prune --dry-run [--json]
-python -m wxverify --db /path/to/wxverify.db wind-history prune --restored-backup <backup_name> [--json]
 ```
 
 For `weathercom`, the cap in force is the lower of the value stored with
@@ -656,16 +654,6 @@ rows are missing; it inserts missing `sources` and `feeds` rows without
 overwriting edited caps or feed settings. New or changed Python adapter code
 still requires restarting the app process so the running interpreter loads that
 code.
-
-`wind-history prune` deletes, once, the 5-minute wind readings stored before
-0.16.14 that are dated more than 20 minutes before their site's first closed
-day. Run it with `--dry-run` first: that only reads, and prints each station's
-row count and date range, then every reason the prune would refuse. A run that
-deletes needs `--restored-backup`, naming a backup from before 0.16.14 whose
-restore you have checked. It refuses until the daily close is on and the first
-closed day of every site that still has such readings is closed or missed. It
-deletes one station at a time, prints the rows left, and exits `0` only when
-none is left, so it is safe to run again after a stop.
 
 ## Changing a site's time zone
 
