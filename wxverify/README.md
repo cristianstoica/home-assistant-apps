@@ -107,7 +107,20 @@ The add-on config exposes these options:
 | `min_n`                | No               | `30`    | Minimum paired samples for confident scores      |
 | `obs_interval_minutes` | No               | `180`   | Base observation refresh cadence                 |
 | `obs_jitter_minutes`   | No               | `20`    | Not used. Kept so existing configurations still load |
+| `wind_constant_hours`  | No               | `6` (trial value) | Stuck wind station check: whole hours (2-48) one unchanged wind reading must last |
+| `wind_constant_other_stations` | No       | `3` (trial value) | Stuck wind station check: other stations of the site (1-10) that must report wind in each of those hours |
+| `wind_constant_median_ms` | No            | `1` (trial value) | Stuck wind station check: lowest median of those stations' wind in each of those hours, in m/s (0-20) |
 | `log_level`            | No               | `info`  | Runtime logging level                            |
+
+The three `wind_constant_*` options set the stuck wind station check, which
+runs once an hour. A station is flagged when it holds one unchanged wind
+reading for `wind_constant_hours` whole hours in a row while, in each of those
+hours, at least `wind_constant_other_stations` other stations of its site
+report wind with a median of at least `wind_constant_median_ms` m/s. An hour
+in which the station sends no reading breaks the run. The flag is a warning
+only (see [Monitoring](#monitoring)); nothing is left out of the blend. The
+defaults are trial values: if the check warns on calm or gusty spells, change
+them here.
 
 The add-on serves through Home Assistant Ingress. Do not pass an extra root path
 to uvicorn; the app owns `root_path` internally.
@@ -312,6 +325,41 @@ same site, variable, and valid hour. Metrics are grouped by site, feed, variable
 day-ahead lead bucket, and rolling window. A model can therefore rank well for
 day-1 temperature and poorly for day-5 precipitation; those are separate score
 cells.
+
+### Current-conditions polling
+
+When a station's current-conditions poll gets an empty reply (no
+observations) or a 404 (station not found), the station is rechecked on a
+widening schedule: 1 hour after the first such reply, then 2, 4, 8 and 16
+hours, then every 24 hours. No wait is longer than the `max_backoff_seconds`
+option. While a station is being rechecked, a reply whose reading is more than
+an hour from now, older or newer, counts as one more such reply, and a passing
+error (a timeout, a server error) waits for the same step again. A reading at
+most an hour from now, from the poll or from a 5-minute download, ends the
+recheck, and the station goes back to its normal polling. Other errors are
+handled as before.
+
+The Sites page shows the recheck in the station's status cell, after
+`Enabled`:
+
+- `Rechecking after an empty reply · next check <time>` or
+  `Rechecking after station not found (http 404) · next check <time>` after the
+  first such reply;
+- `Current-condition polling paused (empty reply) · next check <time>` or
+  `Current-condition polling paused (station not found, http 404) · next check <time>`
+  from the second on.
+
+`<time>` is the next check in the site's local time, as `YYYY-MM-DD HH:MM`;
+it is in UTC, ending ` UTC`, when the site's time zone cannot be loaded, and
+`unknown` when no next check is stored or it cannot be read. A **Retry now**
+button beside the station checks it again at once. The check still keeps to
+the daily call budget and to any hold the provider has asked for; a check
+already waiting absorbs the press, and another empty reply moves the station
+one step along the schedule. The text and the button show only while the
+station and its site are enabled.
+
+In Home Assistant, a station paused after empty replies shows offline, and a
+station not found (404) shows unknown.
 
 ## Forecast Horizon
 
@@ -675,34 +723,50 @@ The command exits non-zero with a one-line message, for example when the site is
 
 ## Operational Notes
 
-- SQLite runs in WAL mode.
+- SQLite runs in WAL mode. The mode is checked each time the add-on opens the
+  database: when SQLite reports `delete`, `truncate` or `persist` instead, an
+  ERROR line says so and the add-on keeps running; `off` or `memory` stops it,
+  and the database is not opened.
 - All writes are serialized through one writer connection.
 - Weather.com PWS calls are budgeted per enabled station.
 - Forecast and observation provider keys are never stored in the database.
 - `/api/health/keys` reports only present or absent, never secret values.
+- When a download fails and the provider's reply carries its own message, the
+  error the Ops page shows (the `Feed Status` panel's error, the weather.com
+  access line under `Key Status`, the `Wind History` panel's last error) ends
+  with it, as `; provider says "…"`; keys, station ids and addresses in it are
+  masked, it is cut to 200 characters, and how the add-on reacts to the failure
+  does not change.
 
-## Database version 17: the first start after the upgrade
+## Database version 18: the first start after the upgrade
 
-The first start of a release with database version 17 converts the database
+The first start of a release with database version 18 upgrades the database
 once, before the add-on serves anything:
 
-- Each forecast is stored once, in `forecast_history`, in place of the old
-  pair tables. The tables of the retired verification runs are dropped, and so
-  are queued jobs of kinds the add-on no longer runs.
-- The file is then compacted once (`VACUUM`), giving the freed space back to
-  the disk. That needs free space on `/data` of about 2.2 times the data the
-  file holds. With less, the compaction is skipped with a WARNING and tried
-  again at the next start; the add-on runs normally meanwhile.
+- Stations whose current-conditions polling was parked for a day after an
+  empty reply or a 404 are rechecked at once, and from then on follow the new
+  recheck schedule (see [Current-conditions polling](#current-conditions-polling)).
+- The unused score table is removed, and so is the old wind history: the
+  station wind readings stored before 0.16.14 and dated more than 20 minutes
+  before the start of their site's first day under the daily close. A site
+  keeps them while that first day is not yet closed or marked missed.
+- Stored cloud cover, gust and wind direction values outside their range
+  (cloud cover 0-100 %, gust 0-150 m/s, direction 0-360 degrees) are removed.
+  These values are shown on the Forecast page only and are never scored.
 
-On a large database this first start takes minutes, not seconds. Every start
-after it is quick. A stop during the conversion is safe: the file keeps its
-data, and the next start finishes the conversion.
+This takes seconds. A stop during it is safe: nothing of it is kept until all
+of it has finished, so the file stays as it was, and the next start does all
+of it again.
 
-The conversion accepts only a file at version 16 with the daily close on, which
-is what 0.16.15 writes once the daily close is on. The add-on refuses to start
-on any other file: an older version is told to install 0.16.15 first, and a
-version 16 file without the daily close is told that this release needs it. A
-version 17 file cannot be opened by an older release: to go back, restore an
+The upgrade runs no compaction (`VACUUM`), so the file does not shrink; SQLite
+reuses the freed space for new data. If an earlier upgrade's one-time
+compaction has not finished on this file (it is skipped with a WARNING when
+there is less free space than about 2.2 times the data the file holds), it is
+still tried at each start, as before.
+
+The upgrade accepts only a file at database version 17, the version 0.16.17
+writes. The add-on refuses to start on an older file and says to install
+0.16.17 first. 0.16.17 refuses a version 18 file, so to go back, restore an
 export taken before the upgrade.
 
 ## Database Export
@@ -820,6 +884,19 @@ kinds refused, and its `detail` names them, the HTTP status, since when, and
 until when they are held, or that the hold has ended and the next try is
 awaited. It clears once each refused kind is granted again, or 24 hours after a
 kind's hold ended if that kind is not tried again.
+
+The pipeline group includes one `wind_station_constant:<station>` warning for
+each station the stuck wind station check flags (the `wind_constant_*` options
+under [Home Assistant Add-on Configuration](#home-assistant-add-on-configuration)),
+where `<station>` is the station's name as the Sites page shows it. It means
+"suspected: constant reading while other stations report wind", and its
+`detail` reads `suspected: constant reading while other stations report wind:
+station <station> <value> km/h since <time>`, `<time>` being the first hour of
+the unchanged reading, in UTC. The `detail` ends `(can't assess)` while the
+latest hour cannot be judged: too few other stations report, their median
+wind is below the setting, or the station itself sent no reading. The warning
+clears when the station's reading changes, or when the station or its site is
+switched off. Nothing is left out of the blend.
 
 Home Assistant owns the poll loop and delivery: a **REST sensor** polls
 `/api/health/monitor` on the internal add-on network, and two **automations**
