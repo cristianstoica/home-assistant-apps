@@ -7,11 +7,10 @@ import asyncio
 import contextlib
 import logging
 import sqlite3
-import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Final, Literal, TypeVar
+from typing import TypeVar
 
 from wxverify import config
 from wxverify.core import stop
@@ -20,7 +19,7 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.compaction import compact_storage
 from wxverify.db.migrations import run_migrations
 from wxverify.db.sanitize import sanitize_wedge_prone_timestamps
-from wxverify.db.snapshot import read_only_snapshot, read_snapshot
+from wxverify.db.snapshot import read_only_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +37,8 @@ SLOW_READ_MS = 250.0
 # diagnostic, not a fault. The two halves are checked separately because
 # they have different causes -- `lock_wait` is time queued behind other
 # writers, `hold` is this write's own transaction. With INFO enabled, a log
-# with no such line means every `write`/`write_if_current` that acquired the
-# lock and reached its timing `finally` kept both under a second.
+# with no such line means every `write` that acquired the lock and reached
+# its timing `finally` kept both under a second.
 SLOW_WRITE_MS = 1000.0
 
 # SQLite in WAL mode lets any number of readers run concurrently with no
@@ -51,20 +50,6 @@ SLOW_WRITE_MS = 1000.0
 # worker's own job loop, the page request being served, and the handful of
 # chart JSON fetches a page kicks off) with one spare.
 _READ_POOL_SIZE = 4
-
-
-@dataclass(frozen=True, slots=True)
-class InputCounts:
-    """The weights cache's key counts, read external-commit count first, then epoch."""
-
-    ext: int
-    epoch: int
-
-
-# What `Database.pinned_snapshot` registers for its connection: the counts its
-# snapshot is exactly described by, or why there are none.
-PinRefusal = Literal["probe_error", "counts_moved"]
-SnapshotPin = InputCounts | PinRefusal
 
 
 @dataclass
@@ -112,26 +97,6 @@ def _log_slow_write(
         )
 
 
-class EpochMoved:
-    """The outcome of a ``write_if_current`` whose input epoch had moved.
-
-    Returned, never raised: a miss is an expected outcome that the caller
-    answers by recomputing from committed state. ``fn`` did not run and the
-    transaction changed nothing. Compare against the ``EPOCH_MOVED``
-    singleton or with ``isinstance``.
-    """
-
-    __slots__ = ()
-
-
-EPOCH_MOVED: Final = EpochMoved()
-
-
-class _EpochMovedSignal(Exception):
-    """Raised inside a ``write_if_current`` transaction, before ``fn`` runs,
-    when the input epoch no longer matches; caught by ``write_if_current``."""
-
-
 class Database:
     def __init__(self, path: str) -> None:
         config.ensure_parent_dir(path)
@@ -150,20 +115,6 @@ class Database:
         # of this Database instance; never reset.
         self._read_stats: dict[str, ReadTiming] = {}
         self._read_stats_since = isoformat_utc()
-        # The input epoch moves on every commit that could change a scoring
-        # input: a non-exempt write on the writer connection that changed a
-        # row, a commit by any other connection (seen through
-        # `PRAGMA data_version`, tracked in `_dv_seen`), and every `_open`.
-        # See `_run_epoch_txn`.
-        self._input_epoch = 0
-        self._dv_seen = 0
-        # The external-commit count (`external_commit_seq`) and the lock that
-        # guards it together with the probe's baseline `_probe_dv`. The count
-        # only grows, so no count stored earlier can recur.
-        self._probe_lock = threading.Lock()
-        self._external_seq = 0
-        # Pooled readers inside `pinned_snapshot`, each with its pin.
-        self._snapshot_pins: dict[sqlite3.Connection, SnapshotPin] = {}
         self._open()
         self._stock_pool()
 
@@ -174,8 +125,8 @@ class Database:
         return conn
 
     def _open(self) -> None:
-        """Open the writer, sync reader, pooled readers and probe on
-        ``self.path``. The write lock and the pool object are ``__init__``'s.
+        """Open the writer, sync reader and pooled readers on ``self.path``.
+        The write lock and the pool object are ``__init__``'s.
 
         Creation only: ``__init__`` calls ``_stock_pool()`` afterward to
         publish the pooled connections.
@@ -251,21 +202,6 @@ class Database:
             raise
         self._read_conns = [self._connect_reader() for _ in range(_READ_POOL_SIZE)]
         self._read_sync_conn = self._connect_reader()
-        # The external-commit probe: one more reader, in neither `_read_conns`
-        # nor the pool, so no request can draw it. It never writes, so every
-        # commit on the file moves its `data_version`. Its baseline is read
-        # here, after the migrations, the sanitizer and the compaction
-        # committed, and only ever compared with its own later values.
-        self._probe = self._connect_reader()
-        with self._probe_lock:
-            self._probe_dv = int(
-                self._probe.execute("PRAGMA data_version").fetchone()[0]
-            )
-        # The migrations and the sanitizer above ran through `_run_immediate`
-        # directly, and the compaction on `_conn` itself; this bump covers
-        # all three.
-        self._dv_seen = int(self._conn.execute("PRAGMA data_version").fetchone()[0])
-        self._input_epoch += 1
 
     def _stock_pool(self) -> None:
         """Publish ``self._read_conns`` into the pool queue.
@@ -308,7 +244,7 @@ class Database:
             self._conn.commit()
         except BaseException:
             # Roll back before logging anything. Callers branch on the
-            # ORIGINAL error's type (the epoch signal, IntegrityError), so
+            # ORIGINAL error's type (IntegrityError, a stop's interrupt), so
             # neither a failed rollback nor a raising log call may replace it.
             try:
                 self._conn.rollback()
@@ -324,253 +260,26 @@ class Database:
         logger.debug("db txn commit")
         return result
 
-    def _run_epoch_txn(
-        self,
-        fn: Callable[[sqlite3.Connection], T],
-        *,
-        expected: int | None,
-        exempt: bool,
-    ) -> T:
-        """Run ``fn`` in one ``_run_immediate`` transaction, moving the epoch.
-
-        Every write transaction on ``self._conn`` except ``_open``'s own
-        passes through here. Inside ``BEGIN IMMEDIATE`` a changed
-        ``PRAGMA data_version`` (a commit by another connection) moves the
-        epoch; then, when ``expected`` is given and no longer matches, the
-        transaction ends before ``fn`` runs (``_EpochMovedSignal``). After
-        the commit or rollback, a non-exempt ``fn`` that changed at least one
-        row (``total_changes`` moved) moves the epoch once more, and then, on
-        every exit, ``_absorb_own_commit`` acknowledges this transaction's own
-        commit on the external-commit probe.
-
-        Invariant: every commit on ``self._conn`` goes through here, except
-        ``_open``'s own, which run before the probe exists. The absorb takes
-        every commit it sees on the probe for its own, so a commit made on
-        ``_conn`` any other way would be acknowledged without moving either
-        count, and a caller comparing the counts would not see that commit.
-        """
-        # `_body` records the connection and its `total_changes` just before
-        # `fn` runs. A list, not `nonlocal` flags: pyright does not see a
-        # nested function's writes, narrows such flags to their initial
-        # values here, and would treat the bump below as unreachable.
-        ran: list[tuple[sqlite3.Connection, int]] = []
-
-        def _body(conn: sqlite3.Connection) -> T:
-            dv = int(conn.execute("PRAGMA data_version").fetchone()[0])
-            if dv != self._dv_seen:
-                self._dv_seen = dv
-                self._input_epoch += 1
-            if expected is not None and expected != self._input_epoch:
-                raise _EpochMovedSignal
-            ran.append((conn, conn.total_changes))
-            return fn(conn)
-
-        try:
-            # Looked up on the instance: tests and the bench patch it there.
-            return self._run_immediate(_body)
-        finally:
-            if ran and not exempt:
-                used, before = ran[-1]
-                if used.total_changes != before:
-                    self._input_epoch += 1
-            # Last, after the bump: a lookup that reads the count after the
-            # absorb also sees the bump. Looked up on the instance, like
-            # `_run_immediate`. Never raises (see its docstring).
-            self._absorb_own_commit()
-
-    def _absorb_own_commit(self) -> None:
-        """Acknowledge this process's own commit on the probe, uncounted.
-
-        Runs in ``_run_epoch_txn``'s ``finally`` on every exit. Within one
-        hold of ``_probe_lock``: (1) read the probe's ``data_version``; (2)
-        read ``_conn``'s, which moves only for other connections' commits and
-        was stored in ``_dv_seen`` inside this transaction's ``BEGIN
-        IMMEDIATE``; (3) if it differs, another connection committed after
-        this transaction, so count it; (4) store the probe's value as the
-        baseline. Steps 3 and 4 run only after both reads succeed, so a
-        failed read changes nothing and the next ``external_commit_seq``
-        counts the unacknowledged change (a conservative miss). The probe is
-        read before ``_conn``: the other way round, a foreign commit landing
-        between the two reads would be stored as the baseline with neither
-        count moved.
-
-        Never changes ``_dv_seen`` or ``_input_epoch``: the next write's
-        ``_body`` must still see a foreign commit and move the epoch for it.
-
-        Never raises: an exception escaping the ``finally`` would turn a
-        committed write into a failure, or replace the original exception
-        (including ``_EpochMovedSignal``). A ``sqlite3.Error`` is logged at
-        DEBUG, anything else at WARNING, both after ``_probe_lock`` is
-        released; ``BaseException`` outside ``Exception`` propagates.
-        """
-        try:
-            with self._probe_lock:
-                seen = int(self._probe.execute("PRAGMA data_version").fetchone()[0])
-                own = int(self._conn.execute("PRAGMA data_version").fetchone()[0])
-                if own != self._dv_seen:
-                    self._external_seq += 1
-                self._probe_dv = seen
-        except sqlite3.Error:
-            logger.debug(
-                "probe absorb failed; the next lookup will miss", exc_info=True
-            )
-        except Exception:
-            logger.warning(
-                "probe absorb failed; the next lookup will miss", exc_info=True
-            )
-
-    def external_commit_seq(self) -> int | None:
-        """A count that moves after every commit by another connection.
-
-        Reads the probe's ``PRAGMA data_version`` and, when it differs from
-        the stored baseline, stores it and adds 1 to the count, all within one
-        hold of ``_probe_lock``. This process's own commits are absorbed
-        uncounted by ``_absorb_own_commit``. Returns ``None`` when the probe
-        cannot be read: whether another connection committed can't be told.
-
-        ``.fetchone()`` on the one-row ``PRAGMA`` resets the statement, so
-        the probe holds no read mark between calls and never blocks a
-        checkpoint.
-        """
-        with self._probe_lock:
-            try:
-                seen = int(self._probe.execute("PRAGMA data_version").fetchone()[0])
-            except sqlite3.Error:
-                return None
-            if seen != self._probe_dv:
-                self._probe_dv = seen
-                self._external_seq += 1
-            return self._external_seq
-
-    def owns_pooled_reader(self, conn: sqlite3.Connection) -> bool:
-        """Whether ``conn`` is one of this database's current pooled readers.
-
-        An identity test against ``_read_conns``, which ``_settle_reader``
-        keeps naming the pooled objects when it replaces one. ``read_sync``'s
-        connection and the probe are not pooled readers.
-        """
-        return any(conn is pooled for pooled in self._read_conns)
-
-    def input_counts(self) -> InputCounts | None:
-        """The external-commit count, then the input epoch; ``None`` when the
-        probe cannot be read.
-
-        The count first: the writer bumps the epoch and then absorbs, so a
-        reading whose count follows the absorb also sees the bump.
-        """
-        # Looked up on the instance: tests patch it there.
-        ext = self.external_commit_seq()
-        if ext is None:
-            return None
-        return InputCounts(ext=ext, epoch=self.input_epoch)
-
-    def snapshot_pin(self, conn: sqlite3.Connection) -> SnapshotPin | None:
-        """The pin ``pinned_snapshot`` holds for ``conn``, or ``None`` outside one."""
-        return self._snapshot_pins.get(conn)
-
-    @contextlib.contextmanager
-    def pinned_snapshot(
-        self, conn: sqlite3.Connection, *, label: str
-    ) -> Generator[sqlite3.Connection]:
-        """``read_snapshot`` on ``conn`` that also pins the weights cache's counts.
-
-        The counts are read before ``BEGIN DEFERRED`` and again after the
-        priming read, both times from the probe, never ``conn``. Equal, the
-        snapshot is exactly the state they describe and the pin is those
-        counts; otherwise the pin is ``"counts_moved"``, or ``"probe_error"``
-        when either reading failed. ``snapshot_pin`` returns it inside the
-        block. A ``conn`` that is not one of this database's pooled readers
-        gets a plain ``read_snapshot``: no pin is registered, no counts read.
-        """
-        if not self.owns_pooled_reader(conn):
-            with read_snapshot(conn, label=label):
-                yield conn
-            return
-        before = self.input_counts()
-        with read_snapshot(conn, label=label):
-            after = self.input_counts()
-            pin: SnapshotPin
-            if before is None or after is None:
-                pin = "probe_error"
-            elif after != before:
-                pin = "counts_moved"
-            else:
-                pin = before
-            # Registered inside the snapshot, so a nesting refusal on entry
-            # never reaches the `finally` and never pops an outer pin.
-            self._snapshot_pins[conn] = pin
-            try:
-                yield conn
-            finally:
-                # Before read_snapshot's ROLLBACK.
-                del self._snapshot_pins[conn]
-
-    async def write(
-        self,
-        fn: Callable[[sqlite3.Connection], T],
-        *,
-        epoch_exempt: bool = False,
-    ) -> T:
+    async def write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         requested = time.perf_counter()
         async with self._write_lock:
             acquired = time.perf_counter()
             try:
-                # A nested zero-arg closure, not `self._run_epoch_txn` passed
-                # directly: `_run_epoch_txn` is itself generic, and
+                # A nested zero-arg closure, not `self._run_immediate` passed
+                # directly: `_run_immediate` is itself generic, and
                 # run_to_completion's `Callable[..., T]` erases per-argument
                 # types, so a bare method reference loses the binding between
                 # its own T and this T. Closing over the already-bound `fn`
-                # here resolves `_run_epoch_txn`'s T against it first.
+                # here resolves `_run_immediate`'s T against it first. Looked
+                # up on the instance at call time: tests and the bench patch
+                # it there.
                 def _call() -> T:
-                    return self._run_epoch_txn(fn, expected=None, exempt=epoch_exempt)
+                    return self._run_immediate(fn)
 
                 return await run_to_completion(_call)
             finally:
                 # The stop time is taken here, inside the lock, so the raise
                 # and cancellation paths are measured too.
-                _log_slow_write(fn, requested, acquired, time.perf_counter())
-
-    @property
-    def input_epoch(self) -> int:
-        """Input epoch: moves on every commit that could change a scoring input.
-
-        Safe to read from the event loop with no lock: an unlocked read is an
-        optimistic snapshot for the caller's bookkeeping, and the guarantee
-        comes from the recheck that ``_run_epoch_txn`` makes under the write
-        lock, inside ``BEGIN IMMEDIATE``, in ``write_if_current``.
-        """
-        return self._input_epoch
-
-    async def write_if_current(
-        self,
-        fn: Callable[[sqlite3.Connection], T],
-        *,
-        epoch: int,
-    ) -> tuple[T, int] | EpochMoved:
-        """Apply ``fn`` only if the input epoch is still ``epoch``.
-
-        Two outcomes. ``EPOCH_MOVED`` when a commit that could change a
-        scoring input landed since ``epoch`` was read; ``fn`` did not run.
-        Otherwise ``(result, epoch_after)``, where ``epoch_after`` includes
-        this write's own bump, so a caller applying the next chunk of the
-        same delta passes it and its own earlier chunk does not count as a
-        foreign change.
-        """
-        requested = time.perf_counter()
-        async with self._write_lock:
-            acquired = time.perf_counter()
-            try:
-
-                def _call() -> T:
-                    return self._run_epoch_txn(fn, expected=epoch, exempt=False)
-
-                try:
-                    result = await run_to_completion(_call)
-                except _EpochMovedSignal:
-                    return EPOCH_MOVED
-                # Read under the lock: includes this write's own bump.
-                return result, self._input_epoch
-            finally:
                 _log_slow_write(fn, requested, acquired, time.perf_counter())
 
     async def read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
@@ -785,7 +494,7 @@ class Database:
         return self._read_stats_since
 
     def write_sync(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        return self._run_epoch_txn(fn, expected=None, exempt=False)
+        return self._run_immediate(fn)
 
     def interrupt_writer(self) -> None:
         """End the statement running on the writer, if any (plan 6.4).
@@ -803,7 +512,6 @@ class Database:
 
     def close(self) -> None:
         self._read_sync_conn.close()
-        self._probe.close()
         for conn in self._read_conns:
             conn.close()
         self._conn.close()
@@ -825,8 +533,8 @@ class Database:
         Both checks run on the event-loop thread with no ``await`` between
         them and the ``close()`` they guard, so what they report cannot go
         stale before it is used: a writer holds ``_write_lock`` for the
-        whole of ``write``/``write_if_current``, and a reader holds its
-        connection OUT of ``_read_pool`` for the whole of ``read``.
+        whole of ``write``, and a reader holds its connection OUT of
+        ``_read_pool`` for the whole of ``read``.
 
         State what that buys exactly, because it is narrower than
         "nothing is going on": when both predicates read idle, no thread
@@ -864,48 +572,26 @@ class Database:
 class FencedWriter:
     """A write handle on one ``Database``, threaded through a job's writes.
 
-    A read whose result feeds a later ``write_if_current`` must come from
-    ``read_at_epoch``, which pairs it with the input epoch it was read at.
-    ``epoch_exempt`` marks every write through this handle as unable to
-    change a scoring input, so none of them moves the input epoch.
+    ``read_snapshot_only`` is its read: one read-only snapshot on a pooled
+    reader, for a job that builds a later write from what it read.
     """
 
-    def __init__(self, db: Database, *, epoch_exempt: bool = False) -> None:
+    def __init__(self, db: Database) -> None:
         self._db = db
-        self._epoch_exempt = epoch_exempt
-
-    @property
-    def input_epoch(self) -> int:
-        """The database's current input epoch (``Database.input_epoch``)."""
-        return self._db.input_epoch
 
     async def write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        return await self._db.write(fn, epoch_exempt=self._epoch_exempt)
+        return await self._db.write(fn)
 
-    async def read_at_epoch(
+    async def read_snapshot_only(
         self, fn: Callable[[sqlite3.Connection], T], *, label: str
-    ) -> tuple[int, T]:
-        """Run ``fn`` in one read-only snapshot; return ``(epoch, result)``.
-
-        The epoch is read BEFORE the read is submitted, so it always precedes
-        the snapshot: a commit between the two lies inside the snapshot but
-        after the epoch, and the later ``write_if_current`` misses spuriously
-        (safe). The reverse order would let a commit land after the snapshot
-        and before the epoch read, and a stale apply would pass.
-        """
-        epoch = self._db.input_epoch
+    ) -> T:
+        """Run ``fn`` in one read-only snapshot and return its result."""
 
         def _snap(conn: sqlite3.Connection) -> T:
             with read_only_snapshot(conn, label=label):
                 return fn(conn)
 
-        return epoch, await self._db.read(_snap)
-
-    async def write_if_current(
-        self, fn: Callable[[sqlite3.Connection], T], *, epoch: int
-    ) -> tuple[T, int] | EpochMoved:
-        """``Database.write_if_current`` on this handle's database."""
-        return await self._db.write_if_current(fn, epoch=epoch)
+        return await self._db.read(_snap)
 
 
 def init_db(path: str | None = None) -> Database:
@@ -930,25 +616,6 @@ def current_db() -> Database | None:
     ``sqlite3.Connection``.
     """
     return _db_instance
-
-
-@contextlib.contextmanager
-def pinned_read_snapshot(
-    conn: sqlite3.Connection, *, label: str
-) -> Generator[sqlite3.Connection]:
-    """read_snapshot that also pins the weights cache's counts on a pooled reader.
-
-    A connection that is not a pooled reader of the process database (or no
-    process database) gets a plain ``read_snapshot``. Uses ``current_db``,
-    never ``get_db``, so it never opens a database.
-    """
-    db = current_db()
-    if db is None or not db.owns_pooled_reader(conn):
-        with read_snapshot(conn, label=label):
-            yield conn
-        return
-    with db.pinned_snapshot(conn, label=label):
-        yield conn
 
 
 def close_db() -> None:

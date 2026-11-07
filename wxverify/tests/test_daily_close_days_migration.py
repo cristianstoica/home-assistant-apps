@@ -35,11 +35,11 @@ def _v10_db() -> sqlite3.Connection:
     now, with user_version 1-16 refused outright (storage release 4.1,
     health release U1) -- so there is nothing left to remove onto a
     reachable schema. Pinning at 17 instead of 18 still exercises a real
-    ``run_migrations`` call in ``_migrate`` (step 1's ``migrate_v18`` holds
-    only the ``secure_delete`` toggle and the version write, so it is a
-    fast no-op here regardless of data present), while this function's
-    own subject -- the live CHECK/foreign-key constraints on these tables
-    -- is unaffected either way.
+    ``run_migrations`` call in ``_migrate`` (the version 18 upgrade runs;
+    these tests do not depend on its sub-steps, so it stays a fast no-op
+    here regardless of data present), while this function's own subject
+    -- the live CHECK/foreign-key constraints on these tables -- is
+    unaffected either way.
     """
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row

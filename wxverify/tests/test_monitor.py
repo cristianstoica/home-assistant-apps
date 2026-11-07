@@ -3256,7 +3256,7 @@ def test_wl16_heartbeat_write_failure_reads_as_stale_evidence_not_hung(
     )
 
     class FakeDb:
-        async def write(self, fn, *, epoch_exempt: bool = False):  # type: ignore[no-untyped-def]
+        async def write(self, fn):  # type: ignore[no-untyped-def]
             return fn(conn)
 
     result = asyncio.run(
@@ -3274,9 +3274,6 @@ def test_wl16_heartbeat_write_failure_reads_as_stale_evidence_not_hung(
         and r.getMessage() == "runtime heartbeat write failed key=worker_last_loop_at"
         for r in caplog.records
     )
-    # The logged exception is the injected one: a fake whose write() rejected
-    # the heartbeat's epoch_exempt keyword would log the same message from a
-    # TypeError, and the assertion above alone would still pass.
     assert len(injected) == 1
     assert any(
         r.levelno == logging.ERROR

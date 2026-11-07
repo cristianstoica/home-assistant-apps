@@ -24,7 +24,6 @@ from wxverify.core.lead import parse_day_ahead
 from wxverify.core.secrets import key_status
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.core.units import ms_to_kmh
-from wxverify.db.connection import pinned_read_snapshot
 from wxverify.db.site_days import (
     DayRecord,
     closed_through,
@@ -33,6 +32,7 @@ from wxverify.db.site_days import (
     day_record,
     zone_flagged,
 )
+from wxverify.db.snapshot import read_snapshot
 from wxverify.db.switch import first_record_date
 from wxverify.forecast.wind_blend import load_wind_serving
 from wxverify.scoring.composite import composite_in_snapshot
@@ -463,7 +463,7 @@ def load_dashboard(
 ) -> dict[str, object]:
     """The dashboard page's context, read in one snapshot (9.3).
 
-    Opens a ``pinned_read_snapshot`` unless the caller already holds a
+    Opens a ``read_snapshot`` unless the caller already holds a
     transaction, so every part of the page -- with the daily close on, every
     ranking and the wind weights -- comes from one publication version.
     With the close on, ``rolling_days`` and ``min_n`` are the active
@@ -478,7 +478,7 @@ def load_dashboard(
         return _load_dashboard(
             conn, site_id=site_id, variable=variable, window=window, lead=lead
         )
-    with pinned_read_snapshot(conn, label="dashboard"):
+    with read_snapshot(conn, label="dashboard"):
         return _load_dashboard(
             conn, site_id=site_id, variable=variable, window=window, lead=lead
         )

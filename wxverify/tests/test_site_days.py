@@ -67,7 +67,6 @@ _ALL_KINDS: tuple[WriteKind, ...] = (
     WriteKind.GAP_FILL,
     WriteKind.HOURLY,
     WriteKind.TRUTH,
-    WriteKind.PAIRS,
     WriteKind.DAY_SCORES,
     WriteKind.CLOSE_RECORD,
     WriteKind.RAW_PRUNE,
@@ -87,7 +86,6 @@ _TABLE_5_2: dict[str, dict[WriteKind, bool]] = {
         WriteKind.GAP_FILL: False,
         WriteKind.HOURLY: True,
         WriteKind.TRUTH: True,
-        WriteKind.PAIRS: True,
         WriteKind.DAY_SCORES: False,
         WriteKind.CLOSE_RECORD: False,
         WriteKind.RAW_PRUNE: False,
@@ -98,7 +96,6 @@ _TABLE_5_2: dict[str, dict[WriteKind, bool]] = {
         WriteKind.GAP_FILL: True,
         WriteKind.HOURLY: True,
         WriteKind.TRUTH: True,
-        WriteKind.PAIRS: True,
         WriteKind.DAY_SCORES: True,
         WriteKind.CLOSE_RECORD: True,
         WriteKind.RAW_PRUNE: False,
@@ -115,7 +112,6 @@ _TABLE_5_2: dict[str, dict[WriteKind, bool]] = {
         WriteKind.GAP_FILL: False,
         WriteKind.HOURLY: True,
         WriteKind.TRUTH: True,
-        WriteKind.PAIRS: True,
         WriteKind.DAY_SCORES: False,
         WriteKind.CLOSE_RECORD: False,
         WriteKind.RAW_PRUNE: False,
@@ -1657,7 +1653,6 @@ def test_ds20_close_off_site_takes_no_write_but_table_tables_stay_empty() -> Non
             WriteKind.READING,
             WriteKind.HOURLY,
             WriteKind.TRUTH,
-            WriteKind.PAIRS,
         )
         assert (
             check_day_write(conn, site_id, isoformat_utc(NOW), kind, now_utc=NOW)

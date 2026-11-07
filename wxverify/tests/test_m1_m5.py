@@ -175,15 +175,6 @@ def test_migrations_seed_fk_and_not_null_census(tmp_path: Path) -> None:
             "fetch_interval_minutes",
             "max_lead_hours",
         },
-        "score_cache": {
-            "site_id",
-            "feed_id",
-            "variable",
-            "day_ahead",
-            "window_key",
-            "n",
-            "computed_at",
-        },
         "forecast_samples": {
             "site_id",
             "feed_id",
@@ -386,7 +377,7 @@ def test_worker_heartbeat_write_failure_logs_and_loop_continues(
         async def read(self, fn):  # type: ignore[no-untyped-def]
             return fn(None)
 
-        async def write(self, fn, *, epoch_exempt: bool = False):  # type: ignore[no-untyped-def]
+        async def write(self, fn):  # type: ignore[no-untyped-def]
             return fn(None)
 
     injected: dict[str, sqlite3.OperationalError] = {}
@@ -415,9 +406,6 @@ def test_worker_heartbeat_write_failure_logs_and_loop_continues(
 
     assert "runtime heartbeat write failed key=worker_last_loop_at" in caplog.text
     assert "runtime heartbeat write failed key=scheduler_last_tick_at" in caplog.text
-    # Each logged exception is the injected one: a fake whose write() rejected
-    # the heartbeat's epoch_exempt keyword would log the same messages from a
-    # TypeError, and the two assertions above alone would still pass.
     for key in ("worker_last_loop_at", "scheduler_last_tick_at"):
         records = [
             r
@@ -448,7 +436,7 @@ def test_worker_permission_error_is_process_fatal(
         async def read(self, fn):  # type: ignore[no-untyped-def]
             return fn(None)
 
-        async def write(self, fn, *, epoch_exempt: bool = False):  # type: ignore[no-untyped-def]
+        async def write(self, fn):  # type: ignore[no-untyped-def]
             return fn(None)
 
     def claim_once(conn: object) -> Job:

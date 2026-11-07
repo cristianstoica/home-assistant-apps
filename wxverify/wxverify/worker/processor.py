@@ -313,10 +313,8 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
 
     ``lane`` names the calling lane in the log lines.
     """
-    # Every write below goes through `writer`. A current-obs job's writes are
-    # exempt from the input epoch: they touch only the current-obs lane's
-    # tables.
-    writer = FencedWriter(db, epoch_exempt=(lane == "current_obs"))
+    # Every write below goes through `writer`.
+    writer = FencedWriter(db)
     claimed_at = time.monotonic()
     logger.info(
         "job claimed id=%s type=%s site=%s lane=%s",
@@ -511,14 +509,8 @@ async def _maybe_stamp_runtime_heartbeat(
         # Exempt from generation fencing: a single global runtime_state
         # heartbeat stamp, called from the loop between jobs -- no job-scoped
         # read behind it.
-        #
-        # Exempt from the input epoch too (`epoch_exempt=True`): the only two
-        # callers pass the literal keys `worker_last_loop_at` and
-        # `scheduler_last_tick_at`, read only by the monitor and
-        # `runtime_status` -- neither a scoring nor a wind-training input.
         await db.write(
-            lambda conn, state_key=key: set_runtime_state_now(conn, state_key),
-            epoch_exempt=True,
+            lambda conn, state_key=key: set_runtime_state_now(conn, state_key)
         )
     except Exception:
         logger.exception("runtime heartbeat write failed key=%s", key)

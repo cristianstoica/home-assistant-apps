@@ -21,6 +21,7 @@ here to avoid relying on an unconfirmed default.
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -40,33 +41,95 @@ _STAMP = "2026-07-06T00:00:00Z"
 
 
 def test_sz2_migration_run_twice_adds_nothing_twice(tmp_path: Path) -> None:
-    """SZ2 (first case): running the v14 migration twice on a fresh file
-    raises no error and leaves ``download_record_since`` exactly as the
-    first run set it -- the probe that lets the migration skip its own
-    column/table adds a second time must still be in place.
+    """SZ2 (first case), re-vehicled from the retired ``download_record_
+    since`` key (health release, Part D5) onto ``storage_compacted_at``,
+    written by the same fresh-build loop: running ``run_migrations`` a
+    second time on a file already at the current ``user_version`` raises
+    no error (no duplicate table or column) and does not rewrite
+    ``storage_compacted_at``. The second run never re-enters
+    ``_record_fresh_build_keys`` (it only fires when ``user_version`` is
+    0), so this case cannot exercise that function's "only when absent"
+    guard -- see the second case below for that.
     """
     conn = sqlite3.connect(str(tmp_path / "fresh.db"))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     run_migrations(conn)
     conn.commit()
-    first_since = get_runtime_state(conn, "download_record_since")
-    assert first_since is not None, (
-        "download_record_since not set after the first migration run: P4"
-        " piece 1 (15.4) has migrate_v14_daily_close_scores write this"
-        " runtime_state key once, with the migration's time, when absent"
+    first_compacted = get_runtime_state(conn, "storage_compacted_at")
+    assert first_compacted is not None, (
+        "storage_compacted_at not set after the first migration run: a"
+        " fresh build's _record_fresh_build_keys must write this"
+        " runtime_state key once, with the build's time, when absent"
     )
 
     run_migrations(conn)  # must not raise (no duplicate column/table error)
     conn.commit()
 
-    second_since = get_runtime_state(conn, "download_record_since")
-    assert second_since == first_since, (
-        "M117 -> at this assertion: correct = unchanged (the migration"
-        " writes download_record_since only when absent, 15.4), mutant"
-        " M117 (the column/table probe removed, so every re-run repeats"
-        " every write unconditionally) = second_since differs from"
-        " first_since (a later timestamp from the second run)"
+    second_compacted = get_runtime_state(conn, "storage_compacted_at")
+    assert second_compacted == first_compacted, (
+        "correct = unchanged (a second run_migrations on an already-"
+        "current-version file never re-enters _record_fresh_build_keys,"
+        " so storage_compacted_at is untouched), mutant = second_compacted"
+        " differs from first_compacted (a later timestamp written by a"
+        " bug that re-ran the fresh-build key writer on a non-fresh"
+        " migration)"
+    )
+
+
+def test_sz2_migration_rerun_after_a_build_that_crashed_before_the_version_stamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SZ2 (second case): replays the crash ``_record_fresh_build_keys``'s
+    "only when absent" guard exists for -- a fresh build that wrote both
+    keys but was interrupted before ``user_version`` was stamped to 18, so
+    the next start sees ``user_version == 0`` again and re-enters
+    ``_record_fresh_build_keys``. With the guard in place, that rerun must
+    leave ``storage_compacted_at`` and ``daily_close_on_at`` exactly as the
+    first run set them, even though ``utc_now`` has moved on. The first
+    case above cannot exercise this: once the first run stamps
+    ``user_version`` to 18, a second call to ``run_migrations`` never
+    reaches ``_record_fresh_build_keys`` again (``run_migrations`` only
+    calls it when ``current == 0``), so a build with the guard in
+    ``_record_fresh_build_keys`` (``if get_runtime_state(conn, key) is
+    None:``) deleted still passes the first case.
+    """
+    conn = sqlite3.connect(str(tmp_path / "fresh.db"))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    run_migrations(conn)
+    conn.commit()
+    first_compacted = get_runtime_state(conn, "storage_compacted_at")
+    first_close_on = get_runtime_state(conn, "daily_close_on_at")
+    assert first_compacted is not None
+    assert first_close_on is not None
+
+    # Simulate the crash: both keys are on disk, but the version stamp
+    # that would mark the fresh build as finished never landed.
+    conn.execute("PRAGMA user_version = 0")
+    conn.commit()
+
+    later_now = datetime(2027, 1, 1, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.db.migrations.utc_now", lambda: later_now)
+
+    run_migrations(conn)
+    conn.commit()
+
+    second_compacted = get_runtime_state(conn, "storage_compacted_at")
+    second_close_on = get_runtime_state(conn, "daily_close_on_at")
+    assert second_compacted == first_compacted, (
+        "correct = unchanged (storage_compacted_at was already written by"
+        " the crashed build, so the rerun's _record_fresh_build_keys must"
+        " leave it alone), mutant (the only-when-absent guard removed from"
+        " _record_fresh_build_keys) = second_compacted is later_now's"
+        " timestamp, overwriting first_compacted"
+    )
+    assert second_close_on == first_close_on, (
+        "correct = unchanged (daily_close_on_at was already written by the"
+        " crashed build, so the rerun's _record_fresh_build_keys must"
+        " leave it alone), mutant (the only-when-absent guard removed from"
+        " _record_fresh_build_keys) = second_close_on is later_now's"
+        " timestamp, overwriting first_close_on"
     )
 
 

@@ -268,26 +268,6 @@ def create_tables(conn: sqlite3.Connection) -> None:
             UNIQUE(site_id, quantity, local_date, tz_generation_id)
         );
 
-        CREATE TABLE IF NOT EXISTS score_cache (
-            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
-            variable TEXT NOT NULL,
-            day_ahead INTEGER NOT NULL,
-            window_key TEXT NOT NULL,
-            n INTEGER NOT NULL,
-            bias REAL,
-            mae REAL,
-            rmse REAL,
-            pod REAL,
-            far REAL,
-            csi REAL,
-            ets REAL,
-            hss REAL,
-            skill_score REAL,
-            computed_at TEXT NOT NULL,
-            PRIMARY KEY(site_id, feed_id, variable, day_ahead, window_key)
-        );
-
         CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY,
             type TEXT NOT NULL,
@@ -1256,8 +1236,8 @@ def record_precip_hour_start_boundary(conn: sqlite3.Connection) -> None:
     below the same second without them. With no such row the boundary is
     the `1970-01-01T00:00:00Z` sentinel. No clock is read.
 
-    Only the key is written: no pair, `score_cache`, job or
-    `forecast_samples` row changes, so a file from before the boundary
+    Only the key is written: no pair, job or `forecast_samples` row
+    changes, so a file from before the boundary
     keeps its stored pairs and scores as they stand, like any other file.
 
     Gated on the key, not on `user_version`, whose number depends on which
@@ -1287,9 +1267,6 @@ def record_precip_hour_start_boundary(conn: sqlite3.Connection) -> None:
     logger.info("precip hour-start boundary recorded at %s", boundary)
 
 
-# Value: when the download record (``forecast_downloads``) starts, a
-# canonical whole-second UTC ``...Z`` stamp. A fresh file gets its build time.
-DOWNLOAD_RECORD_SINCE_KEY: Final = "download_record_since"
 # Value: when the file was last compacted, a canonical UTC ``...Z`` stamp. A
 # fresh file gets its build time: it has nothing to compact.
 STORAGE_COMPACTED_KEY: Final = "storage_compacted_at"
@@ -1303,12 +1280,13 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     ``install 0.16.17 first``. Then, in order: `create_tables`; on every
     start, `drop_forecast_record`; `create_indexes`; at 17 only,
     `migrate_v18`; the four one-shot corrections, the three seeds and the
-    rain-label boundary; at 0 only, the fresh file's three keys
+    rain-label boundary; at 0 only, the fresh file's two keys
     (`_record_fresh_build_keys`); last, ``user_version`` 18. A file already
     at 18 runs the same steps less the upgrade and the fresh keys.
 
     A stop is checked before each step (``core.stop.begin_step``), which
-    also names the step for ``Database._open``'s log line. A step that does
+    also names the step for ``Database._open``'s log line; `migrate_v18`
+    checks again before each of its sub-steps. A step that does
     not run leaves ``user_version`` unchanged, and each step finds its own
     work done on a repeat, so the next start reruns from it. `migrate_v18`
     writes ``user_version`` 18 inside its own savepoint, so a stop after it
@@ -1363,17 +1341,15 @@ def run_migrations(conn: sqlite3.Connection) -> None:
 
 
 def _record_fresh_build_keys(conn: sqlite3.Connection) -> None:
-    """A fresh file's three ``runtime_state`` keys, each written only when absent.
+    """A fresh file's two ``runtime_state`` keys, each written only when absent.
 
     ``DAILY_CLOSE_ON_KEY``: the daily close is on from the build.
-    ``DOWNLOAD_RECORD_SINCE_KEY``: the download record starts at the build,
-    in whole seconds. ``STORAGE_COMPACTED_KEY``: the file has nothing to
-    compact. All three come from one read of this module's ``utc_now``.
+    ``STORAGE_COMPACTED_KEY``: the file has nothing to compact. Both come
+    from one read of this module's ``utc_now``.
     """
     now = utc_now()
     for key, value in (
         (DAILY_CLOSE_ON_KEY, isoformat_utc(now)),
-        (DOWNLOAD_RECORD_SINCE_KEY, isoformat_utc(now.replace(microsecond=0))),
         (STORAGE_COMPACTED_KEY, isoformat_utc(now)),
     ):
         if get_runtime_state(conn, key) is None:
@@ -1440,17 +1416,19 @@ def migrate_v18(conn: sqlite3.Connection) -> None:
     sets it to 0 on this connection, so the deletes do not overwrite each
     freed page; the ``finally`` puts it back, whatever happens.
 
-    One SAVEPOINT holds the upgrade, ending with ``user_version`` 18: the
-    version sits in the file header, which the savepoint rolls back with
-    everything else. `create_tables`'s ``executescript`` has already
-    committed any outer transaction, so the RELEASE is the commit, and
-    nothing inside the savepoint may end the transaction (no
-    ``executescript``, commit, rollback, ``BEGIN`` or ``VACUUM``).
+    One SAVEPOINT holds the upgrade: the sub-step
+    `_v18_drop_unused_write_state`, under the stop check
+    ``v18_drop_unused_write_state``, then ``user_version`` 18. The version
+    sits in the file header, which the savepoint rolls back with everything
+    else. `create_tables`'s ``executescript`` has already committed any
+    outer transaction, so the RELEASE is the commit, and nothing inside the
+    savepoint may end the transaction (no ``executescript``, commit,
+    rollback, ``BEGIN`` or ``VACUUM``).
 
-    Any error rolls the savepoint back and is re-raised, so the file stays
-    at version 17 as it was and the next open runs the upgrade again; the
-    in_transaction check covers an error that has already ended the
-    transaction.
+    Any error, a stop at a sub-step's check included, rolls the savepoint
+    back and is re-raised, so the file stays at version 17 as it was and
+    the next open runs the upgrade again; the in_transaction check covers
+    an error that has already ended the transaction.
     """
     secure_delete = int(conn.execute("PRAGMA secure_delete").fetchone()[0])
     logger.info(
@@ -1460,6 +1438,8 @@ def migrate_v18(conn: sqlite3.Connection) -> None:
     try:
         conn.execute("SAVEPOINT migrate_v18")
         try:
+            stop.begin_step("v18_drop_unused_write_state")
+            _v18_drop_unused_write_state(conn)
             conn.execute("PRAGMA user_version = 18")
         except BaseException:
             if conn.in_transaction:
@@ -1472,9 +1452,45 @@ def migrate_v18(conn: sqlite3.Connection) -> None:
         conn.execute(f"PRAGMA secure_delete = {restored}")
 
 
+def _v18_drop_unused_write_state(conn: sqlite3.Connection) -> None:
+    """Drop the score table and the download-record key nothing uses.
+
+    A sub-step of `migrate_v18`, run inside its savepoint. Two statements:
+    ``DROP TABLE IF EXISTS score_cache`` (nothing writes, reads or
+    references it, so the drop cascades nowhere), then a DELETE of the
+    ``runtime_state`` row whose key is exactly ``download_record_since``
+    (read by nothing). The table's row count is read before the drop, when
+    the table exists. Plain ``conn.execute`` only: nothing here ends the
+    transaction. One INFO line gives the counts and the time taken.
+    """
+    started = time.perf_counter()
+    dropped = 0
+    rows = 0
+    if _table_exists(conn, "score_cache"):
+        dropped = 1
+        rows = int(conn.execute("SELECT COUNT(*) FROM score_cache").fetchone()[0])
+    conn.execute("DROP TABLE IF EXISTS score_cache")
+    removed = conn.execute(
+        "DELETE FROM runtime_state WHERE key = 'download_record_since'"
+    ).rowcount
+    logger.info(
+        "v18 upgrade: score_cache dropped=%d (%d row(s)), "
+        "download_record_since removed=%d, %d ms",
+        dropped,
+        rows,
+        removed,
+        _elapsed_ms(started),
+    )
+
+
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     """Whether the main schema has a table named ``table``. Read-only."""
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
     ).fetchone()
     return row is not None
+
+
+def _elapsed_ms(started: float) -> int:
+    """Whole milliseconds since ``started``, a ``time.perf_counter`` value."""
+    return int((time.perf_counter() - started) * 1000)

@@ -59,7 +59,6 @@ class WriteKind(StrEnum):
     GAP_FILL = "gap_fill"
     HOURLY = "hourly"
     TRUTH = "truth"
-    PAIRS = "pairs"
     DAY_SCORES = "day_scores"
     CLOSE_RECORD = "close_record"
     RAW_PRUNE = "raw_prune"
@@ -127,18 +126,15 @@ _JOINING_CHANGES: Final[frozenset[str]] = frozenset({"added", "turned_on"})
 # state that is not done. ``retry_due`` allows nothing; a done day allows
 # only RAW_PRUNE, by the 5.4 rule.
 _CLOSE_OFF_KINDS: Final[frozenset[WriteKind]] = frozenset(
-    {WriteKind.READING, WriteKind.HOURLY, WriteKind.TRUTH, WriteKind.PAIRS}
+    {WriteKind.READING, WriteKind.HOURLY, WriteKind.TRUTH}
 )
 _STATE_KINDS: Final[dict[str, frozenset[WriteKind]]] = {
-    "open": frozenset(
-        {WriteKind.READING, WriteKind.HOURLY, WriteKind.TRUTH, WriteKind.PAIRS}
-    ),
+    "open": frozenset({WriteKind.READING, WriteKind.HOURLY, WriteKind.TRUTH}),
     "closing": frozenset(
         {
             WriteKind.GAP_FILL,
             WriteKind.HOURLY,
             WriteKind.TRUTH,
-            WriteKind.PAIRS,
             WriteKind.DAY_SCORES,
             WriteKind.CLOSE_RECORD,
         }
@@ -1011,8 +1007,8 @@ def filter_day_writes(
 ) -> frozenset[str]:
     """The subset of ``instants`` that may be written as ``kind`` (7.1).
 
-    While the close is off, all of them for ``READING``, ``HOURLY``,
-    ``TRUTH`` and ``PAIRS`` and none otherwise. While it is on, creates the
+    While the close is off, all of them for ``READING``, ``HOURLY`` and
+    ``TRUTH`` and none otherwise. While it is on, creates the
     site's missing records, then allows an instant only when table 5.2
     allows ``kind`` for the record whose bounds hold it; ``HISTORY_PRUNE``
     is allowed for an instant before the site's first record. An instant

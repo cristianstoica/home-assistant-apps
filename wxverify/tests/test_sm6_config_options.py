@@ -193,9 +193,7 @@ class _RealDb:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
-    async def write(
-        self, fn: Callable[[sqlite3.Connection], T], *, epoch_exempt: bool = False
-    ) -> T:
+    async def write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         return fn(self._conn)
 
     async def read(self, fn: Callable[[sqlite3.Connection], T]) -> T:

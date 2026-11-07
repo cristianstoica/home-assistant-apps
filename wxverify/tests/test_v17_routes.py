@@ -154,6 +154,7 @@ def test_v17_database_opens_and_every_route_answers_without_db_error(
             "close_pairs",
             "verification_runs",
             "verification_evidence",
+            "score_cache",
         ):
             row = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",

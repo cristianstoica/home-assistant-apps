@@ -1011,7 +1011,7 @@ def _rd7_make_file_db(tmp_path: Path) -> tuple[sqlite3.Connection, str]:
 def test_rd7_curve_response_reads_one_publication_version_throughout(
     tmp_path: Path,
 ) -> None:
-    """RD7: one response built inside ONE ``pinned_read_snapshot`` -- the
+    """RD7: one response built inside ONE ``read_snapshot`` -- the
     mechanism 9.3 names for ``/curve`` -- sees the SAME publication (D-1)
     at every leaderboard read inside it, even when a SECOND connection
     commits a newer (D) publication while that snapshot is held open (9.3).
@@ -1022,14 +1022,14 @@ def test_rd7_curve_response_reads_one_publication_version_throughout(
     (``api/routes/dashboard.py:77-97``) must call once per lead, since its
     OWN snapshotting facade, ``leaderboard_with_status``, "refuses to nest"
     inside a caller-held snapshot such as ``/curve``'s one
-    ``pinned_read_snapshot`` (the facade's own docstring). On the spy's
+    ``read_snapshot`` (the facade's own docstring). On the spy's
     FIRST call, a second, real connection to the SAME on-disk file commits
     a newer publication before the spy returns; the second call, still
     inside the first connection's one open snapshot, is the one put at
     risk. Every value in the response (each call's ``evidence_through``)
     must still come from the ORIGINAL (D-1) publication.
     """
-    from wxverify.db.connection import pinned_read_snapshot
+    from wxverify.db.snapshot import read_snapshot
     from wxverify.scoring.leaderboard import leaderboard_with_status_in_transaction
 
     conn, db_path = _rd7_make_file_db(tmp_path)
@@ -1059,15 +1059,15 @@ def test_rd7_curve_response_reads_one_publication_version_throughout(
                 blocker.close()
         return result
 
-    with pinned_read_snapshot(conn, label="rd7-test"):
+    with read_snapshot(conn, label="rd7-test"):
         _spy(day_ahead=1)
         _spy(day_ahead=1)
 
     assert seen_cutoffs, "fixture bug: the spy must be called"
     assert len(set(seen_cutoffs)) == 1 and seen_cutoffs[0] == _D1, (
         "M85 -> at this assertion: correct = every call inside the one"
-        " pinned snapshot reports evidence_through D-1, the publication"
-        " active when the snapshot opened (9.3: one pinned_read_snapshot"
+        " snapshot reports evidence_through D-1, the publication"
+        " active when the snapshot opened (9.3: one read_snapshot"
         " per response), mutant M85 (/curve reads each leaderboard in its"
         " own snapshot) = the second call, no longer sharing the first"
         f" call's snapshot, would see the newly-committed D publication"
@@ -1079,12 +1079,12 @@ def test_rd7_curve_route_itself_reads_one_publication_version_throughout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """RD7, routed through the real production code: the test above proves
-    the MECHANISM (a pinned_read_snapshot holds one publication version
+    the MECHANISM (a read_snapshot holds one publication version
     across calls inside it); it calls
     ``leaderboard_with_status_in_transaction`` directly inside a
-    manually-opened ``pinned_read_snapshot`` of its own, so a mutant that
+    manually-opened ``read_snapshot`` of its own, so a mutant that
     changes what ``/curve`` itself does (M85: drops
-    ``pinned_read_snapshot`` and reads each of its eight leads through
+    ``read_snapshot`` and reads each of its eight leads through
     ``leaderboard_with_status``, which opens its own snapshot per call)
     never runs any of the route's own code and cannot be seen by it.
 
@@ -1165,8 +1165,8 @@ def test_rd7_curve_route_itself_reads_one_publication_version_throughout(
         "M85 -> at this assertion (the route's OWN eight calls, not a"
         " manual simulation of the mechanism): correct = every one of"
         " /curve's 8 leaderboard reads reports evidence_through D-1, the"
-        " publication active when /curve's one pinned_read_snapshot"
-        " opened (9.3), mutant M85 (/curve drops pinned_read_snapshot and"
+        " publication active when /curve's one read_snapshot"
+        " opened (9.3), mutant M85 (/curve drops read_snapshot and"
         " reads each lead through leaderboard_with_status, its own"
         " snapshot per call) = the leads read after the first would see"
         f" the newly-committed D publication instead -- got {seen_cutoffs!r}"

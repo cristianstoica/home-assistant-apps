@@ -8,7 +8,8 @@ from typing import Literal
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import HTMLResponse
 
-from wxverify.db.connection import get_db, pinned_read_snapshot
+from wxverify.db.connection import get_db
+from wxverify.db.snapshot import read_snapshot
 from wxverify.forecast.data import forecast_fingerprint
 from wxverify.forecast.page import ForecastPage, build_forecast_page
 from wxverify.forecast.service import DAY_COUNT
@@ -94,7 +95,7 @@ def _read_forecast_context(
     and rankings) then describe one database state, so the fingerprint in the
     page's poll URL is the one its region was built from.
     """
-    with pinned_read_snapshot(conn, label=label):
+    with read_snapshot(conn, label=label):
         return _load_forecast_context(conn, site_id, day)
 
 
@@ -148,7 +149,7 @@ async def forecast_tiles(
     def _poll(
         conn: sqlite3.Connection,
     ) -> Literal["unknown", "unchanged"] | dict[str, object]:
-        with pinned_read_snapshot(conn, label="forecast_tiles"):
+        with read_snapshot(conn, label="forecast_tiles"):
             site_view = _resolve_site(conn, site)
             if site_view is None:
                 return "unknown"

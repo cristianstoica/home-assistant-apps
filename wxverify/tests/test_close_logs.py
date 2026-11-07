@@ -600,9 +600,9 @@ def _build_v12_file(
     migrate_v16 function, and user_version 1-16 is refused outright
     (storage release 4.1, health release U1) -- so there is nothing left
     to undo onto a reachable schema. Pinning at 17 instead of 18 still
-    exercises a real ``run_migrations`` call on open (step 1's
-    ``migrate_v18`` holds only the ``secure_delete`` toggle and the
-    version write, so it is a fast no-op here).
+    exercises a real ``run_migrations`` call on open (the version 18
+    upgrade runs; these tests do not depend on its sub-steps, so it
+    stays a fast no-op here).
     """
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row

@@ -164,15 +164,6 @@ def test_gw4_materialize_consensus_leaves_a_closed_days_hour_alone(
     )
     conn.execute(
         """
-        INSERT INTO score_cache
-            (site_id, feed_id, variable, day_ahead, window_key, n, skill_score,
-             computed_at)
-        VALUES (?, ?, 'temperature', 1, 'w:all', 1, 0.5, ?)
-        """,
-        (site_id, feed_id, d3_hour),
-    )
-    conn.execute(
-        """
         INSERT INTO daily_truth
             (site_id, local_date, quantity, value, eligible, covered_hours,
              expected_slots, day_start_utc, day_end_utc, timezone,
@@ -193,12 +184,6 @@ def test_gw4_materialize_consensus_leaves_a_closed_days_hour_alone(
         "SELECT * FROM forecast_history WHERE site_id = ? ORDER BY feed_id, valid_at",
         (site_id,),
     )
-    before_cache = _rows(
-        conn,
-        "SELECT * FROM score_cache WHERE site_id = ?"
-        " ORDER BY feed_id, variable, day_ahead, window_key",
-        (site_id,),
-    )
     before_truth = _rows(
         conn,
         "SELECT * FROM daily_truth WHERE site_id = ? AND local_date = ?",
@@ -214,12 +199,6 @@ def test_gw4_materialize_consensus_leaves_a_closed_days_hour_alone(
     assert before_hist == _rows(
         conn,
         "SELECT * FROM forecast_history WHERE site_id = ? ORDER BY feed_id, valid_at",
-        (site_id,),
-    )
-    assert before_cache == _rows(
-        conn,
-        "SELECT * FROM score_cache WHERE site_id = ?"
-        " ORDER BY feed_id, variable, day_ahead, window_key",
         (site_id,),
     )
     assert before_truth == _rows(

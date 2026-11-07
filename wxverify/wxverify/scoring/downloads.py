@@ -282,8 +282,7 @@ def latest_stored_download(
 
     The value-change log reads it before a new download's row exists, as
     the download that one is compared with (5.2). Only the record is read;
-    a download before ``download_record_since`` is never returned.
-    Read-only.
+    a download it does not hold is never returned. Read-only.
     """
     fetch_feed_id = _fetch_feed_id(conn, feed_id)
     rows = conn.execute(

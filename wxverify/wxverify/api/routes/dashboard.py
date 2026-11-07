@@ -18,7 +18,8 @@ from fastapi import APIRouter, Depends, Query, Response
 
 from wxverify.api.schemas import LeaderboardOut
 from wxverify.core.lead import parse_day_ahead
-from wxverify.db.connection import get_db, pinned_read_snapshot
+from wxverify.db.connection import get_db
+from wxverify.db.snapshot import read_snapshot
 from wxverify.scoring.composite import composite_with_status
 from wxverify.scoring.leaderboard import (
     LeaderboardResult,
@@ -102,7 +103,7 @@ async def curve(
     def _read(conn: sqlite3.Connection) -> dict[str, object]:
         # The eight leads in one snapshot, so every one reads the same
         # publication (9.3).
-        with pinned_read_snapshot(conn, label="curve"):
+        with read_snapshot(conn, label="curve"):
             results = [
                 leaderboard_in_snapshot(
                     conn,

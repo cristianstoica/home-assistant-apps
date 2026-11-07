@@ -1,12 +1,14 @@
-"""U1-U3, the version-18 upgrade's shape only (plan `2026-11-07-health-
-release.md` §9, §10 step 1; test IDs UT1, UT4, UT5, UT6, adapted to this
-step). `migrate_v18` at this step holds only the ``secure_delete`` handling
-and the ``PRAGMA user_version = 18`` write inside its ``SAVEPOINT``; the
-four part sub-steps (U4: ``_v18_poll_pause``, ``_v18_drop_unused_write_
-state``, ``_v18_prune_wind_history``, ``_v18_drop_bad_display_values``) are
-not wired in yet, so UT2 (each part's effect) and UT3 (all-or-nothing
-across the four sub-steps, BT9's ``CHECK`` table in UT1) are not written
-here -- they belong to the later steps that add those sub-steps.
+"""The version-18 upgrade (plan `2026-11-07-health-release.md` §9, §10;
+test IDs UT1-UT6, adapted to the sub-steps wired in so far). The version
+18 upgrade runs under `migrate_v18`; UT1, UT4, UT5 and UT6 below do not
+depend on which of its sub-steps are wired in, and stay correct as later
+steps add more. Of U4's four sub-steps (``_v18_poll_pause``,
+``_v18_drop_unused_write_state``, ``_v18_prune_wind_history``,
+``_v18_drop_bad_display_values``), only ``_v18_drop_unused_write_state`` is
+wired in as of this file; UT2 (each part's effect) and UT3 (all-or-nothing)
+below cover that one sub-step only -- BT9's ``CHECK`` table in UT1 and the
+other three sub-steps' own UT2/UT3 pieces land with the steps that add
+them.
 
 Fixture: ``tests/fixtures/v17_schema.sql`` and ``v17_seed.sql``, dumped
 from a fresh 0.16.17 (``6f49f1a``) file the same way the version-16 pair
@@ -15,8 +17,8 @@ seed with ``iterdump``, restricted to the boot-seed tables -- ``sources``,
 ``feeds``, ``settings``, ``runtime_state``; no site, station or job row).
 Every test below loads both into a fresh ``tmp_path`` file, sets
 ``user_version`` 17 and ``foreign_keys`` on, and calls
-``migrations.run_migrations`` directly on the autocommit connection (the
-6f49f1a's ``tests/test_migration_v17.py``/``_run_migrate_v17`` convention: no
+``migrations.run_migrations`` directly on the autocommit connection
+(6f49f1a's ``tests/test_migration_v17.py``/``_run_migrate_v17`` convention: no
 surrounding ``BEGIN``, since ``create_tables``'s own ``executescript``
 ends any outer transaction anyway, per plan §9's "the transaction" note).
 
@@ -248,3 +250,259 @@ def test_ut6_secure_delete_reads_1_after_a_stop_before_migrate_v18_runs(
         "a stop before migrate_v18 runs must leave the version at 17"
     )
     assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# U4's first wired-in sub-step: _v18_drop_unused_write_state.
+# ---------------------------------------------------------------------------
+
+
+def _score_cache_exists(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='score_cache'"
+        ).fetchone()
+        is not None
+    )
+
+
+def _download_record_since_exists(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM runtime_state WHERE key = 'download_record_since'"
+        ).fetchone()
+        is not None
+    )
+
+
+def _seed_score_cache_rows(conn: sqlite3.Connection) -> int:
+    """Insert one made-up site and two made-up ``score_cache`` rows under
+    boot-seeded feed 1. Returns the row count inserted (2)."""
+    conn.execute(
+        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+        " timezone) VALUES ('Site A', 1.0, 1.0, 1.0, 'UTC')"
+    )
+    site_id = conn.execute("SELECT id FROM sites WHERE name = 'Site A'").fetchone()[0]
+    for day_ahead in (0, 1):
+        conn.execute(
+            "INSERT INTO score_cache (site_id, feed_id, variable, day_ahead,"
+            " window_key, n, computed_at) VALUES (?, 1, 'temperature', ?,"
+            " 'w:all', 1, '2026-01-01T00:00:00Z')",
+            (site_id, day_ahead),
+        )
+    return 2
+
+
+def _assert_sub_step_done(conn: sqlite3.Connection) -> None:
+    """The shared, correct end state this sub-step must reach: at 18,
+    `score_cache` gone, `download_record_since` gone -- UT2's own result,
+    reused by UT3's "the next open finishes" checks."""
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 18
+    assert not _score_cache_exists(conn)
+    assert not _download_record_since_exists(conn)
+
+
+def test_fresh_file_has_no_score_cache_and_no_download_record_since(
+    tmp_path: Path,
+) -> None:
+    """Catches: the `score_cache` DDL left in `create_tables` (a fresh file
+    never reaches `migrate_v18`, which only runs at version 17, so this is
+    the only place that would catch it); the `download_record_since` key
+    written again at a fresh build."""
+    conn = sqlite3.connect(str(tmp_path / "fresh.db"), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+
+    migrations.run_migrations(conn)
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 18
+    assert not _score_cache_exists(conn)
+    assert not _download_record_since_exists(conn)
+    assert (
+        conn.execute(
+            "SELECT value FROM runtime_state WHERE key = 'daily_close_on_at'"
+        ).fetchone()
+        is not None
+    )
+    assert (
+        conn.execute(
+            "SELECT value FROM runtime_state WHERE key = 'storage_compacted_at'"
+        ).fetchone()
+        is not None
+    )
+
+
+def test_ut2_the_score_cache_table_and_only_its_key_go(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """UT2 for this sub-step. Catches: `_v18_drop_unused_write_state` not
+    wired into `migrate_v18` (`score_cache` and the key would survive the
+    upgrade); the sub-step reaching a row or table outside its own two
+    statements (another `runtime_state` key going missing, or any other
+    table's rows changing, would show up below)."""
+    conn = _v17_connect(tmp_path / "ut2.db")
+    inserted = _seed_score_cache_rows(conn)
+    conn.commit()
+
+    before_keys = {row[0] for row in conn.execute("SELECT key FROM runtime_state")}
+    assert "download_record_since" in before_keys
+    assert len(before_keys - {"download_record_since"}) >= 2, (
+        "the v17 seed must carry download_record_since beside at least two"
+        " other runtime_state keys, or this oracle cannot tell a sub-step"
+        " that deletes more than its own key from one that does not"
+    )
+    before = _all_table_rows(conn)
+    before_sets = {table: set(rows) for table, rows in before.items()}
+    removed_row = next(
+        row for row in before["runtime_state"] if row[0] == "download_record_since"
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="wxverify.db.migrations"):
+        migrations.run_migrations(conn)
+
+    _assert_sub_step_done(conn)
+    after = _all_table_rows(conn)
+    after_sets = {table: set(rows) for table, rows in after.items()}
+
+    assert set(after_sets) == set(before_sets) - {"score_cache"}, (
+        "exactly score_cache must disappear from the schema"
+    )
+    assert after_sets["runtime_state"] == before_sets["runtime_state"] - {
+        removed_row
+    }, "exactly the download_record_since row must disappear from runtime_state"
+    for table, rows in after_sets.items():
+        if table == "runtime_state":
+            continue
+        assert rows == before_sets[table], (
+            f"table {table!r} changed, but this sub-step touches only"
+            " score_cache and runtime_state"
+        )
+
+    assert any(
+        f"score_cache dropped=1 ({inserted} row(s))" in r.getMessage()
+        and "download_record_since removed=1" in r.getMessage()
+        for r in caplog.records
+    ), "the INFO line must report the real counts"
+
+
+def test_ut3_a_stop_at_the_sub_step_leaves_everything_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """UT3 for this sub-step, the stop half. Catches: the sub-step doing
+    anything -- an `executescript`, an early commit -- before the
+    `stop.begin_step("v18_drop_unused_write_state")` check, which would
+    leave `score_cache` or the key gone even though `run_migrations` never
+    finished."""
+    real_begin_step = stop_module.begin_step
+
+    def _fake_begin_step(name: str) -> None:
+        if name == "v18_drop_unused_write_state":
+            raise stop_module.StopRequested
+        real_begin_step(name)
+
+    monkeypatch.setattr(stop_module, "begin_step", _fake_begin_step)
+
+    conn = _v17_connect(tmp_path / "ut3-stop.db")
+    inserted = _seed_score_cache_rows(conn)
+    conn.execute("PRAGMA secure_delete = 1")
+    conn.commit()
+    before = _all_table_rows(conn)
+
+    with pytest.raises(stop_module.StopRequested):
+        migrations.run_migrations(conn)
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 17, (
+        "a stop before the sub-step runs must leave the version at 17"
+    )
+    assert _score_cache_exists(conn)
+    assert conn.execute("SELECT COUNT(*) FROM score_cache").fetchone()[0] == inserted
+    assert _download_record_since_exists(conn)
+    assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+    assert _all_table_rows(conn) == before
+
+    monkeypatch.setattr(stop_module, "begin_step", real_begin_step)
+    migrations.run_migrations(conn)
+    _assert_sub_step_done(conn)
+
+
+def test_ut3_a_denied_runtime_state_delete_rolls_back_the_drop_too(
+    tmp_path: Path,
+) -> None:
+    """UT3 for this sub-step, the all-or-nothing half. Catches: the
+    sub-step's `DROP TABLE` and `DELETE` not sharing one atomic unit with
+    `migrate_v18`'s `SAVEPOINT` -- if the drop had already committed on its
+    own before the delete failed, `score_cache` would stay gone even though
+    the upgrade as a whole raised and the version stayed at 17.
+
+    The authorizer denies the SECOND `DELETE FROM runtime_state` statement
+    `run_migrations` issues, by call order: the first is
+    `drop_forecast_record`'s (every start, well before `migrate_v18` is
+    even entered); the second is this sub-step's own. A `delete_calls`
+    count of exactly 2 at the point of the raise is the fixture's own
+    precondition check that the denial landed where intended, not on
+    `drop_forecast_record`'s unrelated delete. `order` additionally records
+    whether `score_cache`'s `DROP TABLE` was seen before the denied DELETE,
+    not merely that exactly two DELETEs ran -- so a later sub-step that adds
+    a `runtime_state` DELETE earlier in the order (ahead of the DROP) fails
+    this test loudly instead of silently denying the wrong statement.
+    """
+    conn = _v17_connect(tmp_path / "ut3-deny.db")
+    inserted = _seed_score_cache_rows(conn)
+    conn.execute("PRAGMA secure_delete = 1")
+    conn.commit()
+    before = _all_table_rows(conn)
+
+    delete_calls = {"n": 0}
+    order: list[str] = []
+
+    def _authorizer(
+        action_code: int,
+        arg1: str | None,
+        arg2: str | None,
+        dbname: str | None,
+        source: str | None,
+    ) -> int:
+        if action_code == sqlite3.SQLITE_DROP_TABLE and arg1 == "score_cache":
+            order.append("drop_score_cache")
+        if action_code == sqlite3.SQLITE_DELETE and arg1 == "runtime_state":
+            delete_calls["n"] += 1
+            if delete_calls["n"] == 2:
+                order.append("denied_delete")
+                return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    conn.set_authorizer(_authorizer)
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            migrations.run_migrations(conn)
+    finally:
+        conn.set_authorizer(None)
+
+    assert delete_calls["n"] == 2, (
+        "fixture bug: the denial must land on the sub-step's own DELETE,"
+        " not drop_forecast_record's -- otherwise the DROP TABLE this"
+        " oracle depends on never ran"
+    )
+    assert "drop_score_cache" in order and "denied_delete" in order, (
+        "fixture bug: expected both the score_cache DROP TABLE and the"
+        f" denied runtime_state DELETE to fire -- got order={order!r}"
+    )
+    assert order.index("drop_score_cache") < order.index("denied_delete"), (
+        "fixture bug: score_cache's DROP TABLE must be authorized before"
+        " the denied DELETE, so this oracle actually exercises the"
+        " all-or-nothing rollback of a drop that already ran -- got"
+        f" order={order!r}"
+    )
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 17
+    assert _score_cache_exists(conn), (
+        "a sub-step committing its DROP TABLE ahead of the failed DELETE"
+        " would leave score_cache gone here"
+    )
+    assert conn.execute("SELECT COUNT(*) FROM score_cache").fetchone()[0] == inserted
+    assert _download_record_since_exists(conn)
+    assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+    assert _all_table_rows(conn) == before
+
+    migrations.run_migrations(conn)
+    _assert_sub_step_done(conn)

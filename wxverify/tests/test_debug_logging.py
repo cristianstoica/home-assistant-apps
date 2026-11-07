@@ -103,7 +103,7 @@ def _make_job(
 class _FakeDb:
     """Minimal shim for worker loop logging tests (passes None as conn)."""
 
-    async def write(self, fn, *, epoch_exempt: bool = False):  # type: ignore[no-untyped-def]
+    async def write(self, fn):  # type: ignore[no-untyped-def]
         return fn(None)
 
     async def read(self, fn):  # type: ignore[no-untyped-def]

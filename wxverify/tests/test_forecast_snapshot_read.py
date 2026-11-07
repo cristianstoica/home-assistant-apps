@@ -49,8 +49,8 @@ from tests.test_leaderboard_cache_backed import _init_tmp_db as _init_lb_db
 from tests.test_leaderboard_read_snapshot import _hit_fixture, _side_conn
 from wxverify import config
 from wxverify.core.timeutil import floor_hour, isoformat_utc, utc_now
-from wxverify.db.connection import _READ_POOL_SIZE, Database, get_db
-from wxverify.db.snapshot import read_snapshot
+from wxverify.db.connection import _READ_POOL_SIZE, Database, close_db, get_db, init_db
+from wxverify.db.snapshot import read_only_snapshot, read_snapshot
 from wxverify.forecast.data import forecast_ranking_with_status
 from wxverify.scoring.metrics import MetricSums, metrics_from_sums
 from wxverify.settings.keys import get_number_setting, set_setting
@@ -905,3 +905,65 @@ def test_tk_guard_refuses_without_snapshot(tmp_path: Path) -> None:
     with read_snapshot(conn, label="t_k"):
         result = _load_forecast_context(conn, None, 1)
     assert set(result) == {"sites", "site", "page", "day"}
+
+
+# ---------------------------------------------------------------------------
+# T-ros -- moved from the input-epoch tests retired with Part D: the
+# query_only reset
+# ---------------------------------------------------------------------------
+
+
+def _init_snapshot_tmp_db(tmp_path: Path) -> Database:
+    close_db()
+    db_path = tmp_path / "wxverify.db"
+    config.db_path = str(db_path)
+    options_path = tmp_path / "options.json"
+    options_path.write_text("{}", encoding="utf-8")
+    config.options_path = str(options_path)
+    return init_db(str(db_path))
+
+
+def _make_snapshot_probe(db: Database) -> None:
+    db._conn.execute("CREATE TABLE _probe(a INTEGER)")  # noqa: SLF001
+
+
+def test_ros_query_only_reset_on_normal_exit_and_after_an_exception(
+    tmp_path: Path,
+) -> None:
+    """T-ros -> at the first `query_only` read: correct = 1 (the pragma is
+    ON for the duration of the `read_only_snapshot` block), mutant (a
+    `read_only_snapshot` that never sets it) = 0.
+    T-ros -> at the INSERT under `query_only`: correct = raises
+    `sqlite3.OperationalError` (a read-only connection refuses a write),
+    mutant (the pragma never actually set) = the INSERT succeeds silently.
+    T-ros -> at `query_only_after` and `query_only_after_exception`: correct
+    = 0 both times (the reset in `read_only_snapshot`'s own `finally` runs
+    whether the block exited normally or raised), mutant (a reset that only
+    runs on the happy path) = 1 after the exception case.
+    """
+    db = _init_snapshot_tmp_db(tmp_path)
+    _make_snapshot_probe(db)
+
+    def _fn(conn: sqlite3.Connection) -> None:
+        with read_only_snapshot(conn, label="t"):
+            query_only = conn.execute("PRAGMA query_only").fetchone()[0]
+            assert query_only == 1
+            with pytest.raises(sqlite3.OperationalError):
+                conn.execute("INSERT INTO _probe(a) VALUES (1)")
+        query_only_after = conn.execute("PRAGMA query_only").fetchone()[0]
+        assert query_only_after == 0
+
+        try:
+            with read_only_snapshot(conn, label="t2"):
+                raise ValueError("boom")
+        except ValueError:
+            pass
+        query_only_after_exception = conn.execute("PRAGMA query_only").fetchone()[0]
+        assert query_only_after_exception == 0
+
+    async def _run() -> None:
+        await db.read(_fn)
+
+    asyncio.run(_run())
+
+    assert_read_pool_at_rest(db)

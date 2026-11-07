@@ -319,10 +319,8 @@ def test_cancellation_during_claim_write_leaves_no_running_row(
     release = asyncio.Event()
     real_write = Database.write
 
-    async def _write_with_barrier(
-        self: Database, fn: Any, *, epoch_exempt: bool = False
-    ) -> Any:
-        result = await real_write(self, fn, epoch_exempt=epoch_exempt)
+    async def _write_with_barrier(self: Database, fn: Any) -> Any:
+        result = await real_write(self, fn)
         if fn is _claim_if_on:
             claimed.set()
             await release.wait()

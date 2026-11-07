@@ -103,11 +103,9 @@ async def run_current_obs_poller(db: Database, *, run_job: RunJob) -> None:
             or now_mono - last_heartbeat >= RUNTIME_HEARTBEAT_INTERVAL_SECONDS
         )
         # The enqueue, the claim and the heartbeat run before any job is
-        # claimed. The write is exempt from the input epoch because it
-        # touches only the current-obs lane's tables.
+        # claimed.
         claimed = await db.write(
-            lambda conn, s=stamp: _enqueue_and_claim(conn, stamp_heartbeat=s),
-            epoch_exempt=True,
+            lambda conn, s=stamp: _enqueue_and_claim(conn, stamp_heartbeat=s)
         )
         if stamp:
             last_heartbeat = now_mono

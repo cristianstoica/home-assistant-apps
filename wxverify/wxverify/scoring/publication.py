@@ -499,7 +499,7 @@ async def _publish(
     if existing is not None:
         return str(existing)
     published = _whole_second(now_utc)
-    _epoch, build = await writer.read_at_epoch(
+    build = await writer.read_snapshot_only(
         lambda conn: _build(conn, site_id=site_id, cutoff=cutoff),
         label="publication_build",
     )

@@ -109,12 +109,6 @@ def test_mg8_boundary_step_keeps_only_its_key_write() -> None:
         local_date="2030-01-01",
         variable="precip",
     )
-    conn.execute(
-        "INSERT INTO score_cache (site_id, feed_id, variable, day_ahead,"
-        " window_key, n, computed_at) VALUES (?, ?, 'precip', 0, '7d', 1,"
-        " '2030-01-01T00:00:00Z')",
-        (site_id, feed_id),
-    )
     jobs_before = {r["id"] for r in _jobs(conn)}
 
     run_migrations(conn)
@@ -131,13 +125,6 @@ def test_mg8_boundary_step_keeps_only_its_key_write() -> None:
     assert rain_history_rows == 1, (
         "M34 -> at this assertion: correct = 1 (the rain history row kept, "
         f"the rain-pair delete retired), mutant = {rain_history_rows!r} (deleted)"
-    )
-    score_rows = conn.execute(
-        "SELECT COUNT(*) AS n FROM score_cache WHERE variable='precip'"
-    ).fetchone()["n"]
-    assert score_rows == 1, (
-        "M34 -> at this assertion: correct = 1 (the rain score_cache row "
-        f"kept), mutant = {score_rows!r} (deleted)"
     )
     jobs_after = {r["id"] for r in _jobs(conn)}
     assert jobs_after == jobs_before, (

@@ -13,9 +13,9 @@ user_version`` back down -- plus a site and two synthetic stations
 fixture used to undo by hand are unconditional parts of ``create_tables``
 now (storage release 4.1), so there is nothing left to undo onto a
 reachable schema; pinning at 17 instead of 18 still exercises a real
-``run_migrations`` call on open (step 1's ``migrate_v18`` holds only the
-``secure_delete`` toggle and the version write, so it is a fast no-op
-here). Unlike the retired helper,
+``run_migrations`` call on open (the version 18 upgrade runs; these tests
+do not depend on its sub-steps, so it stays a fast no-op here). Unlike
+the retired helper,
 the file built here is never opened through ``init_db`` afterward: 15.12
 says "the source file unchanged" means its bytes and ``user_version``,
 read through a ``mode=ro`` connection, are equal before and after the
@@ -60,9 +60,9 @@ def _build_v17_file(
     refused outright (storage release 4.1, health release U1) -- so
     there is no longer a reachable schema to undo them onto. Pinning at
     17 instead of a fully fresh 18 keeps these tests exercising a REAL
-    migration on open (step 1's ``migrate_v18`` holds only the
-    ``secure_delete`` toggle and the version write, so it is a fast
-    no-op, but ``run_migrations`` still has to carry the file's own
+    migration on open (the version 18 upgrade runs; these tests do not
+    depend on its sub-steps, so it stays a fast no-op, but
+    ``run_migrations`` still has to carry the file's own
     ``user_version`` write up to ``TARGET_USER_VERSION``, which a CLI
     that forgot to migrate the copy at all would miss).
     """

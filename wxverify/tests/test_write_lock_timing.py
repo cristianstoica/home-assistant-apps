@@ -1,8 +1,8 @@
 """Tests for the 0.16.3 write-lock timing instrumentation (D1.1, connection.py).
 
-Covers the `slow db write` INFO line `Database.write` and `Database.write_if_current`
-emit via `_log_slow_write`: `hold` is measured across the whole locked section
--- including the exception path, because the stop time is taken in a
+Covers the `slow db write` INFO line `Database.write` emits via
+`_log_slow_write`: `hold` is measured across the whole locked section --
+including the exception path, because the stop time is taken in a
 `try/finally` INSIDE `async with self._write_lock` -- `lock_wait` is measured
 from before lock acquisition, and a write that keeps both under the threshold
 logs nothing at all.
@@ -258,27 +258,42 @@ def test_raising_write_still_logs_hold(
     assert int(match.group(2)) >= 1000
 
 
-def test_raising_write_if_current_still_logs_hold(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Same as above through `write_if_current`, the other of the two call
-    sites the plan names (the generation-fenced `write_fenced` this used to
-    drive is gone -- storage-release plan 5.5)."""
+def _named_probe_write(conn: sqlite3.Connection) -> None:
+    conn.execute("INSERT INTO _probe(a) VALUES (1)")
 
-    async def _drive() -> None:
+
+def test_label_slow_write_log_names_the_callback_not_the_wrapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T-label -> at each "slow db write" record's message: correct =
+    contains "_named_probe_write:" and neither "_body" nor "_call" (the
+    label comes from the caller's own callback, via `_read_label`, not from
+    the write path's internal wrapper closures), mutant (MX-label, the
+    label taken from the wrapper instead) = contains "_body:" or "_call:"
+    and never "_named_probe_write:". Moved from the input-epoch tests
+    retired with Part D; that version also drove the writer's other call
+    site through the same label check and expected 2 records -- that call
+    site (the write-if-current call) was removed by this release's Part D1
+    (plan 5.5 removed `write_fenced` instead), so this keeps only the
+    `db.write` call and expects 1 record.
+    """
+    caplog.set_level(logging.INFO, logger="wxverify.db.connection")
+    monkeypatch.setattr("wxverify.db.connection.SLOW_WRITE_MS", 0.0)
+
+    async def _drive() -> list[logging.LogRecord]:
         db = Database(str(tmp_path / "db.sqlite"))
         try:
-            with (
-                caplog.at_level(logging.INFO, logger="wxverify.db.connection"),
-                pytest.raises(RuntimeError, match="synthetic write failure"),
-            ):
-                await db.write_if_current(_slow_raising_write, epoch=db.input_epoch)
+            db._conn.execute("CREATE TABLE _probe(a INTEGER)")  # noqa: SLF001
+            await db.write(_named_probe_write)
         finally:
             db.close()
+        return [r for r in caplog.records if r.getMessage().startswith("slow db write")]
 
-    asyncio.run(_drive())
-    records = _slow_write_records(caplog)
-    assert len(records) == 1
-    match = _SLOW_WRITE_LOG_RE.match(records[0].getMessage())
-    assert match is not None
-    assert int(match.group(2)) >= 1000
+    slow_records = asyncio.run(_drive())
+    assert len(slow_records) == 1
+    message = slow_records[0].getMessage()
+    assert "_named_probe_write:" in message
+    assert "_body" not in message
+    assert "_call" not in message

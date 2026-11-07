@@ -140,26 +140,17 @@ def _await_export_ready(
 
 
 def test_observations_write_deletes_no_pair_cache_or_history_row() -> None:
-    """B6: ``materialize_consensus`` must not delete any ``score_cache`` or
-    ``forecast_history`` row on an ``observations`` write (no pair tables
-    are read or written here at all any more, storage-release plan table
-    1.B row B6). Guards against a future regression reintroducing a
-    dependents-invalidation delete keyed on this write.
+    """B6: ``materialize_consensus`` must not delete any ``forecast_history``
+    row on an ``observations`` write (no pair tables are read or written
+    here at all any more, storage-release plan table 1.B row B6). Guards
+    against a future regression reintroducing a dependents-invalidation
+    delete keyed on this write.
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "obs-write-site")
     feed_id = asof_make_real_feed(conn, "obs-write-model")
     valid_at = f"{D.isoformat()}T06:00:00Z"
 
-    conn.execute(
-        """
-        INSERT INTO score_cache
-            (site_id, feed_id, variable, day_ahead, window_key, n, skill_score,
-             computed_at)
-        VALUES (?, ?, 'temperature', 1, 'w:all', 1, 0.5, ?)
-        """,
-        (site_id, feed_id, valid_at),
-    )
     seed_forecast_history(
         conn,
         site_id=site_id,
@@ -174,21 +165,18 @@ def test_observations_write_deletes_no_pair_cache_or_history_row() -> None:
     )
     conn.commit()
 
-    cache_sql = "SELECT * FROM score_cache WHERE site_id=? AND variable=?"
     hist_sql = (
         "SELECT * FROM forecast_history WHERE site_id=? AND variable=? AND valid_at=?"
     )
 
-    before_cache = _rows(conn, cache_sql, (site_id, "temperature"))
     before_hist = _rows(conn, hist_sql, (site_id, "temperature", valid_at))
-    assert before_cache and before_hist
+    assert before_hist
 
     materialize_consensus(
         conn, site_id=site_id, variable="temperature", valid_at=valid_at, now_utc=NOW
     )
     conn.commit()
 
-    assert before_cache == _rows(conn, cache_sql, (site_id, "temperature"))
     assert before_hist == _rows(conn, hist_sql, (site_id, "temperature", valid_at))
 
 
