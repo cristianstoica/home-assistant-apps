@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.16.18
+
+A wind station that keeps one unchanged reading for hours while the
+site's other stations report wind is now flagged in Monitoring, with
+one `wind_station_constant:<station>` warning per station. Three new
+options set the check, at trial values: `wind_constant_hours` (6),
+`wind_constant_other_stations` (3) and `wind_constant_median_ms` (1).
+The warning changes nothing in the blend.
+
+A station whose current-conditions poll gets an empty reply or a 404
+is now rechecked after 1, 2, 4, 8 and 16 hours, then every 24 hours,
+instead of being parked for a day. The Sites page shows the recheck in
+the station's status cell, with a Retry now button.
+
+A failed download now shows the provider's own message after the
+error, as `; provider says "…"`, with keys, station ids and addresses
+masked.
+
+The database's journal mode is now checked on every open. A slower
+rollback mode writes an ERROR line and the add-on keeps running; an
+unsafe mode stops it.
+
+The hourly forecast API no longer fails when a feed has wind for hours
+the chart does not show; those hours are left out.
+
+Cloud cover, gust and wind direction values outside their range are no
+longer stored.
+
+The first start upgrades the database to version 18, in seconds:
+stations parked for a day are rechecked at once, the unused score
+table and the old wind history from before 0.16.14 are removed, and
+the stored out-of-range cloud cover, gust and direction values are
+removed. The `wind-history prune` command is gone; the upgrade does
+its work. Going back to 0.16.17 needs an export taken before the
+upgrade.
+
 ## 0.16.17
 
 Every page has a new look, and the Forecast page is rebuilt: a day
