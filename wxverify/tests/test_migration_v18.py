@@ -1,16 +1,13 @@
 """The version-18 upgrade (plan `2026-11-07-health-release.md` §9, §10;
-test IDs UT1-UT6, BT9, adapted to the sub-steps wired in so far). The
-version 18 upgrade runs under `migrate_v18`; UT1, UT4, UT5 and UT6 below do
-not depend on which of its sub-steps are wired in, and stay correct as
-later steps add more. Of U4's four sub-steps (``_v18_poll_pause``,
+test IDs UT1-UT6, BT9, H5). The version 18 upgrade runs under
+`migrate_v18`. Of U4's four sub-steps (``_v18_poll_pause``,
 ``_v18_drop_unused_write_state``, ``_v18_prune_wind_history``,
-``_v18_drop_bad_display_values``), ``_v18_poll_pause`` (Part B),
-``_v18_drop_unused_write_state`` (Part D) and ``_v18_prune_wind_history``
-(Part G) are wired in as of this file; UT1 now also checks BT9's ``CHECK``
-table (the two poll-pause columns) on a fresh file and on an upgraded one,
-and BT9's own carry-over test lives here too. UT2 and UT3 below cover
-those three sub-steps only -- the remaining sub-step's own UT2/UT3 pieces
-land with the step that adds it.
+``_v18_drop_bad_display_values``), all four are now wired in:
+``_v18_poll_pause`` (Part B), ``_v18_drop_unused_write_state`` (Part D),
+``_v18_prune_wind_history`` (Part G) and ``_v18_drop_bad_display_values``
+(Part H, H5). UT1 also checks BT9's ``CHECK`` table (the two poll-pause
+columns) on a fresh file and on an upgraded one, and BT9's own carry-over
+test lives here too. UT2 and UT3 below cover each sub-step in turn.
 
 Fixture: ``tests/fixtures/v17_schema.sql`` and ``v17_seed.sql``, dumped
 from a fresh 0.16.17 (``6f49f1a``) file the same way the version-16 pair
@@ -44,6 +41,7 @@ import pytest
 from wxverify.core import stop as stop_module
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db import migrations
+from wxverify.provider_ops import bad_sample_count_sql
 
 _SCHEMA_SQL = (Path(__file__).parent / "fixtures" / "v17_schema.sql").read_text(
     encoding="utf-8"
@@ -365,10 +363,11 @@ def _has_pause_columns(conn: sqlite3.Connection) -> bool:
 
 
 def _assert_sub_step_done(conn: sqlite3.Connection) -> None:
-    """The shared, correct end state both wired-in sub-steps must reach: at
-    18, the poll-pause columns present, `score_cache` gone,
-    `download_record_since` gone -- UT2's own result, reused by UT3's "the
-    next open finishes" checks."""
+    """Checks the full ``migrate_v18`` end state: ``user_version`` at 18,
+    the poll-pause columns present, `score_cache` gone, and
+    `download_record_since` gone. It does not check the wind-history
+    prune or the display-values drop -- those are checked separately by
+    each test that needs them."""
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 18
     assert _has_pause_columns(conn)
     assert not _score_cache_exists(conn)
@@ -784,7 +783,7 @@ def test_ut3_a_stop_at_poll_pause_leaves_everything_as_it_was(
 # U4's third wired-in sub-step: _v18_prune_wind_history (plan §7 Part G).
 # ---------------------------------------------------------------------------
 
-_UT2_WIND_MARGIN_S: Final = 1200  # MAX_PAIR_GAP_SECONDS (obs/wind_pairs.py:17)
+_UT2_WIND_MARGIN_S: Final = 1200  # MAX_PAIR_GAP_SECONDS (obs/wind_pairs.py)
 
 
 def _insert_bare_wind_site(conn: sqlite3.Connection, name: str) -> int:
@@ -966,12 +965,14 @@ def test_ut2_prune_wind_history_deletes_only_the_done_sites_old_null_rows(
 def test_ut3_a_stop_at_prune_wind_history_leaves_everything_as_it_was(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """UT3 for the ``v18_prune_wind_history`` sub-step, the stop half.
-    Catches: the sub-step's ``DELETE`` running ahead of the
-    ``stop.begin_step("v18_prune_wind_history")`` check, which would leave
-    the old row gone even though `run_migrations` never finished; the
-    earlier sub-steps (poll-pause, drop-unused-write-state) committing on
-    their own instead of rolling back with this one's stop."""
+    """UT3 for the ``v18_prune_wind_history`` sub-step, the stop half. This
+    stop restores the old row either way, so it cannot catch a ``DELETE``
+    running ahead of the ``stop.begin_step("v18_prune_wind_history")``
+    check. Catches: the earlier sub-steps (poll-pause,
+    drop-unused-write-state) committing on their own instead of rolling
+    back with this one's stop; ``secure_delete`` not restored; the call
+    itself replaced with ``pass`` -- the "next open, with no fault" check
+    below is what would then still show the old row."""
     real_begin_step = stop_module.begin_step
 
     def _fake_begin_step(name: str) -> None:
@@ -1023,4 +1024,323 @@ def test_ut3_a_stop_at_prune_wind_history_leaves_everything_as_it_was(
     _assert_sub_step_done(conn)
     assert not _wind_history_row_exists(conn, done_station, old), (
         "the next open, with no fault, must finish the sub-step it stopped short of"
+    )
+
+
+# ---------------------------------------------------------------------------
+# U4's fourth wired-in sub-step: _v18_drop_bad_display_values (plan §8 Part
+# H; §9 H5). feed_id 1 and 2 are the boot-seed's own (`feeds` rows from
+# `v17_seed.sql`), never created by these tests.
+# ---------------------------------------------------------------------------
+
+
+def _insert_forecast_sample(
+    conn: sqlite3.Connection,
+    site_id: int,
+    feed_id: int,
+    variable: str,
+    value: float,
+    valid_at: str,
+    *,
+    issued_at: str = "2026-11-07T00:00:00Z",
+    lead_hours: int = 6,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO forecast_samples (site_id, feed_id, variable, issued_at,"
+        " valid_at, lead_hours, value, source_raw, model_run_id)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'run-1')",
+        (site_id, feed_id, variable, issued_at, valid_at, lead_hours, value),
+    )
+    return int(cur.lastrowid)
+
+
+def test_h5_drop_bad_display_values_deletes_only_the_out_of_range_rows(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """H5 / UT2 for the ``v18_drop_bad_display_values`` sub-step (plan §8
+    Part H; §9 H5). Feed X (boot-seeded feed 1) carries display rows at
+    eight distinct hours: cloud cover -4, 0, 100, 106, wind direction 361,
+    360, wind gust -1, 0, and one in-range cloud cover (50) with a
+    malformed ``valid_at``. Feed Y (boot-seeded feed 2) carries one scored
+    temperature 75 (out of ``FORECAST_VALUE_RANGES``). Catches: a delete
+    reaching a scored-roster row (the temperature 75 row would disappear);
+    a predicate built from cloud cover alone (the 361/360 direction rows
+    would survive untouched instead of dropping the 361 one); the
+    malformed-stamp row deleted though it is not out of range
+    (``out_of_range_display_sql`` must gate the delete, not
+    ``invalid_stored_sample_sql`` alone -- the statement running at all
+    also proves ``INDEXED BY idx_samples_invalid`` is usable, since SQLite
+    refuses to prepare an ``INDEXED BY`` it cannot use). Under the AND,
+    the boundary rows (0/100/360) fail ``invalid_stored_sample_sql``, so a
+    ``<=`` slip in ``out_of_range_display_sql`` cannot be seen here;
+    ``test_out_of_range_display_sql_boundaries_and_non_display_rows`` (in
+    ``test_display_rosters.py``) pins it.
+    """
+    conn = _v17_connect(tmp_path / "h5-drop-bad-display.db")
+    site_id = _seed_bare_site(conn, "H5 site")
+    feed_x, feed_y = 1, 2
+
+    hours = [f"2026-11-07T0{h}:00:00Z" for h in range(8)]
+    id_cloud_low = _insert_forecast_sample(
+        conn, site_id, feed_x, "cloud_cover", -4.0, hours[0]
+    )
+    _insert_forecast_sample(conn, site_id, feed_x, "cloud_cover", 0.0, hours[1])
+    _insert_forecast_sample(conn, site_id, feed_x, "cloud_cover", 100.0, hours[2])
+    id_cloud_high = _insert_forecast_sample(
+        conn, site_id, feed_x, "cloud_cover", 106.0, hours[3]
+    )
+    id_direction_high = _insert_forecast_sample(
+        conn, site_id, feed_x, "wind_direction", 361.0, hours[4]
+    )
+    _insert_forecast_sample(conn, site_id, feed_x, "wind_direction", 360.0, hours[5])
+    id_gust_low = _insert_forecast_sample(
+        conn, site_id, feed_x, "wind_gust", -1.0, hours[6]
+    )
+    _insert_forecast_sample(conn, site_id, feed_x, "wind_gust", 0.0, hours[7])
+    _insert_forecast_sample(
+        conn, site_id, feed_x, "cloud_cover", 50.0, "2026-11-07T08:00:00"
+    )
+    _insert_forecast_sample(
+        conn, site_id, feed_y, "temperature", 75.0, "2026-11-07T09:00:00Z"
+    )
+    conn.commit()
+
+    before = {
+        int(row["id"]): tuple(row)
+        for row in conn.execute("SELECT * FROM forecast_samples ORDER BY id")
+    }
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="wxverify.db.migrations"):
+        migrations.run_migrations(conn)
+
+    _assert_sub_step_done(conn)
+
+    after = {
+        int(row["id"]): tuple(row)
+        for row in conn.execute("SELECT * FROM forecast_samples ORDER BY id")
+    }
+    deleted_ids = set(before) - set(after)
+    assert deleted_ids == {
+        id_cloud_low,
+        id_cloud_high,
+        id_direction_high,
+        id_gust_low,
+    }, f"expected exactly the four out-of-range rows deleted, got {deleted_ids!r}"
+    for row_id, row in after.items():
+        assert row == before[row_id], (
+            f"row id={row_id} changed though it must survive untouched"
+        )
+
+    sql = bad_sample_count_sql("?")
+    count_x = conn.execute(sql, (site_id, feed_x)).fetchone()["bad_sample_count"]
+    count_y = conn.execute(sql, (site_id, feed_y)).fetchone()["bad_sample_count"]
+    assert int(count_x) == 1, (
+        "only the malformed-stamp row must still read as bad for feed X"
+    )
+    assert int(count_y) == 1, (
+        "the scored out-of-range row must still read as bad for feed Y"
+    )
+
+    assert any(
+        "4 out-of-range display value(s) deleted" in r.getMessage()
+        for r in caplog.records
+    ), "the INFO line must report the deleted count"
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="wxverify.db.migrations"):
+        migrations.run_migrations(conn)
+    assert conn.execute("SELECT COUNT(*) FROM forecast_samples").fetchone()[0] == len(
+        after
+    ), "a second open must not delete anything else"
+    assert not any(
+        "out-of-range display value(s) deleted" in r.getMessage()
+        for r in caplog.records
+    ), "a second open at 18 must not run the v18 upgrade again"
+
+
+def test_ut3_a_stop_at_drop_bad_display_values_leaves_everything_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """UT3 for the ``v18_drop_bad_display_values`` sub-step, the stop half.
+    Catches: any of the three earlier sub-steps (poll-pause,
+    drop-unused-write-state, wind-history prune) committing on their own
+    instead of rolling back with this one's stop -- this sub-step runs
+    LAST in ``migrate_v18``, so a stop here must leave every one of the
+    earlier sub-steps' effects absent too, which ``_all_table_rows``
+    catches."""
+    real_begin_step = stop_module.begin_step
+
+    def _fake_begin_step(name: str) -> None:
+        if name == "v18_drop_bad_display_values":
+            raise stop_module.StopRequested
+        real_begin_step(name)
+
+    monkeypatch.setattr(stop_module, "begin_step", _fake_begin_step)
+
+    conn = _v17_connect(tmp_path / "ut3-stop-drop-bad-display.db")
+    site_id = _seed_bare_site(conn, "UT3 drop-bad-display stop site")
+    out_of_range_id = _insert_forecast_sample(
+        conn, site_id, 1, "cloud_cover", 106.0, "2026-11-07T06:00:00Z"
+    )
+    inserted = _seed_score_cache_rows(conn)
+
+    f_start = datetime(2026, 11, 7, tzinfo=UTC)
+    f_end = f_start + timedelta(days=1)
+    wind_site = _insert_bare_wind_site(conn, "UT3 drop-bad-display wind site")
+    wind_station = _insert_bare_wind_station(conn, wind_site, "<WPDBD>")
+    _insert_bare_site_days_record(
+        conn,
+        wind_site,
+        f_start.date().isoformat(),
+        isoformat_utc(f_start),
+        isoformat_utc(f_end),
+        done=True,
+    )
+    old_wind_at = f_start - timedelta(seconds=_UT2_WIND_MARGIN_S + 800)
+    _insert_wind_history_row(conn, wind_station, old_wind_at, fetched_at=None)
+
+    conn.execute("PRAGMA secure_delete = 1")
+    conn.commit()
+    before = _all_table_rows(conn)
+
+    with pytest.raises(stop_module.StopRequested):
+        migrations.run_migrations(conn)
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 17, (
+        "a stop before the drop-bad-display-values sub-step runs must leave"
+        " the version at 17"
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM forecast_samples WHERE id = ?", (out_of_range_id,)
+        ).fetchone()
+        is not None
+    ), "the out-of-range row must survive a stop before this sub-step runs"
+    assert not _has_pause_columns(conn)
+    assert _score_cache_exists(conn)
+    assert conn.execute("SELECT COUNT(*) FROM score_cache").fetchone()[0] == inserted
+    assert _wind_history_row_exists(conn, wind_station, old_wind_at), (
+        "the old wind row must survive -- v18_prune_wind_history runs"
+        " before this sub-step and must roll back with it"
+    )
+    assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+    assert _all_table_rows(conn) == before
+
+    monkeypatch.setattr(stop_module, "begin_step", real_begin_step)
+    migrations.run_migrations(conn)
+    _assert_sub_step_done(conn)
+    assert (
+        conn.execute(
+            "SELECT 1 FROM forecast_samples WHERE id = ?", (out_of_range_id,)
+        ).fetchone()
+        is None
+    ), "the next open, with no fault, must finish the sub-step it stopped short of"
+    assert not _wind_history_row_exists(conn, wind_station, old_wind_at), (
+        "the next open, with no fault, must also finish G's wind-history prune"
+    )
+
+
+def test_ut3_a_denied_forecast_samples_delete_rolls_back_the_wind_prune_too(
+    tmp_path: Path,
+) -> None:
+    """UT3 for the ``v18_drop_bad_display_values`` sub-step, the
+    all-or-nothing half. Catches: ``_v18_prune_wind_history`` (G) and
+    ``_v18_drop_bad_display_values`` (H) not sharing one atomic unit with
+    ``migrate_v18``'s SAVEPOINT -- if the wind-history DELETE had already
+    committed on its own before the display-values DELETE failed, the old
+    wind row would stay gone even though the upgrade as a whole raised and
+    the version stayed at 17.
+
+    The authorizer denies the ``SQLITE_DELETE`` on ``forecast_samples`` and
+    records, in order, the ``station_wind_records`` DELETE (G's own) and
+    the denied ``forecast_samples`` DELETE (H's own) -- the same
+    order-list pattern as
+    ``test_ut3_a_denied_runtime_state_delete_rolls_back_the_drop_too``. The
+    wind DELETE coming first in ``order`` is this fixture's own
+    precondition check that G ran (and was rolled back) ahead of H's
+    denial, not merely that the denial landed on the right table.
+    """
+    conn = _v17_connect(tmp_path / "ut3-deny-drop-bad-display.db")
+    site_id = _seed_bare_site(conn, "UT3 deny drop-bad-display site")
+    out_of_range_id = _insert_forecast_sample(
+        conn, site_id, 1, "cloud_cover", 106.0, "2026-11-07T06:00:00Z"
+    )
+
+    f_start = datetime(2026, 11, 7, tzinfo=UTC)
+    f_end = f_start + timedelta(days=1)
+    wind_site = _insert_bare_wind_site(conn, "UT3 deny drop-bad-display wind site")
+    wind_station = _insert_bare_wind_station(conn, wind_site, "<WPDENY>")
+    _insert_bare_site_days_record(
+        conn,
+        wind_site,
+        f_start.date().isoformat(),
+        isoformat_utc(f_start),
+        isoformat_utc(f_end),
+        done=True,
+    )
+    old_wind_at = f_start - timedelta(seconds=_UT2_WIND_MARGIN_S + 800)
+    _insert_wind_history_row(conn, wind_station, old_wind_at, fetched_at=None)
+    conn.execute("PRAGMA secure_delete = 1")
+    conn.commit()
+    before = _all_table_rows(conn)
+
+    order: list[str] = []
+
+    def _authorizer(
+        action_code: int,
+        arg1: str | None,
+        arg2: str | None,
+        dbname: str | None,
+        source: str | None,
+    ) -> int:
+        if action_code == sqlite3.SQLITE_DELETE and arg1 == "station_wind_records":
+            order.append("wind_delete")
+        if action_code == sqlite3.SQLITE_DELETE and arg1 == "forecast_samples":
+            order.append("denied_delete")
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    conn.set_authorizer(_authorizer)
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            migrations.run_migrations(conn)
+    finally:
+        conn.set_authorizer(None)
+
+    assert "wind_delete" in order and "denied_delete" in order, (
+        "fixture bug: expected both the station_wind_records DELETE and the"
+        f" denied forecast_samples DELETE to fire -- got order={order!r}"
+    )
+    assert order.index("wind_delete") < order.index("denied_delete"), (
+        "fixture bug: the station_wind_records DELETE must be authorized"
+        " before the denied forecast_samples DELETE, so this oracle"
+        " actually exercises the rollback of a prune that already ran --"
+        f" got order={order!r}"
+    )
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 17
+    assert _wind_history_row_exists(conn, wind_station, old_wind_at), (
+        "a sub-step committing its DELETE ahead of the later failed DELETE"
+        " would leave the old wind row gone here"
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM forecast_samples WHERE id = ?", (out_of_range_id,)
+        ).fetchone()
+        is not None
+    )
+    assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+    assert _all_table_rows(conn) == before
+    assert not _has_pause_columns(conn)
+
+    migrations.run_migrations(conn)
+    _assert_sub_step_done(conn)
+    assert (
+        conn.execute(
+            "SELECT 1 FROM forecast_samples WHERE id = ?", (out_of_range_id,)
+        ).fetchone()
+        is None
+    ), "the next open, with no fault, must finish dropping the row"
+    assert not _wind_history_row_exists(conn, wind_station, old_wind_at), (
+        "the next open, with no fault, must also finish G's wind-history prune"
     )

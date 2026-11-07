@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify.collection.budget import reserve_budget
 from wxverify.collection.forecast_validation import (
+    DISPLAY_VALUE_RANGES,
     FORECAST_VARIABLES,
     invalid_forecast_sample_sql,
 )
@@ -153,22 +154,30 @@ def persist_fetch_result(
     """Store a reply's samples, one row per hour (rain release, Part B, B1).
 
     Each usable sample (``lead_hours >= 1``) is upserted on its hour
-    (``_UPSERT_SAMPLE_SQL``), invalid values included: the newest value is
-    what the feed last said, and readers filter invalid values out. Where
-    the reply gives one hour twice, the newer label's sample is written
-    (the later one on a tie). A NaN value cannot be stored (it binds as
-    NULL) and is skipped, as the old ``INSERT OR IGNORE`` skipped it, so the
-    hour keeps its stored row. Then the feed state is stamped.
+    (``_UPSERT_SAMPLE_SQL``), invalid scored values included: the newest
+    value is what the feed last said, and readers filter invalid values
+    out. Where the reply gives one hour twice, the newer label's sample is
+    written (the later one on a tie). A NaN value cannot be stored (it
+    binds as NULL) and is skipped, as the old ``INSERT OR IGNORE`` skipped
+    it, so the hour keeps its stored row. Then the feed state is stamped.
 
-    Display samples (card 7) are upserted like any other, but only
-    scored-roster samples count in ``usable`` and ``labels``, so a
+    Display samples (card 7) are upserted like any other when in range,
+    but only scored-roster samples count in ``usable`` and ``labels``, so a
     display-only change moves neither the no-op stamp nor the download
-    record.
+    record. A display value outside its ``DISPLAY_VALUE_RANGES`` range (both
+    ends valid) is not stored: it is dropped after the NaN skip, so the
+    hour keeps whatever row an earlier download stored for it, and it is
+    tallied per variable (count, lowest, highest). A call that dropped any
+    logs one INFO line naming the source and each variable's tally; a NaN
+    display value is skipped, never tallied. The feed's ``labels`` entry is
+    made before any of this, so a feed whose display values were all
+    dropped still maps to an empty tuple.
     """
     usable = 0
     has_valid = False
     labels: dict[int, set[str]] = {}
     newest: dict[tuple[int, str, str], NormalizedSample] = {}
+    dropped: dict[str, tuple[int, float, float]] = {}
     fetched_at = fetched_at or isoformat_utc()
     for sample in result.samples:
         feed_id = _feed_id_for_sample(conn, source, fetch_feed_id, sample)
@@ -182,10 +191,32 @@ def persist_fetch_result(
                 has_valid = _sample_is_valid(conn, sample)
         if math.isnan(sample.value):
             continue
+        display_range = DISPLAY_VALUE_RANGES.get(sample.variable)
+        if display_range is not None and not (
+            display_range[0] <= sample.value <= display_range[1]
+        ):
+            count, lowest, highest = dropped.get(
+                sample.variable, (0, sample.value, sample.value)
+            )
+            dropped[sample.variable] = (
+                count + 1,
+                min(lowest, sample.value),
+                max(highest, sample.value),
+            )
+            continue
         key = (feed_id, sample.variable, sample.valid_at)
         prior = newest.get(key)
         if prior is None or sample.issued_at >= prior.issued_at:
             newest[key] = sample
+    if dropped:
+        logger.info(
+            "display values out of range dropped source=%s %s",
+            source,
+            "; ".join(
+                f"{variable} count={n} low={low:g} high={high:g}"
+                for variable, (n, low, high) in sorted(dropped.items())
+            ),
+        )
     inserted = 0
     written: dict[int, list[NormalizedSample]] = {}
     for (feed_id, _variable, _valid_at), sample in newest.items():

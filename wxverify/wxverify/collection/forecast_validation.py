@@ -79,3 +79,24 @@ def invalid_stored_sample_sql(alias: str = "forecast_samples") -> str:
         OR {prefix}issued_at NOT LIKE '{FORECAST_TIMESTAMP_LIKE}'
         OR {prefix}valid_at NOT LIKE '{FORECAST_TIMESTAMP_LIKE}'
     )"""
+
+
+def out_of_range_display_sql(alias: str = "forecast_samples") -> str:
+    """The display-row out-of-range predicate, wrapped in parentheses.
+
+    True for a row of the display roster whose value is outside its
+    ``DISPLAY_VALUE_RANGES`` range (``value < low OR value > high``, so both
+    ends are valid), and for nothing else: a scored row, a NULL value or a
+    malformed stamp alone never makes it true. Generated from the same
+    dict, in the same per-variable form, as the display half of
+    :func:`invalid_stored_sample_sql`, so the writer's drop, the readers'
+    filter and the version 18 upgrade's delete cannot drift apart. An empty
+    ``alias`` gives bare column names.
+    """
+    prefix = f"{alias}." if alias else ""
+    variable_checks = " OR ".join(
+        f"({prefix}variable='{variable}' AND "
+        f"({prefix}value < {low:g} OR {prefix}value > {high:g}))"
+        for variable, (low, high) in DISPLAY_VALUE_RANGES.items()
+    )
+    return f"({variable_checks})"

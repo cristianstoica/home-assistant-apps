@@ -209,9 +209,10 @@ def test_g1_prune_deletes_only_the_margin_bounded_null_rows_of_done_sites(
     is deleted), mutant = a different count (``<=`` for ``<`` would also
     take C's boundary row; the margin dropped would also take C's ``near``
     row; the ``fetched_at IS NULL`` filter dropped would also take C's
-    ``set_old`` row; the done-state check dropped would also take A's and
-    B's ``old`` rows at site 1, whose F is open; a delete not scoped to the
-    site's stations would also take rows at site 3).
+    ``set_old`` row; the done-state check dropped, or a delete not scoped
+    to the site's stations, would both widen the count the same way --
+    A's and B's ``old`` rows at site 1, whose F is open, are what catch
+    either one; site 3 owns no rows at all, so it cannot).
     M -> at the ``kept_sites`` assertion: correct = ``(site1,)`` (only site
     1's F is open; site 2's is closed and site 3 owns no ``fetched_at``-null
     row at all, so it is never even considered), mutant = a different tuple
@@ -346,9 +347,21 @@ def test_wp10_station_wind_records_and_the_prune_call_are_scoped() -> None:
     other module call the prune too would also be found by this scan, which
     walks every ``.py`` file under the package, not just
     ``db/migrations.py``).
+
+    M -> at the ``reference_files`` assertion: correct = ``{"db/migrations.py"}``
+    (every ``ast.Name`` reference in a ``Load`` context, every
+    ``ast.Attribute`` access and every import ``ast.alias`` named
+    ``prune_wind_history``, package-wide, points at only one file), mutant =
+    that set plus the file of a new reference that is not itself a call
+    (e.g. a re-export, or the name passed to another function without
+    being called) -- the ``call_sites`` scan above only walks ``ast.Call``
+    nodes and would miss such a reference. ``db/switch.py``'s own ``def
+    prune_wind_history`` is an ``ast.FunctionDef``, not a ``Name``,
+    ``Attribute`` or ``alias``, so it does not count here.
     """
     out_of_scope: list[str] = []
     call_sites: list[str] = []
+    reference_files: set[str] = set()
     for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
         rel = path.relative_to(_PACKAGE_ROOT).as_posix()
         text = path.read_text(encoding="utf-8")
@@ -382,5 +395,16 @@ def test_wp10_station_wind_records_and_the_prune_call_are_scoped() -> None:
             )
             if is_plain_name or is_attr:
                 call_sites.append(rel)
+            if (
+                isinstance(node, ast.Name)
+                and node.id == "prune_wind_history"
+                and isinstance(node.ctx, ast.Load)
+            ):
+                reference_files.add(rel)
+            if isinstance(node, ast.Attribute) and node.attr == "prune_wind_history":
+                reference_files.add(rel)
+            if isinstance(node, ast.alias) and node.name == "prune_wind_history":
+                reference_files.add(rel)
     assert out_of_scope == []
     assert call_sites == ["db/migrations.py"]
+    assert reference_files == {"db/migrations.py"}

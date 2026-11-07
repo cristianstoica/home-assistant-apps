@@ -8,7 +8,10 @@ import time
 from typing import Final
 
 from wxverify import config
-from wxverify.collection.forecast_validation import invalid_stored_sample_sql
+from wxverify.collection.forecast_validation import (
+    invalid_stored_sample_sql,
+    out_of_range_display_sql,
+)
 from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
 from wxverify.core import stop
 from wxverify.core.timeutil import isoformat_utc, utc_now
@@ -1286,12 +1289,12 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     ``install 0.16.17 first``. Then, in order: `create_tables`; on every
     start, `drop_forecast_record`; `create_indexes`; at 17 only,
     `migrate_v18` (the station poll-pause columns and their carry-over,
-    the drop of the unused write state, then the one-time prune of the old
-    wind history, in one savepoint); the four one-shot corrections, the
-    three seeds and the rain-label boundary; at 0 only, the fresh file's
-    two keys (`_record_fresh_build_keys`); last, ``user_version`` 18. A
-    file already at 18 runs the same steps less the upgrade and the fresh
-    keys.
+    the drop of the unused write state, the one-time prune of the old wind
+    history, then the delete of the stored out-of-range display values, in
+    one savepoint); the four one-shot corrections, the three seeds and the
+    rain-label boundary; at 0 only, the fresh file's two keys
+    (`_record_fresh_build_keys`); last, ``user_version`` 18. A file already
+    at 18 runs the same steps less the upgrade and the fresh keys.
 
     A stop is checked before each step (``core.stop.begin_step``), which
     also names the step for ``Database._open``'s log line; `migrate_v18`
@@ -1429,10 +1432,13 @@ def migrate_v18(conn: sqlite3.Connection) -> None:
     its own name: `_v18_poll_pause` (``v18_poll_pause``), then
     `_v18_drop_unused_write_state` (``v18_drop_unused_write_state``), then
     `_v18_prune_wind_history` (``v18_prune_wind_history``), then
+    `_v18_drop_bad_display_values` (``v18_drop_bad_display_values``), then
     ``user_version`` 18. The version
     sits in the file header, which the savepoint rolls back with everything
-    else. `create_tables`'s ``executescript`` has already committed any
-    outer transaction, so the RELEASE is the commit, and nothing inside the
+    else. `create_indexes` has run first, so ``idx_samples_invalid`` holds
+    the live predicate the last sub-step's ``INDEXED BY`` needs.
+    `create_tables`'s ``executescript`` has already committed any outer
+    transaction, so the RELEASE is the commit, and nothing inside the
     savepoint may end the transaction (no ``executescript``, commit,
     rollback, ``BEGIN`` or ``VACUUM``).
 
@@ -1455,6 +1461,8 @@ def migrate_v18(conn: sqlite3.Connection) -> None:
             _v18_drop_unused_write_state(conn)
             stop.begin_step("v18_prune_wind_history")
             _v18_prune_wind_history(conn)
+            stop.begin_step("v18_drop_bad_display_values")
+            _v18_drop_bad_display_values(conn)
             conn.execute("PRAGMA user_version = 18")
         except BaseException:
             if conn.in_transaction:
@@ -1582,6 +1590,35 @@ def _v18_prune_wind_history(conn: sqlite3.Connection) -> None:
         "kept at sites %s (first day not done), %d ms",
         result.deleted,
         kept,
+        _elapsed_ms(started),
+    )
+
+
+def _v18_drop_bad_display_values(conn: sqlite3.Connection) -> None:
+    """Delete the stored display values (card 7) outside their range.
+
+    A sub-step of `migrate_v18`, run inside its savepoint, after
+    `create_indexes`. One DELETE on ``forecast_samples`` ``INDEXED BY
+    idx_samples_invalid``: its first condition is the index's own predicate
+    (`invalid_stored_sample_sql`), word for word, so the delete reads only
+    the invalid rows; its second (`out_of_range_display_sql`, generated
+    from ``DISPLAY_VALUE_RANGES``) keeps it to display rows out of range.
+    Scored invalid rows and display rows invalid for another reason (a
+    malformed stamp) stay. The writer
+    (`wxverify.collection.forecast_fetcher.persist_fetch_result`) no longer
+    stores such values, so only rows written before version 18 match.
+    Plain ``conn.execute`` only: nothing here ends the transaction. One
+    INFO line gives the rows deleted and the time taken.
+    """
+    started = time.perf_counter()
+    deleted = conn.execute(
+        "DELETE FROM forecast_samples INDEXED BY idx_samples_invalid"
+        f" WHERE {invalid_stored_sample_sql('forecast_samples')}"
+        f" AND {out_of_range_display_sql('forecast_samples')}"
+    ).rowcount
+    logger.info(
+        "v18 upgrade: %d out-of-range display value(s) deleted, %d ms",
+        deleted,
         _elapsed_ms(started),
     )
 

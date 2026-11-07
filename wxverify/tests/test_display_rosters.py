@@ -20,6 +20,7 @@ import pytest
 from wxverify.collection.forecast_validation import (
     invalid_forecast_sample_sql,
     invalid_stored_sample_sql,
+    out_of_range_display_sql,
 )
 from wxverify.db.migrations import (
     _index_predicate,  # noqa: PLC2701 -- the helper IS the comparison under test
@@ -252,3 +253,69 @@ def test_bad_sample_count_sql_counts_zero_with_only_valid_display_rows() -> None
     sql = bad_sample_count_sql("?")
     row = conn.execute(sql, (site_id, feed_id)).fetchone()
     assert int(row["bad_sample_count"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# §8 Part H (plan 2026-11-07-health-release.md): out_of_range_display_sql,
+# exercised directly on a bare table rather than through the version 18
+# upgrade's DELETE, where the ANDed invalid_stored_sample_sql predicate
+# would mask a boundary-row ``<=``/``>=`` slip in this helper alone (a
+# boundary row that fails the index predicate never reaches the DELETE).
+# ---------------------------------------------------------------------------
+
+_OUT_OF_RANGE_DISPLAY_CASES: tuple[tuple[str, str, float | None, bool], ...] = (
+    # In range, both ends valid.
+    ("cloud_cover_low_bound", "cloud_cover", 0.0, False),
+    ("cloud_cover_high_bound", "cloud_cover", 100.0, False),
+    ("cloud_cover_mid", "cloud_cover", 50.0, False),
+    ("wind_gust_low_bound", "wind_gust", 0.0, False),
+    ("wind_gust_high_bound", "wind_gust", 150.0, False),
+    ("wind_direction_low_bound", "wind_direction", 0.0, False),
+    ("wind_direction_high_bound", "wind_direction", 360.0, False),
+    # Out of range.
+    ("cloud_cover_below_range", "cloud_cover", -4.0, True),
+    ("cloud_cover_above_range", "cloud_cover", 106.0, True),
+    ("wind_gust_below_range", "wind_gust", -1.0, True),
+    ("wind_gust_above_range", "wind_gust", 151.0, True),
+    ("wind_direction_below_range", "wind_direction", -1.0, True),
+    ("wind_direction_above_range", "wind_direction", 361.0, True),
+    # Not display rows out of range: a scored variable, and a NULL value.
+    ("scored_temperature_out_of_range_not_display", "temperature", 75.0, False),
+    ("cloud_cover_null_value", "cloud_cover", None, False),
+)
+
+
+def test_out_of_range_display_sql_boundaries_and_non_display_rows() -> None:
+    """Catches: ``<=``/``>=`` swapped for ``<``/``>`` (the boundary rows,
+    valid at both ends, would flip to out-of-range); a predicate built from
+    one display variable only (the other two variables' out-of-range rows
+    would read as in-range); a predicate that also matches scored rows (the
+    out-of-range ``temperature`` row would read as a display drop); and a
+    NULL value misread as out-of-range (``value < low`` is NULL, not true,
+    for a NULL value, so a NULL row must stay out of the result)."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE t (id TEXT, variable TEXT, valid_at TEXT, value REAL)")
+    conn.executemany(
+        "INSERT INTO t (id, variable, valid_at, value)"
+        " VALUES (?, ?, '2026-01-01T06:00:00Z', ?)",
+        [
+            (id_, variable, value)
+            for id_, variable, value, _ in _OUT_OF_RANGE_DISPLAY_CASES
+        ],
+    )
+    conn.commit()
+
+    predicate = out_of_range_display_sql("t")
+    out_of_range_ids = {
+        str(row["id"]) for row in conn.execute(f"SELECT id FROM t WHERE {predicate}")
+    }
+    expected_ids = {
+        id_ for id_, _, _, expected in _OUT_OF_RANGE_DISPLAY_CASES if expected
+    }
+    assert out_of_range_ids == expected_ids
+    assert expected_ids, "non-vacuous: at least one row must be expected out of range"
+    assert len(expected_ids) < len(_OUT_OF_RANGE_DISPLAY_CASES), (
+        "non-vacuous: at least one row must be expected in range"
+    )
+    conn.close()
