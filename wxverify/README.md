@@ -737,6 +737,18 @@ The command exits non-zero with a one-line message, for example when the site is
   with it, as `; provider says "…"`; keys, station ids and addresses in it are
   masked, it is cut to 200 characters, and how the add-on reacts to the failure
   does not change.
+- Meteosource is asked for UTC times. A reply not marked UTC is refused before
+  anything is saved; the Feed Status error says so, and the next try is the
+  feed's next scheduled one. The first start of 0.16.20 deletes, once, every
+  Meteosource value stored before it, with Meteosource's own scores, rankings
+  and download records (log line `meteosource utc fix:`); Meteosource stays off
+  until you switch it on.
+- Each meteoblue reply logs one INFO line per model,
+  `meteoblue run: call=… site=… model=… run=… updated=… prev=… new=…`.
+  `updated` is meteoblue's own update time for the run, `none` when the reply
+  has none, or `unreadable-<kind>`; `prev` is the latest run stored before the
+  reply (`none` or `unread` when unknown); `new` is `yes`, `no` or `unknown`.
+  The lines hold no key, address or location.
 
 ## Database version 18: the first start after the upgrade
 
@@ -1091,8 +1103,8 @@ pass without checking anything. pyright is configured with `exclude = ["tests"]`
 so `uv run --locked pyright tests/test_daily_truth_oracles.py` prints
 `0 errors, 0 warnings, 0 informations` while analyzing zero files
 (`filesAnalyzed: 0` under `--outputjson`) — it type-checks nothing and reports
-success. `ruff format --check` covers 315 files from the add-on directory but
-only 312 when scoped to `wxverify tests`, which drops `scripts/`.
+success. `ruff format --check` covers 319 files from the add-on directory but
+only 316 when scoped to `wxverify tests`, which drops `scripts/`.
 
 CI additionally runs the query-plan tests inside the add-on's base image with
 `WXV_EQP_SHIPPING=1`, so they check the SQLite build that actually ships rather

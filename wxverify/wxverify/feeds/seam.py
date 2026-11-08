@@ -60,11 +60,32 @@ class NormalizedSample(BaseModel):
     model_run_id: str
 
 
+class ModelRun(BaseModel):
+    """One model run a reply carried, for the run log (card 27).
+
+    ``run_at`` is the canonical UTC stamp the model's samples carry as
+    ``issued_at``. ``updated`` is a log token: a canonical UTC stamp (the
+    provider's own update time for the run), ``none`` (the reply has no
+    update time for the model), or ``unreadable-<kind>`` with kind one of
+    ``text``, ``number``, ``boolean``, ``array``, ``object`` (the field is
+    there but cannot be read; the value itself is never kept).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    model: str
+    run_at: str
+    updated: str
+
+
 class FetchResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     samples: list[NormalizedSample]
     grid: GridProvenance | None = None
+    # Filled by the meteoblue adapter only; every other adapter leaves it
+    # empty.
+    runs: tuple[ModelRun, ...] = ()
 
 
 class ForecastRequest(BaseModel):
@@ -100,3 +121,8 @@ def precip_hour_start(hour_end: str) -> str:
     are stored as received until settled (README, Site Field Notes).
     """
     return isoformat_utc(parse_utc(hour_end) - timedelta(hours=1))
+
+
+class ProviderAnswerRefused(RuntimeError):
+    """A provider answered, but the answer cannot be used. Recorded once; not
+    retried before the feed's next scheduled try."""

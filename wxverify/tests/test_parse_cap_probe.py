@@ -108,6 +108,7 @@ def _vc_request(max_lead_hours: int = 168) -> ForecastRequest:
 
 
 _MS_PAYLOAD: dict[str, object] = {
+    "timezone": "UTC",
     "hourly": {
         "data": [
             {
@@ -136,7 +137,7 @@ _MS_PAYLOAD: dict[str, object] = {
                 "wind": {"speed": 2.0},
             },
         ]
-    }
+    },
 }
 
 _MS_EXPECTED_LINE = (

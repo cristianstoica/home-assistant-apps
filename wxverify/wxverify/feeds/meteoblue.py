@@ -16,6 +16,7 @@ from wxverify.feeds.seam import (
     FetchResult,
     ForecastRequest,
     GridProvenance,
+    ModelRun,
     NormalizedSample,
     display_float,
     precip_hour_start,
@@ -155,6 +156,8 @@ def _to_fetch_result(req: ForecastRequest, payload: MeteoblueResponse) -> FetchR
     if len(metadata.models) != len(metadata.modelrun_utc):
         raise ValueError("meteoblue models/modelrun_utc length mismatch")
     samples: list[NormalizedSample] = []
+    updated = _updated_tokens(_update_time_field(metadata), len(metadata.models))
+    runs: list[ModelRun] = []
     times = [isoformat_utc(parse_utc(raw_time)) for raw_time in data_1h.time]
     matrices = {
         "temperature": data_1h.temperature,
@@ -165,6 +168,9 @@ def _to_fetch_result(req: ForecastRequest, payload: MeteoblueResponse) -> FetchR
     }
     for model_index, model in enumerate(metadata.models):
         issued_at = isoformat_utc(parse_utc(metadata.modelrun_utc[model_index]))
+        runs.append(
+            ModelRun(model=model, run_at=issued_at, updated=updated[model_index])
+        )
         for variable in req.variables:
             provider_name, unit = VARIABLE_MAP.get(variable, ("", ""))
             if not provider_name:
@@ -207,7 +213,70 @@ def _to_fetch_result(req: ForecastRequest, payload: MeteoblueResponse) -> FetchR
             grid_lon=metadata.longitude,
             grid_elevation_m=metadata.height,
         ),
+        runs=tuple(runs),
     )
+
+
+def _update_time_field(metadata: MeteoblueMetadata) -> object:
+    """The reply's ``modelrun_updatetime_utc`` field as given, or ``None``
+    when it is absent."""
+    extra = metadata.model_extra
+    if extra is None:
+        return None
+    value: object = extra.get("modelrun_updatetime_utc")
+    return value
+
+
+def _updated_tokens(value: object, count: int) -> list[str]:
+    """One ``updated`` log token per model, ``count`` of them; never raises.
+
+    ``None`` gives ``none`` for every model; a string is read the same for
+    every model; a list as long as ``models`` gives item ``i`` for model
+    ``i``, a list of another length ``unreadable-array`` for every model;
+    any other value ``unreadable-<kind>`` for every model.
+    """
+    if value is None:
+        return ["none"] * count
+    if isinstance(value, str):
+        return [_updated_text(value)] * count
+    if isinstance(value, list):
+        items = cast(list[object], value)
+        if len(items) != count:
+            return ["unreadable-array"] * count
+        return [_updated_item(item) for item in items]
+    return [f"unreadable-{_json_kind(value)}"] * count
+
+
+def _updated_item(item: object) -> str:
+    """One list item's token: ``None`` is ``none``, a string is read as a
+    stamp, anything else is ``unreadable-<kind>``."""
+    if item is None:
+        return "none"
+    if isinstance(item, str):
+        return _updated_text(item)
+    return f"unreadable-{_json_kind(item)}"
+
+
+def _updated_text(text: str) -> str:
+    """A canonical UTC stamp, or ``unreadable-text`` when ``text`` does not
+    parse as one."""
+    try:
+        return isoformat_utc(parse_utc(text))
+    except ValueError:
+        return "unreadable-text"
+
+
+def _json_kind(value: object) -> str:
+    """The JSON kind of a decoded value, for an ``unreadable-<kind>`` token."""
+    if isinstance(value, str):
+        return "text"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int | float):
+        return "number"
+    if isinstance(value, list):
+        return "array"
+    return "object"
 
 
 def _convert_value(variable: str, raw_value: float) -> float:

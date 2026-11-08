@@ -17,13 +17,24 @@ from wxverify.feeds.seam import (
     FetchResult,
     ForecastRequest,
     NormalizedSample,
+    ProviderAnswerRefused,
     display_mapping,
 )
 from wxverify.feeds.synthetic_run import snap_run
 
 _ENDPOINT: Final = "https://www.meteosource.com/api/v1/free/point"
 
+#: The only ``timezone`` values a reply may carry; any other is refused.
+_ACCEPTED_TIMEZONES: Final[frozenset[str]] = frozenset({"UTC"})
+#: The refusal's whole message. Fixed text: nothing in it comes from the reply.
+_TIMEZONE_REFUSED: Final = "meteosource reply is not in UTC; nothing was saved"
+
 logger = logging.getLogger(__name__)
+
+
+class MeteosourceTimezoneError(ProviderAnswerRefused):
+    """A Meteosource reply not marked ``"UTC"``; its message is always
+    ``_TIMEZONE_REFUSED``."""
 
 
 class MeteosourceWind(BaseModel):
@@ -75,6 +86,9 @@ class MeteosourceResponse(BaseModel):
     model_config = ConfigDict(extra="allow", frozen=True)
 
     hourly: MeteosourceHourly = Field(default_factory=MeteosourceHourly)
+    # Typed ``object`` so no value fails validation: a validation error's
+    # text would repeat the value. ``fetch_forecast`` checks it.
+    timezone: object = None
 
 
 class MeteosourceAdapter:
@@ -97,12 +111,18 @@ class MeteosourceAdapter:
                 "lon": req.lon,
                 "sections": "hourly",
                 "units": "metric",
+                "timezone": "UTC",
                 "key": self._api_key,
             },
             timeout=httpx.Timeout(15.0, connect=5.0),
         )
         response.raise_for_status()
         payload = MeteosourceResponse.model_validate(response.json())
+        # Before anything reads the hours (the parse-cap probe's reparse
+        # included): a reply not marked "UTC" is refused whole.
+        zone = payload.timezone
+        if not (isinstance(zone, str) and zone in _ACCEPTED_TIMEZONES):
+            raise MeteosourceTimezoneError(_TIMEZONE_REFUSED)
         result = _to_fetch_result(req, payload)
         if self._parse_cap_probe:
             emit_parse_cap_probe(
@@ -120,11 +140,12 @@ class MeteosourceAdapter:
 
 
 def _force_utc_iso(value: str) -> str:
-    """Parse a Meteosource timestamp and force UTC.
+    """Parse a Meteosource timestamp as a canonical UTC stamp.
 
-    Meteosource's ``data[].date`` is timezone-naive (no ``Z`` / offset), so the
-    parsed value is forced to UTC explicitly rather than being interpreted as
-    local time -- otherwise ``valid_at`` and ``lead_hours`` would shift.
+    The request asks for UTC, and ``fetch_forecast`` refuses any reply not
+    marked ``"UTC"``, so a naive ``data[].date`` (no ``Z`` or offset) is a
+    UTC time and is read as one. A date with an offset is converted to UTC
+    by ``isoformat_utc``.
     """
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:

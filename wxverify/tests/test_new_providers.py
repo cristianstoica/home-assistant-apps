@@ -192,6 +192,7 @@ ADAPTER_SNAP_CASES = (
         MeteosourceAdapter,
         meteosource_feed,
         {
+            "timezone": "UTC",
             "hourly": {
                 "data": [
                     {
@@ -201,7 +202,7 @@ ADAPTER_SNAP_CASES = (
                         "precipitation": {"total": 1.2},
                     }
                 ]
-            }
+            },
         },
         SINGLE_HOUR_VALID_ATS,
         SINGLE_HOUR_LEADS,

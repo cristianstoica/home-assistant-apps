@@ -43,6 +43,7 @@ from wxverify.scoring.history import (
     _CHART_RANGE_SQL,  # noqa: PLC2701
     _WINRATE_RANGE_SQL,  # noqa: PLC2701
 )
+from wxverify.worker.run_log import STORED_RUNS_SQL
 
 
 def _fresh_conn() -> sqlite3.Connection:
@@ -712,3 +713,47 @@ def test_eqp_claim_partition_clauses_keep_todays_claim_plan() -> None:
     degraded_plan = _claim_subselect_plan(conn, degraded_clause)
     assert degraded_plan != baseline_plan
     assert any("idx_jobs_type_key_site" in line for line in degraded_plan)
+
+
+def test_stored_runs_sql_seeks_idx_samples_runs_per_feed() -> None:
+    """T14: the meteoblue run log's per-feed "latest stored run" read
+    (``STORED_RUNS_SQL``) seeks ``idx_samples_runs`` on ``(site_id, feed_id)``
+    for its correlated subquery, one seek per feed of the source -- never a
+    full scan of ``forecast_samples`` per feed. Substring match only: the
+    correlated subquery's alias (``fs``) changes where each line starts
+    between SQLite builds.
+
+    M16 -> at this assertion: correct = some plan line contains
+    "COVERING INDEX idx_samples_runs (site_id=? AND feed_id=?)"; mutant (that
+    seek shipped as a full scan per feed, the negative control's own shape)
+    = no plan line contains it.
+    """
+    conn = _fresh_conn()
+    site_id = int(
+        conn.execute(
+            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+            " timezone) VALUES ('QueryPlanRuns2', 0.0, 0.0, 0.0, 'UTC')"
+        ).lastrowid
+    )
+    _seed_meteoblue_package_with_16_members(conn, site_id=site_id, rows_per_feed=50)
+    params = (site_id, "meteoblue")
+    plan = _plan(conn, STORED_RUNS_SQL, params)
+    assert any(
+        "COVERING INDEX idx_samples_runs (site_id=? AND feed_id=?)" in line
+        for line in plan
+    ), plan
+
+    # Negative control: removing "fs.site_id = ? AND" from the correlated
+    # subquery's WHERE leaves a statement no plan line of THIS query can
+    # match -- proving the positive assertion is not vacuously true on this
+    # fixture.
+    degraded = STORED_RUNS_SQL.replace("fs.site_id = ? AND ", "")
+    assert degraded != STORED_RUNS_SQL, (
+        "'fs.site_id = ? AND' not found; negative control is vacuous"
+    )
+    degraded_params = ("meteoblue",)
+    degraded_plan = _plan(conn, degraded, degraded_params)
+    assert not any(
+        "COVERING INDEX idx_samples_runs (site_id=? AND feed_id=?)" in line
+        for line in degraded_plan
+    ), degraded_plan

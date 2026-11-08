@@ -80,6 +80,7 @@ from wxverify.worker.feed_fetch import (
     DownloadOutcome,
     DownloadSlot,
     Ineligible,
+    Refused,
     Unavailable,
     fetch_feed_once,
     fetch_feed_retry_floor_seconds,
@@ -818,9 +819,11 @@ async def _fetch_feed(
 
     The slot comes from ``payload``; a payload with no ``slot`` runs
     ``unscheduled``. A persisted reply's row is written with its samples
-    (``fetch_feed_once``); ``budget``, ``backoff``, ``ineligible`` and
-    ``unavailable`` are written here before the job is deferred or
-    cancelled, and ``failed`` by ``_fail_job`` for a raised error.
+    (``fetch_feed_once``), and so is a refused answer's ``refused`` row,
+    after which the job is cancelled; ``budget``, ``backoff``,
+    ``ineligible`` and ``unavailable`` are written here before the job is
+    deferred or cancelled, and ``failed`` by ``_fail_job`` for a raised
+    error.
 
     A round try (P4 plan 4.4) is cancelled before any call, with no row, at
     or after its round's bound or once the feed has a ``stored`` round row
@@ -879,6 +882,19 @@ async def _fetch_feed(
         # Complete through the cancelled branch, without the success marker:
         # the adapter could not be built, so no fetch ran and nothing about
         # an earlier failure of this scope has been resolved.
+        raise JobCancelled()
+    if isinstance(outcome, Refused):
+        logger.warning(
+            "feed answer refused site=%s feed=%s source=%s: %s",
+            outcome.target.site_id,
+            outcome.target.feed_id,
+            outcome.target.source,
+            outcome.error,
+        )
+        # fetch_feed_once already wrote the feed's state and the refused
+        # download row. Complete through the cancelled branch, without the
+        # success marker and without a retry: the same request gets the
+        # same answer, so the next try is the feed's next scheduled one.
         raise JobCancelled()
 
 

@@ -307,12 +307,14 @@ def _round_progress(
     conn: sqlite3.Connection, site_id: int, feed_id: int, round_date: date
 ) -> tuple[int, bool]:
     """The feed's last recorded try of the round, and whether a try ended it:
-    ``stored``, ``budget``, ``ineligible`` or ``unavailable`` (4.4)."""
+    ``stored``, ``budget``, ``ineligible``, ``unavailable`` or ``refused``
+    (4.4)."""
     low, high = _round_row_dates(round_date)
     row = conn.execute(
         """
         SELECT MAX(round_try),
-               MAX(outcome IN ('stored', 'budget', 'ineligible', 'unavailable'))
+               MAX(outcome IN ('stored', 'budget', 'ineligible', 'unavailable',
+                               'refused'))
         FROM forecast_downloads
         WHERE site_id = ? AND feed_id = ?
           AND local_date BETWEEN ? AND ?
@@ -358,7 +360,8 @@ def round_state(
     on ``schedule_day``, plus ``ROUND_BOUND``: it exists for any date, a
     round that never ran and a date with no record yet included. ``settled``
     is whether every feed of the round has ended it: a ``stored`` try, a try
-    ending ``budget``, ``ineligible`` or ``unavailable``, or try 4 recorded.
+    ending ``budget``, ``ineligible``, ``unavailable`` or ``refused``, or
+    try 4 recorded.
     A feed with no try, or with a further try still due, is not settled.
     On a day with no round (``schedule_day`` excludes the setting's local
     time, 4.4) ``settled`` is True and ``bound_utc`` the day's

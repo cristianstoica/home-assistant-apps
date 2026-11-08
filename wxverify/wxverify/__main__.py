@@ -57,6 +57,7 @@ from wxverify.worker.feed_fetch import (
     FetchFeedOutcome,
     FetchFeedSuccess,
     Ineligible,
+    Refused,
     fetch_feed_once,
 )
 
@@ -679,6 +680,9 @@ async def _provider_outcome_row(
         return base
     if isinstance(outcome, Ineligible):
         base.update({"status": "ineligible", "message": outcome.reason})
+        return base
+    if isinstance(outcome, Refused):
+        base.update({"status": "error", "message": outcome.error})
         return base
     base.update({"status": "unavailable", "message": outcome.error})
     return base

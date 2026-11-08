@@ -211,10 +211,11 @@ def test_database_open_writes_no_wind_basis_key_on_a_legacy_shaped_file(
     """Opening a database writes no wind key, even for a file carrying a
     legacy station_observations wind row.
 
-    This inspects the legacy-shaped file directly:
-    ``_build_legacy_shaped_replacement``'s own ``Database(...)``
-    construction already runs the identical open path, so no behaviour
-    under test is lost.
+    ``_build_legacy_shaped_replacement`` plants the row after its own
+    ``Database(...)`` open and closes that connection, so this test opens
+    the file once more -- with the row already in place -- before reading
+    it, exercising the real open path against a file that actually carries
+    the row.
 
     mutant_open_writes_wind_key -> at this assertion: correct = None (no
     ``wind_basis:`` key after open), mutant (``run_migrations`` calling the
@@ -222,6 +223,7 @@ def test_database_open_writes_no_wind_basis_key_on_a_legacy_shaped_file(
     legacy row recognized on open.
     """
     path = _build_legacy_shaped_replacement(tmp_path, "legacy-import.db")
+    Database(str(path)).close()
     direct = sqlite3.connect(str(path))
     direct.row_factory = sqlite3.Row
     try:

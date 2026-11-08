@@ -427,7 +427,11 @@ def test_ut2_the_score_cache_table_and_only_its_key_go(
     wired into `migrate_v18` (`score_cache` and the key would survive the
     upgrade); the sub-step reaching a row or table outside its own two
     statements (another `runtime_state` key going missing, or any other
-    table's rows changing, would show up below)."""
+    table's rows changing, would show up below). `run_migrations` also runs
+    `delete_pre_utc_meteosource` on every call and that step writes its own
+    `meteosource_utc_fix_at` key (0.16.20); that new row is matched by key
+    below, since its value and `updated_at` are stamps, not compared as an
+    exact tuple."""
     conn = _v17_connect(tmp_path / "ut2.db")
     inserted = _seed_score_cache_rows(conn)
     conn.commit()
@@ -459,9 +463,20 @@ def test_ut2_the_score_cache_table_and_only_its_key_go(
         "exactly score_cache must disappear from the schema, and the empty"
         " station_wind_constant table create_tables always makes must appear"
     )
-    assert after_sets["runtime_state"] == before_sets["runtime_state"] - {
+    after_runtime_state = after_sets["runtime_state"]
+    fix_rows = {
+        row for row in after_runtime_state if row[0] == "meteosource_utc_fix_at"
+    }
+    assert len(fix_rows) == 1, (
+        "delete_pre_utc_meteosource must write exactly one"
+        " meteosource_utc_fix_at row on this (fresh-to-it) v17 file"
+    )
+    assert after_runtime_state - fix_rows == before_sets["runtime_state"] - {
         removed_row
-    }, "exactly the download_record_since row must disappear from runtime_state"
+    }, (
+        "besides the new meteosource_utc_fix_at row, exactly the"
+        " download_record_since row must disappear from runtime_state"
+    )
     assert after_sets["station_wind_constant"] == set(), (
         "station_wind_constant must be empty -- this sub-step seeds no episode"
     )

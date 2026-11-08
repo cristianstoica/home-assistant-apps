@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.16.20
+
+Meteosource is now asked for its times in UTC, so its values are filed at
+the right hours. A Meteosource reply that does not say it is in UTC is
+refused before anything is saved: the Ops page shows "meteosource reply is
+not in UTC; nothing was saved" as the feed's error, and the add-on tries
+again only at the feed's next scheduled time.
+
+The first start deletes, once, every Meteosource value stored before
+this release, with Meteosource's own scores, rankings and download
+records. One `meteosource utc fix:` log line gives the counts. Meteosource
+stays switched off; switching it back on is a separate choice.
+
+Each meteoblue reply now writes one `meteoblue run:` log line per model:
+when the reply came, the model's run time, meteoblue's own update time
+when the reply has one, the run stored before, and whether the run is
+new.
+
 ## 0.16.19
 
 Two open tabs no longer break each other's buttons with "Session

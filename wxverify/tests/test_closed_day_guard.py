@@ -365,6 +365,9 @@ _GW17_ALLOWLIST: Final = frozenset(
         # no guard of its own (the bound is always before the site's first
         # record, so the old write-kind guard case is gone).
         ("wxverify.db.switch", "prune_wind_history"),
+        # 0.16.20 plan §1.4: the owner's one-time, key-gated deletion of
+        # every Meteosource row stored before this release's UTC fix.
+        ("wxverify.db.migrations", "_prune_meteosource_table"),
         # No entries for _invalidate_consensus_dependents and
         # _delete_future_persistence_pairs, or for the old pair-and-score
         # pipeline's own writers (wxverify.scoring.multimodel, .pairing,

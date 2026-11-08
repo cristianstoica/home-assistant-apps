@@ -372,7 +372,7 @@ def _meteosource_payload(
     }
     if cloud_cover is not _absent:
         hour["cloud_cover"] = {"total": cloud_cover}
-    return {"hourly": {"data": [hour]}}
+    return {"timezone": "UTC", "hourly": {"data": [hour]}}
 
 
 def _google_payload(

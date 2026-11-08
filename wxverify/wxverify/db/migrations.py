@@ -1,4 +1,5 @@
-"""SQLite schema, insert-only boot seeds, and the one upgrade to version 18."""
+"""SQLite schema, insert-only boot seeds, the one upgrade to version 18, and
+the one-time deletion of the Meteosource rows stored before its UTC fix."""
 
 from __future__ import annotations
 
@@ -1287,6 +1288,126 @@ def record_precip_hour_start_boundary(conn: sqlite3.Connection) -> None:
 # fresh file gets its build time: it has nothing to compact.
 STORAGE_COMPACTED_KEY: Final = "storage_compacted_at"
 
+# Value: when `delete_pre_utc_meteosource` ran, a canonical UTC ``...Z``
+# stamp. Presence, not value, is the gate. A fresh file gets its build time:
+# it has no Meteosource row to delete.
+METEOSOURCE_UTC_FIX_KEY: Final = "meteosource_utc_fix_at"
+
+#: The Meteosource feeds: every row of one is cleared by
+#: `delete_pre_utc_meteosource`.
+METEOSOURCE_FEED_IDS_SQL: Final = "SELECT id FROM feeds WHERE source = 'meteosource'"
+
+#: Every table with a ``feed_id`` column but ``site_feed_state`` (which holds
+#: the off switch and is kept), in the order `delete_pre_utc_meteosource`
+#: clears them: the value changes before their downloads, and ``rain_picks``,
+#: whose ``feed_id`` is set to NULL rather than its row deleted, last.
+METEOSOURCE_PRUNE_TABLES: Final[tuple[str, ...]] = (
+    "forecast_value_changes",
+    "forecast_downloads",
+    "forecast_samples",
+    "forecast_scored",
+    "forecast_history",
+    "day_scores",
+    "close_record_downloads",
+    "starting_scores",
+    "starting_wind_days",
+    "rain_forecast_days",
+    "publication_rankings",
+    "publication_coverage",
+    "publication_wind_weights",
+    "publication_rain_ranks",
+    "rain_picks",
+)
+
+# The tables of METEOSOURCE_PRUNE_TABLES with no site_id column, cleared by
+# feed id alone; every other one is cleared per site and feed.
+_FEED_KEYED_PRUNE_TABLES: Final = frozenset(
+    {
+        "forecast_value_changes",
+        "publication_rankings",
+        "publication_coverage",
+        "publication_wind_weights",
+        "publication_rain_ranks",
+    }
+)
+
+
+def delete_pre_utc_meteosource(conn: sqlite3.Connection) -> None:
+    """Clear every stored Meteosource row, once.
+
+    Every row of a Meteosource feed (`METEOSOURCE_FEED_IDS_SQL`) was written
+    before its adapter asked for UTC, so each sits at the wrong hour. Returns
+    at once when `METEOSOURCE_UTC_FIX_KEY` is present; the check asks only
+    whether the row exists, so it works whatever the connection's
+    ``row_factory`` is. Otherwise one SAVEPOINT clears the tables of
+    `METEOSOURCE_PRUNE_TABLES`, in its order:
+    ``DELETE ... WHERE site_id = ? AND feed_id = ?`` for each site and
+    Meteosource feed, or ``WHERE feed_id = ?`` for each Meteosource feed in
+    the tables with no ``site_id``; ``rain_picks`` gets ``SET feed_id =
+    NULL``, its own ``ON DELETE SET NULL`` meaning. Last, the key. The
+    ``feeds`` row, ``site_feed_state`` (the off switch), ``jobs``,
+    ``api_budget`` and every row of every other feed stay as they are. Plain
+    ``conn.execute`` only: nothing here ends the transaction. After the
+    RELEASE, one INFO line gives the count of each table, in the same order
+    (``rain_picks_cleared`` for ``rain_picks``), and the time taken.
+
+    Any error rolls the savepoint back and is re-raised, so every table
+    stays as it was, the key stays absent, and the next start runs the step
+    again; the in_transaction check covers an error that has already ended
+    the transaction.
+    """
+    present = conn.execute(
+        "SELECT 1 FROM runtime_state WHERE key = ?", (METEOSOURCE_UTC_FIX_KEY,)
+    ).fetchone()
+    if present is not None:
+        return
+    started = time.perf_counter()
+    counts: dict[str, int] = {}
+    conn.execute("SAVEPOINT delete_pre_utc_meteosource")
+    try:
+        site_ids = [int(row[0]) for row in conn.execute("SELECT id FROM sites")]
+        feed_ids = [int(row[0]) for row in conn.execute(METEOSOURCE_FEED_IDS_SQL)]
+        for table in METEOSOURCE_PRUNE_TABLES:
+            counts[table] = _prune_meteosource_table(conn, table, site_ids, feed_ids)
+        set_runtime_state(conn, METEOSOURCE_UTC_FIX_KEY, isoformat_utc(utc_now()))
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK TO delete_pre_utc_meteosource")
+            conn.execute("RELEASE delete_pre_utc_meteosource")
+        raise
+    conn.execute("RELEASE delete_pre_utc_meteosource")
+    tokens = " ".join(
+        f"{'rain_picks_cleared' if table == 'rain_picks' else table}={count}"
+        for table, count in counts.items()
+    )
+    logger.info("meteosource utc fix: deleted %s, %d ms", tokens, _elapsed_ms(started))
+
+
+def _prune_meteosource_table(
+    conn: sqlite3.Connection,
+    table: str,
+    site_ids: list[int],
+    feed_ids: list[int],
+) -> int:
+    """Clear the Meteosource rows of one table of `METEOSOURCE_PRUNE_TABLES`;
+    the number of rows deleted (cleared, for ``rain_picks``)."""
+    count = 0
+    if table in _FEED_KEYED_PRUNE_TABLES:
+        for feed_id in feed_ids:
+            count += conn.execute(
+                f"DELETE FROM {table} WHERE feed_id = ?", (feed_id,)
+            ).rowcount
+        return count
+    statement = (
+        f"UPDATE {table} SET feed_id = NULL WHERE site_id = ? AND feed_id = ?"
+        if table == "rain_picks"
+        else f"DELETE FROM {table} WHERE site_id = ? AND feed_id = ?"
+    )
+    for site_id in site_ids:
+        for feed_id in feed_ids:
+            count += conn.execute(statement, (site_id, feed_id)).rowcount
+    return count
+
 
 def run_migrations(conn: sqlite3.Connection) -> None:
     """Bring the file to version 18, or refuse it.
@@ -1299,9 +1420,11 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     the drop of the unused write state, the one-time prune of the old wind
     history, then the delete of the stored out-of-range display values, in
     one savepoint); the four one-shot corrections, the three seeds and the
-    rain-label boundary; at 0 only, the fresh file's two keys
-    (`_record_fresh_build_keys`); last, ``user_version`` 18. A file already
-    at 18 runs the same steps less the upgrade and the fresh keys.
+    rain-label boundary; at 0 only, the fresh file's three keys
+    (`_record_fresh_build_keys`); `delete_pre_utc_meteosource`, which
+    returns at its key on a fresh file and on any file it has already
+    cleared; last, ``user_version`` 18. A file already at 18 runs the same
+    steps less the upgrade and the fresh keys.
 
     A stop is checked before each step (``core.stop.begin_step``), which
     also names the step for ``Database._open``'s log line; `migrate_v18`
@@ -1355,21 +1478,26 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current == 0:
         stop.begin_step("record_fresh_build_keys")
         _record_fresh_build_keys(conn)
+    stop.begin_step("delete_pre_utc_meteosource")
+    delete_pre_utc_meteosource(conn)
     conn.execute(f"PRAGMA user_version = {TARGET_USER_VERSION}")
     logger.debug("migrations done user_version=%s", TARGET_USER_VERSION)
 
 
 def _record_fresh_build_keys(conn: sqlite3.Connection) -> None:
-    """A fresh file's two ``runtime_state`` keys, each written only when absent.
+    """A fresh file's three ``runtime_state`` keys, each written only when
+    absent.
 
     ``DAILY_CLOSE_ON_KEY``: the daily close's switch time is the build's.
-    ``STORAGE_COMPACTED_KEY``: the file has nothing to compact. Both come
-    from one read of this module's ``utc_now``.
+    ``STORAGE_COMPACTED_KEY``: the file has nothing to compact.
+    ``METEOSOURCE_UTC_FIX_KEY``: the file has no Meteosource row to delete.
+    All three come from one read of this module's ``utc_now``.
     """
     now = utc_now()
     for key, value in (
         (DAILY_CLOSE_ON_KEY, isoformat_utc(now)),
         (STORAGE_COMPACTED_KEY, isoformat_utc(now)),
+        (METEOSOURCE_UTC_FIX_KEY, isoformat_utc(now)),
     ):
         if get_runtime_state(conn, key) is None:
             set_runtime_state(conn, key, value)

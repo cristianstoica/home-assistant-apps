@@ -42,6 +42,7 @@ from wxverify.feeds.seam import (
     FetchResult,
     ForecastAdapter,
     ForecastRequest,
+    ProviderAnswerRefused,
 )
 from wxverify.scoring.downloads import (
     ScoredDownload,
@@ -58,6 +59,7 @@ from wxverify.worker.domain_backoff import (
     record_http_backoff,
     source_domain,
 )
+from wxverify.worker.run_log import log_model_runs
 
 AdapterBuilder = Callable[[str, httpx.AsyncClient], ForecastAdapter]
 
@@ -71,7 +73,14 @@ VALUE_CHANGE_TOLERANCE: Final = 1e-9
 
 # A forward download try's outcome in forecast_downloads (plan 4.2).
 DownloadOutcome = Literal[
-    "stored", "no_usable", "failed", "budget", "backoff", "ineligible", "unavailable"
+    "stored",
+    "no_usable",
+    "failed",
+    "budget",
+    "backoff",
+    "ineligible",
+    "unavailable",
+    "refused",
 ]
 
 
@@ -136,6 +145,16 @@ class Unavailable:
     error: str
 
 
+@dataclass(frozen=True)
+class Refused:
+    """The provider answered, but the answer was refused
+    (``ProviderAnswerRefused``). The feed's state and the try's ``refused``
+    download row are already written; ``error`` is the refusal's message."""
+
+    target: FeedFetchTarget
+    error: str
+
+
 FetchFeedOutcome = (
     FetchFeedSuccess
     | FetchFeedNoOp
@@ -143,6 +162,7 @@ FetchFeedOutcome = (
     | BackoffActive
     | Ineligible
     | Unavailable
+    | Refused
 )
 
 
@@ -163,8 +183,14 @@ async def fetch_feed_once(
 
     ``slot`` is the try's place in the feed's schedule. A reply that is
     persisted writes its ``stored`` or ``no_usable`` download row with it,
-    in the samples' transaction (daily-close P4 plan 4.2); every other
-    outcome is the caller's to record.
+    in the samples' transaction (daily-close P4 plan 4.2). A refused answer
+    (``ProviderAnswerRefused``) writes the feed's state and its ``refused``
+    row here, saves nothing of the reply and returns ``Refused``. Every
+    other outcome is the caller's to record.
+
+    A reply that carries model runs (``FetchResult.runs``, meteoblue) logs
+    one line per run (``worker.run_log``) before it is saved, so each line's
+    ``prev`` is the run stored before this reply.
     """
 
     async def _write(fn: Callable[[sqlite3.Connection], T]) -> T:
@@ -246,6 +272,17 @@ async def fetch_feed_once(
             if next_attempt_at is not None:
                 return BackoffActive(next_attempt_at)
             raise
+        except ProviderAnswerRefused as exc:
+            # Deterministic: the same request gets the same answer, so it is
+            # recorded once and not raised into the retry ladder. No refund:
+            # the provider counted the call.
+            error = sanitized_exception(exc)
+            await write_after_reservation(
+                db,
+                writer,
+                lambda conn, err=error: _record_refusal(conn, target, err, slot),
+            )
+            return Refused(target=target, error=error)
         except Exception as exc:
             error = sanitized_exception(exc)
             refund = reservation if is_refundable_transport_error(exc) else None
@@ -265,6 +302,17 @@ async def fetch_feed_once(
                 error,
             )
             raise
+    # Before the save, so each line's prev is the run stored before this
+    # reply; after the call, so it costs the call nothing.
+    if result.runs:
+        call_at = isoformat_utc(timeutil.utc_now().replace(microsecond=0))
+        await log_model_runs(
+            db,
+            source=target.source,
+            site_id=site_id,
+            runs=result.runs,
+            call_at=call_at,
+        )
     persist_outcome = await write_after_reservation(
         db,
         writer,
@@ -458,6 +506,28 @@ def _mark_feed_error_and_refund(
     mark_feed_error(conn, target, error)
     if reservation is not None:
         refund_budget(conn, reservation)
+
+
+def _record_refusal(
+    conn: sqlite3.Connection,
+    target: FeedFetchTarget,
+    error: str,
+    slot: DownloadSlot,
+) -> None:
+    """Record a refused answer in one transaction: the feed's state as
+    ``mark_feed_unavailable`` stamps it (last run, ``error``, one more
+    error), and the try's ``refused`` download row with ``error`` as its
+    reason."""
+    mark_feed_unavailable(conn, target, error)
+    record_download_try(
+        conn,
+        site_id=target.site_id,
+        feed_id=target.feed_id,
+        slot=slot,
+        outcome="refused",
+        ended_at=timeutil.utc_now(),
+        reason=error,
+    )
 
 
 def mark_feed_error_and_backoff(
