@@ -10,7 +10,7 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse
 
 from wxverify import __version__, config
-from wxverify.api.csrf import issue_csrf_pair, set_csrf_cookie
+from wxverify.api.csrf import csrf_pair_for, set_csrf_cookie
 from wxverify.web.context import feed_label, variable_label_for
 from wxverify.web.scales import ink_class, rain_color, temp_color, wind_color
 
@@ -83,7 +83,7 @@ def active_page(request: Request) -> str:
 
 
 def render(request: Request, template: str, **ctx: object) -> HTMLResponse:
-    pair = issue_csrf_pair()
+    pair = csrf_pair_for(request)
     tmpl = env.get_template(template)
 
     def url(path: object) -> str:

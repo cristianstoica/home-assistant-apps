@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import MutableHeaders
 
 from wxverify import __version__, config
-from wxverify.api.csrf import issue_csrf_pair, set_csrf_cookie
+from wxverify.api.csrf import csrf_pair_for, set_csrf_cookie
 from wxverify.api.discovery import publish_discovery
 from wxverify.api.errors import register_error_handlers
 from wxverify.api.guard import MutationGuard
@@ -114,7 +114,7 @@ def create_app(
 
     @app.get("/api/csrf")
     async def csrf(request: Request, response: Response) -> dict[str, str]:
-        pair = issue_csrf_pair()
+        pair = csrf_pair_for(request)
         set_csrf_cookie(response, pair, request.scope.get("root_path", "") or "")
         return {"csrf_token": pair.token}
 
