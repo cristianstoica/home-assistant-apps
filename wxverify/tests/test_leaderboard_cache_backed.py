@@ -1,12 +1,8 @@
 """Shared harness for the leaderboard cache-backed read path.
 
-``leaderboard_with_status``/``_cached_leaderboard`` in
-``wxverify/scoring/leaderboard.py`` are reached only when the daily close
-is off -- never on the owner's only install (close on) -- so there are no
-close-off leaderboard cache-status tests here. This module holds only the
-fixture-construction helpers that ``tests/test_leaderboard_read_snapshot.py``,
-``tests/test_close_triggers.py`` and ``tests/test_forecast_snapshot_read.py``
-still import.
+This module holds only the fixture-construction helpers that
+``tests/test_leaderboard_read_snapshot.py``, ``tests/test_close_triggers.py``
+and ``tests/test_forecast_snapshot_read.py`` still import.
 
 Synthetic fixtures only -- fake site names and the repo's existing 40/-105
 lat-lon convention, no real keys or station IDs.

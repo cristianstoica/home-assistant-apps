@@ -608,9 +608,8 @@ def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
     published rain ranking, read with the daily close on, and shows in its
     extrema state (the cell's hourly state is `normal`), so the rollup is
     the tile's `confidence_state`. The rain cell's state does not come from
-    the close-off leaderboard, so this runs with the close on, where the normal
-    cell of day tile 1 is wind (two feeds with published weights) and
-    temperature has no samples there.
+    the leaderboard. On day tile 1 the normal cell is wind (two feeds with
+    published weights) and temperature has no samples there.
     """
     conn = _make_db()
     ecmwf_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")

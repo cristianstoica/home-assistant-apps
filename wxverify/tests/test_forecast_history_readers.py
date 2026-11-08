@@ -2,9 +2,8 @@
 ``observations`` directly, with persistence rebuilt on read (storage-release
 plan 2026-11-02-storage-release.md, 3.5, 3.6, A2-A5; W4, plan line 298).
 
-Written before the readers' rewrite exists. ``forecast_history`` itself
-is already built and is used here only as a fixture table -- these tests
-exercise the READERS, not the table.
+``forecast_history`` itself is already built and is used here only as a
+fixture table -- these tests exercise the READERS, not the table.
 
 This fixture never writes a row into ``forecast_pairs`` or ``close_pairs``:
 today's code (before W4) answers both the win rate and the history chart

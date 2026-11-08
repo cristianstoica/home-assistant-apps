@@ -219,7 +219,7 @@ def test_gw4_materialize_consensus_leaves_a_closed_days_hour_alone(
 # No test here for apply_pair_ops/_apply_split_chunk refusing a closed
 # day's ops, or for the real-model/persistence/multimodel pair computes
 # proposing no ops for a done or recordless day. Nor for
-# real_model_pair_pending's probe, which the fetch score gate replaced.
+# real_model_pair_pending's probe.
 
 
 # ---------------------------------------------------------------------------
