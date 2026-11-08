@@ -354,7 +354,7 @@ wheels = [
 
 [[package]]
 name = "wxverify"
-version = "0.16.18"
+version = "0.16.19"
 source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },

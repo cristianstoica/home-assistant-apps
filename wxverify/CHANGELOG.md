@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.16.19
+
+Two open tabs no longer break each other's buttons with "Session
+expired". After an add-on restart, a page that was already open needs
+one reload.
+
+The daily close is always on: the code for running with it off is
+gone, along with the `close-day` command and the Backfill panel on
+Ops. Nothing changes for a running install, which already has the
+close on.
+
+At start, the add-on logs its version and the SQLite and Python
+versions it runs.
+
+Images are now published only after every check in the repository has
+passed, and the workflow has no manual run.
+
 ## 0.16.18
 
 A wind station that keeps one unchanged reading for hours while the
