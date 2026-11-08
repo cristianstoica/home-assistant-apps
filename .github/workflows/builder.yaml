@@ -15,7 +15,6 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -47,28 +46,23 @@ jobs:
         env:
           APPS: ${{ steps.apps.outputs.addons }}
           CHANGED_FILES: ${{ steps.changed_files.outputs.all_changed_files }}
-          EVENT_NAME: ${{ github.event_name }}
         run: |
           all_apps=()
           read -r -a all_apps <<< "${APPS}"
           changed_apps=()
           own_changed_apps=()
 
-          # Add-ons whose own monitored files changed. A manual run changes none.
-          if [[ "${EVENT_NAME}" != "workflow_dispatch" ]]; then
-            for app in "${all_apps[@]}"; do
-              for file in ${MONITORED_FILES}; do
-                if [[ "${CHANGED_FILES}" =~ ${app}/${file} ]]; then
-                  own_changed_apps+=("${app}")
-                  break
-                fi
-              done
+          # Add-ons whose own monitored files changed.
+          for app in "${all_apps[@]}"; do
+            for file in ${MONITORED_FILES}; do
+              if [[ "${CHANGED_FILES}" =~ ${app}/${file} ]]; then
+                own_changed_apps+=("${app}")
+                break
+              fi
             done
-          fi
+          done
 
-          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
-            changed_apps=("${all_apps[@]}")
-          elif [[ "${CHANGED_FILES}" =~ \.github/(workflows/(builder|build-app)\.yaml|scripts/publish_guard\.py) ]]; then
+          if [[ "${CHANGED_FILES}" =~ \.github/(workflows/(builder|build-app)\.yaml|scripts/publish_guard\.py) ]]; then
             changed_apps=("${all_apps[@]}")
           else
             changed_apps=("${own_changed_apps[@]}")
@@ -113,9 +107,17 @@ jobs:
       - name: pytest
         run: PYTHONPATH=.github/scripts python -m pytest -p no:cacheprovider .github/scripts/tests
 
+  checks:
+    name: Checks
+    permissions:
+      contents: read
+    uses: ./.github/workflows/checks.yaml
+
   build-app:
     name: Build ${{ matrix.app }}
-    needs: [init, publish-guard-tests]
+    # No status function is named below, so GitHub adds success(): a failed,
+    # cancelled or skipped need skips build-app.
+    needs: [init, publish-guard-tests, checks]
     if: needs.init.outputs.changed == 'true'
     permissions:
       contents: read
@@ -132,6 +134,6 @@ jobs:
     uses: ./.github/workflows/build-app.yaml
     with:
       app: ${{ matrix.app }}
-      publish: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+      publish: ${{ github.event_name == 'push' }}
       own-files-changed: ${{ contains(fromJSON(needs.init.outputs.own_changed_apps), matrix.app) }}
     secrets: inherit

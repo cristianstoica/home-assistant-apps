@@ -26,6 +26,8 @@ import publish_guard as pg
 REPO_ROOT = Path(__file__).resolve().parents[3]
 BUILDER_PATH = REPO_ROOT / ".github" / "workflows" / "builder.yaml"
 BUILD_APP_PATH = REPO_ROOT / ".github" / "workflows" / "build-app.yaml"
+CHECKS_PATH = REPO_ROOT / ".github" / "workflows" / "checks.yaml"
+LINT_PATH = REPO_ROOT / ".github" / "workflows" / "lint.yaml"
 
 
 def _load(path: Path) -> dict[Any, Any]:
@@ -41,6 +43,16 @@ def builder() -> dict[Any, Any]:
 @pytest.fixture()
 def build_app() -> dict[Any, Any]:
     return _load(BUILD_APP_PATH)
+
+
+@pytest.fixture()
+def checks() -> dict[Any, Any]:
+    return _load(CHECKS_PATH)
+
+
+@pytest.fixture()
+def lint() -> dict[Any, Any]:
+    return _load(LINT_PATH)
 
 
 def _step(steps: list[dict[Any, Any]], step_id: str) -> dict[Any, Any]:
@@ -79,6 +91,20 @@ def _collect_run(node: Any) -> list[str]:
     elif isinstance(node, list):
         for item in node:
             found.extend(_collect_run(item))
+    return found
+
+
+def _collect_key(node: Any, key: str) -> list[Any]:
+    """All values found anywhere under ``key``, at any nesting depth."""
+    found: list[Any] = []
+    if isinstance(node, dict):
+        for k, value in node.items():
+            if k == key:
+                found.append(value)
+            found.extend(_collect_key(value, key))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_collect_key(item, key))
     return found
 
 
@@ -251,6 +277,7 @@ EXPECTED_USES = {
     "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
     "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
     "./.github/workflows/build-app.yaml",
+    "./.github/workflows/checks.yaml",
     "home-assistant/actions/helpers/info@master",
     "home-assistant/builder/actions/prepare-multi-arch-matrix@2026.03.2",
     "home-assistant/builder/actions/build-image@2026.03.2",
@@ -465,13 +492,11 @@ def test_w9_build_app_caller(builder: dict[Any, Any]) -> None:
     assert build_app_job["with"]["own-files-changed"] == (
         "${{ contains(fromJSON(needs.init.outputs.own_changed_apps), matrix.app) }}"
     )
-    assert build_app_job["with"]["publish"] == (
-        "${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}"
-    )
+    assert build_app_job["with"]["publish"] == ("${{ github.event_name == 'push' }}")
     assert builder["jobs"]["init"]["outputs"]["own_changed_apps"] == (
         "${{ steps.filter.outputs.own_changed_apps }}"
     )
-    assert build_app_job["needs"] == ["init", "publish-guard-tests"]
+    assert build_app_job["needs"] == ["init", "publish-guard-tests", "checks"]
     assert build_app_job["if"] == "needs.init.outputs.changed == 'true'"
 
 
@@ -488,7 +513,7 @@ def test_w10_own_files_changed_input(build_app: dict[Any, Any]) -> None:
 
 
 def _run_filter_script(
-    script: str, monitored_files: str, event_name: str, changed_files: str
+    script: str, monitored_files: str, changed_files: str
 ) -> dict[str, object]:
     with tempfile.TemporaryDirectory() as tmp_dir:
         output_path = Path(tmp_dir) / "github_output"
@@ -498,7 +523,6 @@ def _run_filter_script(
             {
                 "APPS": "addon-a addon-b",
                 "CHANGED_FILES": changed_files,
-                "EVENT_NAME": event_name,
                 "MONITORED_FILES": monitored_files,
                 "GITHUB_OUTPUT": str(output_path),
             }
@@ -527,15 +551,6 @@ def _run_filter_script(
 
 W11_CASES = [
     pytest.param(
-        "workflow_dispatch",
-        "addon-a/config.yaml",
-        [],
-        True,
-        ["addon-a", "addon-b"],
-        id="workflow-dispatch",
-    ),
-    pytest.param(
-        "push",
         ".github/workflows/builder.yaml addon-a/config.yaml",
         ["addon-a"],
         True,
@@ -543,7 +558,6 @@ W11_CASES = [
         id="push-workflow-edit-plus-own-change",
     ),
     pytest.param(
-        "push",
         ".github/workflows/build-app.yaml",
         [],
         True,
@@ -551,7 +565,6 @@ W11_CASES = [
         id="push-build-app-workflow-edit",
     ),
     pytest.param(
-        "pull_request",
         ".github/scripts/publish_guard.py",
         [],
         True,
@@ -559,16 +572,14 @@ W11_CASES = [
         id="pr-script-edit",
     ),
     pytest.param(
-        "push",
         "addon-b/Dockerfile",
         ["addon-b"],
         True,
         ["addon-b"],
         id="push-own-change-only",
     ),
-    pytest.param("push", "README.md", [], False, None, id="push-unrelated-file"),
+    pytest.param("README.md", [], False, None, id="push-unrelated-file"),
     pytest.param(
-        "push",
         ".github/scripts/tests/test_publish_guard.py",
         [],
         False,
@@ -580,7 +591,6 @@ W11_CASES = [
 
 @pytest.mark.parametrize(
     (
-        "event_name",
         "changed_files",
         "expected_own",
         "expected_changed",
@@ -590,7 +600,6 @@ W11_CASES = [
 )
 def test_w11_filter_step_cases(
     builder: dict[Any, Any],
-    event_name: str,
     changed_files: str,
     expected_own: list[str],
     expected_changed: bool,
@@ -600,7 +609,7 @@ def test_w11_filter_step_cases(
     script = filter_step["run"]
     monitored_files = builder["env"]["MONITORED_FILES"]
 
-    result = _run_filter_script(script, monitored_files, event_name, changed_files)
+    result = _run_filter_script(script, monitored_files, changed_files)
 
     assert result["own_changed_apps"] == expected_own
     assert result["changed"] == expected_changed
@@ -650,3 +659,104 @@ def test_w14_publish_guard_tests_steps(builder: dict[Any, Any]) -> None:
     assert "continue-on-error" not in job
     for step in steps:
         assert "if" not in step and "continue-on-error" not in step
+
+
+# --------------------------------------------------------------------------
+# W15 — card 20: every check gates every publish
+# --------------------------------------------------------------------------
+
+_CHECKS_JOB_NAMES = {
+    "find",
+    "addon-lint",
+    "pysyslog-gates",
+    "pyddns-gates",
+    "pyweather-gates",
+    "wxverify-gates",
+    "wxverify-shipping-sqlite-plan",
+}
+
+_FORBIDDEN_IF_FUNCTIONS = ("always()", "failure()", "cancelled()", "!cancelled()")
+
+
+def test_w15_1_builder_on_is_pull_request_and_push_to_main(
+    builder: dict[Any, Any],
+) -> None:
+    """G5: a restored ``workflow_dispatch:`` must fail this.
+
+    PyYAML reads the ``on:`` key as the boolean ``True`` (W10).
+    """
+    on_block = builder[True]
+    assert set(on_block) == {"pull_request", "push"}
+    assert on_block["push"]["branches"] == ["main"]
+
+
+def test_w15_2_build_app_needs_every_other_job(builder: dict[Any, Any]) -> None:
+    """G1 (``checks`` dropped from ``needs``) and G2 (an unneeded job added)
+    must both fail this allowlist check: a job added later is a gate unless
+    this test is changed.
+    """
+    jobs = builder["jobs"]
+    assert set(jobs["build-app"]["needs"]) == set(jobs) - {"build-app"}
+
+
+def test_w15_3_checks_job_shape(builder: dict[Any, Any]) -> None:
+    checks_job = builder["jobs"]["checks"]
+    assert set(checks_job) == {"name", "permissions", "uses"}
+    assert checks_job["uses"] == "./.github/workflows/checks.yaml"
+
+
+def test_w15_4_no_continue_on_error_or_cancellation_escape(
+    builder: dict[Any, Any], checks: dict[Any, Any]
+) -> None:
+    """G3 (``continue-on-error: true``) and G4 (an ``if:`` that runs
+    ``build-app`` despite a cancelled/failed need) must both fail this.
+    """
+    for workflow in (builder, checks):
+        assert _collect_key(workflow, "continue-on-error") == []
+        for if_value in _collect_key(workflow, "if"):
+            if isinstance(if_value, str):
+                for forbidden in _FORBIDDEN_IF_FUNCTIONS:
+                    assert forbidden not in if_value, (forbidden, if_value)
+    # checks.yaml itself permits no `if:` at all — the reusable workflow's
+    # jobs/steps are unconditional.
+    assert _collect_key(checks, "if") == []
+
+
+def test_w15_5_checks_yaml_is_workflow_call_with_seven_jobs(
+    checks: dict[Any, Any],
+) -> None:
+    """G6 (``wxverify-shipping-sqlite-plan`` dropped) must fail this."""
+    assert set(checks[True]) == {"workflow_call"}
+    assert set(checks["jobs"]) == _CHECKS_JOB_NAMES
+
+
+def test_w15_6_lint_yaml_is_schedule_only_calling_checks(
+    lint: dict[Any, Any],
+) -> None:
+    """G7 (``lint.yaml`` gains a job using ``build-app.yaml``) must fail
+    this: ``lint.yaml``'s only job is ``checks``.
+    """
+    assert set(lint[True]) == {"schedule"}
+    assert set(lint["jobs"]) == {"checks"}
+    assert lint["jobs"]["checks"]["uses"] == "./.github/workflows/checks.yaml"
+
+
+def test_w15_7_only_builder_uses_build_app_workflow() -> None:
+    """G7 (``lint.yaml`` gains a second ``uses: build-app.yaml`` path) must
+    fail this: no second path can publish.
+    """
+    users = {
+        path.name
+        for path in sorted((REPO_ROOT / ".github" / "workflows").glob("*.y*ml"))
+        if "./.github/workflows/build-app.yaml" in _collect_uses(_load(path))
+    }
+    assert users == {"builder.yaml"}
+
+
+def test_w15_8_checks_yaml_run_steps_never_swallow_a_failure(
+    checks: dict[Any, Any],
+) -> None:
+    """G8 (``pytest ... || true`` in ``wxverify-gates``) must fail this."""
+    for run_text in _collect_run(checks):
+        for forbidden in ("|| true", "|| :", "set +e"):
+            assert forbidden not in run_text, (forbidden, run_text)

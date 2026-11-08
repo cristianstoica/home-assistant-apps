@@ -1091,12 +1091,14 @@ pass without checking anything. pyright is configured with `exclude = ["tests"]`
 so `uv run --locked pyright tests/test_daily_truth_oracles.py` prints
 `0 errors, 0 warnings, 0 informations` while analyzing zero files
 (`filesAnalyzed: 0` under `--outputjson`) — it type-checks nothing and reports
-success. `ruff format --check` covers 227 files from the add-on directory but
-only 225 when scoped to `wxverify tests`, which drops `scripts/`.
+success. `ruff format --check` covers 315 files from the add-on directory but
+only 312 when scoped to `wxverify tests`, which drops `scripts/`.
 
 CI additionally runs the query-plan tests inside the add-on's base image with
 `WXV_EQP_SHIPPING=1`, so they check the SQLite build that actually ships rather
-than the local one. A green local run does not cover them.
+than the local one. A green local run does not cover them. The query-plan run
+prints its SQLite version and Python path in the test header, and the add-on
+logs its SQLite version when it starts, so the two can be compared.
 
 Cite code by its owning symbol, never by `file.py:<line>`: a line number
 drifts the moment the file changes. The pytest suite includes a guard

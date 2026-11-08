@@ -6,7 +6,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import platform
 import signal
+import sqlite3
 import threading
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -123,6 +125,13 @@ def create_app(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+    # Versions only (no path, key or id): ties this run's SQLite to the release.
+    logger.info(
+        "wxverify %s; sqlite %s; python %s",
+        __version__,
+        sqlite3.sqlite_version,
+        platform.python_version(),
+    )
     # `core.stop.STOP` belongs to one app run. The `finally` below sets it,
     # and while it is set every later database open stops at its first
     # migration step. So each run starts with no stop, and clears its own

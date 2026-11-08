@@ -1858,14 +1858,15 @@ def test_options_boot_apply_bad_options_and_packaging_files(
 
     # wxverify is wired into monorepo CI in the bundled de-nest PR.
     # builder.yaml MONITORED_FILES includes wxverify, pyproject.toml, and uv.lock;
-    # lint.yaml carries a wxverify-gates job.
+    # checks.yaml carries the wxverify-gates job (card 20 moved it out of
+    # lint.yaml, which now only calls checks.yaml on the nightly schedule).
     workflow_dir = repo.parent / ".github" / "workflows"
     builder = (workflow_dir / "builder.yaml").read_text(encoding="utf-8")
-    lint = (workflow_dir / "lint.yaml").read_text(encoding="utf-8")
+    checks = (workflow_dir / "checks.yaml").read_text(encoding="utf-8")
     assert "wxverify" in builder
     assert "pyproject.toml" in builder
     assert "uv.lock" in builder
-    assert "wxverify-gates" in lint
+    assert "wxverify-gates" in checks
 
 
 # ---------------------------------------------------------------------------

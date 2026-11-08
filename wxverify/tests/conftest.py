@@ -52,6 +52,9 @@ clock fails here instead of silently passing on a wrong one.
 
 import asyncio
 import logging
+import platform
+import sqlite3
+import sys
 from collections.abc import Awaitable, Callable, Iterator
 
 import pytest
@@ -61,6 +64,13 @@ from wxverify.api.routes.db_transfer import reset_export_sweeper_death
 from wxverify.core.stop import reset_stop
 
 pytest_plugins = ["pytester"]
+
+
+def pytest_report_header(config: pytest.Config) -> str:
+    return (
+        f"sqlite {sqlite3.sqlite_version}; python {platform.python_version()}"
+        f" at {sys.executable}"
+    )
 
 
 @pytest.fixture(autouse=True)
