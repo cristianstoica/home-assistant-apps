@@ -1186,7 +1186,7 @@ def test_rd8_served_forecast_follows_the_publication_order_at_blend_depth_1() ->
     names the serving feed); ``_rolling_fixture``'s published ranking
     alone decides X over Y (skill 0.8 vs 0.3, both confident under the
     publication's own ``min_n=3``) -- no pair table or live recompute is
-    read for serving any more (storage release, table 1.B)."""
+    read for serving any more."""
     from wxverify.forecast.service import build_forecast
 
     conn = asof_conn()
@@ -1421,13 +1421,12 @@ def test_rd12_active_publication_resolves_by_published_at_not_by_id() -> None:
 
 
 def test_rd14_chart_pairs_returns_only_a_closed_dates_rows() -> None:
-    """RD14: the history chart reads D-1's (closed) ``forecast_history``
+    """The history chart reads D-1's (closed) ``forecast_history``
     row, and omits D's -- open, but holding a leftover ``forecast_history``
-    row, as a failed close attempt's stage 5 leaves it (plan row RD14,
-    :913; 16.2). ``closed_day_pairs`` itself is gone (storage-release plan
-    A3): its one caller, the history chart, now reads this through
-    ``chart_pairs`` (A4/3.6), so this is where the fact it protected is
-    checked."""
+    row, as a failed close attempt's stage 5 leaves it. There is no
+    ``closed_day_pairs`` function: its one caller, the history chart, now
+    reads this through ``chart_pairs``, so this is where the fact it
+    protected is checked."""
     from wxverify.scoring.history import chart_pairs
 
     conn = asof_conn()

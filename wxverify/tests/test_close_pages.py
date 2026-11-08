@@ -160,8 +160,8 @@ def test_pg1_closed_day_history_replaces_forecast_pairs(
     (M86, M87). The starting-history row is itself a D+1 forecast
     (`lead_hours` 24, `issued_at` 24h before its `valid_at`), so the
     route's default `lead` (D+1) keeps it too (plan row ~812, 9.2).
-    ``close_pairs``/``forecast_pairs`` are no longer read; both the
-    closed-day row and the starting-history row now live in
+    Neither ``close_pairs`` nor ``forecast_pairs`` is read; both the
+    closed-day row and the starting-history row live in
     ``forecast_history``."""
     conn = _init_tmp_db(tmp_path)
     site_id = day_close_site(conn)
@@ -866,9 +866,9 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
     control (M127-M129, M131-M135, M137-M140).
 
     Storage-release plan A3/A4/3.3: the reads now come from
-    `forecast_history` (via `seed_forecast_history`) -- the close-off reply
-    is gone (B16), so there is no separate close-off path to exercise here
-    any more. `forecast_history`'s primary key is `(site_id, feed_id,
+    `forecast_history` (via `seed_forecast_history`); there is no
+    separate close-off path to exercise here. `forecast_history`'s
+    primary key is `(site_id, feed_id,
     variable, day_ahead, valid_at)`, so X's two `day_ahead=1`
     starting-history runs (a write-time duplicate `_closed_hour_pick` used
     to break by earliest `issued_at`, M132) cannot both exist as

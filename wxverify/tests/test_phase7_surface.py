@@ -3,10 +3,10 @@
 Covers the depth-resolution helper (override wins, invalid falls through,
 provenance), the options→settings clearing rule, the
 ``record_snapshot_local_time`` setter endpoint, and the forecast-page
-ride-alongs. (§16's verification UI/API -- the ``/api/verification/*``
+ride-alongs. (There is no verification UI/API -- the ``/api/verification/*``
 endpoints, the ``/verification`` page, the run config snapshot/fingerprint
-lockstep, and the published-run pointer -- was removed with the
-verification-run layer, 0.16.14 Part B.)
+lockstep, and the published-run pointer are all gone with the
+verification-run layer.)
 
 Synthetic fixtures only — fake site names/coords, UTC timezone, invented
 feed models; no real station IDs or keys.
@@ -340,7 +340,7 @@ def test_forecast_page_ride_alongs(
         # default) -- today (day=0) is where this fixture's precip lives.
         page = client.get("/forecast?day=0")
         assert page.status_code == 200
-        # Relabel: the old "Chance of rain" copy is gone entirely (G.5).
+        # The page carries no "Chance of rain" copy anywhere.
         assert "Chance of rain" not in page.text
         # Fixture guard: the grid actually rendered, so the assertion below
         # is not vacuous.

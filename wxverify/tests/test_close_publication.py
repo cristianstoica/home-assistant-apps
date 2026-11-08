@@ -102,7 +102,7 @@ async def _publication_row(db, site_id, cutoff):  # type: ignore[no-untyped-def]
 async def _real_publication_id(db, site_id, cutoff):  # type: ignore[no-untyped-def]
     """The real ``publications`` row's id for ``cutoff``, as text -- the
     id ``close_p4.publish``'s call-through actually returns, now that
-    P3's stand-in no longer invents one (plan 18.13)."""
+    P3's stand-in no longer invents one."""
     row = await db.read(
         lambda c: c.execute(
             "SELECT id FROM publications WHERE site_id = ? AND cutoff = ?",
@@ -474,9 +474,9 @@ def test_pb4_an_older_open_record_is_superseded_by_a_newer_one(
     keyed by cutoff), and the ``jobs`` table's partial unique index only
     forbids a second PENDING/RUNNING row of that key (`migrations.py:771-
     772`), so D + 1's own job cannot be seeded until D's has run to
-    completion -- exactly the real sequence (plan 8.6: the repair step,
-    8.5 item 4, enqueues the newer cutoff's stage 7 only once the older
-    job is no longer pending). D's job is claimed and run first, below;
+    completion -- exactly the real sequence (the repair step enqueues the
+    newer cutoff's stage 7 only once the older job is no longer pending).
+    D's job is claimed and run first, below;
     D + 1's job is seeded only afterward, once D's row is no longer
     pending/running. Only the state of ``close_publications`` (not
     ``site_days``) decides stage 7's own body, so D + 1's ``site_days`` row
@@ -534,7 +534,7 @@ def test_pb4_an_older_open_record_is_superseded_by_a_newer_one(
         # D's job is no longer pending/running, so the shared job key
         # (publish:{site_id}:7) is free again (migrations.py:771-772) and
         # D + 1's own stage-7 job can now be seeded, as the repair step
-        # (plan 8.5 item 4) would enqueue it on the next tick.
+        # would enqueue it on the next tick.
         job_d1 = await db.write(
             lambda c: _seed_publish_job(
                 c, site_id, 7, D_PLUS_1, 1, created_at=opened_d1

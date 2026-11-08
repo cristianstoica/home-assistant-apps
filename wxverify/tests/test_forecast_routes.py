@@ -140,8 +140,8 @@ def test_forecast_tiles_204_when_fingerprint_matches_fragment_when_it_differs(
 ) -> None:
     conn = _init_tmp_db(tmp_path)
     # Zero samples, no stamps, no active publication -> "0-p0" (the daily
-    # close is permanently on from the build, storage release 3.2, so the
-    # token always carries the "-p<id>" publication suffix; "0" for none).
+    # close is permanently on, so the token always carries the "-p<id>"
+    # publication suffix; "0" for none).
     site_id = _make_site(conn)
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
@@ -157,10 +157,9 @@ def test_forecast_tiles_204_when_fingerprint_matches_fragment_when_it_differs(
 def test_forecast_tiles_unknown_site_yields_200_not_found_region(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Renamed from "...yields_204": an unknown site now answers 200 with
-    the "Site not found." region, which carries no ``hx-get`` so the
-    auto-poll stops instead of looping against a site that no longer
-    exists."""
+    """An unknown site answers 200 with the "Site not found." region, which
+    carries no ``hx-get`` so the auto-poll stops instead of looping against
+    a site that does not exist."""
     _init_tmp_db(tmp_path)
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
@@ -226,11 +225,9 @@ def test_api_forecast_hourly_in_range_day_passes_through_unclamped(
 def test_forecast_day_clamps_and_embeds_clamped_day_in_poll_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Renamed from "...embeds_clamped_day_in_chart_src": card 7 removed
-    the per-day hourly chart /forecast/day used to embed, so the clamp is
-    now pinned through the region's own auto-poll URL, which always
-    carries the day it was built for (``&day=<n>``), rather than through a
-    chart data-src that no longer exists."""
+    """/forecast/day has no per-day hourly chart, so the clamp is pinned
+    through the region's own auto-poll URL, which always carries the day
+    it was built for (``&day=<n>``)."""
     conn = _init_tmp_db(tmp_path)
     site_id = _make_site(conn)
     app = _make_app(monkeypatch)
@@ -258,15 +255,13 @@ def test_forecast_degrades_to_rebuilding_without_score_cache_no_enqueue(
 ) -> None:
     """future_samples exist, but no publication is ever seeded. With no
     active publication, `leaderboard_with_status`'s verdict is `empty`, so
-    every candidate is unconfident/unscored; the daily close being
-    permanent means `_state_of` can no longer read this as `rebuilding` --
-    that state required a `rebuilding` leaderboard status, which no
-    longer exists -- so it reads `low_confidence` instead. No pair table
-    or live recompute is read for scoring any more (storage release, table
-    1.B), so an absent publication is the only thing that can produce this
-    state; the only counterfactual worth keeping is the one already
-    covered elsewhere (a seeded publication ranks this feed above
-    persistence and yields `normal`).
+    every candidate is unconfident/unscored; with the daily close
+    permanent, there is no `rebuilding` leaderboard status for `_state_of`
+    to read, so it reads `low_confidence` instead. No pair table or live
+    recompute is read for scoring, so an absent publication is the only
+    thing that can produce this state; the only counterfactual worth
+    keeping is the one already covered elsewhere (a seeded publication
+    ranks this feed above persistence and yields `normal`).
 
     Asserts against OBSERVABLE output surfaces only -- `confident` /
     `skill_score` / `pair_n` are candidate-level fields the rendered views
@@ -431,16 +426,11 @@ def test_forecast_partial_coverage_rebuilding_agrees_across_both_surfaces(
 
 
 # ---------------------------------------------------------------------------
-# DELETED: test_forecast_hourly_chart_fallback_svg_hidden_and_summary_mount_
-# outside_container pinned the per-day hourly uPlot chart's fallback <svg>
-# and its [data-chart]/[data-summary] mounts on /forecast/day. Card 7
-# replaced the whole Day Detail view with _tiles.html's table grids, so
-# /forecast/day no longer renders a chart, an svg, or a data-summary mount
-# at all -- there is nothing left on this route for the test's subject to
-# pin, and no table-grid counterpart needs the same accessibility contract
-# (no canvas, no uPlot instance, nothing JS mounts into). This lines up
-# with tests/test_app_js_chart_a11y.py's app.js-level pin that the number of
-# ``new uPlot(...)`` instantiations dropped from 3 to 2 (owned by the
-# parallel test writer on this plan) -- the third chart this test exercised
-# is the one that was removed.
+# /forecast/day's Day Detail view is table grids (_tiles.html), not a
+# chart: there is no <svg> fallback or [data-chart]/[data-summary] mount on
+# this route for an accessibility test to pin, and no table-grid
+# counterpart needs the same contract (no canvas, no uPlot instance,
+# nothing JS mounts into). This lines up with
+# tests/test_app_js_chart_a11y.py's app.js-level pin that counts only 2
+# ``new uPlot(...)`` instantiations now that this route has no chart.
 # ---------------------------------------------------------------------------

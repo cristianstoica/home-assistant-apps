@@ -777,11 +777,11 @@ def test_wind_lane_due_ignores_any_stored_wind_basis_value(value: str) -> None:
 
 
 # =============================================================================
-# 2026-10-23 wind pre-midnight fetch (plan §9). Items 1, 2, 4-8 and 11
-# (S1-S6, the day-finish step) are retired by the daily-close switch-over
-# plan (R4/R7: nothing fetches or finishes a past/waiting day, and the
-# ``history_all`` auth hold is gone). Item 3 (``_today_next_attempt``'s
-# cap) and item 10 (a 429 during the evening window) are kept below, for
+# Wind pre-midnight fetch: the day-finish step (items 1, 2, 4-8 and 11)
+# has nothing left to pin now that the daily close is permanent -- nothing
+# fetches or finishes a past/waiting day, and there is no ``history_all``
+# auth hold. Item 3 (``_today_next_attempt``'s cap) and item 10 (a 429
+# during the evening window) are kept below, for
 # today's own row. D = the local day under test; start, end =
 # local_day_slots(D, tz)[:2]. Every expected value is derived from `end`,
 # never written as a bare literal.

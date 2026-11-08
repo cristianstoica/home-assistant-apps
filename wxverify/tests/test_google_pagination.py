@@ -1,8 +1,8 @@
 """Google adapter pagination oracles — 0.12.0 §15 families 1-6.
 
-Covers ``wxverify.feeds.google``'s paginated horizon collection (W2), the
-horizon-derived budget reservation (W3), and partial-sequence budget honesty
-(W4). Families 7-9 (horizon correction, snapshot provenance, composite
+Covers ``wxverify.feeds.google``'s paginated horizon collection, the
+horizon-derived budget reservation, and partial-sequence budget honesty.
+Families 7-9 (horizon correction, snapshot provenance, composite
 disclosure) are out of scope for this module.
 
 Every fixture in this file is synthetic: a fake site at ``lat=40.0,

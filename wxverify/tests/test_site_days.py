@@ -97,10 +97,8 @@ _TABLE_5_2: dict[str, dict[WriteKind, bool]] = {
     "retry_due": dict.fromkeys(_ALL_KINDS, False),
     "closed": dict.fromkeys(_ALL_KINDS, False),
     "missed": dict.fromkeys(_ALL_KINDS, False),
-    # With no record, every kind is refused (health-release plan 2026-11-07
-    # §7 Part G: the only write kind this state used to allow is gone, and
-    # check_date_write now hard-codes "with no record nothing is allowed"
-    # rather than branching on kind).
+    # With no record, every kind is refused: check_date_write hard-codes
+    # "with no record nothing is allowed" rather than branching on kind.
     "no_record": dict.fromkeys(_ALL_KINDS, False),
 }
 
@@ -1032,8 +1030,8 @@ def test_ds12_record_station_change_effective_dates() -> None:
     )
     assert off_date == D.isoformat()
     # record_station_change always runs the open-days update now (the
-    # close is always on, so its own guard is gone), so it creates the
-    # site's first record rather than leaving none.
+    # close is always on, so it needs no guard of its own), so it creates
+    # the site's first record rather than leaving none.
     assert (
         conn.execute(
             "SELECT COUNT(*) FROM site_days WHERE site_id = ?", (site_id,)

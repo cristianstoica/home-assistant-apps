@@ -6,18 +6,17 @@ with ``effective_to`` set -- a closed prospective change, G2 published and
 the pointer, G3 building) and call every reader named in the row's group
 (plan §17.6): TZ1 adds the mean's existing published rows (G6) to pairing
 candidates (G1); TZ3 adds the as-of exclusions (G11) to wind training
-pairs (G10). TZ2 and TZ4 are both retired: TZ2's live readers (metrics
-aggregation, the leaderboard (G8), the composite (G9) and the win rate
-(G7)) are gone with the daily close being permanent -- the live "Nd"
-window reads per-day sums from day_scores through the active publication
-(scoring/publication.py's live_cells -> live_ranking) instead -- and its
-retention half (``forecast_pairs`` pruned by generation,
-``keep_read_generations``) is gone too, both the table and the function
-deleted (storage release). TZ4 (the timeseries stored-pairs reader, G12)
-is retired the same way -- its one reader, ``_stored_pairs``, is gone.
+pairs (G10). TZ2 and TZ4 have no test here: TZ2's live readers (metrics
+aggregation, the leaderboard, the composite, and the win rate) read
+per-day sums from day_scores through the active publication
+(scoring/publication.py's live_cells -> live_ranking) instead of
+per-generation rows, and the retention half (``forecast_pairs`` pruned by
+generation, ``keep_read_generations``) does not exist, table and
+function both. TZ4's one reader, ``_stored_pairs``, does not exist.
 ``wxverify.db.switch`` is imported at module level above. TZ5 (the gap
-scan's origin resolver and the 07:00 record readers) was removed with the
-daily forecast record (card 29). TZ7 imports new ``wxverify.db.switch``
+scan's origin resolver and the 07:00 record readers) has no test: the
+daily forecast record it read does not exist. TZ7 imports new
+``wxverify.db.switch``
 names. TZ6 needs no such import: it calls the
 EXISTING function ``write_close_truth`` after directly deleting the site's
 ``tz_generation_published:`` pointer key -- exactly what A4 does (plan
@@ -55,10 +54,10 @@ from wxverify.verification.truth import evaluate_day_window, write_close_truth
 
 
 def _pointer_key(site_id: int) -> str:
-    """The retired time zone pointer's text (``db/switch.py:35``'s
-    ``_POINTER_KEY_PREFIX``, private), local since the module that used to
-    build it is gone. These tests seed/delete the PRE-switch pointer Part A
-    reads and A4 deletes.
+    """The retired time zone pointer's key text (``db/switch.py``'s private
+    ``_POINTER_KEY_PREFIX``), kept here since the module that built it no
+    longer exists. These tests seed and delete the pre-switch pointer that
+    Part A reads and A4 deletes.
     """
     return f"tz_generation_published:{site_id}"
 
@@ -82,20 +81,20 @@ def _insert_site(conn: sqlite3.Connection, name: str = "tz-site") -> int:
 
 
 # ---------------------------------------------------------------------------
-# TZ2 and TZ4 -- both retired. TZ2's live readers (metrics aggregation, the
-# leaderboard, the composite, the win rate) are gone with the daily close
-# being permanent (storage release); its retention half (``forecast_pairs``
-# pruned by generation, ``keep_read_generations``) is gone too -- both the
-# table and the function are deleted (storage release 4.1/table 1.B). TZ4's
-# one reader, the timeseries stored-pairs reader (G12, ``_stored_pairs``),
-# is gone the same way. Nothing from either row survives to test.
+# TZ2 and TZ4 -- neither has a test here. TZ2's live readers (metrics
+# aggregation, the leaderboard, the composite, the win rate) read
+# per-day sums now that the daily close is permanent, not per-generation
+# rows; its retention half (``forecast_pairs`` pruned by generation,
+# ``keep_read_generations``) does not exist, table and function both.
+# TZ4's one reader, the timeseries stored-pairs reader (``_stored_pairs``),
+# does not exist either. Nothing from either row survives to test.
 # ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
 # TZ6 -- stage 4's truth write resolves the site's one kept generation even
-# after its pointer is gone (A4 deletes it); a second write replaces the
-# first's rows under the same generation. M37.
+# after its pointer is deleted (A4's unconditional delete); a second write
+# replaces the first's rows under the same generation.
 # ---------------------------------------------------------------------------
 
 

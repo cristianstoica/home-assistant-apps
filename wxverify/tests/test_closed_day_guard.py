@@ -216,14 +216,10 @@ def test_gw4_materialize_consensus_leaves_a_closed_days_hour_alone(
     )
 
 
-# GW9 (apply_pair_ops/_apply_split_chunk refusing a closed day's ops) and
-# GW9b (the real-model/persistence/multimodel pair computes proposing no
-# ops for a done or recordless day) are removed: the old pair-and-score
-# pipeline they drove -- `wxverify.scoring.split`, `wxverify.scoring.pairing`,
-# `wxverify.scoring.persistence`, `wxverify.scoring.multimodel` and
-# `wxverify.worker.score_batches` -- is gone with it (storage-release plan
-# 2026-11-02, table 1.B). GW9c (real_model_pair_pending's probe) was already
-# removed with the rain release (Part B)'s fetch score gate.
+# No test here for apply_pair_ops/_apply_split_chunk refusing a closed
+# day's ops, or for the real-model/persistence/multimodel pair computes
+# proposing no ops for a done or recordless day. Nor for
+# real_model_pair_pending's probe, which the fetch score gate replaced.
 
 
 # ---------------------------------------------------------------------------
@@ -255,11 +251,9 @@ def _csrf_headers(client: TestClient) -> dict[str, str]:
     return {"Origin": "http://testserver", "X-CSRF-Token": token}
 
 
-# GW11 (update_site's own DELETE of the open day's pairs/scores before the
-# PUT returns) was removed with storage-release plan B14: update_site no
-# longer deletes, re-pairs or re-scores anything -- it only stores the rain
-# threshold. The test existed solely to pin that DELETE; nothing in it
-# covered kept behaviour.
+# No test here for update_site's own DELETE of the open day's
+# pairs/scores before the PUT returns: update_site only stores the rain
+# threshold; it never deletes, re-pairs or re-scores anything.
 
 
 # ---------------------------------------------------------------------------
@@ -267,10 +261,8 @@ def _csrf_headers(client: TestClient) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-# GW13 (the import's rebuild-only-the-open-day behavior), GW13b's bad-case
-# bound checks and GW13b's paired accepted case were removed with the
-# database import (storage-release plan 5.5): every one of them was
-# entirely about the removed import route.
+# No test here for the import's rebuild-only-the-open-day behavior, or
+# for the import's bad-case bound checks and paired accepted case.
 
 
 # ---------------------------------------------------------------------------
@@ -361,11 +353,8 @@ _GW17_ALLOWLIST: Final = frozenset(
         ("wxverify.db.station_readings", "prune_raw_readings"),
         # P1 7.3 row: P3's writers, TRUTH.
         ("wxverify.verification.truth", "write_close_truth"),
-        # 7.5 W14 (the import's _rebuild_all) was removed with the database
-        # import (storage-release plan 5.5). update_site (7.3 W12) and
-        # _invalidate_mean_for_site (7.3 W13) were removed with the pair
-        # rebuilds (storage-release plan W5, B13/B14): neither writes a
-        # guarded table any longer.
+        # No entries for the import's _rebuild_all, for update_site, or for
+        # _invalidate_mean_for_site: none of them writes a guarded table.
         # P1 state functions, 4.7 and 6.4; also station_changes (its seed
         # migration constant and migrate_v15_switch's keep_read_generations,
         # which wrote it below v15, are both deleted, storage-release plan
@@ -376,15 +365,12 @@ _GW17_ALLOWLIST: Final = frozenset(
         # no guard of its own (the bound is always before the site's first
         # record, so the old write-kind guard case is gone).
         ("wxverify.db.switch", "prune_wind_history"),
-        # _invalidate_consensus_dependents and _delete_future_persistence_pairs
-        # (7.3) were removed with B6 (storage-release plan W5): neither
-        # writes a guarded table any longer. wxverify.scoring.multimodel,
-        # .pairing, .persistence and .split -- the old pair-and-score
-        # pipeline's own writers -- are themselves gone (storage-release
-        # plan 2026-11-02, table 1.B), so their four entries are dropped
-        # here too, not just the two names above. The replay/verification-run
-        # layer's own writers (runs.py, simulate.py, cleanup.py) are gone the
-        # same way (0.16.14 Part B), so their three entries are dropped too.
+        # No entries for _invalidate_consensus_dependents and
+        # _delete_future_persistence_pairs, or for the old pair-and-score
+        # pipeline's own writers (wxverify.scoring.multimodel, .pairing,
+        # .persistence and .split), or for the replay/verification-run
+        # layer's own writers (runs.py, simulate.py, cleanup.py): none of
+        # them writes a guarded table.
         ("wxverify.verification.truth", "mark_daily_truth_stale"),  # 7.3 notes
     }
 )

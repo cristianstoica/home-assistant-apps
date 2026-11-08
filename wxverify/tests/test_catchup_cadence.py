@@ -176,9 +176,8 @@ def test_t20_scheduler_hostile_fetch_interval_skips_only_that_feed(
 def test_t20_scheduler_unreadable_last_run_at_is_ignored_and_due(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Rewritten to the slot rule (plan §5.1, plan §18.14): the slot rule
-    never reads ``last_run_at`` at all, so a garbage
-    ``site_feed_state.last_run_at`` no longer stops the feed's daytime
+    """The slot rule never reads ``last_run_at`` at all, so a garbage
+    ``site_feed_state.last_run_at`` does not stop the feed's daytime
     download, and a stored forward download is what rewrites the column
     (catchup's fail-closed skip heals). Same seed as before (site zone
     ``UTC``, ``open-meteo``/``ecmwf_ifs`` subscribed, ``last_run_at``

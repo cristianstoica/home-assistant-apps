@@ -2,10 +2,9 @@
 2026-10-22-daily-close-pairs-and-publication.md, section 15, test IDs
 SZ2-SZ3, 18.12): the live, fresh-schema behaviour of P4's twelve new tables
 and their migration -- idempotence on repeat, foreign-key cascade/restrict
-rules. SZ4 (``_validate_upload``'s per-table import checks) was removed
-with the database import (storage-release plan 5.5). Section 19 of the
-plan names the mutant each test ID must kill; that mapping is also given
-inline on each assertion.
+rules. SZ4 (``_validate_upload``'s per-table import checks) has no test
+here. The mutant each test ID must kill is given inline on each
+assertion.
 
 Real SQLite and real migrations throughout; nothing in the code under test
 is mocked. Synthetic data only: station ids ``ISTATION01``/``ISTATION02``

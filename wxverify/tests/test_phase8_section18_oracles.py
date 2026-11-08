@@ -9,15 +9,12 @@ One family lives here now, pinned against the mutation it exists to kill
   variable in one module without the others fails loudly.
 
 Family 2 (NB-1, ``_contingency``/``_continuous_metrics`` fail-closed on a
-partial common core) was removed: both were called only from
+partial common core) has no test here: both were called only from
 ``verification.engine._write_result``, reached only from ``aggregate_run``,
 the nightly replay function. Family 3 (NB-9, ``current_result_basis_
-fingerprint``'s read-only purity) and Family 4/5 (the §16 element-presence
-oracle over the ``/verification`` page) were removed with the
-verification-run layer and its API/page, 0.16.14 Part B — the
-``verification.runs``/``verification.simulate``/``verification.engine``
-modules and the ``/api/verification/*``/``/verification`` routes they
-backed no longer exist. ``depth_option_values`` (still read by
+fingerprint``'s read-only purity) and Family 4/5 (the element-presence
+oracle over the ``/verification`` page) have no test here either.
+``depth_option_values`` (still read by
 ``settings/service.py`` on every settings save) is the only one of the
 original three NB-4/NB-9 subjects that survives independent of the
 verification-run layer, alongside NB-4's roster lockstep itself.

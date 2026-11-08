@@ -632,9 +632,9 @@ def test_fully_covered_feed_beats_higher_skill_partial_feed() -> None:
     labels = [ref.label for ref in today.temp.meta.feeds]
     assert feed_label("open-meteo", "ecmwf_ifs") in labels
     assert feed_label("open-meteo", "gfs_global") not in labels
-    # Card 7 removed the old tile's "Feeds: <names>" tooltip for the extrema
-    # (high/low) contributor set with no replacement -- the detail grid's
-    # only tooltip (`grid.blend_labels`) names the BLEND set instead, which
+    # The old tile's "Feeds: <names>" tooltip for the extrema (high/low)
+    # contributor set has no replacement -- the detail grid's only
+    # tooltip (`grid.blend_labels`) names the BLEND set instead, which
     # differs here (the higher-skill partial feed wins blend_depth=1's
     # ranking but is excluded from the extrema set used above). Flagged as
     # a possible gap: the user can no longer see which models back the
@@ -1197,15 +1197,15 @@ def _seed_shared_ab_fixture(
 
 
 def test_shared_contributor_set_states_roll_up_identically_to_today() -> None:
-    # M2 remediation: the plan's shared-CONTRIBUTOR-SET half of F-T26 --
-    # every feed covers the day so ``extrema_feeds`` equals the blend set's
-    # clearing subset exactly. Swept over fresh, stale and low-confidence:
-    # in every state the two sides read identically, because they ARE the
-    # same ranking over the same candidates. The daily close is always on
-    # now, so there is no longer a "rebuilding" leaderboard verdict to sweep
-    # beside low-confidence (the daily close is permanent; rebuilding was a
-    # close-off-only state). The plan's stale-rebuilding-beside-a-low-
-    # confidence-cell case is F-T28(5), not repeated here.
+    # The shared-CONTRIBUTOR-SET half: every feed covers the day so
+    # ``extrema_feeds`` equals the blend set's clearing subset exactly.
+    # Swept over fresh, stale and low-confidence: in every state the two
+    # sides read identically, because they ARE the same ranking over the
+    # same candidates. The daily close is always on now, so there is no
+    # "rebuilding" leaderboard verdict to sweep beside low-confidence (the
+    # daily close is permanent; rebuilding was a close-off-only state).
+    # The stale-rebuilding-beside-a-low-confidence-cell case is not
+    # repeated here.
 
     # Fresh, both confident.
     conn = _make_db()

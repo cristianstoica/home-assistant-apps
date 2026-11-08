@@ -229,8 +229,7 @@ def _seed_score_cache_for_fixture(conn: sqlite3.Connection) -> None:
     through to 'rebuilding'-empty rather than the confident-feed selection
     this test exercises.
 
-    The pair-aggregate SQL that used to compute these sums is gone (W6b);
-    the sums below are hand-derived from `_seed_two_confident_feeds`'s 3
+    The sums below are hand-derived from `_seed_two_confident_feeds`'s 3
     far-horizon rows per feed (forecast/observed=10.0, persistence
     forecast=8.0), fed through the surviving pure `metrics_from_sums`:
     ecmwf (forecast 10.5): error 0.5 x3 -> err_sum=1.5, abs_sum=1.5,

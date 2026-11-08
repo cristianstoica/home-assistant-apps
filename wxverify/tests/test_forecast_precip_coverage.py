@@ -1413,11 +1413,11 @@ def test_rebuilding_precedence_on_the_precip_extrema_set() -> None:
 
     # The daily close is permanent now, so `leaderboard_with_status` never
     # reports "rebuilding" for an active publication (status is hit, live
-    # or empty); the guard that used to distinguish day_ahead=0 ("hit") from
-    # day_ahead=1 ("rebuilding") here pinned that removed per-cell status
-    # and is gone with it. The rain cell never reads the leaderboard anyway
-    # (rain release, C4) -- its own "rebuilding" below comes from the rain
-    # ranking's own provisional flag, asserted further down.
+    # or empty), so there is no day_ahead=0 ("hit") vs day_ahead=1
+    # ("rebuilding") per-cell status distinction left to guard here. The
+    # rain cell never reads the leaderboard anyway -- its own "rebuilding"
+    # below comes from the rain ranking's own provisional flag, asserted
+    # further down.
     #
     # ``seed_rain_ranks`` runs BEFORE the ``_seed_score_cache``
     # setup below: both create a publication if none exists yet, and

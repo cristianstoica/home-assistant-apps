@@ -311,8 +311,9 @@ def test_rt8_unreadable_last_obstime() -> None:
 def test_rt9_runtime_state_dropped_every_group_off() -> None:
     """RT9: migrated in-memory db, `runtime_state` dropped, every group off.
     With every group disabled, the pipeline-off path reads nothing (the
-    switch read it used to make is gone with the always-on close) and
-    neither does the db-off path, so the dropped table causes no failure:
+    close is always on, so the pipeline-off path never reads the switch)
+    and neither does the db-off path, so the dropped table causes
+    no failure:
     the pipeline group's skipped list is still appended, `db_readable` is
     its own skipped row, and the verdict stays 'ok' -- a broken
     `runtime_state` table is reported only by a group that actually reads

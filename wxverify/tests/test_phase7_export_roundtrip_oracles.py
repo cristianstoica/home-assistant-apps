@@ -8,9 +8,9 @@ per-variable depth-override setting, and station observation rows --
 proving the export carries every 0.11.0 artifact over faithfully, row for
 row.
 
-The import half of this round trip (POST /api/import/db) was removed in the
-storage-release plan (5.5); a hand-built-payload oracle that drove the
-import directly, with no export step at all, was removed with it.
+There is no import half to this round trip: POST /api/import/db does not
+exist, and no hand-built-payload oracle drives an import directly without
+an export step.
 
 Synthetic fixtures only: invented town names, UTC, fake fingerprints, an
 invented PWS station id.
@@ -95,12 +95,10 @@ def test_shipped_export_download_restores_full_0_11_0_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The real shipped export path (VACUUM INTO + gzip) carries every
-    0.11.0 artifact over faithfully. The import half of this round-trip
-    (POST /api/import/db) was removed in the storage-release plan (5.5);
-    re-pointed to open the downloaded, decompressed snapshot read-only and
-    compare its rows directly against the source, per the plan's own
-    export-round-trip guidance (5.5) rather than driving it back through a
-    second live app.
+    0.11.0 artifact over faithfully. There is no POST /api/import/db to
+    round-trip back through, so this opens the downloaded, decompressed
+    snapshot read-only and compares its rows directly against the source
+    rather than driving it back through a second live app.
     """
     options_path = tmp_path / "options.json"
     options_path.write_text(

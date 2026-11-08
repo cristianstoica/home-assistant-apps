@@ -205,11 +205,11 @@ def assert_summary_mount_not_nested_in_chart(html: str, *, summary_id: str) -> N
 
 
 # ---------------------------------------------------------------------------
-# As-of / outcome-knowability fixture builders (plan §6, §18.1, §18.6).
+# As-of / outcome-knowability fixture builders.
 # Shared by test_asof_reconstruction.py and other files still exercising
-# knowable-pair fixtures (e.g. test_publication_readers.py) after the as-of
-# ranking/leaderboard machinery itself was removed with the daily close made
-# permanent (W6b).
+# knowable-pair fixtures (e.g. test_publication_readers.py) even though the
+# as-of ranking/leaderboard machinery itself does not exist, now that the
+# daily close is permanent.
 # All values are synthetic (fake site names, fake source/model ids).
 # ---------------------------------------------------------------------------
 
@@ -916,13 +916,11 @@ def install_p4_standins(
 ) -> dict[str, RecordingStandIn]:
     """Patch ``close_p4``'s other two call points -- ``score_day``,
     ``publish`` -- with generic recorders that call through to P4's real
-    body when the test leaves neither ``result`` nor ``raises`` set (plan
-    §15.1 "P4."; §18.13; stage 1's ``round_state`` has its own
-    :func:`install_round_state_standin`, since its answer is keyed by round
-    date and may need to fault one site only). ``clean_worksheets`` (stage
-    8, the worksheet cleanup) had its own stand-in here; stage 8 and
-    ``clean_worksheets`` were removed with the daily-close chain's cleanup
-    step (0.16.14 Part B), so there is nothing left to stand in for it.
+    body when the test leaves neither ``result`` nor ``raises`` set. The
+    round-state stage has its own :func:`install_round_state_standin`,
+    since its answer is keyed by round date and may need to fault one
+    site only. The worksheet-cleanup stage and its ``clean_worksheets``
+    function do not exist, so there is nothing left to stand in for it.
     """
     from wxverify.worker import close_p4
 
@@ -1008,10 +1006,10 @@ def disable_other_enqueuers(
     monkeypatch: pytest.MonkeyPatch, *, keep: Sequence[str] = ()
 ) -> None:
     """No-op every one of ``scheduler_tick``'s non-close enqueuers except
-    those named in ``keep`` (plan §15.1 "Other job kinds."). ``_enqueue_due_obs``,
+    those named in ``keep``. ``_enqueue_due_obs``,
     ``_enqueue_due_verification_runs`` and ``_enqueue_due_score_refresh``
     (the routine download's clock, the nightly replay trigger and the score
-    backstop) are retired (R1, R12, R17) and no longer exist to no-op.
+    backstop) do not exist, so there is nothing left to no-op.
     Without this, the first tick of a standard night would also queue a
     ``fetch_feed`` job per seeded open-meteo feed, which ``run_due_jobs``
     would then claim.
@@ -1861,11 +1859,10 @@ def seed_forecast_history(
     observed: float,
     issued_at: str | None = None,
 ) -> None:
-    """A storage-release ``forecast_history`` row (plan 3.1) plus the
-    ``observations`` row it joins to (3.6) -- the one table the win rate
-    and the history chart now read for both a closed day's forecast and
-    the days before the site's first record (A2-A5; ``close_pairs`` and
-    ``forecast_pairs`` are no longer read by either, W4).
+    """A ``forecast_history`` row plus the ``observations`` row it joins
+    to -- the one table the win rate and the history chart now read for
+    both a closed day's forecast and the days before the site's first
+    record (``close_pairs`` and ``forecast_pairs`` are read by neither).
 
     ``observations`` is keyed on ``(site_id, variable, valid_at)`` alone --
     one shared truth value, never per feed -- so a second call at the same

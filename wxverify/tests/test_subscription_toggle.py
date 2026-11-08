@@ -1,10 +1,5 @@
 """Tests for the Sites page's subscription-toggle client behaviour (app.js,
 the HTML fragment, and the toggle buttons' scoping -- T9-T11).
-
-The route/CLI mean-rebuild-skip tests this file used to carry (T1-T8) pinned
-`set_site_subscription`'s old `rebuild_mean_for_site` call, removed whole by
-the storage-release plan's B13: `set_site_subscription` no longer rebuilds
-any mean, so those pins are gone with it.
 """
 
 from __future__ import annotations
@@ -63,10 +58,9 @@ class _AttrParser(HTMLParser):
 
 
 # --------------------------------------------------------------------------
-# T1-T8 removed (storage-release plan B13): set_site_subscription,
-# update_subscription and update_feed no longer call rebuild_mean_for_site
-# at all, so every old-trigger mean-rebuild-skip pin above pinned removed
-# behaviour. T9-T11 (app.js/HTML, unrelated to the rebuild) stay.
+# set_site_subscription, update_subscription and update_feed do not call
+# rebuild_mean_for_site at all, so there is no mean-rebuild-skip behavior
+# for T1-T8 to pin. T9-T11 (app.js/HTML, unrelated to the rebuild) stay.
 # --------------------------------------------------------------------------
 
 

@@ -112,9 +112,8 @@ def _seed_s0(conn: sqlite3.Connection) -> Seed:
         window_days=30,
         min_n=min_n,
     )
-    # The pair-aggregate SQL that used to compute these (`strategy_for(
-    # ...).aggregate`) is gone (W6b), and no pair table is read for
-    # scoring any more (storage release 3.1): hand-derived here as if from
+    # No pair table is read for scoring; the sums below are hand-derived
+    # as if from
     # 3 identical far-future hours (forecast/observed=10.0, persistence
     # forecast=8.0), through the surviving pure `metrics_from_sums`,
     # skill-paired 1:1 against persistence's own (also constant) error.

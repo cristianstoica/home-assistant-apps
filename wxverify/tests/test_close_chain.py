@@ -84,7 +84,7 @@ async def _publication_row(db, site_id, cutoff):  # type: ignore[no-untyped-def]
 async def _real_publication_id(db, site_id, cutoff):  # type: ignore[no-untyped-def]
     """The real ``publications`` row's id for ``cutoff``, as text -- the
     id ``close_p4.publish``'s call-through actually returns, now that
-    P3's stand-in no longer invents one (plan 18.13)."""
+    the close stage's stand-in no longer invents one."""
     row = await db.read(
         lambda c: c.execute(
             "SELECT id FROM publications WHERE site_id = ? AND cutoff = ?",

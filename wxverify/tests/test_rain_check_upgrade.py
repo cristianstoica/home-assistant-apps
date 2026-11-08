@@ -9,9 +9,9 @@ pins what those leave out:
   only while a station is set aside, the date being the first day left out.
 
 U1 (a made-up v15 file upgrading to v16 with every existing list row
-counted) is retired: the dedicated v15->v16 migration function it pinned
-is deleted along with every other ``migrate_v2`` ... ``migrate_v16``
-function (storage release 4.1) -- ``station_rain_checks`` is now just
+counted) has no test here: the dedicated v15->v16 migration function it
+pinned is deleted along with every other ``migrate_v2`` ... ``migrate_v16``
+function -- ``station_rain_checks`` is now just
 part of the permanent schema (``create_tables``), with no conversion step
 left to test, and a file at user_version 1-15 is refused outright rather
 than upgraded.

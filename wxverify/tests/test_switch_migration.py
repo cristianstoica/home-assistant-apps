@@ -4,8 +4,8 @@ retired-rescore-free behaviour, exercised on every normal boot, not just a
 one-time upgrade. MG7 (the gate that kept ``migrate_v15_switch`` from
 rerunning on a file already at its target version) is retired:
 ``migrate_v15_switch`` and every migration below the current target are
-deleted (storage release 4.1), and a file at user_version 1-15 is now
-refused outright rather than silently left alone.
+deleted, and a file at user_version 1-15 is now refused outright rather
+than silently left alone.
 
 Synthetic data only: stations/sites are bare synthetic rows (no real
 station ids, coordinates or site names); dates are far-future (2030) to
@@ -60,9 +60,9 @@ def _jobs(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 # ---------------------------------------------------------------------------
-# MG7 -- retired: ``migrate_v15_switch`` and every migration below the
-# current ``TARGET_USER_VERSION`` are deleted (storage release 4.1); a
-# file at user_version 1-15, including 15 itself, is now refused outright
+# MG7 -- no test here: ``migrate_v15_switch`` and every migration below
+# the current ``TARGET_USER_VERSION`` are deleted; a file at user_version
+# 1-15, including 15 itself, is now refused outright
 # ("too old for this release"), not silently left alone on a later open.
 # Nothing about Part A's old rerun gate survives to test.
 # ---------------------------------------------------------------------------

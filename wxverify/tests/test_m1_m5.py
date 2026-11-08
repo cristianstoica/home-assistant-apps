@@ -608,14 +608,11 @@ def test_s6_finish_halts_on_worker_crash_exit_but_not_signal_shutdown() -> None:
     assert "exec /run/s6/basedir/bin/halt" in finish
 
 
-# test_v1_migration_adds_backfill_columns (a hand-crafted v1 sites table
-# gaining backfill_status/backfill_through on open) is retired:
-# migrate_v1 and every other migrate_v2 ... migrate_v16 function are
-# deleted (storage release 4.1), and user_version 1 is refused outright
-# now rather than upgraded. A fresh build's sites table carries both
-# columns from create_tables directly -- test_migrations_seed_fk_and_
-# not_null_census above already pins backfill_status there; nothing
-# migrate_v1-specific survives to test.
+# There is no migrate_v1 (or migrate_v2 ... migrate_v16) function to test:
+# user_version 1 is refused outright rather than upgraded, and a fresh
+# build's sites table carries both backfill columns from create_tables
+# directly -- test_migrations_seed_fk_and_not_null_census above already
+# pins backfill_status there.
 
 
 def test_database_rejects_sqlite_without_returning(
@@ -928,10 +925,9 @@ def test_consensus_lapse_normalization_oracle() -> None:
     assert result.value == pytest.approx(20.05)
 
 
-# test_corrected_observation_rebuilds_future_persistence was removed with
-# storage-release plan B6: materialize_consensus no longer deletes or
-# rebuilds pairs/score_cache rows when an observation is written or
-# corrected, so the delete-then-rebuild it pinned no longer happens.
+# materialize_consensus never deletes or rebuilds pairs/score_cache rows
+# when an observation is written or corrected, so there is no
+# delete-then-rebuild behavior to pin here.
 
 
 def test_station_toggle_leaves_forecast_history_alone(
@@ -1010,12 +1006,11 @@ def test_station_toggle_leaves_forecast_history_alone(
                     """,
                     (site_id, feed_id, variable, forecast, f"{variable}-run"),
                 )
-            # Fixture only: `pair_and_score` (the old inline pairing/scoring
-            # pass) is gone (storage-release plan 2026-11-02, table 1.B).
-            # Plant the one forecast_history row the assertion below reads
-            # directly, with the same forecast value that call used to
-            # produce -- 11.0, from the sample above -- rather than pin
-            # anything about how the row is built.
+            # Fixture only: there is no inline pairing/scoring pass to build
+            # this row, so plant the one forecast_history row the assertion
+            # below reads directly, with the forecast value from the sample
+            # above (11.0), rather than pin anything about how the row is
+            # built.
             conn.execute(
                 """
                 INSERT INTO forecast_history
@@ -1047,8 +1042,8 @@ def test_station_toggle_leaves_forecast_history_alone(
                 (site_id, feed_id),
             ).fetchone()
         )
-        # The toggle no longer re-materializes or inline-scores (8.3 removes
-        # it), so the history row keeps its pre-toggle forecast value.
+        # The toggle does not re-materialize or inline-score, so the history
+        # row keeps its pre-toggle forecast value.
         assert temperature_history["value"] == pytest.approx(11.0)
         station_row = db.read_sync(
             lambda conn: conn.execute(
@@ -1058,10 +1053,9 @@ def test_station_toggle_leaves_forecast_history_alone(
         assert station_row["enabled"] == 0
 
 
-# The rain-threshold half of this test (PUT /api/sites/{id} deleting and
-# rebuilding the precip pair with the new threshold) was removed with
-# storage-release plan B14: update_site only stores the rain threshold now,
-# it no longer deletes, re-pairs or re-scores anything.
+# update_site only stores the rain threshold; it does not delete, re-pair
+# or re-score anything, so there is no delete-and-rebuild behavior for
+# PUT /api/sites/{id} to pin here.
 
 
 def test_domain_backoff_records_defers_and_clears(tmp_path: Path) -> None:

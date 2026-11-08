@@ -105,13 +105,11 @@ def _hit_fixture(conn: sqlite3.Connection) -> tuple[int, int, int]:
 
 
 # ---------------------------------------------------------------------------
-# O1 and O2 (the torn-read six-seams oracle and the statement-shape matrix
-# over score_cache's window set -- "all", a live "7d", the disabled-site and
-# no-cell cache misses) pinned the cache-backed leaderboard/composite read
-# path (score_cache rows, the writers that mutated them mid-read). That path
-# is gone with `wxverify.scoring.cache` (storage release); both oracles and
-# their fixtures are retired with it. O3-O7 below, the read_snapshot
-# bracket itself, are unaffected and keep their own publication-backed
+# There is no `wxverify.scoring.cache` module and no cache-backed
+# leaderboard/composite read path (score_cache rows, writers mutating them
+# mid-read) for a torn-read oracle or a statement-shape matrix over
+# score_cache's window set to probe. The read_snapshot bracket itself,
+# pinned below, is unaffected and keeps its own publication-backed
 # `_hit_fixture`.
 # ---------------------------------------------------------------------------
 
@@ -189,12 +187,12 @@ def leaderboard_with_status_in_transaction_wrapper(
 
 
 # ---------------------------------------------------------------------------
-# O4 -- retired: its one write-path caller, ``_leaderboard_status_cell`` in
-# ``verification/record.py``, is gone with the daily close being permanent
-# (the close-on record always writes ``leaderboard_status`` NULL and never
-# reads the live/as-of leaderboard status at all, storage release W6b) --
-# nothing calls ``leaderboard_with_status_in_transaction`` under a writer's
-# own ``BEGIN IMMEDIATE`` any more, so there is no in-transaction write-path
+# ``verification/record.py`` has no ``_leaderboard_status_cell`` write-path
+# caller: with the daily close permanent, the close-on record always
+# writes ``leaderboard_status`` NULL and never reads the live/as-of
+# leaderboard status at all. Nothing calls
+# ``leaderboard_with_status_in_transaction`` under a writer's own
+# ``BEGIN IMMEDIATE`` any more, so there is no in-transaction write-path
 # case left to pin.
 # ---------------------------------------------------------------------------
 
@@ -211,7 +209,7 @@ def test_o5_leaderboard_with_status_in_transaction_has_exactly_two_callers() -> 
     ``forecast/data.py``, which calls it only when ``conn.in_transaction`` (a
     forecast route's read snapshot is open). The former write-path caller,
     ``verification/record.py``'s ``_leaderboard_status_cell``, is gone with
-    the daily close being permanent (W6b). Any third caller would bypass the
+    the daily close being permanent. Any third caller would bypass the
     bracket outside a caller-owned transaction.
     """
     import wxverify

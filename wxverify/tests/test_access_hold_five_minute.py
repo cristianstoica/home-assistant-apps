@@ -714,11 +714,11 @@ def test_fm4_each_kinds_hold_leaves_the_other_two_lanes_running(
     ensure_wind_days(conn, site_id, ZoneInfo("UTC"), now.date())
     conn.commit()
 
-    # P2 4.4/14.7's AH1 rule (the existing "today's rows are not due while
-    # five_minute is held" pin): wind_lane_due no longer reads the
-    # five_minute hold at all for due-ness -- all_1day is always open, and
-    # a held row's `AccessHeld` is caught per row inside the reservation
-    # instead (AH1-AH4), not at this due-selector level. So today's
+    # The existing "today's rows are not due while five_minute is held"
+    # pin: wind_lane_due never reads the five_minute hold for
+    # due-ness -- all_1day is always open, and a held row's `AccessHeld`
+    # is caught per row inside the reservation instead, not at this
+    # due-selector level. So today's
     # still-pending row (created by the ensure_wind_days call just above,
     # while the site has no observations yet, with next_attempt_at NULL --
     # due at once) is due regardless of which kind is held.

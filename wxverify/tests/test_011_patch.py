@@ -1677,7 +1677,7 @@ def test_worker_retry_read_timeout_logs_class_name_only(
     assert recorded_errors == ["ReadTimeout"]
 
 
-# idx_pairs_cell index + phase-split write discipline: retired.
-# idx_pairs_cell was forecast_pairs's own index, added by a v2 migration;
-# both the table and that migration are deleted (storage release 3.1,
-# 4.1), so there is no index left to create, drop or re-create here.
+# No test here for the idx_pairs_cell index or phase-split write
+# discipline. idx_pairs_cell was forecast_pairs's own index, added by a
+# v2 migration; both the table and that migration are deleted, so there
+# is no index left to create, drop or re-create here.

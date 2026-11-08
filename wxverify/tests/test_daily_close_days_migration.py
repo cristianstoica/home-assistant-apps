@@ -32,10 +32,10 @@ def _v10_db() -> sqlite3.Connection:
     pre-v11 file. That migration (whatever added them below v16) is
     deleted along with every other migrate_v2 ... migrate_v16 function,
     and those tables/column are unconditional parts of ``create_tables``
-    now, with user_version 1-16 refused outright (storage release 4.1,
-    health release U1) -- so there is nothing left to remove onto a
-    reachable schema. Pinning at 17 instead of 18 still exercises a real
-    ``run_migrations`` call in ``_migrate`` (the version 18 upgrade runs;
+    now, with user_version 1-16 refused outright -- so there is nothing
+    left to remove onto a reachable schema. Pinning at 17 instead of 18
+    still exercises a real ``run_migrations`` call in ``_migrate`` (the
+    version 18 upgrade runs;
     these tests do not depend on its sub-steps, so it stays a fast no-op
     here regardless of data present), while this function's own subject
     -- the live CHECK/foreign-key constraints on these tables -- is

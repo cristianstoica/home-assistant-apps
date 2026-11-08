@@ -272,12 +272,8 @@ def test_label_slow_write_log_names_the_callback_not_the_wrapper(
     label comes from the caller's own callback, via `_read_label`, not from
     the write path's internal wrapper closures), mutant (MX-label, the
     label taken from the wrapper instead) = contains "_body:" or "_call:"
-    and never "_named_probe_write:". Moved from the input-epoch tests
-    retired with Part D; that version also drove the writer's other call
-    site through the same label check and expected 2 records -- that call
-    site (the write-if-current call) was removed by this release's Part D1
-    (plan 5.5 removed `write_fenced` instead), so this keeps only the
-    `db.write` call and expects 1 record.
+    and never "_named_probe_write:". This drives only the `db.write` call
+    and expects 1 record.
     """
     caplog.set_level(logging.INFO, logger="wxverify.db.connection")
     monkeypatch.setattr("wxverify.db.connection.SLOW_WRITE_MS", 0.0)

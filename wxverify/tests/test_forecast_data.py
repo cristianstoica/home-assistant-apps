@@ -113,7 +113,7 @@ def _seed_cell_pairs(
     (the canonical far-future valid_at/lead_hours trio this fixture always
     uses, so persistence's own error over the same 3 valid_ats stays the
     skill baseline). No row is written: nothing reads a pair table for
-    scoring any more (W6b, storage release 3.1). ``forecasts`` is local to
+    scoring any more. ``forecasts`` is local to
     the caller, never module-level state, so no connection's values can
     ever leak into another's."""
     forecasts[feed_id] = forecast
@@ -809,8 +809,7 @@ def _seed_complete_score_cache(
     active publication (9.2): a feed set that does not match the query's
     expected-active-feed set exactly degrades to a 'rebuilding' empty
     ranking rather than the live-recomputed values these tests assert on.
-    The pair-aggregate SQL that used to compute these (`strategy_for(
-    ...).aggregate`) is gone (W6b); the sums below are hand-derived exactly
+    The sums below are hand-derived exactly
     from the 3 identical far-future pairs `_seed_cell_pairs` wrote into
     `forecasts` for each feed (a fixed observed=10.0 baseline) through the
     surviving pure `metrics_from_sums`, skill-paired 1:1 against

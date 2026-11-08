@@ -443,13 +443,11 @@ def test_export_round_trip_still_opens_and_passes_integrity_check(
 def test_startup_no_longer_resumes_import_rebuild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """5.5 step (d): start-up must no longer read ``import_rebuild_state``
-    (``api/app.py:192-197``) and must never call
-    ``db_transfer.run_rebuild_all`` because of it. Fails now: with the key
-    seeded ``pending`` (an interrupted rebuild), the lifespan calls
-    ``run_rebuild_all`` once and the key is left as it stands either way,
-    so the call count -- not the stored value -- is the observable that
-    distinguishes before from after.
+    """Start-up never reads ``import_rebuild_state`` and never calls
+    ``db_transfer.run_rebuild_all`` because of it: with the key seeded
+    ``pending`` (an interrupted rebuild), the lifespan makes no rebuild
+    call and the key is left as it stands, so the call count -- not the
+    stored value -- is the observable this pins.
     """
     conn = _init_tmp_db(tmp_path)
     set_runtime_state(conn, "import_rebuild_state", "pending")

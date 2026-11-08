@@ -1,8 +1,8 @@
 """Tests for DB export (db_transfer routes).
 
-The database import half (upload, validation, rebuild, swap) was removed in
-the storage-release plan (5.5); only export (``/export/begin``,
-``/export/status``, ``/export/download``) remains, and so do its tests.
+There is no database import half (upload, validation, rebuild, swap); only
+export (``/export/begin``, ``/export/status``, ``/export/download``)
+exists, and so do its tests.
 
 Harness idioms match test_web_ui.py / test_static_ingress.py: per-test tmp DB
 via ``_init_tmp_db``, idle-worker app, ``TestClient(app, client=(ip, port))``
@@ -90,8 +90,8 @@ def _make_site(conn: sqlite3.Connection, name: str, *, enabled: int = 1) -> int:
 # Part A -- Export (X1-X18: prepare-then-stream begin/status/download trio).
 # ---------------------------------------------------------------------------
 #
-# The old blocking `GET /api/export/db` route was removed; these tests target
-# the new registry-backed `POST /api/export/begin` -> `GET /export/status/{id}`
+# There is no blocking `GET /api/export/db` route; these tests target
+# the registry-backed `POST /api/export/begin` -> `GET /export/status/{id}`
 # -> `GET /export/download/{id}` flow. `TestClient` runs the `begin` task's
 # VACUUM on its own event loop and runs the download `BackgroundTask` inline, so
 # state transitions and post-send cleanup are directly observable via polling.

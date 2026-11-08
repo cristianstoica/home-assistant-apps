@@ -299,10 +299,9 @@ def test_e_t4_duplicate_forward_fetch_keeps_the_newest_value() -> None:
 
 
 def test_e_t5_revised_payload_for_the_same_run_is_stored() -> None:
-    """E.3.5's known limitation (a provider revision to an already-fetched
-    run's values silently dropped) is gone since the rain release (Part B):
-    the revision replaces every non-key value the hour stored, and its
-    ``fetched_at``.
+    """A provider revision to an already-fetched run's values is no
+    longer silently dropped: the revision replaces every non-key value
+    the hour stored, and its ``fetched_at``.
     """
     conn = asof_conn()
     site_id = _make_site(conn, "ISTATION01")

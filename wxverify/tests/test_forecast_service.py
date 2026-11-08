@@ -533,9 +533,9 @@ def _seed_wind_publication(
 
 
 def test_tile_precedence_low_confidence_beats_normal_not_available_excluded() -> None:
-    """Rain release, C4: the rain cell no longer reads the leaderboard; its
-    state comes from the published rain ranking, read with the daily close
-    on. So this runs with the close on, and the roles move: temperature has
+    """The rain cell's state comes from the published rain ranking, not the
+    leaderboard, read with the daily close on. So this runs with the close
+    on, and the roles move: temperature has
     samples and no published ranking (low_confidence), rain's winner has a
     full day under a settled ranking (normal), wind has no published weights
     (not_available)."""
@@ -607,8 +607,8 @@ def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
     Rain release, C4: the rain cell's `rebuilding` is now a provisional
     published rain ranking, read with the daily close on, and shows in its
     extrema state (the cell's hourly state is `normal`), so the rollup is
-    the tile's `confidence_state`. The close-off leaderboard no longer
-    reaches the rain cell, so this runs with the close on, where the normal
+    the tile's `confidence_state`. The rain cell's state does not come from
+    the close-off leaderboard, so this runs with the close on, where the normal
     cell of day tile 1 is wind (two feeds with published weights) and
     temperature has no samples there.
     """
@@ -824,14 +824,10 @@ def test_mixed_representative_leads_stay_low_confidence_unconfident_winner() -> 
     assert hourly["states"]["temperature"] == "low_confidence"
 
 
-# NOTE (storage release): ``test_coverage_guard_splits_tile_and_drill_down_
-# rebuilding_state`` (O8) is removed here, not updated. Its subject WAS the
-# "rebuilding" leaderboard status and its precedence against low_confidence
-# on the tile vs. the drill-down -- the published leaderboard
-# (scoring/leaderboard.py's ``_published_leaderboard``) never returns
-# "rebuilding" any more (only "hit", "live" or "empty"), so the disagreement
-# this test pinned can no longer occur; there is no updated assertion to
-# write in its place.
+# The published leaderboard (scoring/leaderboard.py's
+# ``_published_leaderboard``) only ever returns "hit", "live" or "empty",
+# never "rebuilding", so there is no disagreement between the tile and the
+# drill-down over a "rebuilding" leaderboard status left to pin.
 
 
 # ---------------------------------------------------------------------------
@@ -1203,11 +1199,10 @@ def test_build_hourly_wind_series_weighted_and_kmh_converted() -> None:
 # ---------------------------------------------------------------------------
 # A paused feed (global or site-level) never serves wind.
 #
-# NOTE (storage release): the sibling training-side test (pausing feed C
-# dropping it out of ``load_wind_training``'s feed_highs) is removed here,
-# not updated -- ``load_wind_training`` no longer exists: wind weights come
-# only from the active publication's ``publication_wind_weights``, never a
-# live recompute from training pairs.
+# There is no ``load_wind_training`` function: wind weights come only from
+# the active publication's ``publication_wind_weights``, never a live
+# recompute from training pairs, so there is no training-side pause test
+# to pair with this one.
 # ---------------------------------------------------------------------------
 
 

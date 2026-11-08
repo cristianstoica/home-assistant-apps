@@ -208,12 +208,10 @@ def _build_legacy_shaped_replacement(tmp_path: Path, filename: str) -> Path:
 def test_database_open_writes_no_wind_basis_key_on_a_legacy_shaped_file(
     tmp_path: Path,
 ) -> None:
-    """Opening a database writes no wind key (plan §3 item 1), even for a
-    file carrying a legacy station_observations wind row.
+    """Opening a database writes no wind key, even for a file carrying a
+    legacy station_observations wind row.
 
-    The import-swap path this used to drive end to end (``replace_from``
-    -> ``_open`` -> ``run_migrations``) was removed in the storage-release
-    plan (5.5). Re-pointed to inspect the legacy-shaped file directly:
+    This inspects the legacy-shaped file directly:
     ``_build_legacy_shaped_replacement``'s own ``Database(...)``
     construction already runs the identical open path, so no behaviour
     under test is lost.

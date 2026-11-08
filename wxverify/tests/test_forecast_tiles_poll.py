@@ -201,10 +201,9 @@ def test_tiles_renders_fragment_when_fingerprint_changed(
 def test_tiles_200_not_found_region_for_unknown_site(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An unknown site now answers 200 with the "Site not found." region,
+    """An unknown site answers 200 with the "Site not found." region,
     which carries no ``hx-get`` -- so the auto-poll stops on its own rather
-    than looping against a site that no longer exists. Renamed from
-    "...204_for_unknown_site": that status no longer holds."""
+    than looping against a site that does not exist."""
     _init_tmp_db(tmp_path)
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
@@ -315,9 +314,8 @@ def test_tiles_204_when_only_non_sample_state_changed(
         window_days=30,
         min_n=min_n,
     )
-    # The pair-aggregate SQL that used to compute these (`strategy_for(
-    # ...).aggregate`) is gone (W6b), and no pair table is read for scoring
-    # any more (storage release 3.1): hand-derived here instead, as if from
+    # There is no pair-aggregate SQL (`strategy_for(...).aggregate`) and no
+    # pair table read for scoring: hand-derived here instead, as if from
     # 3 identical far-future hours (forecast/observed=10.0, persistence
     # forecast=8.0), through the surviving pure `metrics_from_sums`,
     # skill-paired 1:1 against persistence's own (also constant) error.

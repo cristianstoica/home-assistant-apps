@@ -1,8 +1,6 @@
 """Tests for `backup_exclude` static config content.
 
-The database import, its `.bak` producer and the `.bak` retention sweep
-(`sweep_bak_files`, `_looks_like_valid_sqlite`) were removed in the
-storage-release plan (5.5). `config.yaml`'s `backup_exclude` key is kept
+`config.yaml`'s `backup_exclude` key is kept
 regardless: a `.bak` left in `/data` by an earlier (pre-upgrade) import
 stays on disk, and the add-on no longer touches it, so Home Assistant's
 backups must still skip it.

@@ -38,8 +38,8 @@ _TZ = "UTC"
 _TODAY: date = date(2026, 3, 10)
 _API_KEY = "synthetic-weathercom-key"  # noqa: S105
 
-# R6's retired dated endpoint. The package no longer names it (RE5), so the
-# test keeps its own copy of the path.
+# The package names no dated endpoint for this path, so the test keeps
+# its own copy of the path.
 _HISTORY_ALL_PATH = "/v2/pws/history/all"
 
 

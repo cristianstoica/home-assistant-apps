@@ -797,8 +797,8 @@ def test_rs11_a_reclaimed_round_try_is_cancelled(
     # Run the job the way a restart's own claim loop would -- claim the
     # now-pending row again rather than reusing the stale `job` object
     # from before the reclaim, whose claim run_claimed_job's
-    # `_still_claimed` check no longer finds 'running' (cause 6): running
-    # it unclaimed would silently drop the outcome and leave the row
+    # `_still_claimed` check no longer finds 'running': running it
+    # unclaimed would silently drop the outcome and leave the row
     # 'pending' instead of cancelling it.
     reclaimed_job = claim_next_job(conn)
     assert reclaimed_job is not None

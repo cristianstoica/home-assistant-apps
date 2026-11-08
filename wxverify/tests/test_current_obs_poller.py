@@ -2,8 +2,7 @@
 
 Covers plan §14.2 tests P, P2, X, Q, the idle-poller-seam test, H, W and
 DL3 -- the 2026-09-23 station-health-and-retries plan, commit 5 (D1.2).
-F (the generation-fence capture race) was removed with the generation
-fence itself (storage-release plan 5.5).
+F (the generation-fence capture race) has no test here.
 
 EQP (the query-plan relationship for the two claim clauses) lives in
 ``tests/test_query_plan_regressions.py``, so the shipping-SQLite CI job runs

@@ -402,9 +402,8 @@ def test_m5_fresh_install_reads_the_sentinel_with_no_rescore_job(
         db.close()
 
 
-# M6 (the database import recomputing the precip-hour-start boundary key
-# for an old backup, keeping it for a new one) was removed with the
-# database import itself (storage-release plan 5.5).
+# No test here for the database import recomputing the precip-hour-start
+# boundary key for an old backup and keeping it for a new one.
 
 
 # ---------------------------------------------------------------------------
@@ -976,10 +975,10 @@ def _m18_seed_rank(
     )
 
 
-# Rain release, C4: the rain tile no longer blends the leaderboard's
-# selected feeds; it shows the published rain ranking's winner. The M18
-# cases keep their leaderboard fixtures and now pin that neither the
-# leaderboard's ranks nor the blend depth reach the rain tile.
+# The rain tile does not blend the leaderboard's selected feeds; it shows
+# the published rain ranking's winner. The M18 cases keep their
+# leaderboard fixtures and pin that neither the leaderboard's ranks nor
+# the blend depth reach the rain tile.
 
 
 def test_m18a0_rain_tile_follows_the_rain_ranking_not_the_leaderboard() -> None:

@@ -205,7 +205,7 @@ def _job_id_for_key(conn, job_type: str, key_suffix: str) -> int:  # type: ignor
 def _real_publication_id(conn, site_id: int, cutoff) -> str:  # type: ignore[no-untyped-def]
     """The real ``publications`` row's id for ``cutoff``, as text -- the
     id ``close_p4.publish``'s call-through actually returns, now that
-    P3's stand-in no longer invents one (plan 18.13)."""
+    the close stage's stand-in no longer invents one."""
     row = conn.execute(
         "SELECT id FROM publications WHERE site_id = ? AND cutoff = ?",
         (site_id, cutoff.isoformat()),

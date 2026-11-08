@@ -50,10 +50,10 @@ def _make_station(conn: sqlite3.Connection, pws_station_id: str = "ISTATION01") 
     return int(station_id)
 
 
-# SC1 (opening a version-11 file rebuilds station_wind_records to the
-# fresh shape, rows kept) and SC2 (the rebuild's own re-run guard) are
-# retired: both pinned migrate_v12_widen_raw_readings, deleted along with
-# every other migrate_v2 ... migrate_v16 function (storage release 4.1).
+# No test here for opening a version-11 file rebuilding
+# station_wind_records to the fresh shape with rows kept, or for the
+# rebuild's own re-run guard: both pinned migrate_v12_widen_raw_readings,
+# deleted along with every other migrate_v2 ... migrate_v16 function.
 # station_wind_records' widened shape is an unconditional part of
 # create_tables now, with no separate rebuild step left to guard or
 # compare against a fresh file, and user_version 1-15 is refused outright
@@ -194,6 +194,6 @@ def test_sc4_site_delete_route_cascades_to_station_wind_records(
         assert fk_violations == []
 
 
-# SC5 (import-file validation of fetched_at/local_date in
-# station_wind_records via `_validate_upload`) was removed with the database
-# import (storage-release plan 5.5).
+# No test here for import-file validation of fetched_at/local_date in
+# station_wind_records via `_validate_upload` (the database import no
+# longer exists).

@@ -80,10 +80,8 @@ def _boot(tmp_path: Path, name: str, monkeypatch: pytest.MonkeyPatch) -> object:
 def test_verification_page_route_returns_404(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Fails now: ``web/routes.py`` still registers ``GET /verification``
-    (``web/verification.py``'s ``load_verification``), so the page renders
-    200. Passes once W6 deletes the route and its template: FastAPI 404s
-    any path it has no route for."""
+    """``web/routes.py`` registers no ``GET /verification`` route, so
+    FastAPI 404s this path like any other it has no route for."""
     app = _boot(tmp_path, "page.db", monkeypatch)
     with TestClient(app) as client:
         resp = client.get("/verification")
@@ -129,27 +127,17 @@ def _csrf_headers(client: TestClient) -> dict[str, str]:
 def test_every_verification_api_route_returns_404(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, path: str
 ) -> None:
-    """Fails now for each case, but never against the framework's own
-    no-route 404 (``{"detail": "Not Found"}``) -- the app registers no
-    custom handler for unmatched routes (``wxverify/api/errors.py`` only
-    handles ``ApiError``, ``JobDeferred`` and ``RequestValidationError``),
-    so that body is Starlette's alone and is the one and only thing that
-    proves the route is gone.
+    """Only Starlette's own no-route 404 (``{"detail": "Not Found"}``)
+    proves the route is absent -- the app registers no custom handler for
+    unmatched routes (``wxverify/api/errors.py`` only handles
+    ``ApiError``, ``JobDeferred`` and ``RequestValidationError``), so that
+    body comes from Starlette alone, never from a route's own 404 (such as
+    an ``ApiError(404, ...)`` body ``{"error": ...}``, which would match
+    the status but not this body).
 
-    Today each case reaches the live route and gets one of:
-    - GET status/latest/runs/999 (+ verdicts/evidence/diagnostics/
-      methodology): the route's own ``ApiError(404, ...)`` ("site not
-      found" / "no published verification run" / "verification run not
-      found"), body ``{"error": ...}`` -- a 404 status but the WRONG body,
-      so today's assert on the body fails even though the status matches.
-    - GET /api/verification/status, /runs: 200, body a JSON object/array.
-    - PUT /api/verification/publish-hold (with a valid CSRF token so it
-      clears ``MutationGuard`` and reaches the route): 422 from the
-      ``held``/``confirm`` schema validation, since no body is sent.
-
-    Passes once W6 deletes ``api/routes/verification.py`` whole and its
-    ``app.py`` registration: FastAPI then has no route at any of these
-    paths and Starlette's own no-route handler answers 404 with
+    There is no ``api/routes/verification.py`` and no ``app.py``
+    registration for it: FastAPI has no route at any of these paths, so
+    Starlette's own no-route handler answers 404 with
     ``{"detail": "Not Found"}`` regardless of method, headers or body."""
     app = _boot(tmp_path, "api.db", monkeypatch)
     with TestClient(app) as client:

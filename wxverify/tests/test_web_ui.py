@@ -14,7 +14,7 @@ live-recomputes, so skill values are exact and deterministic). The two
 metric-boundary tests hand-derive their ``MetricSums`` and run them through
 the surviving pure ``metrics_from_sums`` so the boundary (skill None) is
 produced by real metric math, not asserted around -- no pair table exists
-any more for either to read live (storage release 3.1, W6b).
+for either to read live.
 
 Synthetic fixtures only — fake site names/coords, no real keys or station IDs.
 """
@@ -167,10 +167,10 @@ def _seed_cell(
     """Seed one leaderboard cell: a published ranking row.
 
     The composite/coverage panels and the leaderboard all read only the
-    active publication now, never a live recompute (storage release, table
-    1.B) -- the ``publication_rankings`` row (window_key ``w:all``) alone
-    supplies the exact ``skill``/``n`` that serves the leaderboard, giving
-    deterministic control of eligibility and skill.
+    active publication, never a live recompute -- the
+    ``publication_rankings`` row (window_key ``w:all``) alone supplies the
+    exact ``skill``/``n`` that serves the leaderboard, giving deterministic
+    control of eligibility and skill.
     """
     pub_id = _ensure_test_publication(conn, site_id=site_id)
     seed_publication_ranking(
@@ -840,10 +840,9 @@ def test_metric_boundary_continuous_persistence_mse_zero_is_neutral(
     feed = _feed_id(conn, "ecmwf_ifs")
     persistence = _feed_id(conn, "_persistence", source="virtual")
 
-    # Direct metrics assertion: skill None, withheld, at n >= min_n. The
-    # pair-aggregate SQL that used to compute these (`strategy_for(
-    # "temperature").aggregate`) is gone (W6b), and no pair table is read
-    # for scoring any more (storage release 3.1): hand-derived here as if
+    # Direct metrics assertion: skill None, withheld, at n >= min_n. No
+    # pair table is read for scoring; the sums below are hand-derived as
+    # if
     # from 3 matched valid_ats where persistence forecasts perfectly
     # (sq_error 0) and the feed has error 2.0 (n=3 >= min_n=2), through the
     # surviving pure `metrics_from_sums`: persistence_mse == 0 makes
@@ -911,9 +910,8 @@ def test_metric_boundary_precip_all_dry_all_correct_is_neutral(
     # All samples dry and correctly forecast dry: h=f=m=0, cn=N -> ETS
     # denominator empty -> skill None despite ample samples.
 
-    # The pair-aggregate SQL that used to compute these (`strategy_for(
-    # "precip").aggregate`) is gone (W6b), and no pair table is read for
-    # scoring any more (storage release 3.1): hand-derived here as if from
+    # No pair table is read for scoring; the sums below are hand-derived
+    # as if from
     # 4 days all correctly forecast dry (h=f=m=0, cn=4), through the
     # surviving pure `metrics_from_sums`: h+f+m all zero makes ETS's
     # denominator (and numerator) 0/0 -> None.
@@ -1561,7 +1559,7 @@ def test_overlay_chart_fallback_svg_hidden_and_summary_mount_outside_container(
     feed_id = _feed_id(conn, "ecmwf_ifs")
     # A published ranking cell so the Overlay's skill panel has something
     # to render; `load_overlay`'s own feed list comes from the site's
-    # active feeds regardless (storage release), not from this seed.
+    # active feeds regardless, not from this seed.
     _seed_cell(
         conn,
         site_id=site_id,

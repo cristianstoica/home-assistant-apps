@@ -759,8 +759,8 @@ def test_sd5_gap_hours_unpaired_and_threshold_from_truth_row(tmp_path) -> None: 
         if p["variable"] == "precip" and p["valid_at"] == rain_valid_at
     ]
     assert rain_pairs, "expected a rain pair at the seeded rain hour"
-    # cat_hit and rain_threshold_mm are no longer stored per row (storage
-    # release 3.1), so the fact they protected -- the truth row's threshold
+    # cat_hit and rain_threshold_mm are not stored per row, so the
+    # fact they protected -- the truth row's threshold
     # (0.25) wins over sites.rain_threshold_mm (0.5) -- is read here from
     # day_scores' categorical sum instead: this seeded hour is the day's
     # only one that can register a hit (every other hour is dry, a 0.0mm

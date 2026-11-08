@@ -184,8 +184,7 @@ def test_malformed_settings_table_falls_back_to_default_interval(
 # ---------------------------------------------------------------------------
 # Entry-point wiring: Database._open() (every open). This pins that the
 # wedge fix actually runs from the real caller, not just that the
-# underlying function works in isolation. (The database import's own
-# staged-upload pass was removed in the storage-release plan, 5.5.)
+# underlying function works in isolation.
 # ---------------------------------------------------------------------------
 
 
@@ -285,9 +284,8 @@ def test_boot_guard_clears_open_transaction_after_failed_rollback(
         db.close()
 
 
-# `test_stage_pending_rebuild_state_sanitizes_the_staged_upload` (the staged
-# import's own sanitize-before-promotion call) was removed with the database
-# import (storage-release plan 5.5).
+# No test here for the staged import's own sanitize-before-promotion
+# call.
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +599,4 @@ def test_up3_second_call_changes_nothing_and_logs_no_info(
         db.close()
 
 
-# UP4 (`test_up4_staged_upload_is_released_before_promotion`: the staged
-# import's own release-before-promotion call) was removed with the database
-# import (storage-release plan 5.5).
+# No test here for the staged import's own release-before-promotion call.

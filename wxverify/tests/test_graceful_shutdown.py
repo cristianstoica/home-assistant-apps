@@ -80,9 +80,9 @@ def _insert_job(
     conn: sqlite3.Connection, *, status: str = "pending", job_key: str = "k1"
 ) -> int:
     """Insert a minimal, synthetic ``fetch_feed`` job row against a minimal
-    seeded site. ``catchup`` (the job kind this fixture used before R8
-    retired it) is gone; ``fetch_feed`` is a kept main-lane kind the claim
-    still takes (``MAIN_LANE_TYPE_SQL``, ``db/queue.py``), and every test
+    seeded site. There is no ``catchup`` job kind; ``fetch_feed`` is a kept
+    main-lane kind the claim still takes (``MAIN_LANE_TYPE_SQL``,
+    ``db/queue.py``), and every test
     here stubs ``dispatch`` so the literal kind is otherwise inert. The
     jobs table's CHECK only allows a NULL ``site_id`` for ``catchup``, so a
     real site is seeded here for every call. The site is seeded disabled so
@@ -1562,8 +1562,8 @@ def test_startup_failure_after_task_creation_still_closes_the_database(
 # `idle_current_obs_poller` uses elsewhere); C3's plain-cancel/interrupted-
 # drain cases do the same; C3's repeated-cancel case unit-tests
 # `_shutdown_reclaim` directly; DL4/DL5 drive a REAL tmp `Database` end to
-# end, matching this file's existing idiom. (C4, the stale-generation case,
-# was removed with the generation fence itself -- storage-release plan 5.5.)
+# end, matching this file's existing idiom. (There is no stale-generation
+# case to drive.)
 # ---------------------------------------------------------------------------
 
 

@@ -5,11 +5,7 @@ A scripted deletion removed explanatory prose from the publish-hold panel
 "Nightly Verification Publishing" to "Nightly Verification Run Hold"; and
 the one fact the deleted prose carried -- that a run already in progress
 continues and may publish while the hold is armed -- was moved into the
-arm confirmation dialog in `app.js`. The Ops timezone-correction panel
-this file's O42/O43 tests once covered was removed in 0.16.14 Part 6, and
-the publish-hold panel this file's O44/O45 tests once covered was removed
-with the rest of the publish-hold feature in the storage-release plan
-(W6a); both panels' own coverage went with them.
+arm confirmation dialog in `app.js`.
 
 Isolation: HTTP-route oracles drive a real app over `TestClient` against a
 file-backed `tmp_path` database with an idle worker stand-in.

@@ -3,9 +3,9 @@ section 12, test IDs SC3-SC5): the five ``close_*`` tables and the widened
 ``jobs`` CHECK, both now unconditional parts of ``create_tables``.
 ``migrate_v13_close_jobs``, the migration that originally added them to an
 existing file, is deleted along with every other ``migrate_v2`` ...
-``migrate_v16`` function (storage release 4.1) -- SC1 and SC2's migration-
-mechanics tests retired with it; what remains (SC3-SC5) exercises the
-tables' own CHECK/foreign-key rules directly. Section 16.2 of the plan
+``migrate_v16`` function -- SC1 and SC2's migration-mechanics tests
+retired with it; what remains (SC3-SC5) exercises the tables' own
+CHECK/foreign-key rules directly. Section 16.2 of the plan
 names the mutant each surviving test ID kills; that mapping is also given
 inline on each assertion, in the file's own style.
 
@@ -30,20 +30,18 @@ from wxverify.db.migrations import create_tables
 # A hand-crafted version-12 file (today's narrow jobs CHECK, the five
 # close_* tables absent) used to stand in for a pre-piece-1 database here,
 # built by migrating a fresh file up and then undoing piece 1's additions.
-# That technique no longer has anything to undo onto a reachable schema:
+# That technique has nothing left to undo onto a reachable schema:
 # migrate_v13_close_jobs (and every other migrate_v2 ... migrate_v16
 # function) is deleted, create_tables carries the widened jobs CHECK and
 # the five close_* tables unconditionally, and user_version 1-15 is
-# refused outright rather than migrated (storage release 4.1) -- so no
-# test below builds one any more.
+# refused outright rather than migrated -- so no test below builds one.
 
 
-# test_sc1_fresh_and_migrated_files_agree_and_the_check_admits_both_kinds
-# is retired: it proved a migrated version-12 file lands on the same shape
-# as a fresh one, but migrate_v13_close_jobs (like every other migrate_v2
-# ... migrate_v16 function) is deleted, and user_version 1-15 is now
-# refused outright rather than migrated (storage release 4.1) -- there is
-# no migrated-from-v12 path left to compare against a fresh file.
+# No test here for the claim that a migrated version-12 file lands on the
+# same shape as a fresh one: migrate_v13_close_jobs (like every other
+# migrate_v2 ... migrate_v16 function) is deleted, and user_version 1-15
+# is now refused outright rather than migrated -- there is no
+# migrated-from-v12 path left to compare against a fresh file.
 
 
 # --- SC1 (extension): the CHECK copy in isolation ---------------------------
@@ -108,13 +106,13 @@ def test_sc1_create_tables_copy_of_the_check_admits_both_kinds_alone() -> None:
     _assert_jobs_check_admits_both_close_kinds_refuses_bogus(conn, mutant="M7c")
 
 
-# test_sc1_the_rebuild_guard_checks_for_day_publish_not_day_close and
-# test_sc2_a_fault_on_rename_leaves_v12_intact_and_the_rerun_converges are
-# both retired: both call migrate_v13_close_jobs directly, and it is
-# deleted along with every other migrate_v2 ... migrate_v16 function
-# (storage release 4.1) -- create_tables carries the widened jobs CHECK
-# and the five close_* tables unconditionally now, with no rebuild step
-# left to guard or fault-inject.
+# No test here for the rebuild guard checking for day_publish not
+# day_close, or for a fault on rename leaving a v12 file intact so the
+# rerun converges: both called migrate_v13_close_jobs directly, and it is
+# deleted along with every other migrate_v2 ... migrate_v16 function --
+# create_tables carries the widened jobs CHECK and the five close_*
+# tables unconditionally now, with no rebuild step left to guard or
+# fault-inject.
 
 
 # --- SC3 --------------------------------------------------------------------
@@ -548,12 +546,11 @@ def test_sc4_station_delete_scopes_to_its_rows_site_delete_clears_all_five() -> 
 
 # --- SC5 --------------------------------------------------------------------
 #
-# SC5's db-transfer-import tests (the two log tables' local_date check, and
-# close_publications.cutoff's foreign-key coverage) tested only
-# ``_validate_upload``, removed with the database import (storage-release
-# plan 5.5). The one SC5 test that also checked a live migration path (an
-# older version-12 file migrating the rest of the way on open) is retired
-# too: a version-12 file is now refused outright rather than migrated
-# (storage release 4.1), and a fresh or v16 file already carries the five
-# close_* tables unconditionally via create_tables -- nothing migrated-
-# from-v12-specific survives to test.
+# No test here for the two log tables' local_date check or for
+# close_publications.cutoff's foreign-key coverage: both tested only
+# ``_validate_upload``. The one such test that also checked a live
+# migration path (an older version-12 file migrating the rest of the way
+# on open) has no test either: a version-12 file is now refused outright
+# rather than migrated, and a fresh or v16 file already carries the five
+# close_* tables unconditionally via create_tables -- nothing
+# migrated-from-v12-specific survives to test.
