@@ -13,7 +13,6 @@ from wxverify.db.queue import (
     LATEST_JOB_SQL,
     enqueue_if_absent_with_cooldown,
 )
-from wxverify.db.site_days import daily_close_on
 from wxverify.worker.close_chain import enqueue_due_close_work
 from wxverify.worker.round import (
     enqueue_due_daytime_downloads,
@@ -46,10 +45,6 @@ _DUE_JOB_FAILURE_COOLDOWN = timedelta(hours=1)
 
 def scheduler_tick(conn: sqlite3.Connection) -> None:
     logger.debug("scheduler tick")
-    # While the daily close is off the tick enqueues nothing. The key is read
-    # in the tick's own transaction.
-    if not daily_close_on(conn):
-        return
     # The forward downloads: the scored round and the fixed daytime slots
     # (daily-close P4 4.4, 5.1).
     now = utc_now()

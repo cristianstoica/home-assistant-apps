@@ -14,11 +14,11 @@ flips an exact-value assertion.
 from __future__ import annotations
 
 import sqlite3
-from datetime import date
+from datetime import UTC, date, datetime
 
-from tests.helpers import close_off
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
+from wxverify.db.site_days import record_station_change, start_site_days
 from wxverify.db.switch import ensure_site_generation
 from wxverify.scoring.consensus import materialize_consensus
 from wxverify.verification.coverage import (
@@ -539,7 +539,6 @@ def test_consensus_marks_on_upsert_and_delete_branches() -> None:
     only — the classic relocation below the early return).
     """
     conn = _conn()
-    close_off(conn)
     site_id = _make_site(conn, timezone="UTC")
     day = "2026-06-10"
     _seed_obs(
@@ -549,6 +548,13 @@ def test_consensus_marks_on_upsert_and_delete_branches() -> None:
         [(f"{day}T{h:02d}:00:00Z", 10.0) for h in range(24)],
     )
     _seed_truth_rows(conn, site_id, day)
+
+    # A P1 record holding the day (the close is always on; the closed-day
+    # guard behind materialize_consensus refuses the write with no record).
+    start_site_days(
+        conn, site_id, date(2026, 6, 10), now_utc=datetime(2026, 6, 10, tzinfo=UTC)
+    )
+
     for i in range(3):
         cur = conn.execute(
             """
@@ -559,13 +565,25 @@ def test_consensus_marks_on_upsert_and_delete_branches() -> None:
             (site_id, f"SYNTH{i:03d}"),
         )
         assert cur.lastrowid is not None
+        station_id = int(cur.lastrowid)
+        # Puts the station on the day's saved list (6.2) through the real
+        # record_station_change path -- its "added" takes effect on the next
+        # local date, so a day-before now_utc lands it on `day`.
+        record_station_change(
+            conn,
+            site_id,
+            station_id,
+            "added",
+            reason="test fixture",
+            now_utc=datetime(2026, 6, 9, 12, tzinfo=UTC),
+        )
         conn.execute(
             """
             INSERT INTO station_observations
                 (station_id, variable, valid_at, value, qc_flag)
             VALUES (?, 'temperature', ?, 11.0, 'ok')
             """,
-            (int(cur.lastrowid), f"{day}T05:00:00Z"),
+            (station_id, f"{day}T05:00:00Z"),
         )
 
     # Upsert branch: three stations feed a consensus value.
@@ -575,6 +593,14 @@ def test_consensus_marks_on_upsert_and_delete_branches() -> None:
     rows = _truth_rows(conn, site_id, day)
     assert rows["temperature_high"]["stale"] == 1
     assert rows["temperature_low"]["stale"] == 1
+    assert (
+        conn.execute(
+            "SELECT 1 FROM observations WHERE site_id = ? AND variable = ?"
+            " AND valid_at = ?",
+            (site_id, "temperature", f"{day}T05:00:00Z"),
+        ).fetchone()
+        is not None
+    ), "the upsert branch must actually materialize a consensus observation"
 
     conn.execute("UPDATE daily_truth SET stale = 0")
 

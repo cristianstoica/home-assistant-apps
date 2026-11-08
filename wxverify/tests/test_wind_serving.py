@@ -395,17 +395,8 @@ def test_t66_weighted_hour_with_no_wind_contributor_is_none() -> None:
 def test_t66_weighted_states_wind_ignores_rebuilding() -> None:
     """``states["wind"]`` in ``pair_max`` is decided without consulting any
     ranking-rebuild flag -- weighted wind's own eligible feeds are always
-    ``low_confidence=False``, and its ``rebuilding`` dict is always empty,
-    so this must simply run cleanly and read "normal".
-
-    mutant_consult_rebuilding -> at
-    ``assert payload["states"]["wind"] == "normal"``: correct = ``"normal"``
-    (the override short-circuits before ``_any_rebuilding`` is called),
-    mutant (removing the ``False if variable == "wind" else ...``
-    override, so ``_any_rebuilding`` is always called) raises
-    ``KeyError`` instead of returning any state string, because
-    ``_any_rebuilding`` indexes ``rebuilding_by_feed[c.feed_id]`` directly
-    and wind's weighted-mode ``rebuilding["wind"]`` dict is always ``{}``.
+    ``low_confidence=False``, and wind has no per-feed "rebuilding" state
+    to consult at all, so this must simply run cleanly and read "normal".
     """
     conn = _make_db()
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")

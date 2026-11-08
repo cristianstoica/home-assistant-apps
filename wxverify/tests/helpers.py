@@ -24,7 +24,12 @@ import httpx
 import pytest
 
 from wxverify import config
-from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro, parse_utc
+from wxverify.core.timeutil import (
+    isoformat_utc,
+    isoformat_utc_micro,
+    local_day_slots,
+    parse_utc,
+)
 from wxverify.core.units import ms_to_kmh
 from wxverify.db.connection import (  # noqa: SLF001
     _READ_POOL_SIZE,
@@ -376,7 +381,6 @@ def day_close_site(
     conn: sqlite3.Connection,
     *,
     timezone: str = "UTC",
-    close_on: bool = True,
     with_records: bool = True,
     station_ids: tuple[str, str] = (_DAY_CLOSE_STATION_A, _DAY_CLOSE_STATION_B),
 ) -> int:
@@ -385,17 +389,16 @@ def day_close_site(
     Makes a site under ``timezone`` with two enabled stations, A and B,
     defaulting to ``ISTATION01`` and ``ISTATION02`` (override with
     ``station_ids``), each seeded with an ``added`` station_changes row
-    dated D-10 (``reason="test_seed"``). With ``close_on``, sets
-    ``DAILY_CLOSE_ON_KEY``. With ``with_records``, also starts the site at
-    D-3 and fills through its next local date, then moves D-3 to
-    ``closed`` and D-2 to ``missed`` (``never_attempted``), each 30 minutes
-    after that day's own ``day_end_utc``.
+    dated D-10 (``reason="test_seed"``), and sets ``DAILY_CLOSE_ON_KEY``.
+    With ``with_records``, also starts the site at D-3 and fills through
+    its next local date, then moves D-3 to ``closed`` and D-2 to
+    ``missed`` (``never_attempted``), each 30 minutes after that day's own
+    ``day_end_utc``.
     """
     # wxverify.db.site_days arrives in Step 4 piece 2 of the daily-close
     # plan; importing it inside this function body, rather than at module
     # top, keeps every other test module that imports this file collecting
     # until then.
-    from wxverify.db.runtime_state import delete_runtime_state
     from wxverify.db.site_days import (
         DAILY_CLOSE_ON_KEY,
         begin_close,
@@ -433,10 +436,7 @@ def day_close_site(
             (site_id, station_id, seed_date, seed_changed_at),
         )
 
-    if close_on:
-        set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(NOW))
-    else:
-        delete_runtime_state(conn, DAILY_CLOSE_ON_KEY)
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(NOW))
 
     if with_records:
         d_minus_3 = D - timedelta(days=3)
@@ -470,6 +470,22 @@ def day_close_site(
 
     _day_close_conns.append(conn)
     return site_id
+
+
+def evening_slots_utc(local_date: date, tz_name: str) -> tuple[datetime, ...]:
+    """The 15 evening-window instants for ``local_date`` in ``tz_name``,
+    written out independently of the app (plan §1.5), never from
+    ``EVENING_SLOTS``.
+
+    The suite's zones (``UTC`` and ``Etc/GMT-14``) have no clock change, so
+    ``end - start`` is always a plain 24 hours.
+    """
+    start, end, _tz_name = local_day_slots(local_date, tz_name)
+    assert end - start == timedelta(hours=24), (
+        "fixture bug: the suite's zones have no clock change"
+    )
+    minutes = (0, 6, 11, 16, 21, 26, 31, 36, 41, 46, 51, 56, 57, 58, 59)
+    return tuple(end - timedelta(hours=1) + timedelta(minutes=m) for m in minutes)
 
 
 def note_day_clock(t: datetime) -> datetime:
@@ -1130,7 +1146,7 @@ def standard_night(
     db = init_db(str(db_path))
     conn = db._conn  # noqa: SLF001 -- tests build the fixture on the real writer conn
 
-    site_id = day_close_site(conn, timezone="UTC", close_on=True, with_records=True)
+    site_id = day_close_site(conn, timezone="UTC", with_records=True)
     stations = {
         str(row["pws_station_id"]): int(row["id"])
         for row in conn.execute(
@@ -1242,26 +1258,6 @@ def meteoblue_package_feed_id(conn: sqlite3.Connection) -> int:
     ).fetchone()
     assert row is not None, "meteoblue/multimodel feed is not seeded"
     return int(row["id"])
-
-
-def close_off(conn: sqlite3.Connection) -> None:
-    """Put a test database in the close-off state (deletes
-    ``DAILY_CLOSE_ON_KEY`` and commits).
-
-    A fresh database now starts with the daily close ON (the storage
-    release's v17 upgrade stamps ``DAILY_CLOSE_ON_KEY`` on every fresh
-    build, ``_record_fresh_build_keys``); production never turns it back
-    off again -- the close is permanent (storage-release plan §3.2). Only
-    the close-off branches kept in other code for a later cleanup card
-    still read this state; call this right after the database is built,
-    before anything reads the key, for a test whose subject is one of
-    those close-off branches.
-    """
-    from wxverify.db.runtime_state import delete_runtime_state
-    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY
-
-    delete_runtime_state(conn, DAILY_CLOSE_ON_KEY)
-    conn.commit()
 
 
 def subscribe_meteoblue_package(conn: sqlite3.Connection, site_id: int) -> int:

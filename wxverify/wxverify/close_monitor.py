@@ -899,8 +899,7 @@ def close_alerts(conn: sqlite3.Connection, now: datetime) -> list[CloseAlert]:
     ``CLOSE_RECOVERED_SHOW_HOURS``. Enabled sites only, and only days with
     a P1 record, so before any day has a state every alert is ok; a site
     with no record holding ``now`` has no current day, and alerts 4 and 7
-    and the daytime warning leave it out. Called only while the close is
-    on. Read-only.
+    and the daytime warning leave it out. Read-only.
     """
     missed: list[str] = []
     thin: list[str] = []
@@ -1056,20 +1055,16 @@ def _silent_line(
     )
 
 
-def station_silent(
-    conn: sqlite3.Connection, now: datetime, *, close_on: bool
-) -> CloseAlert:
+def station_silent(conn: sqlite3.Connection, now: datetime) -> CloseAlert:
     """Alert 5, ``station_silent_today``: stations whose poll sees them silent.
 
     Judges each enabled station of an enabled site from its
     ``station_poll_state`` row, ``online`` and ``offline`` only: ``transient``
     and ``terminal`` are failures, not silence. While ``current_obs`` is
     among ``refused_kinds`` no station is judged, since the refused key is
-    alert 6's. Never reads the full-day readings (plan §6.3, K3). Called with
-    the close on and off; ``close_on`` is the switch as the caller read it.
-    With it on, a station alert 3 names for every variable is left out, so
-    it shows once, as alert 3's standing line; with it off there is no
-    alert 3 and nothing is left out. Read-only.
+    alert 6's. Never reads the full-day readings (plan §6.3, K3). A station
+    alert 3 names for every variable is left out, so it shows once, as
+    alert 3's standing line. Read-only.
     """
     if any(record.kind == "current_obs" for record in refused_kinds(conn, now)):
         return CloseAlert(id=_STATION_SILENT_ID, tripped=False, count=0)
@@ -1078,7 +1073,7 @@ def station_silent(
         line = _silent_line(str(row[1]), row[2], row[3], row[4], now)
         if line is not None:
             found.append((int(row[0]), line))
-    if close_on and found:
+    if found:
         every_variable = {
             finding.station_id
             for finding in _nothing_usable(conn, now)
@@ -1238,8 +1233,7 @@ def access_days_affected(conn: sqlite3.Connection, now: datetime) -> AccessDays:
     the refusal run and that are not done or were done within
     ``CLOSE_ALERT_DAYS``, with the state as "collecting", "closing", "retry
     due <retry_at>", "closed" or "missed". Never judges or names a station.
-    Empty while no kind is listed. Called only while the close is on.
-    Read-only.
+    Empty while no kind is listed. Read-only.
     """
     refused = refused_kinds(conn, now)
     if not refused:

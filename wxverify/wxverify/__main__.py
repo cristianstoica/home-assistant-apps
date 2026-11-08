@@ -10,8 +10,7 @@ import logging
 import sqlite3
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from pathlib import Path
+from datetime import date, timedelta
 from typing import Any, NoReturn, cast
 
 import uvicorn
@@ -24,23 +23,17 @@ from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.log_redaction import RedactUrlSecretsFilter
 from wxverify.core.options import load_runtime_config
-from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
+from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import get_db, init_db
-from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import (
     count_failed_jobs_older_than,
     purge_failed_jobs_older_than,
 )
-from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.db.site_days import (
-    OFFLINE_COPY_KEY,
     RETIRED_CONTROL_MESSAGE,
     DayStateError,
-    daily_close_on,
     day_record,
-    day_station_ids,
     enter_zone_change,
-    open_day_on_copy,
 )
 from wxverify.provider_ops import (
     NEW_PROVIDER_SOURCES,
@@ -56,12 +49,6 @@ from wxverify.provider_ops import (
 )
 from wxverify.settings.keys import get_setting, set_setting
 from wxverify.settings.service import set_rolling_window_days_sync
-from wxverify.worker.close_chain import (
-    begin_offline_close,
-    close_status,
-    run_offline_stage,
-    stage_log,
-)
 from wxverify.worker.feed_fetch import (
     BackoffActive,
     BudgetExhausted,
@@ -88,10 +75,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         return _serve(args)
     _configure_logging()
-    if args.command == "close-day":
-        # Before init_db, which migrates the file and sets WAL: close-day
-        # reads --db only through a read-only connection (plan 8.8).
-        return _close_day(args)
     init_db(args.db)
     if args.command == "fetch":
         return _fetch(args)
@@ -212,12 +195,6 @@ def _build_parser() -> argparse.ArgumentParser:
     # message rather than a usage error.
     tz_change.add_argument("--effective-from")
     tz_change.add_argument("--json", action="store_true")
-
-    # Plan 8.8: one past day closed offline, on a copy of --db.
-    close_day = sub.add_parser("close-day")
-    close_day.add_argument("--site", type=int, required=True)
-    close_day.add_argument("--date", type=date.fromisoformat, required=True)
-    close_day.add_argument("--hours", choices=("stored", "raw"), required=True)
     return parser
 
 
@@ -388,10 +365,6 @@ def _timezone(args: argparse.Namespace) -> int:
     _die("unknown timezone command")
 
 
-def _or_dash(value: object) -> str:
-    return "-" if value is None else str(value)
-
-
 def _timezone_error(message: str, *, json_output: bool) -> int:
     """Report a rejected timezone operation: message, exit 1, no traceback."""
     if json_output:
@@ -403,7 +376,7 @@ def _timezone_error(message: str, *, json_output: bool) -> int:
 
 @dataclass(frozen=True, slots=True)
 class _ZoneChangeEntered:
-    """A zone change entered while the daily close is on."""
+    """A zone change entered from the next full local day."""
 
     changeover_date: date | None
     first_full_day: date
@@ -437,10 +410,6 @@ def _timezone_change(args: argparse.Namespace) -> int:
     )
 
     def _write(conn: sqlite3.Connection) -> _ZoneChangeEntered:
-        # The daily close is read inside this write transaction, so the
-        # refusal and the write it guards see the same state.
-        if not daily_close_on(conn):
-            raise ValueError("a zone change can be entered once the daily close is on")
         if effective_from is not None:
             raise ValueError(
                 "a zone change applies from the next full local day; "
@@ -471,241 +440,6 @@ def _timezone_change(args: argparse.Namespace) -> int:
         print(f"  changeover date: {changeover}")
     print(f"  first full day under the new zone: {first_full_day}")
     return 0
-
-
-#: A worker heartbeat younger than this means an add-on may still be running
-#: on the file, so ``close-day`` refuses it (plan 8.8).
-_LIVE_WORKER_WINDOW = timedelta(minutes=10)
-#: ``close-day --hours raw``'s refusal when no raw reading of the day has a
-#: temperature (plan 8.8).
-_NO_RAW_TEMPERATURE = "no raw reading of that day has a temperature"
-
-
-class _CopyRefused(Exception):
-    """``close-day`` refuses the file; the message says why (plan 8.8)."""
-
-
-def _copy_beside(source: Path, made_at: datetime) -> Path:
-    """Copy ``source`` to a new file beside it, named with ``made_at`` (8.8).
-
-    Reads ``source`` only through a read-only connection: first its
-    ``worker_last_loop_at``, raising ``_CopyRefused`` with nothing created
-    when that heartbeat is under ``_LIVE_WORKER_WINDOW`` old or unreadable;
-    then as the source of SQLite's backup API. The copy is neither migrated
-    nor marked here. A failed backup removes the copy.
-    """
-    resolved = source.resolve()
-    reader = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
-    try:
-        reader.row_factory = sqlite3.Row
-        last_loop = get_runtime_state(reader, "worker_last_loop_at")
-        if last_loop is not None:
-            try:
-                age = made_at - parse_utc(last_loop)
-            except ValueError:
-                raise _CopyRefused(
-                    "the file's worker heartbeat is unreadable"
-                ) from None
-            if age < _LIVE_WORKER_WINDOW:
-                raise _CopyRefused(
-                    "the file's worker ran less than 10 minutes ago;"
-                    " stop the add-on and copy its database first"
-                )
-        stamp = made_at.strftime("%Y%m%dT%H%M%SZ")
-        target = resolved.with_name(
-            f"{resolved.stem}.close-day-{stamp}{resolved.suffix}"
-        )
-        target.touch(mode=0o600, exist_ok=False)
-        try:
-            copy_conn = sqlite3.connect(target)
-            try:
-                reader.backup(copy_conn)
-            finally:
-                copy_conn.close()
-        except BaseException:
-            target.unlink(missing_ok=True)
-            raise
-    finally:
-        reader.close()
-    return target
-
-
-def _begin_write(conn: sqlite3.Connection) -> sqlite3.Connection:
-    """Open a ``BEGIN IMMEDIATE`` transaction on ``conn`` and return it.
-
-    Used as ``with _begin_write(conn):``, so the connection's own context
-    manager commits the transaction, or rolls it back on an exception, as
-    the add-on's writer runs each write (``Database._run_immediate``).
-    """
-    conn.execute("BEGIN IMMEDIATE")
-    return conn
-
-
-def _day_has_raw_temperature(
-    conn: sqlite3.Connection, site_id: int, local_date: date
-) -> bool:
-    """Whether a raw reading of the day has a temperature (plan 8.8).
-
-    A ``station_wind_records`` row of a station on the day's saved list
-    (``day_station_ids``, the stations stage 3 rebuilds), with ``obs_at``
-    inside the day record's bounds (as stage 3 reads them) and ``temp_c``
-    set. One primary-key range read per station, stopping at the first hit.
-    """
-    record = day_record(conn, site_id, local_date)
-    if record is None:
-        return False
-    start = isoformat_utc(record.day_start_utc)
-    end = isoformat_utc(record.day_end_utc)
-    for station_id in sorted(day_station_ids(conn, site_id, local_date)):
-        row = conn.execute(
-            "SELECT 1 FROM station_wind_records"
-            " WHERE station_id = ? AND obs_at >= ? AND obs_at < ?"
-            " AND temp_c IS NOT NULL LIMIT 1",
-            (station_id, start, end),
-        ).fetchone()
-        if row is not None:
-            return True
-    return False
-
-
-def _print_offline_close(
-    conn: sqlite3.Connection, site_id: int, local_date: date, *, raw_hours: bool
-) -> int:
-    """Print what K34 measures for the day; 0 when it closed (plan 8.8).
-
-    The day's verdict per value, the truth version, P4's summary of
-    forecasts scored and absent (stage 5's detail) and each stage's
-    duration from the stage log (11.1).
-    """
-    status = close_status(
-        conn, site_id=site_id, local_date=local_date, now_utc=utc_now()
-    )
-    if status is None:
-        print(f"error site {site_id} has no record dated {local_date.isoformat()}")
-        return 1
-    print(f"day site={site_id} date={local_date.isoformat()} state={status.state}")
-    attempt = status.attempt_records[-1] if status.attempt_records else None
-    truth_version = None if attempt is None else attempt.truth_version
-    print(f"truth version {_or_dash(truth_version)}")
-    verdicts = conn.execute(
-        "SELECT quantity, value, eligible, exclusion_reason FROM daily_truth"
-        " WHERE site_id = ? AND local_date = ? ORDER BY quantity",
-        (site_id, local_date.isoformat()),
-    ).fetchall()
-    for row in verdicts:
-        eligible = "yes" if row["eligible"] else "no"
-        print(
-            f"verdict {row['quantity']} value={_or_dash(row['value'])}"
-            f" eligible={eligible} exclusion={_or_dash(row['exclusion_reason'])}"
-        )
-    if not raw_hours:
-        print("stage 3 not run (--hours stored)")
-    for run in stage_log(conn, site_id=site_id, local_date=local_date):
-        line = (
-            f"stage {run.stage} {run.outcome} duration_s={run.duration_s:.3f}"
-            f" queue_wait_s={run.queue_wait_s:.3f}"
-        )
-        if run.reason is not None:
-            line += f" reason={run.reason}"
-        print(line)
-        if run.stage == 5 and run.outcome == "completed":
-            print(f"  forecasts scored and absent {run.detail}")
-    if status.state != "closed":
-        print(f"error the day did not close: {_or_dash(status.last_failure)}")
-        return 1
-    return 0
-
-
-def _run_offline_close(
-    conn: sqlite3.Connection, site_id: int, local_date: date, *, raw_hours: bool
-) -> int:
-    """``begin_close``, stage 3 (``--hours raw`` only), stages 4 to 6 (8.8).
-
-    Each step in its own write on the copy, as in the add-on. With
-    ``--hours raw`` it refuses, before stage 3 writes, when no raw reading
-    of the day has a temperature.
-    """
-    first_stage = 3 if raw_hours else 4
-    try:
-        with _begin_write(conn):
-            begin_offline_close(
-                conn,
-                site_id=site_id,
-                local_date=local_date,
-                first_stage=first_stage,
-                now_utc=utc_now(),
-            )
-    except DayStateError as exc:
-        print(f"error {exc}")
-        return 1
-    if raw_hours and not _day_has_raw_temperature(conn, site_id, local_date):
-        print(f"error {_NO_RAW_TEMPERATURE}")
-        return 1
-    for stage in range(first_stage, 7):
-        try:
-            with _begin_write(conn):
-                ran = run_offline_stage(
-                    conn, site_id=site_id, local_date=local_date, stage=stage
-                )
-        except Exception as exc:
-            print(f"error stage {stage} failed: {sanitized_exception(exc)}")
-            return 1
-        if not ran:
-            break
-    return _print_offline_close(conn, site_id, local_date, raw_hours=raw_hours)
-
-
-def _close_day(args: argparse.Namespace) -> int:
-    """Close one past day offline, on a copy of ``--db`` (plan 8.8, K34).
-
-    Refuses with exit 1, before anything opens ``--db`` for writing, when
-    it is the add-on's own database or its worker ran less than 10 minutes
-    ago. Otherwise copies it beside itself, migrates the copy, marks it
-    with ``OFFLINE_COPY_KEY``, opens the day there with P1's
-    ``open_day_on_copy`` and closes it: stage 3 only with ``--hours raw``,
-    then stages 4 to 6. No network call, no publication, no cleanup, no raw
-    retention; ``--db`` itself is never written. Prints the copy's path and
-    the close's results; returns 0 when the day closed, else 1.
-    """
-    source = Path(str(args.db))
-    site_id = int(args.site)
-    local_date: date = args.date
-    raw_hours = args.hours == "raw"
-    if source.resolve() == Path(config.db_path).resolve():
-        print("error refusing the add-on's own database; pass a copy with --db")
-        return 1
-    made_at = utc_now()
-    try:
-        copy_path = _copy_beside(source, made_at)
-    except _CopyRefused as exc:
-        print(f"error {exc}")
-        return 1
-    except (OSError, sqlite3.Error) as exc:
-        print(f"error cannot copy the database: {sanitized_exception(exc)}")
-        return 1
-    print(f"copy {copy_path}")
-    conn = sqlite3.connect(copy_path, isolation_level=None)
-    try:
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        with _begin_write(conn):
-            run_migrations(conn)
-            set_runtime_state(conn, OFFLINE_COPY_KEY, isoformat_utc(made_at))
-        try:
-            with _begin_write(conn):
-                open_day_on_copy(
-                    conn,
-                    site_id,
-                    local_date,
-                    now_utc=utc_now(),
-                    live_db_path=Path(config.db_path),
-                )
-        except DayStateError as exc:
-            print(f"error {exc}")
-            return 1
-        return _run_offline_close(conn, site_id, local_date, raw_hours=raw_hours)
-    finally:
-        conn.close()
 
 
 def _providers_doctor(args: argparse.Namespace) -> int:

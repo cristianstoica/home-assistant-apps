@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.helpers import asof_conn, asof_make_site, close_off
+from tests.helpers import asof_conn, asof_make_site
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.options import (
@@ -464,7 +464,6 @@ def test_liveness_no_eligible_work_does_not_trip(
         db = get_db()
 
         def _seed(conn: sqlite3.Connection) -> None:
-            close_off(conn)
             conn.execute(
                 "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
                 "WHERE key='worker_started_at'"
@@ -473,7 +472,7 @@ def test_liveness_no_eligible_work_does_not_trip(
 
         db.write_sync(_seed)
         body = client.get("/api/health/monitor").json()
-        for cid in ("fetch_obs_live", "fetch_feed_live"):
+        for cid in ("fetch_feed_live",):
             assert _cond(body, cid)["ok"] is True
 
 
@@ -489,7 +488,6 @@ def test_liveness_disabled_site_and_unsubscribed_feed_do_not_trip(
         db = get_db()
 
         def _seed(conn: sqlite3.Connection) -> None:
-            close_off(conn)
             conn.execute(
                 "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
                 "WHERE key='worker_started_at'"
@@ -510,7 +508,7 @@ def test_liveness_disabled_site_and_unsubscribed_feed_do_not_trip(
 
         db.write_sync(_seed)
         body = client.get("/api/health/monitor").json()
-        for cid in ("fetch_obs_live", "fetch_feed_live"):
+        for cid in ("fetch_feed_live",):
             assert _cond(body, cid)["ok"] is True
 
 
@@ -543,134 +541,6 @@ def test_fetch_feed_live_trips_when_eligible_feed_but_no_recent_run(
         db.write_sync(_seed)
         body = client.get("/api/health/monitor").json()
         assert _cond(body, "fetch_feed_live")["ok"] is False
-
-
-def test_obs_stale_uses_sites_last_obs_at(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    close_db()
-    config.db_path = str(tmp_path / "obs-stale.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
-    app = create_app(root_path="")
-    with TestClient(app) as client:
-        db = get_db()
-
-        def _seed(conn: sqlite3.Connection) -> None:
-            close_off(conn)
-            conn.execute(
-                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
-                "WHERE key='worker_started_at'"
-            )
-            site_id = _seed_site(conn)
-            conn.execute(
-                """
-                INSERT INTO stations
-                    (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-                VALUES (?, 'FAKE1', 40.0, -105.0, 900.0, 1)
-                """,
-                (site_id,),
-            )
-            # last_obs_at NULL → never-observed → stale.
-
-        db.write_sync(_seed)
-        body = client.get("/api/health/monitor").json()
-        assert _cond(body, "obs_stale")["ok"] is False
-        assert _cond(body, "fetch_obs_live")["ok"] is False
-
-
-def test_obs_stale_at_cutoff_boundary_does_not_trip(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Threshold boundary: a site with last_obs_at exactly equal to obs_cutoff
-    # must NOT count, because the SQL uses `s.last_obs_at < ?` (strict). A
-    # mutant that widened this to `<=` would count the at-boundary site and
-    # fail this assertion. Paired with the "one second earlier" test below to
-    # pin both sides of the `<` operator.
-    fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
-    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
-
-    close_db()
-    config.db_path = str(tmp_path / "obs-stale-at-boundary.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
-    app = create_app(root_path="")
-    with TestClient(app) as client:
-        db = get_db()
-
-        def _seed(conn: sqlite3.Connection) -> None:
-            close_off(conn)
-            conn.execute(
-                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
-                "WHERE key='worker_started_at'"
-            )
-            # Eligible site: enabled, with >=1 enabled station.
-            site_id = _seed_site(conn)
-            conn.execute(
-                """
-                INSERT INTO stations
-                    (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-                VALUES (?, 'FAKE2', 40.0, -105.0, 900.0, 1)
-                """,
-                (site_id,),
-            )
-            # obs_cutoff = fixed_now - 12h = 2026-07-09T00:00:00Z exactly.
-            conn.execute(
-                "UPDATE sites SET last_obs_at='2026-07-09T00:00:00Z' WHERE id=?",
-                (site_id,),
-            )
-
-        db.write_sync(_seed)
-        body = client.get("/api/health/monitor").json()
-        assert _cond(body, "obs_stale")["ok"] is True
-        assert _cond(body, "obs_stale")["count"] == 0
-
-
-def test_obs_stale_one_second_past_cutoff_trips(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Paired: a site with last_obs_at one second OLDER than obs_cutoff must
-    # count. Together with the at-boundary test above this pins both sides of
-    # the `<` operator so a misplaced `<=` or a reversed comparison would be
-    # caught by at least one of the pair.
-    fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
-    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
-
-    close_db()
-    config.db_path = str(tmp_path / "obs-stale-past-boundary.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
-    app = create_app(root_path="")
-    with TestClient(app) as client:
-        db = get_db()
-
-        def _seed(conn: sqlite3.Connection) -> None:
-            close_off(conn)
-            conn.execute(
-                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
-                "WHERE key='worker_started_at'"
-            )
-            # Eligible site: enabled, with >=1 enabled station.
-            site_id = _seed_site(conn)
-            conn.execute(
-                """
-                INSERT INTO stations
-                    (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-                VALUES (?, 'FAKE2', 40.0, -105.0, 900.0, 1)
-                """,
-                (site_id,),
-            )
-            # obs_cutoff = 2026-07-09T00:00:00Z;
-            # 2026-07-08T23:59:59Z is 1 second older → stale.
-            conn.execute(
-                "UPDATE sites SET last_obs_at='2026-07-08T23:59:59Z' WHERE id=?",
-                (site_id,),
-            )
-
-        db.write_sync(_seed)
-        body = client.get("/api/health/monitor").json()
-        assert _cond(body, "obs_stale")["ok"] is False
-        assert _cond(body, "obs_stale")["count"] == 1
 
 
 def test_feed_stale_old_timestamp_trips(
@@ -805,7 +675,6 @@ def test_liveness_recent_completed_job_does_not_trip(
         db = get_db()
 
         def _seed(conn: sqlite3.Connection) -> None:
-            close_off(conn)
             site_id = _seed_site(conn)
             conn.execute(
                 "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
@@ -846,7 +715,7 @@ def test_liveness_recent_completed_job_does_not_trip(
         db.write_sync(_seed)
         body = client.get("/api/health/monitor").json()
         assert body["grace_active"] is False
-        for cid in ("fetch_obs_live", "fetch_feed_live"):
+        for cid in ("fetch_feed_live",):
             c = _cond(body, cid)
             assert c["ok"] is True, f"{cid} should be ok with recent completed job"
 
@@ -3401,9 +3270,12 @@ def test_al2_single_future_hold_trips_with_full_detail() -> None:
     label = "current conditions"
     since_text = isoformat_utc(_AL_N - timedelta(minutes=30))
     until_text = isoformat_utc(_AL_N + timedelta(hours=2))
+    # The close's part of the alert (always read now): a future `until`
+    # means a next-try clause for the kind (no sites, so no days affected).
     assert cond["detail"] == (
         f"weather.com access refused (HTTP 401): {label}; "
-        f"since {since_text}; held until {until_text}"
+        f"since {since_text}; held until {until_text}; "
+        f"next try: current conditions at {until_text}"
     )
     assert cond["group"] == "budget"
     assert cond["severity"] == "warning"
@@ -3440,10 +3312,16 @@ def test_al5_current_obs_401_and_five_minute_403_list_both_statuses() -> None:
     assert cond["count"] == 2
     label_current_obs = "current conditions"
     label_five_minute = "5-minute readings"
+    # The close's part of the alert (always read now): both kinds' `until`
+    # is still in the future, so both get a next-try clause (no sites, so
+    # the five-minute one falls to the "first scheduled download" clause).
     assert cond["detail"] == (
         f"weather.com access refused (HTTP 401/403): "
         f"{label_current_obs}, {label_five_minute}; "
-        f"since {since_five_minute}; held until {until_five_minute}"
+        f"since {since_five_minute}; held until {until_five_minute}; "
+        f"next try: current conditions at {until_current_obs}, "
+        f"5-minute readings at the first scheduled download after"
+        f" {until_five_minute}"
     )
 
 
@@ -3484,11 +3362,19 @@ def test_al5b_three_kinds_min_since_max_until_in_access_kinds_order() -> None:
     cond = _al(conn)
     assert cond["count"] == 3
     detail = str(cond["detail"])
-    assert f"since {since_hourly}" in detail
-    assert f"held until {until_current_obs}" in detail
-    assert since_current_obs not in detail
-    assert until_hourly not in detail
-    assert until_five_minute not in detail
+    # The close's part of the alert (always read now) appends a next-try
+    # clause per kind after "; next try:", which legitimately repeats
+    # some of these kinds' own `until` stamps (e.g. five_minute's, in its
+    # own "first scheduled download after <until>" fallback) -- this
+    # test's subject is the base line's since/until selection, so the
+    # since/until checks below are scoped to the base line, before that
+    # suffix starts.
+    base_detail = detail.split("; next try:")[0]
+    assert f"since {since_hourly}" in base_detail
+    assert f"held until {until_current_obs}" in base_detail
+    assert since_current_obs not in base_detail
+    assert until_hourly not in base_detail
+    assert until_five_minute not in base_detail
     statuses_part = "(HTTP 401/403)"
     assert statuses_part in detail
     labels_part = ", ".join(
@@ -3548,9 +3434,12 @@ def test_al6_partially_unreadable_hold_shows_unreadable_hold_label_text() -> Non
     assert cond["ok"] is False
     assert cond["count"] == 1
     label = ACCESS_KIND_LABELS["hourly"]
+    # The close's part of the alert (always read now): an unreadable
+    # `until` means the days-affected read cannot bound its run, so it
+    # reports "unreadable until" rather than a next-try clause.
     assert cond["detail"] == (
         f"weather.com access refused (HTTP 401): {label} (unreadable hold); "
-        "waiting for the next try"
+        "waiting for the next try; days affected: unreadable until"
     )
 
 
@@ -3568,9 +3457,12 @@ def test_al6b_fully_unreadable_hold_drops_status_head_and_since() -> None:
     cond = _al(conn)
     assert cond["count"] == 1
     label = ACCESS_KIND_LABELS["hourly"]
+    # The close's part of the alert (always read now): an unreadable
+    # `until` means the days-affected read cannot bound its run, so it
+    # reports "unreadable until" rather than a next-try clause.
     assert cond["detail"] == (
         f"weather.com access refused: {label} (unreadable hold); "
-        "waiting for the next try"
+        "waiting for the next try; days affected: unreadable until"
     )
 
 

@@ -1,13 +1,11 @@
-"""Retired checks, the keep list and the switch (daily-close plan
-2026-10-22-daily-close-alerts-and-pages.md §4, §13.2; test IDs RT1-RT9).
+"""Retired checks and the keep list (daily-close plan
+2026-10-22-daily-close-alerts-and-pages.md §4, §13.2; test IDs RT2, RT3,
+RT5-RT9).
 
 Written before ``wxverify.close_monitor`` exists: most rows import it (or a
 name ``monitor.py`` has not yet added) inside the test body, so the rest of
 this file keeps collecting -- each then fails at its own import or at an
 assertion against today's unchanged ``build_verdict``, never at collection.
-RT4 is the one row that may pass unmodified: it pins today's unchanged
-behaviour (no production code here reads the close switch yet, so a kept
-check looks identical with the switch on and off).
 
 Real SQLite throughout (``tests.helpers.asof_conn``), real migrations;
 nothing in the code under test is mocked. Synthetic data only: stations
@@ -19,21 +17,10 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from tests.helpers import NOW, D, asof_conn, close_off, day_close_site
+from tests.helpers import NOW, D, asof_conn, day_close_site
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.monitor import build_verdict
 
-_TODAY_PIPELINE_IDS = (
-    "feed_stale",
-    "obs_stale",
-    "fetch_obs_live",
-    "fetch_feed_live",
-    "problem_jobs",
-    "obs_station_history_failing",
-    "obs_collection_delayed",
-    "main_worker_liveness",
-    "wind_history",
-)
 _RETIRED_IDS = (
     "obs_stale",
     "fetch_obs_live",
@@ -97,60 +84,10 @@ def _trip_retired_checks(conn, site_id: int) -> None:
     )
 
 
-def test_rt1_switch_off_pipeline_ids_and_skipped_list() -> None:
-    """RT1: close off; pipeline_enabled true, then false (M1, M2)."""
-    conn = asof_conn()
-    close_off(conn)
-    day_close_site(conn, close_on=False)
-
-    on = build_verdict(
-        conn,
-        pipeline_enabled=True,
-        budget_enabled=True,
-        db_enabled=True,
-        now=NOW,
-        export_sweeper_dead=None,
-    )
-    ids = _condition_ids(on)
-    pipeline_ids = [c for c in ids if c in _TODAY_PIPELINE_IDS]
-    assert pipeline_ids == list(_TODAY_PIPELINE_IDS), (
-        "M1/M2 -> at this assertion: correct = today's nine pipeline ids in"
-        f" today's order, mutant = {pipeline_ids!r}"
-    )
-    assert "station_silent_today" in ids, (
-        "M1 -> at this assertion: correct = 'station_silent_today' present"
-        " with the close off, mutant = absent (built only with the close on)"
-    )
-    assert not any(cid in _CLOSE_ALERT_IDS for cid in ids), (
-        "M1 -> at this assertion: correct = no close_alerts id with the"
-        f" close off, mutant = one present in {ids!r}"
-    )
-
-    off = build_verdict(
-        conn,
-        pipeline_enabled=False,
-        budget_enabled=True,
-        db_enabled=True,
-        now=NOW,
-        export_sweeper_dead=None,
-    )
-    skipped = [
-        str(c["id"])
-        for c in off["conditions"]
-        if c["group"] == "pipeline"  # type: ignore[index]
-    ]
-    expected_skipped = list(_TODAY_PIPELINE_IDS) + ["station_silent_today"]
-    assert skipped == expected_skipped, (
-        "M2 -> at this assertion: correct ="
-        f" {expected_skipped!r}, mutant = {skipped!r}"
-        " (station_silent_today left out of the close-off skipped list)"
-    )
-
-
 def test_rt2_close_on_no_retired_rows() -> None:
     """RT2: close on, every retired check seeded to trip (M3, M4)."""
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     _trip_retired_checks(conn, site_id)
 
     verdict = build_verdict(
@@ -172,7 +109,7 @@ def test_rt2_close_on_no_retired_rows() -> None:
 def test_rt3_close_on_pipeline_disabled_skipped_list() -> None:
     """RT3: close on; pipeline_enabled false (M5)."""
     conn = asof_conn()
-    day_close_site(conn, close_on=True)
+    day_close_site(conn)
 
     verdict = build_verdict(
         conn,
@@ -201,74 +138,10 @@ def test_rt3_close_on_pipeline_disabled_skipped_list() -> None:
         )
 
 
-def test_rt4_kept_checks_equal_close_on_and_off() -> None:
-    """RT4: each kept check seeded to trip, close off then on (M6).
-
-    Pins today's unchanged behaviour: pins that `problem_jobs` (and the
-    other kept checks) are not reading any close-on branch yet. This row
-    may pass on today's code (13.1 Step 3 names it explicitly) because no
-    production code under test reads the close switch at all today.
-    """
-    conn_off = asof_conn()
-    site_id_off = day_close_site(conn_off, close_on=False)
-    _trip_retired_checks(conn_off, site_id_off)
-    # Trip problem_jobs too: a failed single-row job well past its age bound.
-    conn_off.execute(
-        "INSERT INTO jobs (type, job_key, site_id, status, result, payload,"
-        " retry_count, max_retries, created_at, updated_at)"
-        " VALUES ('fetch_obs', 'obs', ?, 'failed', NULL, '{}', 1, 0, ?, ?)",
-        (
-            site_id_off,
-            "2024-05-01T00:00:00.000Z",
-            "2024-05-01T00:00:00.000Z",
-        ),
-    )
-
-    off = build_verdict(
-        conn_off,
-        pipeline_enabled=True,
-        budget_enabled=True,
-        db_enabled=True,
-        now=NOW,
-        export_sweeper_dead=None,
-    )
-
-    conn_on = asof_conn()
-    site_id_on = day_close_site(conn_on, close_on=True)
-    _trip_retired_checks(conn_on, site_id_on)
-    conn_on.execute(
-        "INSERT INTO jobs (type, job_key, site_id, status, result, payload,"
-        " retry_count, max_retries, created_at, updated_at)"
-        " VALUES ('fetch_obs', 'obs', ?, 'failed', NULL, '{}', 1, 0, ?, ?)",
-        (
-            site_id_on,
-            "2024-05-01T00:00:00.000Z",
-            "2024-05-01T00:00:00.000Z",
-        ),
-    )
-
-    on = build_verdict(
-        conn_on,
-        pipeline_enabled=True,
-        budget_enabled=True,
-        db_enabled=True,
-        now=NOW,
-        export_sweeper_dead=None,
-    )
-
-    off_by_id = {str(c["id"]): c for c in off["conditions"]}  # type: ignore[index]
-    on_by_id = {str(c["id"]): c for c in on["conditions"]}  # type: ignore[index]
-    for kept_id in _KEPT_PIPELINE_IDS:
-        assert off_by_id[kept_id] == on_by_id[kept_id], (
-            f"M6 -> at this assertion: correct = {off_by_id[kept_id]!r} equal"
-            f" close off/on, mutant = {on_by_id[kept_id]!r}"
-        )
-
-
 def test_rt5_close_on_db_error_in_close_alerts_read() -> None:
     """RT5: close on; the test drops a table a close alert reads (M7)."""
     conn = asof_conn()
-    day_close_site(conn, close_on=True)
+    day_close_site(conn)
     conn.execute("DROP TABLE close_publications")
 
     verdict = build_verdict(
@@ -299,7 +172,7 @@ def test_rt6_close_alerts_unexpected_error_isolated() -> None:
         raise ValueError("boom")
 
     conn = asof_conn()
-    day_close_site(conn, close_on=True)
+    day_close_site(conn)
 
     original = getattr(monitor_module, "close_alerts", None)
     monitor_module.close_alerts = _raise  # type: ignore[attr-defined]
@@ -345,7 +218,7 @@ def test_rt7_close_on_startup_grace() -> None:
     """RT7: close on; alert 1 seeded to trip; the worker started 5 minutes
     before `now` (M9)."""
     conn = asof_conn()
-    day_close_site(conn, close_on=True)
+    day_close_site(conn)
     conn.execute(
         "INSERT INTO runtime_state (key, value) VALUES ('worker_started_at', ?)"
         " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -384,7 +257,7 @@ def test_rt8_unreadable_last_obstime() -> None:
     """RT8: one station's offline poll row with `last_obstime` corrupted
     (M10)."""
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     row = conn.execute(
         "SELECT id FROM stations WHERE site_id = ? ORDER BY id LIMIT 1", (site_id,)
     ).fetchone()
@@ -436,8 +309,14 @@ def test_rt8_unreadable_last_obstime() -> None:
 
 
 def test_rt9_runtime_state_dropped_every_group_off() -> None:
-    """RT9: migrated in-memory db, `runtime_state` dropped, every group off
-    (M118, M119)."""
+    """RT9: migrated in-memory db, `runtime_state` dropped, every group off.
+    With every group disabled, the pipeline-off path reads nothing (the
+    switch read it used to make is gone with the always-on close) and
+    neither does the db-off path, so the dropped table causes no failure:
+    the pipeline group's skipped list is still appended, `db_readable` is
+    its own skipped row, and the verdict stays 'ok' -- a broken
+    `runtime_state` table is reported only by a group that actually reads
+    it, not pinned here as a regression."""
     conn = asof_conn()
     conn.execute("DROP TABLE runtime_state")
 
@@ -449,18 +328,19 @@ def test_rt9_runtime_state_dropped_every_group_off() -> None:
         now=NOW,
         export_sweeper_dead=None,
     )
-    assert not any(c["group"] == "pipeline" for c in verdict["conditions"]), (  # type: ignore[index]
-        "M118/M119 -> at this assertion: correct = no row of group"
-        f" 'pipeline', mutant = one present in {verdict['conditions']!r}"
+    pipeline_rows = [c for c in verdict["conditions"] if c["group"] == "pipeline"]  # type: ignore[index]
+    assert pipeline_rows and all(c["skipped"] for c in pipeline_rows), (  # type: ignore[index]
+        "at this assertion: correct = every pipeline row present and"
+        f" skipped, mutant = {pipeline_rows!r}"
     )
     db_readable = next(c for c in verdict["conditions"] if c["id"] == "db_readable")  # type: ignore[index]
     assert (
-        db_readable["ok"] is False
-        and db_readable["skipped"] is False
+        db_readable["ok"] is True
+        and db_readable["skipped"] is True
         and db_readable["severity"] == "critical"
     ), (
-        "M118/M119 -> at this assertion: correct = db_readable ok=False,"
-        f" skipped=False, severity='critical', mutant = {db_readable!r}"
+        "at this assertion: correct = db_readable skipped (nothing reads"
+        f" the dropped table), mutant = {db_readable!r}"
     )
     sweeper = next(
         c
@@ -468,10 +348,11 @@ def test_rt9_runtime_state_dropped_every_group_off() -> None:
         if c["id"] == "export_sweeper_dead"  # type: ignore[index]
     )
     assert sweeper["ok"] is True, (
-        f"M118/M119 -> at this assertion: correct = export_sweeper_dead"
-        f" present and ok, mutant = {sweeper!r}"
+        f"at this assertion: correct = export_sweeper_dead present and ok,"
+        f" mutant = {sweeper!r}"
     )
-    assert verdict["overall"] == "critical", (
-        "M118/M119 -> at this assertion: correct = overall 'critical',"
-        f" mutant = {verdict['overall']!r}"
+    assert verdict["overall"] == "ok", (
+        "at this assertion: correct = overall 'ok' (every group disabled"
+        " reads nothing, so the dropped table causes no failure), mutant"
+        f" = {verdict['overall']!r}"
     )

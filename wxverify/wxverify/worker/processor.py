@@ -41,7 +41,6 @@ from wxverify.db.runtime_state import (
     RUNTIME_HEARTBEAT_INTERVAL_SECONDS,
     set_runtime_state_now,
 )
-from wxverify.db.site_days import daily_close_on
 from wxverify.db.station_readings import store_readings
 from wxverify.feeds.registry import build_adapter
 from wxverify.obs.hourly_values import StationReading
@@ -290,22 +289,11 @@ async def _run_main_lane(db: Database) -> None:
         if stop.STOP.is_set():
             await asyncio.sleep(POLL_INTERVAL)
             continue
-        job = await db.write(_claim_if_on)
+        job = await db.write(claim_next_job)
         if job is None:
             await asyncio.sleep(POLL_INTERVAL)
             continue
         await run_claimed_job(db, job, lane="main")
-
-
-def _claim_if_on(conn: sqlite3.Connection) -> Job | None:
-    """Claim the next main-lane job; None while the daily close is off.
-
-    The key is read in the claim's own transaction (switch-over plan 6.2),
-    so nothing is claimed from a file without the key.
-    """
-    if not daily_close_on(conn):
-        return None
-    return claim_next_job(conn)
 
 
 async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:

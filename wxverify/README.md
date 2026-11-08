@@ -719,7 +719,7 @@ The change takes effect from the next full local day. The command prints the fir
 - **Days already closed keep the zone they were scored under.** They are not rebuilt, and the pages flag them as scored under their own zone.
 - Past days cannot be re-bucketed into a different zone. The earlier retrospective correction was retired when the daily close turned on.
 
-The command exits non-zero with a one-line message, for example when the site is unknown, the zone is not a valid IANA name, the site already runs under that zone from the next day, or the daily close is not yet on.
+The command exits non-zero with a one-line message, for example when the site is unknown, the zone is not a valid IANA name, or the site already runs under that zone from the next day.
 
 ## Operational Notes
 

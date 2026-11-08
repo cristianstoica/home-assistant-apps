@@ -294,9 +294,9 @@ def test_cancellation_during_claim_write_leaves_no_running_row(
     this window.
 
     Construction: wraps ``Database.write`` so that, immediately AFTER the
-    real ``_claim_if_on`` write has committed (so the row genuinely reads
+    real ``claim_next_job`` write has committed (so the row genuinely reads
     ``running`` on disk) but BEFORE control returns to ``run_worker``'s
-    ``job = await db.write(_claim_if_on)`` line, the coroutine blocks on a
+    ``job = await db.write(claim_next_job)`` line, the coroutine blocks on a
     plain ``asyncio.Event``. Cancelling there lands squarely in the claim
     window without needing to hold a sqlite transaction open across threads
     (which would independently and unavoidably fail any second write on the
@@ -307,7 +307,6 @@ def test_cancellation_during_claim_write_leaves_no_running_row(
     conn = _init_tmp_db(tmp_path)
     from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
     from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
-    from wxverify.worker.processor import _claim_if_on  # noqa: PLC0415
 
     set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
     conn.commit()
@@ -321,7 +320,7 @@ def test_cancellation_during_claim_write_leaves_no_running_row(
 
     async def _write_with_barrier(self: Database, fn: Any) -> Any:
         result = await real_write(self, fn)
-        if fn is _claim_if_on:
+        if fn is claim_next_job:
             claimed.set()
             await release.wait()
         return result
@@ -332,7 +331,7 @@ def test_cancellation_during_claim_write_leaves_no_running_row(
         task = asyncio.create_task(run_worker(db))
         await asyncio.wait_for(claimed.wait(), timeout=2.0)
         # The row is committed 'running' on disk right now, but run_worker's
-        # coroutine has not yet resumed past `db.write(_claim_if_on)` --
+        # coroutine has not yet resumed past `db.write(claim_next_job)` --
         # `job_id` does not exist in that frame yet.
         assert _job_status(conn, job_id) == "running"
         task.cancel()

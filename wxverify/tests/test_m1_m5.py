@@ -16,7 +16,6 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.helpers import close_off
 from wxverify import __version__, config
 from wxverify.api.app import _default_stop_process, _stop_on_worker_done, create_app
 from wxverify.collection.budget import current_billing_day
@@ -298,12 +297,6 @@ def test_worker_status_exposes_runtime_and_completed_job_fields(
     app = create_app(root_path="")
     with TestClient(app) as client:
         db = get_db()
-        # This test's subject is close-OFF behaviour: with the close off,
-        # last_completed_pair_and_score_at is always null, regardless of
-        # any completed pair_and_score job. The close is permanently on
-        # from the build (storage release 3.2), so force it off before
-        # anything reads the key.
-        db.write_sync(close_off)
 
         def _seed_completed_jobs(conn: sqlite3.Connection) -> None:
             site_id = int(
@@ -338,7 +331,10 @@ def test_worker_status_exposes_runtime_and_completed_job_fields(
     assert payload["scheduler_last_tick_at"] is None
     assert payload["last_completed_fetch_feed_at"] == "2035-01-01T01:00:00.000Z"
     assert payload["last_completed_fetch_obs_at"] == "2035-01-01T02:00:00.000Z"
-    assert payload["last_completed_pair_and_score_at"] is None
+    assert payload["last_completed_pair_and_score_at"] is None, (
+        "no active publication is seeded here, so the newest published_at"
+        " read has nothing to report"
+    )
 
 
 def test_idle_worker_stamps_runtime_heartbeats(tmp_path: Path) -> None:
@@ -394,7 +390,6 @@ def test_worker_heartbeat_write_failure_logs_and_loop_continues(
         "wxverify.worker.processor.set_runtime_state_now", fail_heartbeat
     )
     monkeypatch.setattr("wxverify.worker.processor.scheduler_tick", lambda conn: None)
-    monkeypatch.setattr("wxverify.worker.processor.daily_close_on", lambda conn: True)
     monkeypatch.setattr(
         "wxverify.worker.processor.purge_failed_jobs_older_than",
         lambda conn, hours: None,
@@ -453,7 +448,6 @@ def test_worker_permission_error_is_process_fatal(
         "wxverify.worker.processor.set_runtime_state_now", lambda c, k: None
     )
     monkeypatch.setattr("wxverify.worker.processor.scheduler_tick", lambda conn: None)
-    monkeypatch.setattr("wxverify.worker.processor.daily_close_on", lambda conn: True)
     monkeypatch.setattr(
         "wxverify.worker.processor.purge_failed_jobs_older_than",
         lambda conn, hours: None,

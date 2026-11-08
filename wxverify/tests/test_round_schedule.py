@@ -497,9 +497,7 @@ def test_rs7_round_start_from_the_records_zone_not_sites_timezone(
     db = init_db(str(db_path))
     conn = db._conn  # noqa: SLF001
 
-    site_id = day_close_site(
-        conn, timezone="Etc/GMT-14", close_on=True, with_records=True
-    )
+    site_id = day_close_site(conn, timezone="Etc/GMT-14", with_records=True)
     seed_round_schedule_feeds(conn, site_id, subscribe=("X",))
     conn.commit()
     install_provider_standin(monkeypatch)

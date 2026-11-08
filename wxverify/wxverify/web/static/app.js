@@ -158,8 +158,8 @@
     ctx.restore();
   }
 
-  // With the daily close on, /api/timeseries also returns the provisional
-  // observed line (provisional_valid_at / provisional) and the missed days.
+  // /api/timeseries also returns the provisional observed line
+  // (provisional_valid_at / provisional) and the missed days.
   // The kept pairs, the line and the missed bands share one x axis; a null
   // point at each band's edges breaks every line there, so no line is drawn
   // across a missed day.
@@ -524,8 +524,8 @@
   // leadLabel is the same function the chart's own x-axis uses, so the row
   // labels can never drift from what the chart shows.
   // One sentence per feed and day ahead of the dashboard's coverage table
-  // (shown with the daily close on) whose scored count is below its expected
-  // count; "" when the page has no coverage table.
+  // whose scored count is below its expected count; "" when the page has no
+  // coverage table.
   function coverageSentences() {
     var table = document.getElementById("coverage-table");
     if (!table) {

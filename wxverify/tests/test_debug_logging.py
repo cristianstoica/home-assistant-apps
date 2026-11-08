@@ -144,7 +144,6 @@ def _patch_worker_infra(monkeypatch: pytest.MonkeyPatch) -> None:
         "wxverify.worker.processor.set_runtime_state_now", lambda c, k: None
     )
     monkeypatch.setattr("wxverify.worker.processor.scheduler_tick", lambda c: None)
-    monkeypatch.setattr("wxverify.worker.processor.daily_close_on", lambda conn: True)
     monkeypatch.setattr(
         "wxverify.worker.processor.purge_failed_jobs_older_than", lambda c, h: None
     )

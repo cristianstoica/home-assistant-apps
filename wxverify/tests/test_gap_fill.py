@@ -294,7 +294,6 @@ def _build_base_site(
     site_id = day_close_site(
         conn,
         timezone=_ZONE,
-        close_on=True,
         with_records=False,
         station_ids=(STATION_PWS_IDS[0], STATION_PWS_IDS[1]),
     )

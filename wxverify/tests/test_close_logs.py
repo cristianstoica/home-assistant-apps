@@ -9,13 +9,10 @@ LG1 and LG2 drive the real night chain end to end
 (``tests.helpers.install_round_state_standin``, the pattern of
 ``tests/test_close_timeline.py``), so each reaches that call before doing
 anything else -- a ``ModuleNotFoundError`` today, since
-``wxverify.worker.close_p4`` does not exist. LG4 calls ``main()`` with the
-not-yet-registered ``close-day`` subcommand, which fails argument parsing
-with ``SystemExit(2)`` (there is no such subparser at ``a4a919c``) before
-anything it builds matters. LG5 imports ``close_chain.run_close_retention``
-inline, an ``ImportError`` at once (``close_chain.py`` holds only
-``record_collection_try`` today). LG6 imports ``close_chain.close_status``
-inline, for the same reason.
+``wxverify.worker.close_p4`` does not exist. LG5 imports
+``close_chain.run_close_retention`` inline, an ``ImportError`` at once
+(``close_chain.py`` holds only ``record_collection_try`` today). LG6 imports
+``close_chain.close_status`` inline, for the same reason.
 
 Section 16.2 of the plan names the mutant each test ID kills; that mapping
 is given inline on the assertion, in ``tests/test_close_timeline.py``'s own
@@ -35,8 +32,7 @@ import asyncio
 import hashlib
 import json
 import sqlite3
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -57,9 +53,7 @@ from tests.helpers import (
     run_due_jobs,
     standard_night,
 )
-from wxverify import config
 from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro
-from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import claim_next_job
 from wxverify.db.site_days import begin_close, fail_close, finish_close, mark_missed
 from wxverify.db.switch import ensure_site_generation
@@ -585,191 +579,69 @@ def _truth_version_from_rows(conn, site_id: int, local_date) -> str:  # type: ig
     return hashlib.sha256(blob).hexdigest()
 
 
-def _build_v12_file(
-    path: Path, *, site_name: str = "Testsite"
-) -> tuple[int, dict[str, int]]:
-    """Write a database to ``path`` with one site and stations A and B
-    (``ISTATION01``/``ISTATION02``), returning ``(site_id, {pws_id:
-    station_id})``, pinned at user_version 17 rather than fully fresh.
-
-    The five ``close_*`` tables and the widened ``jobs`` CHECK this
-    fixture used to undo by hand (copied locally from
-    ``tests/test_close_day_cli.py``'s own, now-retired ``_build_v12_file``)
-    are unconditional parts of ``create_tables`` now -- migrate_v13_
-    close_jobs is deleted along with every other migrate_v2 ...
-    migrate_v16 function, and user_version 1-16 is refused outright
-    (storage release 4.1, health release U1) -- so there is nothing left
-    to undo onto a reachable schema. Pinning at 17 instead of 18 still
-    exercises a real ``run_migrations`` call on open (the version 18
-    upgrade runs; these tests do not depend on its sub-steps, so it
-    stays a fast no-op here).
-    """
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(conn)
-
-    site_id = conn.execute(
-        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-        " timezone) VALUES (?, 0.0, 0.0, 0.0, 'UTC')",
-        (site_name,),
-    ).lastrowid
-    assert site_id is not None
-    # Every real site has a published timezone generation -- a new site
-    # gets it at creation (wxverify/api/routes/sites.py), and migrate_v4
-    # seeds it for pre-existing sites. Seeding it here matches both paths;
-    # it is never set by a migration on this file, because the site is
-    # inserted after run_migrations already ran.
-    ensure_site_generation(conn, int(site_id))
-    stations: dict[str, int] = {}
-    for pws_id in ("ISTATION01", "ISTATION02"):
-        station_id = conn.execute(
-            "INSERT INTO stations"
-            " (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)"
-            " VALUES (?, ?, 0.0, 0.0, 0.0, 1)",
-            (site_id, pws_id),
-        ).lastrowid
-        assert station_id is not None
-        stations[pws_id] = int(station_id)
-    conn.execute("PRAGMA user_version = 17")
-    conn.commit()
-    conn.close()
-    return int(site_id), stations
-
-
-def _seed_observations_full_day(path: Path, site_id: int, local_date) -> None:  # type: ignore[no-untyped-def]
-    """Seed one hourly ``observations`` row per quantity's input variable
-    (``temperature``, ``wind``, ``precip``, ``verification/truth.py:68``)
-    for every hour of ``local_date``, a full, gap-free day stage 4 can
-    judge from stored hours alone (``--hours stored``, CL3). Copied locally
-    from ``tests/test_close_day_cli.py`` per this file's own-helpers rule.
-    """
-    conn = sqlite3.connect(str(path))
-    conn.execute("PRAGMA foreign_keys=ON")
-    for hour in range(24):
-        valid_at = isoformat_utc(
-            datetime(
-                local_date.year, local_date.month, local_date.day, hour, tzinfo=UTC
-            )
-        )
-        for variable, value in (
-            ("temperature", 10.0 + hour * 0.1),
-            ("wind", 5.0),
-            ("precip", 0.0),
-        ):
-            conn.execute(
-                "INSERT INTO observations"
-                " (site_id, variable, valid_at, value, n_stations, computed_at)"
-                " VALUES (?, ?, ?, ?, 2, ?)",
-                (site_id, variable, valid_at, value, valid_at),
-            )
-    conn.commit()
-    conn.close()
-
-
-def test_lg4_the_truth_version_is_a_pure_function_of_the_truth_rows(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
+def _seed_daily_truth_row(
+    conn: sqlite3.Connection,
+    site_id: int,
+    generation_id: int,
+    local_date: date,
+    *,
+    high_value: float,
 ) -> None:
-    """LG4: three source files as CL3's -- a database pinned at
-    user_version 16 (15.12's preamble, built with CL3's own
-    ``_build_v12_file``/``_seed_observations_full_day``, copied locally
-    above) holding D's
-    ``observations`` (temperature, rain and wind), no raw readings, no
-    site-day record -- in their own folders: the first and second
-    identical, the third with D's highest hourly ``temperature`` value in
-    ``observations`` raised by 1.0; ``close-day --hours stored`` run on
-    each; D's ``close_attempts.truth_version`` read in each new file. The
-    first equal to the SHA-256 this test computes from that file's
-    ``daily_truth`` rows of D (11.4); the second equal to the first; the
-    third different, its high's ``value`` 1.0 higher.
+    """Insert D's five ``daily_truth`` rows directly (stage 4's own shape),
+    under ``generation_id``, with ``temperature_high`` set to ``high_value``
+    and every other quantity a fixed synthetic value."""
+    for quantity, value in (
+        ("temperature_high", high_value),
+        ("temperature_low", 4.5),
+        ("wind_max", 9.0),
+        ("precip_total", 0.0),
+        ("precip_occurrence", 0.0),
+    ):
+        conn.execute(
+            "INSERT INTO daily_truth (site_id, local_date, quantity, value,"
+            " eligible, exclusion_reason, covered_hours, expected_slots,"
+            " peak_window_ok, wet_hours, dry_hours, rain_threshold_mm,"
+            " day_start_utc, day_end_utc, timezone, tz_generation_id)"
+            " VALUES (?, ?, ?, ?, 1, NULL, 24, 24, NULL, NULL, NULL, NULL,"
+            " '2024-01-01T00:00:00Z', '2024-01-02T00:00:00Z', 'UTC', ?)",
+            (site_id, local_date.isoformat(), quantity, value, generation_id),
+        )
+    conn.commit()
 
-    M61 -> at the equality assertion for file 1 below: correct =
-    ``truth_version`` equals this test's own hash of the same rows
+
+def test_lg4_the_truth_version_is_a_pure_function_of_the_truth_rows() -> None:
+    """LG4: three sites, each with one published timezone generation and
+    D's five ``daily_truth`` rows inserted directly (stage 4's own shape)
+    -- the first and second identical, the third with ``temperature_high``
+    1.0 higher. ``close_chain._truth_version``, called directly (the same
+    function stage 4 calls to fill ``close_attempts.truth_version``), is
+    compared against this test's own SHA-256 of the same rows (11.4).
+
+    M61 -> at the equality assertion for site A below: correct =
+    ``_truth_version`` equals this test's own hash of the same rows
     (sorted-key JSON), mutant M61 (the truth version built with unsorted
     keys) = a different hex digest for the identical row set, since
     ``dict`` insertion order need not match ``quantity`` field-name sort
     order.
-
-    At ``a4a919c`` ``main()`` has no ``close-day`` subparser at all, so
-    calling it raises ``SystemExit(2)`` from argument parsing -- the
-    present-day failure, before anything this test builds matters.
     """
-    from wxverify.__main__ import main  # noqa: PLC0415
+    from wxverify.worker import close_chain  # noqa: PLC0415
 
-    def _build_lg4_source(dir_path, *, high_bump: float = 0.0):  # type: ignore[no-untyped-def]
-        """A source file as CL3's, in its own folder. ``high_bump`` raises
-        D's highest hourly ``temperature`` value (hour 23, the day's peak
-        under ``_seed_observations_full_day``'s ``10.0 + hour * 0.1``) by
-        that amount (the third file's case)."""
-        dir_path.mkdir(parents=True, exist_ok=True)
-        db_path = dir_path / "wxverify.db"
-        site_id, _stations = _build_v12_file(db_path)
-        _seed_observations_full_day(db_path, site_id, D)
-        if high_bump:
-            conn = sqlite3.connect(str(db_path))
-            conn.execute(
-                "UPDATE observations SET value = value + ?"
-                " WHERE site_id = ? AND variable = 'temperature'"
-                " AND valid_at = ?",
-                (
-                    high_bump,
-                    site_id,
-                    isoformat_utc(datetime(D.year, D.month, D.day, 23, tzinfo=UTC)),
-                ),
-            )
-            conn.commit()
-            conn.close()
-        return db_path, site_id
+    def _build(high_value: float) -> tuple[sqlite3.Connection, int]:
+        conn = asof_conn()
+        site_id = day_close_site(conn, with_records=False)
+        generation_id = ensure_site_generation(conn, site_id)
+        _seed_daily_truth_row(conn, site_id, generation_id, D, high_value=high_value)
+        return conn, site_id
 
-    src1, site1 = _build_lg4_source(tmp_path / "a")
-    src2, site2 = _build_lg4_source(tmp_path / "b")
-    src3, site3 = _build_lg4_source(tmp_path / "c", high_bump=1.0)
-    monkeypatch.setattr(config, "db_path", str(tmp_path / "other.db"))
-    install_p4_standins(monkeypatch)
+    conn_a, site_a = _build(12.3)
+    conn_b, site_b = _build(12.3)
+    conn_c, site_c = _build(13.3)
 
-    new_files: dict[str, object] = {}
-    for label, src, site_id in (
-        ("a", src1, site1),
-        ("b", src2, site2),
-        ("c", src3, site3),
-    ):
-        before = set(src.parent.iterdir())
-        exit_code = main(
-            [
-                "--db",
-                str(src),
-                "close-day",
-                "--site",
-                str(site_id),
-                "--date",
-                D.isoformat(),
-                "--hours",
-                "stored",
-            ]
-        )
-        assert exit_code == 0, f"close-day must exit 0 for file {label!r}"
-        after = set(src.parent.iterdir())
-        created = after - before
-        assert len(created) == 1, "close-day must make exactly one new file"
-        new_files[label] = created.pop()
+    computed_a = _truth_version_from_rows(conn_a, site_a, D)
 
-    def _read_version(path) -> str:  # type: ignore[no-untyped-def]
-        new_conn = sqlite3.connect(path)
-        new_conn.row_factory = sqlite3.Row
-        row = new_conn.execute(
-            "SELECT truth_version FROM close_attempts"
-            " WHERE local_date = ? ORDER BY attempt DESC LIMIT 1",
-            (D.isoformat(),),
-        ).fetchone()
-        version = str(row["truth_version"])
-        computed = _truth_version_from_rows(new_conn, 1, D)
-        new_conn.close()
-        return version, computed
-
-    version_a, computed_a = _read_version(new_files["a"])
-    version_b, computed_b = _read_version(new_files["b"])
-    version_c, _computed_c = _read_version(new_files["c"])
+    version_a = close_chain._truth_version(conn_a, site_a, D)  # noqa: SLF001
+    version_b = close_chain._truth_version(conn_b, site_b, D)  # noqa: SLF001
+    version_c = close_chain._truth_version(conn_c, site_c, D)  # noqa: SLF001
 
     assert version_a == computed_a, (
         "M61 -> at this assertion: correct = truth_version equal to this"
@@ -777,30 +649,10 @@ def test_lg4_the_truth_version_is_a_pure_function_of_the_truth_rows(
         " (the truth version built with unsorted keys) = a different digest"
     )
     assert version_b == version_a, (
-        "two closes of the same hours must give the same version"
+        "identical rows on two different sites must hash identically"
     )
     assert version_c != version_a, (
         "a day whose high is 1.0 higher must get a different truth version"
-    )
-
-    def _read_high(path) -> float:  # type: ignore[no-untyped-def]
-        conn = sqlite3.connect(path)
-        row = conn.execute(
-            "SELECT value FROM daily_truth WHERE local_date = ?"
-            " AND quantity = 'temperature_high'",
-            (D.isoformat(),),
-        ).fetchone()
-        conn.close()
-        assert row is not None, "file c must have a temperature_high truth row"
-        return float(row[0])
-
-    high_a = _read_high(new_files["a"])
-    high_c = _read_high(new_files["c"])
-    assert high_c == pytest.approx(high_a + 1.0), (
-        "the claim this test's own docstring makes -- file c's high is"
-        " exactly 1.0 higher than file a's -- was never checked by the"
-        " version_c != version_a assertion alone (a different hash only"
-        " proves SOME difference, not this specific one)"
     )
 
 
@@ -922,7 +774,7 @@ def test_lg5_the_90_day_cutoff_keeps_the_boundary_row(
     from wxverify.worker.close_chain import run_close_retention  # noqa: PLC0415
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     now = datetime(D.year, D.month, D.day, 12, tzinfo=UTC)
     cutoff = now - timedelta(days=90)
     minus1 = cutoff - timedelta(seconds=1)
@@ -1063,7 +915,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
         begin_close(conn, target_site_id, d_minus_1, now_utc=t_close)
         finish_close(conn, target_site_id, d_minus_1, now_utc=t_close)
 
-    site_id = day_close_site(conn, close_on=True, with_records=True)
+    site_id = day_close_site(conn, with_records=True)
     _close_d_minus_1(site_id)
     d_end_row = conn.execute(
         "SELECT day_end_utc FROM site_days WHERE site_id = ? AND local_date = ?",
@@ -1178,7 +1030,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     # retry_due site above cannot cleanly reach `closed` without P3's own
     # stage bodies to run the retry.
     site_closed = day_close_site(
-        conn, close_on=True, with_records=True, station_ids=("ISTATION03", "ISTATION04")
+        conn, with_records=True, station_ids=("ISTATION03", "ISTATION04")
     )
     _close_d_minus_1(site_closed)
     d_end_row2 = conn.execute(
@@ -1231,7 +1083,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     # A missed day, never_attempted: open, past its own end, no attempt ever
     # made, on a fourth site.
     site_never_attempted = day_close_site(
-        conn, close_on=True, with_records=True, station_ids=("ISTATION03", "ISTATION04")
+        conn, with_records=True, station_ids=("ISTATION03", "ISTATION04")
     )
     _close_d_minus_1(site_never_attempted)
     na_end_row = conn.execute(
@@ -1272,7 +1124,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     # A missed day, zone_changeover: open, flagged a changeover day, past
     # its own end, on a fifth site.
     site_changeover = day_close_site(
-        conn, close_on=True, with_records=True, station_ids=("ISTATION03", "ISTATION04")
+        conn, with_records=True, station_ids=("ISTATION03", "ISTATION04")
     )
     _close_d_minus_1(site_changeover)
     conn.execute(
@@ -1317,7 +1169,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
 
     # A missed day, retry_failed, on a third site.
     site_missed = day_close_site(
-        conn, close_on=True, with_records=True, station_ids=("ISTATION05", "ISTATION06")
+        conn, with_records=True, station_ids=("ISTATION05", "ISTATION06")
     )
     _close_d_minus_1(site_missed)
     d_end_row3 = conn.execute(
@@ -1371,7 +1223,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     # A missed day, retry_not_run: retry_due, its retry_at come and gone
     # with no second attempt made, on a sixth site.
     site_retry_not_run = day_close_site(
-        conn, close_on=True, with_records=True, station_ids=("ISTATION05", "ISTATION06")
+        conn, with_records=True, station_ids=("ISTATION05", "ISTATION06")
     )
     _close_d_minus_1(site_retry_not_run)
     rnr_end_row = conn.execute(

@@ -34,7 +34,6 @@ from tests.helpers import (
     NOW,
     D,
     asof_make_site,
-    close_off,
     day_close_site,
     note_day_clock,
 )
@@ -80,7 +79,6 @@ def _build_site(conn) -> tuple[int, dict[str, int]]:  # type: ignore[no-untyped-
     site_id = day_close_site(
         conn,
         timezone=_ZONE,
-        close_on=True,
         with_records=False,
         station_ids=STATION_PWS_IDS,
     )
@@ -607,8 +605,11 @@ def test_rd2_last_five_minute_store_by_source_and_site(tmp_path: Path) -> None:
 
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
-    close_off(conn)
     site_id = asof_make_site(conn, "rd2-site")
+    # The repeat store below goes through store_readings's closed-day
+    # guard (the daily close is always on): it needs a real P1 record
+    # holding D.
+    start_site_days(conn, site_id, D, now_utc=_day_start(D))
     station_b = _make_station(conn, site_id, "ISTATION04")
     station_c = _make_station(conn, site_id, "ISTATION05")
 

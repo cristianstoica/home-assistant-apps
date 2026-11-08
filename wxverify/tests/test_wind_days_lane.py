@@ -41,13 +41,13 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from tests.helpers import close_off
 from wxverify import config
 from wxverify.core.timeutil import isoformat_utc, local_day_slots
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations, seed_default_sources
 from wxverify.db.queue import Job
 from wxverify.db.runtime_state import set_runtime_state
+from wxverify.db.site_days import WriteKind, check_day_write, start_site_days
 from wxverify.obs.hourly_values import StationReading
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.processor import dispatch
@@ -190,21 +190,30 @@ def _day_row(
 # =============================================================================
 
 
-def test_persist_day_window_and_record_count_scope() -> None:
-    """``_persist_day`` (``worker/wind_days.py:1345``) for today's row,
-    close off: the stored window is yesterday's start to today's end,
-    capped at now plus ``_FUTURE_SLACK`` (``_today_window``, ``:1312``; P2
-    4.1, the past-row margin gone with R4); ``record_count`` is today's
+def test_persist_day_window_and_record_count_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_today_window``/``_persist_day`` for today's row: the stored window
+    is yesterday's start to today's end, capped at now plus ``_FUTURE_SLACK``
+    (P2 4.1, the past-row margin gone with R4); ``record_count`` is today's
     exact [start, end). A reading in yesterday's bounds is stored but not
     counted; one before yesterday's start is dropped from both."""
     conn = _make_db()
-    close_off(conn)
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
     local_date = date(2020, 1, 15)
     _insert_day(conn, station_id, local_date, status="pending")
 
     start = datetime(2020, 1, 15, 0, 0, 0, tzinfo=UTC)
+    now = start + timedelta(hours=2)
+    # P1 records for the 13th, 14th and 15th (the close is always on; `now`
+    # passed here falls on the 13th, so `start_site_days`'s own fill extends
+    # forward through the 15th) -- `before_yesterday` needs its own real,
+    # open record for the guard to admit it.
+    start_site_days(
+        conn, site_id, date(2020, 1, 13), now_utc=start - timedelta(hours=36)
+    )
+    monkeypatch.setattr("wxverify.worker.wind_days.utc_now", lambda: now)
 
     def _reading(obs_at: datetime, speed_kmh: float) -> StationReading:
         return StationReading(
@@ -220,13 +229,23 @@ def test_persist_day_window_and_record_count_scope() -> None:
     before_yesterday = _reading(start - timedelta(hours=25), 5.0)
     in_day = _reading(start + timedelta(hours=1), 7.0)
 
+    assert (
+        check_day_write(
+            conn,
+            site_id,
+            isoformat_utc(before_yesterday.obs_at),
+            WriteKind.READING,
+            now_utc=now,
+        )
+        is True
+    ), "before_yesterday needs its own real, open record"
+
     _persist_day(
         conn,
         site_id=site_id,
         station_id=station_id,
         local_date=local_date,
         tz_name=_TZ,
-        today=local_date,
         records=[in_yesterday_not_in_day, before_yesterday, in_day],
     )
 
@@ -287,13 +306,21 @@ def test_ensure_wind_days_deletes_unparseable_local_date(
 # =============================================================================
 
 
-def test_persist_day_today_204_stays_partial_with_refresh_schedule() -> None:
+def test_persist_day_today_204_stays_partial_with_refresh_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     conn = _make_db()
-    close_off(conn)
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
     today = date(2026, 3, 10)
     _insert_day(conn, station_id, today, status="partial", attempts=0)
+    # A P1 record holding today (the close is always on; without one
+    # `_today_try` has no clock and the row just keeps its old stamp).
+    start = local_day_slots(today, _TZ)[0]
+    start_site_days(conn, site_id, today, now_utc=start)
+    monkeypatch.setattr(
+        "wxverify.worker.wind_days.utc_now", lambda: start + timedelta(hours=12)
+    )
 
     _persist_day(
         conn,
@@ -301,7 +328,6 @@ def test_persist_day_today_204_stays_partial_with_refresh_schedule() -> None:
         station_id=station_id,
         local_date=today,
         tz_name=_TZ,
-        today=today,
         records=[],
         no_content=True,
     )
@@ -454,14 +480,18 @@ def test_dispatch_sends_a_fetch_obs_job_with_another_key_to_the_raise(
 # =============================================================================
 
 
-def test_enqueue_due_wind_days_enqueues_for_a_site_with_an_enabled_station() -> None:
+def test_enqueue_due_wind_days_enqueues_for_a_site_with_an_enabled_station(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     conn = _make_db()
-    close_off(conn)
     site_id = _make_site(conn)
     _make_station(conn, site_id, "WSTATION01")
-    # nothing due + today's row already present would make wind_lane_due
-    # False; to make it due, leave today's row missing (ensure_wind_days has
-    # not run yet in this bare fixture).
+    now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
+    _freeze_scheduler_now(monkeypatch, now)
+    # A P1 record holding `now` (the close is always on; without one
+    # `wind_lane_due` finds no current day at all, 4.2). Today's row is
+    # still missing, which is what makes the lane due.
+    start_site_days(conn, site_id, now.date(), now_utc=now)
 
     _enqueue_due_wind_days(conn)
 
@@ -546,11 +576,11 @@ def test_enqueue_due_wind_days_respects_the_success_cooldown_spacing(
     minutes after -- both inside the SAME frozen ``now``, isolating the
     cooldown boundary itself rather than any other due condition."""
     conn = _make_db()
-    close_off(conn)
     site_id = _make_site(conn)
     _make_station(conn, site_id, "WSTATION01")
     now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
     _freeze_scheduler_now(monkeypatch, now)
+    start_site_days(conn, site_id, now.date(), now_utc=now)
 
     one_min_ago = (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
     _insert_job(
@@ -598,6 +628,7 @@ def test_enqueue_due_wind_days_respects_the_success_cooldown_spacing(
 
 
 def test_enqueue_due_wind_days_fails_open_on_an_unreadable_success_stamp(
+    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """scheduler.py:401-410: the generic ``enqueue_if_absent_with_cooldown``
@@ -608,9 +639,11 @@ def test_enqueue_due_wind_days_fails_open_on_an_unreadable_success_stamp(
     (fail OPEN) when the stamp doesn't parse, logging its own WARNING
     distinct from the wrapper's."""
     conn = _make_db()
-    close_off(conn)
     site_id = _make_site(conn)
     _make_station(conn, site_id, "WSTATION01")
+    now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
+    _freeze_scheduler_now(monkeypatch, now)
+    start_site_days(conn, site_id, now.date(), now_utc=now)
     _insert_job(
         conn,
         "fetch_obs",
@@ -646,6 +679,7 @@ def test_enqueue_due_wind_days_fails_open_on_an_unreadable_success_stamp(
 
 
 def test_enqueue_due_wind_days_skips_a_site_with_an_unusable_time_zone(
+    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """scheduler.py:386-394: a site whose stored ``timezone`` fails
@@ -667,9 +701,12 @@ def test_enqueue_due_wind_days_skips_a_site_with_an_unusable_time_zone(
     (dropping the ``ValueError`` arm) lets the second bad site's exception
     escape uncaught, which this test also catches."""
     conn = _make_db()
-    close_off(conn)
+    now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
+    _freeze_scheduler_now(monkeypatch, now)
+
     good1_id = _make_site(conn, name="Testsite-good1", tz="UTC")
     _make_station(conn, good1_id, "KTEST001")
+    start_site_days(conn, good1_id, now.date(), now_utc=now)
 
     bad_zinfe_id = _make_site(conn, name="Testsite-bad-zinfe", tz="Not/AZone")
     _make_station(conn, bad_zinfe_id, "KTEST002")
@@ -679,6 +716,7 @@ def test_enqueue_due_wind_days_skips_a_site_with_an_unusable_time_zone(
 
     good2_id = _make_site(conn, name="Testsite-good2", tz="UTC")
     _make_station(conn, good2_id, "KTEST004")
+    start_site_days(conn, good2_id, now.date(), now_utc=now)
 
     with caplog.at_level(logging.WARNING, logger="wxverify.worker.scheduler"):
         # mutant -> at this call: correct = returns normally (both bad
@@ -806,10 +844,13 @@ def test_final_call_429_leaves_row_due_until_the_backoff_ends(
     Once the backoff clears, the next run makes the call and finishes the
     evening window normally."""
     conn = _t97_init_tmp_db(tmp_path)
-    close_off(conn)
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
     D = date(2026, 3, 10)
+    # The lane needs a P1 record holding D (the daily close is always on).
+    start_site_days(
+        conn, site_id, D, now_utc=datetime(D.year, D.month, D.day, tzinfo=UTC)
+    )
     _, end, _ = local_day_slots(D, _TZ)
     final = end - timedelta(minutes=4)
     seeded_next_attempt = isoformat_utc(final)

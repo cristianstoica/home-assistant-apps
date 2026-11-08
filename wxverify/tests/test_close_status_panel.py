@@ -1,5 +1,5 @@
 """Ops and the close status panel (daily-close plan 2026-10-22-daily-close-
-alerts-and-pages.md §10; test IDs OP1-OP9 in this file's §13.10).
+alerts-and-pages.md §10; test IDs OP2-OP9 in this file's §13.10).
 
 Written before `load_close_status` (and every other P5 name this file
 reaches) exists: every test below imports it inside its own body, so the
@@ -8,41 +8,30 @@ rest of this file keeps collecting -- each then fails at its own
 already exists today) at a plain assertion against today's unchanged
 output, the failures Step 3 accepts.
 
-Real SQLite throughout (``tests.helpers.asof_conn`` for the loader-level
-tests; a tmp-file database + ``TestClient`` for OP1, which needs the
-whole page or an htmx round trip -- mirrors ``tests/test_forecast_
-routes.py``'s harness). ``utc_now`` is monkeypatched on
-``wxverify.web.context`` wherever a test needs a fixed `now` (plan §13.1).
-Synthetic data only: stations ``ISTATION01``/``ISTATION02``, zone UTC, dates
-from the fixture's ``D``/``NOW``.
+Real SQLite throughout (``tests.helpers.asof_conn``). ``utc_now`` is
+monkeypatched on ``wxverify.web.context`` wherever a test needs a fixed
+`now` (plan §13.1). Synthetic data only: stations ``ISTATION01``/
+``ISTATION02``, zone UTC, dates from the fixture's ``D``/``NOW``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
-from pathlib import Path
-from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 
 from tests.helpers import (
     NOW,
     D,
     asof_conn,
-    close_off,
     day_close_site,
     seed_active_publication,
     seed_attempt,
     seed_publication_state,
     seed_stage_log,
 )
-from wxverify import config
-from wxverify.api.app import create_app
 from wxverify.core.timeutil import isoformat_utc
-from wxverify.db.connection import close_db, init_db
 from wxverify.db.site_days import (
     begin_close,
     day_record,
@@ -52,30 +41,6 @@ from wxverify.db.site_days import (
     start_site_days,
 )
 from wxverify.worker.close_chain import record_collection_try
-
-# ---------------------------------------------------------------------------
-# Harness (mirrors tests/test_forecast_routes.py; only OP1 and OP11 need it).
-# ---------------------------------------------------------------------------
-
-
-async def _idle_worker(_db: object) -> None:
-    await asyncio.Event().wait()
-
-
-def _init_tmp_db(tmp_path: Path) -> sqlite3.Connection:
-    close_db()
-    db_path = tmp_path / "wxverify.db"
-    config.db_path = str(db_path)
-    options_path = tmp_path / "options.json"
-    options_path.write_text("{}", encoding="utf-8")
-    config.options_path = str(options_path)
-    db = init_db(str(db_path))
-    return db._conn  # noqa: SLF001
-
-
-def _make_app(monkeypatch: pytest.MonkeyPatch) -> Any:
-    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
-    return create_app(root_path="")
 
 
 def _close_day(
@@ -117,25 +82,6 @@ def _station_id(conn: sqlite3.Connection, site_id: int, pws_station_id: str) -> 
     return int(row[0])
 
 
-def test_op1_close_off_shows_todays_panels(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """OP1 (plan §13.10, §10): close off, the Ops page is today's --
-    "Backfill Progress", "Last obs" (M98). PASSES today: with the close
-    off P5 changes nothing on this page."""
-    conn = _init_tmp_db(tmp_path)
-    close_off(conn)
-    day_close_site(conn, close_on=False)
-
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        response = client.get("/ops")
-    assert response.status_code == 200
-    text = response.text
-    assert "Backfill Progress" in text
-    assert "Last obs" in text
-
-
 def test_op2_close_status_shows_every_day_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -144,11 +90,11 @@ def test_op2_close_status_shows_every_day_state(
     never ran), D-3 (closed) (M99)."""
     monkeypatch.setattr("wxverify.web.context.utc_now", lambda: NOW)
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
 
     from wxverify.web.context import load_close_status
 
-    panel = load_close_status(conn, NOW, close_on=True)
+    panel = load_close_status(conn, NOW)
     assert panel is not None
     row = next(r for r in panel.rows if r.site_id == site_id)
     by_date = {d.local_date: d for d in row.days}
@@ -176,7 +122,7 @@ def test_op3_failed_attempt_shows_retry_and_stage(
     Failure and the stage line all read from the stored records (M100)."""
     monkeypatch.setattr("wxverify.web.context.utc_now", lambda: NOW)
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     d_minus_1 = D - timedelta(days=1)
     record = day_record(conn, site_id, d_minus_1)
     assert record is not None
@@ -219,7 +165,7 @@ def test_op3_failed_attempt_shows_retry_and_stage(
 
     from wxverify.web.context import load_close_status
 
-    panel = load_close_status(conn, NOW, close_on=True)
+    panel = load_close_status(conn, NOW)
     assert panel is not None
     row = next(r for r in panel.rows if r.site_id == site_id)
     day = next(d for d in row.days if d.local_date == d_minus_1.isoformat())
@@ -258,7 +204,7 @@ def test_op4_publication_state_published_then_failed(
     from wxverify.web.context import load_close_status
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     d_minus_3 = D - timedelta(days=3)
     published_at = NOW - timedelta(hours=2)
     pub_id = seed_active_publication(
@@ -273,7 +219,7 @@ def test_op4_publication_state_published_then_failed(
         finished_at=published_at,
         publication_id=str(pub_id),
     )
-    panel = load_close_status(conn, NOW, close_on=True)
+    panel = load_close_status(conn, NOW)
     assert panel is not None
     row = next(r for r in panel.rows if r.site_id == site_id)
     day = next(d for d in row.days if d.local_date == d_minus_3.isoformat())
@@ -284,7 +230,7 @@ def test_op4_publication_state_published_then_failed(
     )
 
     conn2 = asof_conn()
-    site_id2 = day_close_site(conn2, close_on=True)
+    site_id2 = day_close_site(conn2)
     failed_at = NOW - timedelta(hours=1)
     seed_publication_state(
         conn2,
@@ -295,7 +241,7 @@ def test_op4_publication_state_published_then_failed(
         finished_at=failed_at,
         last_failure="network",
     )
-    panel2 = load_close_status(conn2, NOW, close_on=True)
+    panel2 = load_close_status(conn2, NOW)
     assert panel2 is not None
     row2 = next(r for r in panel2.rows if r.site_id == site_id2)
     day2 = next(d for d in row2.days if d.local_date == d_minus_3.isoformat())
@@ -316,11 +262,11 @@ def test_op5_zone_changeover_and_own_zone_marks(
     from wxverify.web.context import load_close_status
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, timezone="Etc/GMT-14")
+    site_id = day_close_site(conn, timezone="Etc/GMT-14")
     monkeypatch.setattr("wxverify.web.context.utc_now", lambda: NOW)
 
     changeover_day = enter_zone_change(conn, site_id, "Etc/GMT-2", now_utc=NOW)
-    panel = load_close_status(conn, NOW, close_on=True)
+    panel = load_close_status(conn, NOW)
     assert panel is not None
     row = next(r for r in panel.rows if r.site_id == site_id)
     d_minus_3 = D - timedelta(days=3)
@@ -354,13 +300,13 @@ def test_op6_no_record_holds_now_shows_not_started(
     from wxverify.web.context import load_close_status, load_observation_health
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     d_plus_1 = D + timedelta(days=1)
     start_site_days(conn, site_id, d_plus_1, now_utc=NOW)
     assert current_day(conn, site_id, now_utc=NOW) is None
     monkeypatch.setattr("wxverify.web.context.utc_now", lambda: NOW)
 
-    panel = load_close_status(conn, NOW, close_on=True)
+    panel = load_close_status(conn, NOW)
     assert panel is not None
     row = next(r for r in panel.rows if r.site_id == site_id)
     assert row.note is not None and "no day closed yet" in row.note, (
@@ -374,7 +320,7 @@ def test_op6_no_record_holds_now_shows_not_started(
         panel.alert_lines and "".join(panel.alert_lines) or ""
     )
 
-    health_rows = load_observation_health(conn, close_on=True)
+    health_rows = load_observation_health(conn)
     health_row = next(h for h in health_rows if h.site_id == site_id)
     assert (
         health_row.status == "no day closed yet" and health_row.closed_through is None
@@ -389,13 +335,13 @@ def test_op7_observation_status_closed_through_header_and_cell(
     from wxverify.web.context import load_observation_health
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     monkeypatch.setattr("wxverify.web.context.utc_now", lambda: NOW)
     dates = (D - timedelta(days=4), D - timedelta(days=3), D - timedelta(days=2))
     for i, d in enumerate(dates):
         _close_day(conn, site_id, d, first=(i == 0))
 
-    rows = load_observation_health(conn, close_on=True)
+    rows = load_observation_health(conn)
     row = next(r for r in rows if r.site_id == site_id)
     d_minus_2 = (D - timedelta(days=2)).isoformat()
     assert row.closed_through == d_minus_2, (
@@ -421,7 +367,7 @@ def test_op8_alert_lines_include_each_tripped_alert(
     from wxverify.web.context import load_close_status
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)  # D-2 missed -> AL1
+    site_id = day_close_site(conn)  # D-2 missed -> AL1
     station_a = _station_id(conn, site_id, "ISTATION01")
 
     # Alert 7: a down evening slot on D-2, then an answered one on D-1 (recovered).
@@ -465,7 +411,7 @@ def test_op8_alert_lines_include_each_tripped_alert(
     # Alert 6: a current_obs refusal in force.
     record_access_refused(conn, "current_obs", 401, reason=None)
 
-    panel = load_close_status(conn, NOW, close_on=True)
+    panel = load_close_status(conn, NOW)
     assert panel is not None
     lines = "\n".join(panel.alert_lines)
     assert "close_day_missed" in lines or "missed, the close never ran" in lines, (
@@ -492,7 +438,7 @@ def test_op9_load_close_status_catches_any_exception(
     from wxverify.web.context import load_ops
 
     conn = asof_conn()
-    day_close_site(conn, close_on=True)
+    day_close_site(conn)
 
     context = load_ops(conn)
     assert context.get("close_panel") is not None

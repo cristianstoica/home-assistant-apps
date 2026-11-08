@@ -18,7 +18,6 @@ from wxverify.collection.forecast_validation import (
     invalid_forecast_sample_sql,
 )
 from wxverify.core.timeutil import isoformat_utc, parse_utc
-from wxverify.db.site_days import daily_close_on
 from wxverify.feeds.seam import FetchResult, GridProvenance, NormalizedSample
 
 logger = logging.getLogger(__name__)
@@ -327,11 +326,11 @@ def site_local_dates(
     """The site-local date of each UTC stamp in ``instants``.
 
     The rule the download record dates a try's end by
-    (``worker.feed_fetch._download_local_date``): while the daily close is
-    on, the date of the record whose stored bounds hold the instant; else,
-    or with no such record, the date in ``sites.timezone`` (in UTC when that
-    zone does not load). A stamp that does not parse is left out, as is
-    every stamp for a site that does not exist. Read-only.
+    (``worker.feed_fetch._download_local_date``): the date of the record
+    whose stored bounds hold the instant; with no such record, the date in
+    ``sites.timezone`` (in UTC when that zone does not load). A stamp that
+    does not parse is left out, as is every stamp for a site that does not
+    exist. Read-only.
     """
     parsed: dict[str, datetime] = {}
     for stamp in instants:
@@ -351,23 +350,22 @@ def site_local_dates(
     except (ZoneInfoNotFoundError, ValueError):
         zone = None
     records: list[tuple[datetime, datetime, date]] = []
-    if daily_close_on(conn):
-        low = min(parsed.values())
-        high = max(parsed.values())
-        for row in conn.execute(
-            "SELECT local_date, day_start_utc, day_end_utc FROM site_days"
-            " WHERE site_id = ?"
-            " AND julianday(day_start_utc) <= julianday(?)"
-            " AND julianday(day_end_utc) > julianday(?)",
-            (site_id, isoformat_utc(high), isoformat_utc(low)),
-        ):
-            records.append(
-                (
-                    parse_utc(str(row[1])),
-                    parse_utc(str(row[2])),
-                    date.fromisoformat(str(row[0])),
-                )
+    low = min(parsed.values())
+    high = max(parsed.values())
+    for row in conn.execute(
+        "SELECT local_date, day_start_utc, day_end_utc FROM site_days"
+        " WHERE site_id = ?"
+        " AND julianday(day_start_utc) <= julianday(?)"
+        " AND julianday(day_end_utc) > julianday(?)",
+        (site_id, isoformat_utc(high), isoformat_utc(low)),
+    ):
+        records.append(
+            (
+                parse_utc(str(row[1])),
+                parse_utc(str(row[2])),
+                date.fromisoformat(str(row[0])),
             )
+        )
     dates: dict[str, date] = {}
     for stamp, instant in parsed.items():
         held = next(

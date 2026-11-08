@@ -8,9 +8,7 @@ B12), ``PUT /api/sites/{id}/feeds/{id}`` (``update_subscription``, B13),
 and ``PUT /api/sites/{id}`` (``update_site``, B14, ``sites.py:133-148``),
 none of which touch ``forecast_history`` -- the storage-release table drop
 (3.1) removed the mean-rebuild/pair-invalidation call path these routes
-used to run through; ``wxverify.db.site_days.check_date_write``,
-``WriteKind``, ``DAILY_CLOSE_ON_KEY`` and the
-close-off branch at ``db/site_days.py:1109-1111`` deleted by 3.2;
+used to run through;
 ``wxverify.api.routes.db_transfer`` (``export_begin``/``export_status``/
 ``export_download``, ``import_db`` at ``:671``, ``run_rebuild_all``); the
 Ops panel marker ``id="import-panel"`` in
@@ -38,7 +36,6 @@ import gzip
 import sqlite3
 import time
 from collections.abc import Iterator
-from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -51,19 +48,13 @@ from tests.helpers import (
     asof_conn,
     asof_make_real_feed,
     asof_make_site,
-    day_close_site,
     seed_forecast_history,
 )
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.api.routes import db_transfer
 from wxverify.db.connection import close_db, init_db
-from wxverify.db.runtime_state import delete_runtime_state, set_runtime_state
-from wxverify.db.site_days import (
-    DAILY_CLOSE_ON_KEY,
-    WriteKind,
-    check_date_write,
-)
+from wxverify.db.runtime_state import set_runtime_state
 from wxverify.scoring.consensus import materialize_consensus
 
 _EXPORT_BASE = "/api/export"
@@ -382,32 +373,6 @@ def test_rain_threshold_put_leaves_pair_tables_as_seeded(
     finally:
         direct.close()
     assert before_hist == after_hist
-
-
-# ---------------------------------------------------------------------------
-# 3. The close is permanent.
-# ---------------------------------------------------------------------------
-
-
-def test_guard_refuses_hourly_write_into_done_day_with_close_key_missing() -> None:
-    """3.2: deleting the close-off branch (``db/site_days.py:1109-1111``,
-    with ``_CLOSE_OFF_KINDS``) makes the record-based refusal apply even
-    when ``DAILY_CLOSE_ON_KEY`` is missing. Fails now: with the key
-    removed by hand, ``daily_close_on`` reads ``False`` and the close-off
-    branch allows ``HOURLY`` unconditionally, even though D-3 (seeded via
-    ``day_close_site``) is ``closed``. The paired positive on D-1 (``open``)
-    shows the refusal is selective, not a blanket ``False``, both before
-    and after the build.
-    """
-    conn = asof_conn()
-    site_id = day_close_site(conn)  # close ON; D-3 closed, D-2 missed, D-1 open
-    d3 = D - timedelta(days=3)
-    d1 = D - timedelta(days=1)
-    delete_runtime_state(conn, DAILY_CLOSE_ON_KEY)
-    conn.commit()
-
-    assert check_date_write(conn, site_id, d3, WriteKind.HOURLY, now_utc=NOW) is False
-    assert check_date_write(conn, site_id, d1, WriteKind.HOURLY, now_utc=NOW) is True
 
 
 # ---------------------------------------------------------------------------

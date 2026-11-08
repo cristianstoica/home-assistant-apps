@@ -1,21 +1,17 @@
 <section class="panel">
   <h2>Observation Status</h2>
-  {% if close_on %}
   <p class="panel-hint">How far each site's days are done: that day and every earlier one closed or missed.</p>
-  {% else %}
-  <p class="panel-hint">Whether each site's ground-truth station observations are arriving.</p>
-  {% endif %}
   {% if observation_health %}
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Site</th><th>Status</th><th>Stations</th><th>{% if close_on %}Closed through{% else %}Last obs{% endif %}</th></tr></thead>
+        <thead><tr><th>Site</th><th>Status</th><th>Stations</th><th>Closed through</th></tr></thead>
         <tbody>
           {% for row in observation_health %}
             <tr>
               <td>{{ row.site_name }}</td>
               <td>{{ row.status }}</td>
               <td>{{ row.enabled_station_count }}</td>
-              <td>{% if close_on %}{{ row.closed_through or "none yet" }}{% else %}{{ row.last_obs_at or "n/a" }}{% endif %}</td>
+              <td>{{ row.closed_through or "none yet" }}</td>
             </tr>
           {% endfor %}
         </tbody>

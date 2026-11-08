@@ -534,9 +534,9 @@ def _refuse_removal(
 
     Two checks, both before any write. First, the station is enabled and no
     other enabled station remains: the flag is the list of the next local
-    day and every later one. Second, while the daily close is on, the
-    station is the only one in the current local day's list (a station
-    added today counts only from tomorrow).
+    day and every later one. Second, the station is the only one in the
+    current local day's list (a station added today counts only from
+    tomorrow).
     """
     if bool(row["enabled"]) and _enabled_station_count(conn, site_id) <= 1:
         raise ApiError(409, "site must retain at least one enabled station")

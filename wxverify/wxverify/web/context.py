@@ -28,7 +28,6 @@ from wxverify.db.site_days import (
     DayRecord,
     closed_through,
     current_day,
-    daily_close_on,
     day_record,
     zone_flagged,
 )
@@ -268,14 +267,6 @@ class BudgetGauge:
 
 
 @dataclass(frozen=True)
-class BackfillRow:
-    site_id: int
-    site_name: str
-    status: str | None
-    through: str | None
-
-
-@dataclass(frozen=True)
 class KeyStatusRow:
     provider: str
     present: bool
@@ -297,10 +288,9 @@ class ObservationHealthRow:
     site_id: int
     site_name: str
     status: str
-    last_obs_at: str | None
     enabled_station_count: int
-    #: With the daily close on, the site's ``closed_through`` date (plan
-    #: §10.1); None with the close off, and while no day is done.
+    #: The site's ``closed_through`` date (plan §10.1); None while no day is
+    #: done.
     closed_through: str | None = None
 
 
@@ -346,9 +336,9 @@ class ClosePanelRow:
 
 @dataclass(frozen=True)
 class ClosePanel:
-    """The close status panel, shown on Ops while the close is on (§10.2)."""
+    """The close status panel, shown on Ops (§10.2)."""
 
-    #: One per site, in ``load_backfill``'s order.
+    #: One per site, by name (case-insensitive).
     rows: tuple[ClosePanelRow, ...]
     #: "<id>: <detail>" per tripped close alert, alert 7's "recovered" line,
     #: and alert 6's next try and full list of days affected.
@@ -442,16 +432,14 @@ _STARTING_HISTORY_HINT: Final = (
 )
 
 
-def _starting_history_hint(
-    conn: sqlite3.Connection, site_id: int | None, *, close_on: bool
-) -> str | None:
+def _starting_history_hint(conn: sqlite3.Connection, site_id: int | None) -> str | None:
     """The starting-history hint for the site, or None (switch-over plan 5.4).
 
-    Shown from the switch on, while the site has a record: it names the
-    site's first record date (``first_record_date``). None while the close
-    is off, with no site, and for a site with no record yet.
+    Shown while the site has a record: it names the site's first record date
+    (``first_record_date``). None with no site, and for a site with no
+    record yet.
     """
-    if site_id is None or not close_on:
+    if site_id is None:
         return None
     first_day = first_record_date(conn, site_id)
     if first_day is None:
@@ -470,15 +458,14 @@ def load_dashboard(
     """The dashboard page's context, read in one snapshot (9.3).
 
     Opens a ``read_snapshot`` unless the caller already holds a
-    transaction, so every part of the page -- with the daily close on, every
-    ranking and the wind weights -- comes from one publication version.
-    With the close on, ``rolling_days`` and ``min_n`` are the active
-    publication's, so the "Last N days" tab names the published window;
-    ``evidence_through`` is its cutoff and ``pending_settings`` the ranking
-    settings saved since (13.1). With the close off they are today's
-    settings, None and ``{}``. ``starting_history_hint`` is the
-    switch-over plan's hint (5.4), None while the close is off or the site
-    has no record.
+    transaction, so every part of the page -- every ranking and the wind
+    weights -- comes from one publication version. ``rolling_days`` and
+    ``min_n`` are the active publication's, so the "Last N days" tab names
+    the published window; ``evidence_through`` is its cutoff and
+    ``pending_settings`` the ranking settings saved since (13.1). With no
+    active publication they are today's settings, None and ``{}``.
+    ``starting_history_hint`` is the switch-over plan's hint (5.4), None
+    while the site has no record.
     """
     if conn.in_transaction:
         return _load_dashboard(
@@ -504,13 +491,11 @@ def _load_dashboard(
         if site_id is not None
         else (sites[0] if sites else None)
     )
-    # One switch per read (9.1). The publication is the one the page's
-    # rankings read, in the same snapshot; none for a disabled site, as the
-    # leaderboard's own close-on read.
-    close_on = site is not None and daily_close_on(conn)
+    # The publication is the one the page's rankings read, in the same
+    # snapshot (9.1); none for a disabled site, as the leaderboard's own read.
     publication = (
         active_publication(conn, site_id=site.id, at_utc=None)
-        if site is not None and site.enabled and close_on
+        if site is not None and site.enabled
         else None
     )
     if publication is not None:
@@ -600,9 +585,7 @@ def _load_dashboard(
         "evidence_through": evidence_through,
         "evidence_before_close": evidence_before_close,
         "pending_settings": pending_settings,
-        "starting_history_hint": _starting_history_hint(
-            conn, site.id, close_on=close_on
-        ),
+        "starting_history_hint": _starting_history_hint(conn, site.id),
         "coverage": _coverage_table(
             conn,
             publication=publication,
@@ -659,10 +642,9 @@ def _coverage_table(
     P4's stored numbers for the active publication the rankings read, under
     the Leaderboard's own window key, so the table and the rankings name one
     window: ``w:{N}`` for the "Last N days" tab, N the publication's
-    ``window_days``, and ``w:all`` for "All time". None with the close off
-    or no active publication (``publication`` None), and when the
-    Leaderboard has no row: the table has a row per Leaderboard feed, in the
-    Leaderboard's order.
+    ``window_days``, and ``w:all`` for "All time". None with no active
+    publication (``publication`` None), and when the Leaderboard has no row:
+    the table has a row per Leaderboard feed, in the Leaderboard's order.
     """
     if publication is None or not leaderboard:
         return None
@@ -709,29 +691,24 @@ def _coverage_cell(coverage: Coverage | None, day_ahead: int) -> CoverageCell:
 def load_ops(conn: sqlite3.Connection) -> dict[str, object]:
     """The Ops page's context (plan §10).
 
-    Reads ``now`` and the daily close's switch once, at its start, and
-    passes the answer to every panel that has two views, so the page never
-    mixes them. With the close on, ``close_panel`` holds the close status
-    panel; with it off the panels are today's and ``close_panel`` is None.
+    Reads ``now`` once, at its start; ``close_panel`` holds the close status
+    panel.
     """
     now = utc_now()
-    close_on = daily_close_on(conn)
     sites = load_sites(conn)
     return {
         "sites": sites,
         "feed_status": load_feed_health(conn),
         "budgets": load_budgets(conn),
-        "backfill": load_backfill(conn),
         "keys": [
             KeyStatusRow(provider=provider, present=present)
             for provider, present in sorted(key_status().items())
         ],
         "access_holds": load_access_holds(conn),
-        "observation_health": load_observation_health(conn, close_on=close_on),
+        "observation_health": load_observation_health(conn),
         "station_trust": load_station_trust(conn),
         "wind_history": load_wind_history(conn),
-        "close_on": close_on,
-        "close_panel": load_close_status(conn, now, close_on=close_on),
+        "close_panel": load_close_status(conn, now),
     }
 
 
@@ -745,10 +722,10 @@ def load_overlay(
 ) -> dict[str, object]:
     """The Overlay page's context.
 
-    ``lead`` and ``lead_options`` feed the page's lead control and links,
-    shown with the close on only; ``lead`` is not checked here, as the
-    dashboard does not check it (plan §9.2). ``starting_history_hint`` is
-    the switch-over plan's hint (5.4), as on the dashboard.
+    ``lead`` and ``lead_options`` feed the page's lead control and links;
+    ``lead`` is not checked here, as the dashboard does not check it (plan
+    §9.2). ``starting_history_hint`` is the switch-over plan's hint (5.4),
+    as on the dashboard.
     """
     sites = load_sites(conn, include_disabled=False)
     site = (
@@ -756,8 +733,6 @@ def load_overlay(
         if site_id is not None
         else (sites[0] if sites else None)
     )
-    # One switch per read (9.2): it picks the chart hint.
-    close_on = daily_close_on(conn)
     feeds = _scoring_feeds(conn, site.id if site is not None else None)
     selected_feed_id = (
         feed_id if feed_id is not None else (feeds[0].id if feeds else None)
@@ -768,9 +743,8 @@ def load_overlay(
         "variable": variable,
         "feeds": feeds,
         "feed_id": selected_feed_id,
-        "close_on": close_on,
         "starting_history_hint": _starting_history_hint(
-            conn, site.id if site is not None else None, close_on=close_on
+            conn, site.id if site is not None else None
         ),
         "lead": lead,
         "lead_options": LEAD_OPTIONS,
@@ -910,43 +884,15 @@ def load_budgets(conn: sqlite3.Connection) -> list[BudgetGauge]:
     return out
 
 
-def load_backfill(conn: sqlite3.Connection) -> list[BackfillRow]:
-    return [
-        BackfillRow(
-            site_id=int(row["id"]),
-            site_name=str(row["name"]),
-            status=None
-            if row["backfill_status"] is None
-            else str(row["backfill_status"]),
-            through=None
-            if row["backfill_through"] is None
-            else str(row["backfill_through"]),
-        )
-        for row in conn.execute(
-            """
-            SELECT id, name, backfill_status, backfill_through
-            FROM sites
-            ORDER BY name COLLATE NOCASE
-            """
-        )
-    ]
-
-
-def load_observation_health(
-    conn: sqlite3.Connection, *, close_on: bool
-) -> list[ObservationHealthRow]:
+def load_observation_health(conn: sqlite3.Connection) -> list[ObservationHealthRow]:
     """Each site's Observation Status row (plan §10.1).
 
-    With the daily close off: today's query, ``sites.last_obs_at`` and the
-    status "never run / due" while it is NULL. With it on: the same query
-    without ``s.last_obs_at``, the site's ``closed_through`` in its place
-    and the status "no day closed yet" while it is None. "site disabled"
-    and "no enabled stations" come first in both views.
+    The site's ``closed_through`` date and the status "no day closed yet"
+    while it is None. "site disabled" and "no enabled stations" come first.
     """
-    last_obs_column = "" if close_on else " s.last_obs_at,"
     rows = conn.execute(
-        f"""
-        SELECT s.id, s.name, s.enabled,{last_obs_column}
+        """
+        SELECT s.id, s.name, s.enabled,
                COALESCE(station_counts.n, 0) AS enabled_station_count
         FROM sites s
         LEFT JOIN (
@@ -963,28 +909,18 @@ def load_observation_health(
     for row in rows:
         site_id = int(row["id"])
         enabled_station_count = int(row["enabled_station_count"])
-        last_obs_at: str | None = None
-        through: date | None = None
-        if close_on:
-            through = closed_through(conn, site_id)
-        elif row["last_obs_at"] is not None:
-            last_obs_at = str(row["last_obs_at"])
+        through = closed_through(conn, site_id)
         if not bool(row["enabled"]):
             status = "site disabled"
         elif enabled_station_count == 0:
             status = "no enabled stations"
-        elif close_on:
-            status = "no day closed yet" if through is None else "ok"
-        elif last_obs_at is None:
-            status = "never run / due"
         else:
-            status = "ok"
+            status = "no day closed yet" if through is None else "ok"
         out.append(
             ObservationHealthRow(
                 site_id=site_id,
                 site_name=str(row["name"]),
                 status=status,
-                last_obs_at=last_obs_at,
                 enabled_station_count=enabled_station_count,
                 closed_through=None if through is None else through.isoformat(),
             )
@@ -1331,7 +1267,7 @@ def _close_alert_lines(conn: sqlite3.Connection, now: datetime) -> tuple[str, ..
     lines: list[str] = []
     alerts = [
         *close_monitor.close_alerts(conn, now),
-        close_monitor.station_silent(conn, now, close_on=True),
+        close_monitor.station_silent(conn, now),
     ]
     for alert in alerts:
         if alert.tripped:
@@ -1351,12 +1287,10 @@ def _close_alert_lines(conn: sqlite3.Connection, now: datetime) -> tuple[str, ..
     return tuple(lines)
 
 
-def load_close_status(
-    conn: sqlite3.Connection, now: datetime, *, close_on: bool
-) -> ClosePanel | None:
-    """The close status panel (plan §10.2), or None with the close off.
+def load_close_status(conn: sqlite3.Connection, now: datetime) -> ClosePanel:
+    """The close status panel (plan §10.2).
 
-    One row per site, in ``load_backfill``'s order: a disabled site reads
+    One row per site, by name (case-insensitive): a disabled site reads
     "site disabled" and nothing else; an enabled site has its recent days
     (``_close_panel_days``), its newest collection try and its notes. Then
     the alert lines. Day states come only from P1's reads and the close's
@@ -1365,8 +1299,6 @@ def load_close_status(
     unavailable: <Type>: <msg>", so the rest of Ops renders; a
     ``sqlite3.Error`` propagates as every other panel's does.
     """
-    if not close_on:
-        return None
     try:
         sites = conn.execute(
             """
@@ -1435,43 +1367,42 @@ def _station_trust_limits(
 def load_station_trust(conn: sqlite3.Connection) -> list[StationTrustRow]:
     """Each station's ``ok`` values against its site's, worst mean gap first.
 
-    With the daily close off, over all time. With it on (9.3), over each
-    site's closed days and starting history only: rows at or after the
-    site's stop and rows on its missed days (``_station_trust_limits``) are
-    left out, each list passed as a ``VALUES`` table; a list with no row
-    leaves its clause out, as an empty ``VALUES`` list is not valid SQL.
-    The ``observations`` join is on the same ``valid_at``, so both sides end
-    there. Never reads the provisional line.
+    Over each site's closed days and starting history only (9.3): rows at or
+    after the site's stop and rows on its missed days
+    (``_station_trust_limits``) are left out, each list passed as a
+    ``VALUES`` table; a list with no row leaves its clause out, as an empty
+    ``VALUES`` list is not valid SQL. The ``observations`` join is on the
+    same ``valid_at``, so both sides end there. Never reads the provisional
+    line.
     """
     ctes: list[str] = []
     clauses = ["so.qc_flag = 'ok'"]
     params: list[object] = []
-    if daily_close_on(conn):
-        stops, missed = _station_trust_limits(conn, utc_now())
-        if stops:
-            ctes.append(
-                "trust_stops(site_id, valid_before) AS (VALUES "
-                + ", ".join("(?, ?)" for _ in stops)
-                + ")"
-            )
-            params.extend(value for stop in stops for value in stop)
-            clauses.append(
-                "NOT EXISTS (SELECT 1 FROM trust_stops t"
-                " WHERE t.site_id = stations.site_id"
-                " AND so.valid_at >= t.valid_before)"
-            )
-        if missed:
-            ctes.append(
-                "trust_missed(site_id, start_utc, end_utc) AS (VALUES "
-                + ", ".join("(?, ?, ?)" for _ in missed)
-                + ")"
-            )
-            params.extend(value for day in missed for value in day)
-            clauses.append(
-                "NOT EXISTS (SELECT 1 FROM trust_missed m"
-                " WHERE m.site_id = stations.site_id"
-                " AND so.valid_at >= m.start_utc AND so.valid_at < m.end_utc)"
-            )
+    stops, missed = _station_trust_limits(conn, utc_now())
+    if stops:
+        ctes.append(
+            "trust_stops(site_id, valid_before) AS (VALUES "
+            + ", ".join("(?, ?)" for _ in stops)
+            + ")"
+        )
+        params.extend(value for stop in stops for value in stop)
+        clauses.append(
+            "NOT EXISTS (SELECT 1 FROM trust_stops t"
+            " WHERE t.site_id = stations.site_id"
+            " AND so.valid_at >= t.valid_before)"
+        )
+    if missed:
+        ctes.append(
+            "trust_missed(site_id, start_utc, end_utc) AS (VALUES "
+            + ", ".join("(?, ?, ?)" for _ in missed)
+            + ")"
+        )
+        params.extend(value for day in missed for value in day)
+        clauses.append(
+            "NOT EXISTS (SELECT 1 FROM trust_missed m"
+            " WHERE m.site_id = stations.site_id"
+            " AND so.valid_at >= m.start_utc AND so.valid_at < m.end_utc)"
+        )
     with_clause = f"WITH {', '.join(ctes)}" if ctes else ""
     rows = conn.execute(
         f"""

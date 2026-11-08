@@ -35,7 +35,6 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from tests.helpers import close_off
 from wxverify import config
 from wxverify.collection.budget import Reservation
 from wxverify.collection.wind_quota import (
@@ -49,6 +48,7 @@ from wxverify.collection.wind_quota import (
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations, seed_default_sources
 from wxverify.db.runtime_state import set_runtime_state
+from wxverify.db.site_days import start_site_days
 from wxverify.obs.pws_adapter import (
     WeathercomRateLimiter,
     _get_with_deadline,  # noqa: PLC2701 -- private, exercised directly
@@ -486,10 +486,14 @@ def test_t96_a_simulated_day_makes_54_all_1day_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     conn = _init_tmp_db(tmp_path)
-    close_off(conn)
     site_id = _make_site(conn)
     station_ids = [_make_station(conn, site_id, f"KTEST{i:03d}") for i in range(1, 7)]
     start = datetime(2026, 3, 10, 0, 0, 0, tzinfo=UTC)
+    # The lane needs a P1 record holding `start` (the daily close is
+    # always on): without one, _lane_today's `ensure` creates only a
+    # first record dated tomorrow, and the simulated day below would make
+    # no calls at all.
+    start_site_days(conn, site_id, start.date(), now_utc=start)
 
     all_1day_calls = 0
 

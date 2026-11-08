@@ -399,7 +399,6 @@ def test_gw17_writer_source_scan_matches_the_allowlist() -> None:
     hits: set[tuple[str, str]] = set()
     hit_targets: dict[tuple[str, str], set[str]] = {}
     stale_module_calls: list[str] = []
-    copy_on_calls: list[tuple[str, str]] = []
     state_table_modules: set[str] = set()
 
     for py_file in sorted(root.rglob("*.py")):
@@ -474,12 +473,6 @@ def test_gw17_writer_source_scan_matches_the_allowlist() -> None:
                         hit_targets.setdefault((module, fn), set()).add(target)
             if (
                 isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "open_day_on_copy"
-            ):
-                copy_on_calls.append((module, _enclosing(node, tree)))
-            if (
-                isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "mark_daily_truth_stale"
             ):
@@ -517,7 +510,6 @@ def test_gw17_writer_source_scan_matches_the_allowlist() -> None:
     assert sorted(stale_module_calls) == [
         "wxverify.scoring.consensus.materialize_consensus",
     ]
-    assert copy_on_calls == [("wxverify.__main__", "_close_day")], copy_on_calls
 
     offending_state_modules = sorted(
         state_table_modules - {"wxverify.db.migrations", "wxverify.db.site_days"}

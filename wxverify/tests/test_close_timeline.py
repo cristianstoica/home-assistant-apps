@@ -8,10 +8,10 @@ body, below) or through ``tests.helpers.install_round_state_standin``,
 which patches an attribute of ``wxverify.worker.close_p4`` -- a module
 that does not exist yet, so the patch itself raises
 ``ModuleNotFoundError``. Where the close branch is never reached at all
-(``scheduler_tick`` has no ``daily_close_on`` branch to call it from
-until piece 4), the test instead fails on a plain assertion that needs
-P3's behaviour -- the moved-day or new-job-row check simply finds nothing
-moved and nothing enqueued.
+(``scheduler_tick`` has no call to it at all until piece 4), the test
+instead fails on a plain assertion that needs P3's behaviour -- the
+moved-day or new-job-row check simply finds nothing moved and nothing
+enqueued.
 
 Section 16.2 of the plan names the mutant each test ID kills; that mapping
 is given inline on the exact assertion it kills at, in the file's own
@@ -421,7 +421,6 @@ def test_tl5_sites_are_enqueued_in_due_instant_order(
         site_gmt14 = day_close_site(
             conn,
             timezone="Etc/GMT-14",
-            close_on=True,
             with_records=True,
             station_ids=("ISTATION03", "ISTATION04"),
         )
@@ -898,7 +897,6 @@ def test_tl10_one_sites_fault_does_not_stop_the_others(
         site2 = day_close_site(
             conn,
             timezone="UTC",
-            close_on=True,
             with_records=True,
             station_ids=("ISTATION03", "ISTATION04"),
         )
@@ -1002,7 +1000,6 @@ def test_tl10_a_second_loop_fault_does_not_fail_the_whole_tick(
         site1 = day_close_site(
             conn,
             timezone="UTC",
-            close_on=True,
             with_records=False,
             station_ids=("ISTATION03", "ISTATION04"),
         )
@@ -1082,7 +1079,6 @@ def test_l5_a_database_error_from_enqueue_due_close_work_raises(
         site2 = day_close_site(
             conn,
             timezone="UTC",
-            close_on=True,
             with_records=True,
             station_ids=("ISTATION03", "ISTATION04"),
         )
@@ -1126,7 +1122,6 @@ def test_l5_b_integrity_error_is_contained_per_site(
         site2 = day_close_site(
             conn,
             timezone="UTC",
-            close_on=True,
             with_records=True,
             station_ids=("ISTATION03", "ISTATION04"),
         )

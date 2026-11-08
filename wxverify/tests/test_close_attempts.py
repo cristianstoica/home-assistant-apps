@@ -10,10 +10,9 @@ inline/top-level reference to a P3 name that is not there yet, raising
 ``tests.helpers.install_round_state_standin``/``install_p4_standins``, which
 patch an attribute of ``wxverify.worker.close_p4`` -- a module that does not
 exist yet. Where neither applies, the test instead fails on a plain
-assertion that needs P3's behaviour: ``scheduler_tick`` has no
-``daily_close_on`` branch to call ``enqueue_due_close_work`` from until
-piece 4, so the moved-day, attempt or job-row check simply finds nothing
-moved, started or enqueued.
+assertion that needs P3's behaviour: ``scheduler_tick`` has no call to
+``enqueue_due_close_work`` at all until piece 4, so the moved-day, attempt
+or job-row check simply finds nothing moved, started or enqueued.
 
 Section 16.2 of the plan names the mutant each test ID kills; that mapping
 is given inline on the exact assertion it kills at, in
@@ -767,9 +766,7 @@ def test_at7_an_outage_spanning_several_nights_misses_each_in_date_order(
         d_plus_1 = D + timedelta(days=1)
         d_plus_2 = D + timedelta(days=2)
 
-        site_id = day_close_site(
-            conn, timezone="UTC", close_on=True, with_records=False
-        )
+        site_id = day_close_site(conn, timezone="UTC", with_records=False)
         stations = {
             str(row["pws_station_id"]): int(row["id"])
             for row in conn.execute(

@@ -16,7 +16,7 @@
 {% endif %}
 
 {% if site and feed_id %}
-  {% set lead_query = ('&lead=' ~ (lead|urlencode)) if close_on else '' %}
+  {% set lead_query = '&lead=' ~ (lead|urlencode) %}
   <section class="toolbar">
     <div class="segmented">
       {% for item in sites %}
@@ -28,18 +28,16 @@
         <a class="{{ 'active' if feed.id == feed_id else '' }}" href="{{ url('/overlay?site=' ~ site.id ~ '&variable=' ~ variable ~ '&feed_id=' ~ feed.id ~ lead_query) }}">{{ feed.label }}</a>
       {% endfor %}
     </div>
-    {% if close_on %}
-      <div class="segmented" aria-label="Lead time">
-        {% for opt in lead_options %}
-          <a class="{{ 'active' if lead == opt.value else '' }}" href="{{ url('/overlay?site=' ~ site.id ~ '&variable=' ~ variable ~ '&feed_id=' ~ feed_id ~ '&lead=' ~ (opt.value|urlencode)) }}">{{ opt.word }}</a>
-        {% endfor %}
-      </div>
-    {% endif %}
+    <div class="segmented" aria-label="Lead time">
+      {% for opt in lead_options %}
+        <a class="{{ 'active' if lead == opt.value else '' }}" href="{{ url('/overlay?site=' ~ site.id ~ '&variable=' ~ variable ~ '&feed_id=' ~ feed_id ~ '&lead=' ~ (opt.value|urlencode)) }}">{{ opt.word }}</a>
+      {% endfor %}
+    </div>
   </section>
 
   <section class="panel wide">
     <h2>Forecast Overlay</h2>
-    <p class="panel-hint">Two lines on one chart: what the feed predicted and what was observed.{% if close_on %} After the last closed day, a dashed line shows provisional observed values from today's station readings. Missed days have no observed line.{% endif %}</p>
+    <p class="panel-hint">Two lines on one chart: what the feed predicted and what was observed. After the last closed day, a dashed line shows provisional observed values from today's station readings. Missed days have no observed line.</p>
     <div
       class="chart tall"
       data-chart="overlay"

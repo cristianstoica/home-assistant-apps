@@ -143,8 +143,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     options = load_runtime_options()
     await db.write(reclaim_all_stale)
     # Close work a stop cut short is settled before the workers start and
-    # before this start's `worker_started_at`; only while the daily close is
-    # on, which the function reads itself (plan 5.5).
+    # before this start's `worker_started_at` (plan 5.5).
     await db.write(lambda conn: settle_interrupted_closes(conn, now_utc=utc_now()))
     await db.write(lambda conn: set_runtime_state_now(conn, "worker_started_at"))
     if options.rolling_window_days is not None:

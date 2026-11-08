@@ -103,7 +103,7 @@ def test_tz6_write_close_truth_resolves_without_the_pointer() -> None:
     from tests.helpers import NOW, D, day_close_site
 
     conn = _conn()
-    site_id = day_close_site(conn, timezone="UTC", close_on=True, with_records=True)
+    site_id = day_close_site(conn, timezone="UTC", with_records=True)
     generation_id = site_generation_id(conn, site_id)
     assert generation_id is not None
 

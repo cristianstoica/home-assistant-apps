@@ -174,8 +174,8 @@ class ScoreDayRefused(Exception):
     """P1's guard refused one of ``score_day``'s write kinds for the day (6.1).
 
     ``score_day`` checks ``DAY_SCORES`` and ``CLOSE_RECORD`` before any other
-    work; for a ``closing`` day with the close on both are accepted, so a
-    refusal is a programming error, or the close is off (17).
+    work; for a ``closing`` day both are accepted, so a refusal is a
+    programming error.
     """
 
     def __init__(self, kind: WriteKind) -> None:

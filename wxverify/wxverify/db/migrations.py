@@ -1362,7 +1362,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
 def _record_fresh_build_keys(conn: sqlite3.Connection) -> None:
     """A fresh file's two ``runtime_state`` keys, each written only when absent.
 
-    ``DAILY_CLOSE_ON_KEY``: the daily close is on from the build.
+    ``DAILY_CLOSE_ON_KEY``: the daily close's switch time is the build's.
     ``STORAGE_COMPACTED_KEY``: the file has nothing to compact. Both come
     from one read of this module's ``utc_now``.
     """

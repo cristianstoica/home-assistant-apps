@@ -148,7 +148,7 @@ def _run_publish_with_old_rain_pick(
     best_feed_id, worse_feed_id)`` after ``publish()`` has run.
     """
     db, writer, conn = _make_night_db(tmp_path)
-    site_id = day_close_site(conn, timezone="UTC", close_on=True, with_records=True)
+    site_id = day_close_site(conn, timezone="UTC", with_records=True)
     cutoff = D - timedelta(days=3)  # the only date day_close_site closes
     best = _insert_feed(conn, "Best")
     worse = _insert_feed(conn, "Worse")

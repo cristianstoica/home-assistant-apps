@@ -17,7 +17,6 @@ from wxverify.db.day_guard_log import warn_refused_instants
 from wxverify.db.site_days import (
     WriteKind,
     check_day_write,
-    daily_close_on,
     day_for_instant,
     day_rain_station_ids,
     day_station_ids,
@@ -402,13 +401,10 @@ def _consensus_station_filter(
 ) -> tuple[str, tuple[int, ...]]:
     """The stations ``materialize_consensus`` reads for the hour (6.3).
 
-    While the close is off, the site's enabled stations, as today. While it
-    is on, the saved station list of the day that holds the hour, and for
+    The saved station list of the day that holds the hour, and for
     ``precip`` only its stations the rain check counts (rain release, A1);
     no record or an empty list reads no station.
     """
-    if not daily_close_on(conn):
-        return "s.enabled = 1", ()
     record = day_for_instant(conn, site_id, valid_at)
     listed = day_rain_station_ids if variable == "precip" else day_station_ids
     station_ids = (

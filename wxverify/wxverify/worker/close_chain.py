@@ -11,9 +11,7 @@ P5 and P6 (14.2); ``record_collection_try``, the writer of the
 collection try log (11.2); and ``enqueue_due_close_work``, the tick's part
 (8.5): stage 1, the missed days, the repair and the publication retry; and
 ``settle_interrupted_closes``, which settles the closes and publications a
-stop cut short, at each start (5.5, 9.4);
-and ``begin_offline_close`` and ``run_offline_stage``, with which the
-``close-day`` command closes one past day on a database copy (8.8).
+stop cut short, at each start (5.5, 9.4).
 
 P4's three call points are always called through ``close_p4``, never
 imported by name, so P4 binds them in that one module.
@@ -33,7 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
-from typing import Final, Literal, cast
+from typing import Final, Literal
 from zoneinfo import ZoneInfoNotFoundError
 
 from wxverify.collection.forecast_validation import DISPLAY_VARIABLES
@@ -55,7 +53,6 @@ from wxverify.db.site_days import (
     MissedReason,
     begin_close,
     closed_through,
-    daily_close_on,
     day_record,
     ensure_site_days,
     fail_close,
@@ -216,10 +213,10 @@ def record_collection_try(
     the readings stored and ``readings_refused`` those the closed-day guard
     refused.
 
-    Does one INSERT and nothing else: it neither commits nor reads whether
-    the close is on, so the log is stored from install, and it runs in the
-    caller's transaction. A row that breaks a CHECK of the table raises
-    ``sqlite3.IntegrityError`` unchanged.
+    Does one INSERT and nothing else: it never commits, so the log is
+    stored from install, and it runs in the caller's transaction. A row
+    that breaks a CHECK of the table raises ``sqlite3.IntegrityError``
+    unchanged.
     """
     conn.execute(
         "INSERT INTO close_try_log (site_id, local_date, station_id, kind,"
@@ -479,12 +476,11 @@ def close_status(
     """Everything about the close of ``site_id``'s day ``local_date`` (14.2).
 
     None when the site has no P1 record dated ``local_date`` (before its
-    first record, or with the close off). Each field is present or None as
-    the stored rows hold it; nothing is cached. Read-only: runs in the
-    caller's transaction and never commits, so a caller that needs its
-    four SELECTs in one snapshot holds one around the call. Reads no
-    clock: ``now_utc``, the caller's clock, is used only for an ``open``
-    day, to tell whether the day has ended.
+    first record). Each field is present or None as the stored rows hold it;
+    nothing is cached. Read-only: runs in the caller's transaction and never
+    commits, so a caller that needs its four SELECTs in one snapshot holds
+    one around the call. Reads no clock: ``now_utc``, the caller's clock, is
+    used only for an ``open`` day, to tell whether the day has ended.
     """
     record = day_record(conn, site_id, local_date)
     if record is None:
@@ -749,18 +745,6 @@ def _write_stage_row(
     )
 
 
-def _require_close_on(conn: sqlite3.Connection, job: Job) -> None:
-    """End a stray stage job with one WARNING while the close is off (13.1)."""
-    if not daily_close_on(conn):
-        logger.warning(
-            "daily close is off: %s job %s of site %s not run",
-            job.type,
-            job.id,
-            job.site_id,
-        )
-        raise JobCancelled()
-
-
 # --- the hand-off rule, stages 2 to 6 ---------------------------------------
 
 
@@ -806,7 +790,7 @@ def _current(
 
 
 def _open_stage(
-    conn: sqlite3.Connection, raw: Job, job: _StageJob, now_utc: datetime
+    conn: sqlite3.Connection, job: _StageJob, now_utc: datetime
 ) -> _Running | None:
     """Steps 1 and 2 of the hand-off rule for a stage 2 to 6 job (8.2, 8.3).
 
@@ -815,7 +799,6 @@ def _open_stage(
     record left as it is), or one claimed too late (the attempt failed as
     ``stalled``).
     """
-    _require_close_on(conn, raw)
     current = _current(conn, job)
     if current is None:
         return None
@@ -986,9 +969,7 @@ def _write_presence(
         )
 
 
-async def _gap_fill_stage(
-    db: Database, writer: FencedWriter, raw: Job, job: _StageJob
-) -> None:
+async def _gap_fill_stage(db: Database, writer: FencedWriter, job: _StageJob) -> None:
     """Stage 2: the gap fill, then its try rows and presence records (8.1).
 
     Not one transaction: ``fill_gaps`` makes its calls between its own
@@ -996,7 +977,7 @@ async def _gap_fill_stage(
     """
 
     def begin(conn: sqlite3.Connection) -> frozenset[int] | None:
-        if _open_stage(conn, raw, job, utc_now()) is None:
+        if _open_stage(conn, job, utc_now()) is None:
             return None
         return _paused_station_ids(conn, site_id=job.site_id, local_date=job.local_date)
 
@@ -1054,11 +1035,11 @@ async def _gap_fill_stage(
 # --- stages 3 to 5: one transaction each ------------------------------------
 
 
-def _hourly_values_stage(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> None:
+def _hourly_values_stage(conn: sqlite3.Connection, job: _StageJob) -> None:
     """Stage 3: the day's hourly values and site hours (8.1, 8.3), then the
     rain check over them (rain release, A2), in the one transaction."""
     now = utc_now()
-    running = _open_stage(conn, raw, job, now)
+    running = _open_stage(conn, job, now)
     if running is None:
         return
     result = write_hourly_values(
@@ -1094,10 +1075,10 @@ def _truth_version(conn: sqlite3.Connection, site_id: int, local_date: date) -> 
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
-def _truth_stage(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> None:
+def _truth_stage(conn: sqlite3.Connection, job: _StageJob) -> None:
     """Stage 4: the verdict, the bounds check and the truth (6.1, 11.4)."""
     now = utc_now()
-    running = _open_stage(conn, raw, job, now)
+    running = _open_stage(conn, job, now)
     if running is None:
         return
     record = running.record
@@ -1142,10 +1123,10 @@ def _truth_stage(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> None:
     _complete_stage(conn, job, running.stamps, now_utc=utc_now())
 
 
-def _score_stage(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> None:
+def _score_stage(conn: sqlite3.Connection, job: _StageJob) -> None:
     """Stage 5: P4 scores the day in this transaction (plan 2.3, 8.3)."""
     now = utc_now()
-    running = _open_stage(conn, raw, job, now)
+    running = _open_stage(conn, job, now)
     if running is None:
         return
     if running.truth_version is None:
@@ -1167,22 +1148,19 @@ def _score_stage(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> None:
 # --- stage 6: the closure ----------------------------------------------------
 
 
-def _closure(
-    conn: sqlite3.Connection, raw: Job, job: _StageJob, *, publish: bool = True
-) -> bool:
+def _closure(conn: sqlite3.Connection, job: _StageJob) -> bool:
     """Stage 6's one write: the closure, its publication, stage 7 (8.1, 8.6).
 
     ``finish_close``, the attempt closed, the stage-log row, the publication
     record of cutoff ``closed_through`` opened and stage 7 enqueued all
-    commit together or not at all. True when the day was closed. With
-    ``publish`` False (the offline close, 8.8) no publication record is
-    opened and no stage 7 is enqueued. ``finish_close`` runs at the write's
-    start time; the attempt's ``last_progress_at`` and ``ended_at``, the
-    stage-log row's ``ended_at`` and the publication record's ``opened_at``
-    take the clock read after it, before stage 7 is enqueued.
+    commit together or not at all. True when the day was closed.
+    ``finish_close`` runs at the write's start time; the attempt's
+    ``last_progress_at`` and ``ended_at``, the stage-log row's ``ended_at``
+    and the publication record's ``opened_at`` take the clock read after
+    it, before stage 7 is enqueued.
     """
     now = utc_now()
-    running = _open_stage(conn, raw, job, now)
+    running = _open_stage(conn, job, now)
     if running is None:
         return False
     finish_close(conn, job.site_id, job.local_date, now_utc=now)
@@ -1195,8 +1173,6 @@ def _closure(
         (stamp, stamp, job.site_id, job.local_date.isoformat(), job.attempt),
     )
     _write_stage_row(conn, job, running.stamps, now_utc=ended, outcome="completed")
-    if not publish:
-        return True
     cutoff = closed_through(conn, job.site_id)
     if cutoff is None:
         raise RuntimeError("no closed day after finish_close")
@@ -1209,9 +1185,9 @@ def _closure(
     return True
 
 
-async def _closure_stage(writer: FencedWriter, raw: Job, job: _StageJob) -> None:
+async def _closure_stage(writer: FencedWriter, job: _StageJob) -> None:
     """Stage 6: the closure, then raw retention in a write of its own (8.4)."""
-    if await writer.write(lambda conn: _closure(conn, raw, job)):
+    if await writer.write(lambda conn: _closure(conn, job)):
         await writer.write(lambda conn: run_close_retention(conn, now_utc=utc_now()))
 
 
@@ -1233,7 +1209,7 @@ def _newer_publication(conn: sqlite3.Connection, job: _StageJob) -> bool:
     return row is not None
 
 
-def _begin_publication(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> bool:
+def _begin_publication(conn: sqlite3.Connection, job: _StageJob) -> bool:
     """Stage 7's short first write: the checks, then ``building`` (8.2, 9.4).
 
     False, with nothing written, when the job's record is not open (its
@@ -1242,7 +1218,6 @@ def _begin_publication(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> bo
     P4. A job claimed too late fails the publication as ``stalled`` (8.3).
     """
     now = utc_now()
-    _require_close_on(conn, raw)
     record = publication_record(conn, site_id=job.site_id, cutoff=job.local_date)
     if (
         record is None
@@ -1279,14 +1254,12 @@ def _begin_publication(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> bo
     return True
 
 
-async def _publish_stage(
-    db: Database, writer: FencedWriter, raw: Job, job: _StageJob
-) -> None:
+async def _publish_stage(db: Database, writer: FencedWriter, job: _StageJob) -> None:
     """Stage 7, the chain's last: publish up to the cutoff (8.1, 9.4).
 
     An exception from P4 propagates; ``fail_day_publish_job`` records it.
     """
-    if not await writer.write(lambda conn: _begin_publication(conn, raw, job)):
+    if not await writer.write(lambda conn: _begin_publication(conn, job)):
         return
     publication_id = await close_p4.publish(
         db=db,
@@ -1343,122 +1316,38 @@ async def run_day_close(db: Database, writer: FencedWriter, job: Job) -> None:
     """Run one ``day_close`` job: stage 2, 3, 4, 5 or 6 (plan 8.1, 8.2).
 
     ``dispatch`` calls it as ``await run_day_close(db, writer, job)``. A
-    malformed job, or one found while the close is off (one WARNING, 13.1),
-    ends with ``JobCancelled``. A stale job returns at once; a stage that
-    decides it failed records the failure itself and returns. An exception
-    propagates, for ``_fail_job`` to record through ``fail_day_close_job``.
-    Once a stop has begun no stage starts: ``StopRequested`` (storage-release
-    plan 6.3), for which ``run_claimed_job`` records nothing.
+    malformed job ends with ``JobCancelled``. A stale job returns at once; a
+    stage that decides it failed records the failure itself and returns. An
+    exception propagates, for ``_fail_job`` to record through
+    ``fail_day_close_job``. Once a stop has begun no stage starts:
+    ``StopRequested`` (storage-release plan 6.3), for which
+    ``run_claimed_job`` records nothing.
     """
     stop.check()
     stage_job = _parse_or_cancel(job, "day_close")
     if stage_job.stage == 2:
-        await _gap_fill_stage(db, writer, job, stage_job)
+        await _gap_fill_stage(db, writer, stage_job)
     elif stage_job.stage == 3:
-        await writer.write(lambda conn: _hourly_values_stage(conn, job, stage_job))
+        await writer.write(lambda conn: _hourly_values_stage(conn, stage_job))
     elif stage_job.stage == 4:
-        await writer.write(lambda conn: _truth_stage(conn, job, stage_job))
+        await writer.write(lambda conn: _truth_stage(conn, stage_job))
     elif stage_job.stage == 5:
-        await writer.write(lambda conn: _score_stage(conn, job, stage_job))
+        await writer.write(lambda conn: _score_stage(conn, stage_job))
     else:
-        await _closure_stage(writer, job, stage_job)
+        await _closure_stage(writer, stage_job)
 
 
 async def run_day_publish(db: Database, writer: FencedWriter, job: Job) -> None:
     """Run one ``day_publish`` job: stage 7 (plan 8.1, 8.2, 9.4).
 
     ``dispatch`` calls it as ``await run_day_publish(db, writer, job)``. A
-    malformed job, or one found while the close is off (one WARNING, 13.1),
-    ends with ``JobCancelled``. An exception propagates, for ``_fail_job``
-    to record through ``fail_day_publish_job``. Once a stop has begun no
-    stage starts, as in ``run_day_close``.
+    malformed job ends with ``JobCancelled``. An exception propagates, for
+    ``_fail_job`` to record through ``fail_day_publish_job``. Once a stop
+    has begun no stage starts, as in ``run_day_close``.
     """
     stop.check()
     stage_job = _parse_or_cancel(job, "day_publish")
-    await _publish_stage(db, writer, job, stage_job)
-
-
-# --- the offline close of one past day (8.8) ---------------------------------
-
-
-def begin_offline_close(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    local_date: date,
-    first_stage: int,
-    now_utc: datetime,
-) -> None:
-    """Start the offline close's attempt, in the caller's transaction (8.8).
-
-    ``begin_close`` and the attempt record (``last_stage`` 1), as the tick
-    starts an attempt (``_start_attempt``), but with no stage-1 row and no
-    stage 2: ``first_stage`` is enqueued instead, 3 to rebuild the day's
-    hours from the raw readings or 4 to keep its stored ``observations``.
-    Raises ``DayStateError`` as ``begin_close`` does. Never commits.
-    """
-    if first_stage not in (3, 4):
-        raise ValueError(f"the offline close starts at stage 3 or 4, not {first_stage}")
-    attempt = begin_close(conn, site_id, local_date, now_utc=now_utc)
-    stamp = isoformat_utc_micro(now_utc)
-    conn.execute(
-        "INSERT INTO close_attempts (site_id, local_date, attempt, started_at,"
-        " last_progress_at) VALUES (?, ?, ?, ?, ?)",
-        (site_id, local_date.isoformat(), attempt, stamp, stamp),
-    )
-    _enqueue_close_stage(conn, site_id, local_date, first_stage, attempt)
-
-
-def run_offline_stage(
-    conn: sqlite3.Connection, *, site_id: int, local_date: date, stage: int
-) -> bool:
-    """Run one stage, 3 to 6, of the offline close, in the caller's transaction.
-
-    Plan 8.8. Claims the site-day's ``pending`` ``day_close`` job of
-    ``stage`` as the queue's claim does (``status`` ``running``,
-    ``updated_at`` the claim time), runs that stage's body as
-    ``run_day_close`` would and completes the job row with the success
-    marker. Stages 3 to 5 enqueue the next stage as they do in the add-on;
-    stage 6 saves the closure with no publication record and no stage 7,
-    and no raw retention follows. Returns False, with nothing written, when
-    no such job is pending: an earlier stage failed the attempt. Never
-    commits.
-    """
-    if stage not in (3, 4, 5, 6):
-        raise ValueError(f"the offline close runs stages 3 to 6, not {stage}")
-    key = _close_key(site_id, local_date, stage)
-    row = conn.execute(
-        "UPDATE jobs SET status = 'running', updated_at = ?"
-        " WHERE type = 'day_close' AND site_id = ? AND job_key = ?"
-        " AND status = 'pending' RETURNING id, payload, retry_count, max_retries",
-        (isoformat_utc(utc_now()), site_id, key),
-    ).fetchone()
-    if row is None:
-        return False
-    payload: object = json.loads(str(row[1]))
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"day_close job {row[0]} has no object payload")
-    raw = Job(
-        id=int(row[0]),
-        type="day_close",
-        site_id=site_id,
-        job_key=key,
-        payload=cast(dict[str, object], payload),
-        status="running",
-        retry_count=int(row[2]),
-        max_retries=int(row[3]),
-    )
-    stage_job = _parse_or_cancel(raw, "day_close")
-    if stage == 3:
-        _hourly_values_stage(conn, raw, stage_job)
-    elif stage == 4:
-        _truth_stage(conn, raw, stage_job)
-    elif stage == 5:
-        _score_stage(conn, raw, stage_job)
-    else:
-        _closure(conn, raw, stage_job, publish=False)
-    complete(conn, raw.id, result="ok")
-    return True
+    await _publish_stage(db, writer, stage_job)
 
 
 # --- failures ----------------------------------------------------------------
@@ -2118,17 +2007,15 @@ def _site_steps(
 def enqueue_due_close_work(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
     """The tick's close work, in ``scheduler_tick``'s transaction (plan 8.5).
 
-    Does nothing while the close is off (13.1). Each enabled site, in order
-    of the earliest due instant among its candidates, then site id (4.5),
-    runs under ``SAVEPOINT close_site``: step 1 ``ensure_site_days``; steps
-    2 and 3 the missed days and a due attempt, oldest day first (5.1, 5.2);
-    step 4 the repair (8.2); step 5 a due publication retry (9.4). A site
-    whose due instant or steps raise begins nothing this tick and the other
-    sites go on (``_in_site_savepoint``). When the tick moved a day to
-    ``missed``, raw retention runs once after the last site (8.4).
+    Each enabled site, in order of the earliest due instant among its
+    candidates, then site id (4.5), runs under ``SAVEPOINT close_site``:
+    step 1 ``ensure_site_days``; steps 2 and 3 the missed days and a due
+    attempt, oldest day first (5.1, 5.2); step 4 the repair (8.2); step 5 a
+    due publication retry (9.4). A site whose due instant or steps raise
+    begins nothing this tick and the other sites go on
+    (``_in_site_savepoint``). When the tick moved a day to ``missed``, raw
+    retention runs once after the last site (8.4).
     """
-    if not daily_close_on(conn):
-        return
     worker_started_at = get_runtime_state(conn, "worker_started_at")
     rounds: dict[tuple[int, date], close_p4.RoundState] = {}
     order: list[tuple[datetime, int]] = []
@@ -2318,17 +2205,15 @@ def _settle_publication(
 def settle_interrupted_closes(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
     """Settle the close work a stop cut short, in the caller's transaction.
 
-    Plan 5.5 and 9.4. Does nothing while the close is off (13.1). ``lifespan``
-    calls it at each start, after ``reclaim_all_stale`` and before the
-    ``worker_started_at`` write, so ``now_utc`` is the start's time. Each
-    ``closing`` day, oldest first, then each ``building``
-    publication record, oldest cutoff first, is settled under its own
-    ``SAVEPOINT close_settle`` (``_settle_day``, ``_settle_publication``);
-    one that raises is left as it was, with one ERROR line, and the next
-    goes on. Then raw retention runs once (8.4). Never commits.
+    Plan 5.5 and 9.4. ``lifespan`` calls it at each start, after
+    ``reclaim_all_stale`` and before the ``worker_started_at`` write, so
+    ``now_utc`` is the start's time. Each ``closing`` day, oldest first,
+    then each ``building`` publication record, oldest cutoff first, is
+    settled under its own ``SAVEPOINT close_settle`` (``_settle_day``,
+    ``_settle_publication``); one that raises is left as it was, with one
+    ERROR line, and the next goes on. Then raw retention runs once (8.4).
+    Never commits.
     """
-    if not daily_close_on(conn):
-        return
     last_loop_at = get_runtime_state(conn, "worker_last_loop_at")
     days = conn.execute(
         "SELECT site_id, local_date FROM site_days WHERE state = 'closing'"

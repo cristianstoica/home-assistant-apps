@@ -1,4 +1,4 @@
-"""P5 plan §13.6: alert 6's close part (AC1-AC7).
+"""P5 plan §13.6: alert 6's close part (AC1-AC5, AC7).
 
 Fixtures and time per plan §13.1: ``day_close_site`` (tests/helpers.py) gives
 a UTC site with stations A (``ISTATION01``) and B (``ISTATION02``), D-3
@@ -12,9 +12,6 @@ alert 6 is read through ``build_verdict`` (budget group), reusing
 imported inside each test body so this module collects before Step 4 piece 2
 lands it (plan §13.1, §15 Step 3).
 
-Every row fails on today's code except AC6, which pins 0.16.13's unchanged
-detail with the close off -- no new code runs on that path, so it already
-holds.
 """
 
 from __future__ import annotations
@@ -32,7 +29,6 @@ from tests.helpers import (
     NOW,
     D,
     asof_conn,
-    close_off,
     day_close_site,
     disable_station_pacing,
     patch_weathercom_transport,
@@ -146,7 +142,7 @@ def _build_ft1_gap_day_site(conn: sqlite3.Connection) -> int:
     full day of gap hours, so ``fill_gaps`` always calls out for it (the
     layout of ``tests/test_gap_fill.py``'s ``_build_base_site``, trimmed
     to the one station this test needs)."""
-    site_id = day_close_site(conn, timezone="UTC", close_on=True, with_records=False)
+    site_id = day_close_site(conn, timezone="UTC", with_records=False)
     d_minus_3 = D - timedelta(days=3)
     start_site_days(
         conn,
@@ -291,7 +287,7 @@ def test_ac1_next_try_before_and_after_until(monkeypatch: pytest.MonkeyPatch) ->
     to D 15:00 (after ``until``) it names that time.
     """
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     station_a = _station_id(conn, site_id, "ISTATION01")
     station_b = _station_id(conn, site_id, "ISTATION02")
     refusal_at = datetime(D.year, D.month, D.day, 9, 0, tzinfo=UTC)
@@ -339,7 +335,7 @@ def test_ac2_days_affected_spans_two_days(monkeypatch: pytest.MonkeyPatch) -> No
     (collecting).
     """
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     site_name = _site_name(conn, site_id)
 
     from wxverify.db.site_days import begin_close
@@ -380,7 +376,7 @@ def test_ac3_current_obs_clause_after_until(monkeypatch: pytest.MonkeyPatch) -> 
     no new try, it reverts to 0.16.13's "waiting for the next try" (M55).
     """
     conn = asof_conn()
-    day_close_site(conn, close_on=True)
+    day_close_site(conn)
 
     refusal_at = datetime(D.year, D.month, D.day, 9, 0, tzinfo=UTC)
     _freeze(monkeypatch, refusal_at)
@@ -416,7 +412,7 @@ def test_ac4_hourly_clause_reads_retry_at(monkeypatch: pytest.MonkeyPatch) -> No
     (M56).
     """
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     site_name = _site_name(conn, site_id)
 
     from wxverify.db.site_days import begin_close, fail_close
@@ -474,7 +470,7 @@ def test_ac5_days_affected_caps_at_three(monkeypatch: pytest.MonkeyPatch) -> Non
         "wxverify.worker.access_hold.ACCESS_HOLD_SECONDS", 6 * 24 * 3600
     )
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     site_name = _site_name(conn, site_id)
 
     d_minus_3 = D - timedelta(days=3)
@@ -496,36 +492,6 @@ def test_ac5_days_affected_caps_at_three(monkeypatch: pytest.MonkeyPatch) -> Non
         "M57 -> at this assertion: correct = at most 3 '<site> <date>"
         " (<state>)' entries are listed, mutant = no cap of 3 days, so"
         " 4 entries would be counted here."
-    )
-
-
-def test_ac6_detail_unchanged_with_close_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC6 (plan §13.6, §6.4): with the close off, the detail equals
-    0.16.13's line exactly -- no close-part text is appended (M58).
-
-    This row PASSES on today's code: with the close off, P5 adds nothing to
-    this path (§6.4, "with the close off the detail is 0.16.13's,
-    unchanged"), so today's ``_access_refused_detail`` already produces this
-    exact text.
-    """
-    conn = asof_conn()
-    close_off(conn)
-    day_close_site(conn, close_on=False)
-
-    refusal_at = datetime(D.year, D.month, D.day, 9, 0, tzinfo=UTC)
-    _freeze(monkeypatch, refusal_at)
-    until = record_access_refused(conn, "five_minute", 401, reason=None)
-
-    cond = _cond(conn, refusal_at + timedelta(minutes=5))
-    detail = str(cond["detail"])
-    expected = (
-        f"weather.com access refused (HTTP 401): 5-minute readings; since"
-        f" {isoformat_utc(refusal_at)}; held until {until}"
-    )
-    assert detail == expected, (
-        f"M58 -> at this assertion: correct = {expected!r} (0.16.13's line,"
-        " unchanged), mutant = the close part appended even with the close"
-        " off, so this exact string would gain a trailing clause."
     )
 
 
@@ -584,7 +550,7 @@ def test_ac7_no_station_named_with_alert3_and_gap_fill_pause(
     from wxverify.db.site_days import ensure_site_days, mark_missed, start_site_days
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     station_a = _station_id(conn, site_id, "ISTATION01")
     site_name = _site_name(conn, site_id)
 

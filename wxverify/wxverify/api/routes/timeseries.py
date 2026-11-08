@@ -75,7 +75,7 @@ def _reply(
     head: dict[str, object] = {"site": site, "variable": variable, "feed_id": feed_id}
     return {
         **head,
-        **_close_on_keys(
+        **_reply_lists(
             conn,
             site=site,
             variable=variable,
@@ -87,7 +87,7 @@ def _reply(
     }
 
 
-def _close_on_keys(
+def _reply_lists(
     conn: sqlite3.Connection,
     *,
     site: int,

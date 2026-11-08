@@ -11,7 +11,7 @@ from wxverify.core.timeutil import window_cutoff
 from wxverify.db.snapshot import read_snapshot
 from wxverify.settings.keys import get_number_setting
 
-LeaderboardStatus = Literal["hit", "stale", "rebuilding", "empty", "live"]
+LeaderboardStatus = Literal["hit", "empty", "live"]
 
 
 @dataclass(frozen=True)

@@ -28,11 +28,16 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
-from tests.helpers import close_off
 from wxverify import config
 from wxverify.core.timeutil import isoformat_utc, local_day_slots
 from wxverify.db.connection import Database, FencedWriter, close_db, init_db
 from wxverify.db.migrations import run_migrations
+from wxverify.db.site_days import (
+    WriteKind,
+    check_day_write,
+    ensure_site_days,
+    start_site_days,
+)
 from wxverify.db.station_readings import StoreResult, store_readings
 from wxverify.obs.hourly_values import StationReading
 from wxverify.worker.access_hold import read_access_record, record_access_refused
@@ -51,10 +56,13 @@ from wxverify.worker.wind_days import (  # noqa: PLC2701 -- private, exercised d
 _API_KEY = "0123456789abcdef0123456789abcdef"
 
 
-def _make_plain_site(conn: sqlite3.Connection, *, pws_id: str) -> tuple[int, int]:
-    """One enabled site and one enabled station; close stays off, so P1's
-    guard accepts every ``READING``/``HOURLY`` write with no site-day
-    record needed at all."""
+def _make_plain_site(
+    conn: sqlite3.Connection, *, pws_id: str, today: date
+) -> tuple[int, int]:
+    """One enabled site and one enabled station, with a P1 record covering
+    ``today`` -- the daily close is always on, so P1's guard needs a real
+    record holding an instant before it accepts a ``READING``/``HOURLY``
+    write of that instant."""
     cur = conn.execute(
         "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
         " timezone) VALUES ('Raw Store Test Site', 0.0, 0.0, 0.0, 'UTC')"
@@ -69,6 +77,12 @@ def _make_plain_site(conn: sqlite3.Connection, *, pws_id: str) -> tuple[int, int
     )
     assert cur.lastrowid is not None
     station_id = int(cur.lastrowid)
+    start_site_days(
+        conn,
+        site_id,
+        today,
+        now_utc=datetime(today.year, today.month, today.day, tzinfo=UTC),
+    )
     conn.commit()
     return site_id, station_id
 
@@ -141,8 +155,7 @@ def test_rs1_full_five_minute_reply_stores_every_quantity(
 
     db = _init_tmp_db(tmp_path, monkeypatch)
     conn = db._conn  # noqa: SLF001 -- real writer connection, as other tests do
-    close_off(conn)
-    site_id = day_close_site(conn, close_on=False, with_records=False)
+    site_id = day_close_site(conn)
     conn.execute("UPDATE stations SET enabled = 0 WHERE pws_station_id = 'ISTATION01'")
     station_b = conn.execute(
         "SELECT id FROM stations WHERE pws_station_id = 'ISTATION02'"
@@ -195,8 +208,7 @@ def test_rs2_later_download_replaces_only_what_it_carries(
 
     db = _init_tmp_db(tmp_path, monkeypatch)
     conn = db._conn  # noqa: SLF001
-    close_off(conn)
-    site_id = day_close_site(conn, close_on=False, with_records=False)
+    site_id = day_close_site(conn)
     conn.execute("UPDATE stations SET enabled = 0 WHERE pws_station_id = 'ISTATION01'")
     station_b = conn.execute(
         "SELECT id FROM stations WHERE pws_station_id = 'ISTATION02'"
@@ -268,8 +280,9 @@ def test_rs3_one_instant_from_two_sources_gives_two_rows() -> None:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     run_migrations(conn)
-    close_off(conn)
-    _site_id, station_id = _make_plain_site(conn, pws_id="ISTATION03")
+    _site_id, station_id = _make_plain_site(
+        conn, pws_id="ISTATION03", today=date(2024, 6, 5)
+    )
 
     instant = datetime(2024, 6, 5, 6, 0, 0, tzinfo=UTC)
     fetched_at = datetime(2024, 6, 5, 6, 5, 0, tzinfo=UTC)
@@ -340,7 +353,7 @@ def test_rs4_guard_refuses_a_closed_days_readings(
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     run_migrations(conn)
-    day_close_site(conn, close_on=True, with_records=True)
+    day_close_site(conn)
     station_b = conn.execute(
         "SELECT id FROM stations WHERE pws_station_id = 'ISTATION02'"
     ).fetchone()["id"]
@@ -414,8 +427,9 @@ def test_rs5_poll_dedup_and_offline_poll_stores_no_raw_row(
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     run_migrations(conn)
-    close_off(conn)
-    site_id, station_id = _make_plain_site(conn, pws_id="ISTATION04")
+    site_id, station_id = _make_plain_site(
+        conn, pws_id="ISTATION04", today=date(2024, 6, 5)
+    )
 
     now = datetime(2024, 6, 5, 6, 0, 0, tzinfo=UTC)
     monkeypatch.setattr("wxverify.worker.current_obs.utc_now", lambda: now)
@@ -524,8 +538,9 @@ def test_rs7_poll_values_pass_the_per_value_check_before_the_raw_insert(
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     run_migrations(conn)
-    close_off(conn)
-    site_id, station_id = _make_plain_site(conn, pws_id="ISTATION06")
+    site_id, station_id = _make_plain_site(
+        conn, pws_id="ISTATION06", today=date(2024, 6, 5)
+    )
 
     now = datetime(2024, 6, 5, 6, 0, 0, tzinfo=UTC)
     monkeypatch.setattr("wxverify.worker.current_obs.utc_now", lambda: now)
@@ -707,9 +722,8 @@ def test_rs8_todays_row_keeps_only_yesterday_and_todays_bounds(
     earlier_before_today_start: timedelta,
     earlier_stored: bool,
 ) -> None:
-    """Plan 14.5 RS8: today's row, close off, in an ``America/New_York``
-    site on the day after a clock change, so yesterday is not 24 hours
-    long (plan 5.8).
+    """Plan 14.5 RS8: today's row in an ``America/New_York`` site on the
+    day after a clock change, so yesterday is not 24 hours long (plan 5.8).
 
     Autumn (today 2024-11-04, yesterday 25 h): a reading 30 minutes after
     yesterday's start -- 24.5 h before today's start -- lies inside
@@ -727,10 +741,7 @@ def test_rs8_todays_row_keeps_only_yesterday_and_todays_bounds(
     timezone = "America/New_York"
     db = _init_tmp_db(tmp_path, monkeypatch)
     conn = db._conn  # noqa: SLF001 -- real writer connection, as other tests do
-    close_off(conn)
-    site_id = day_close_site(
-        conn, timezone=timezone, close_on=False, with_records=False
-    )
+    site_id = day_close_site(conn, timezone=timezone, with_records=False)
     conn.execute("UPDATE stations SET enabled = 0 WHERE pws_station_id = 'ISTATION01'")
     station_b = conn.execute(
         "SELECT id FROM stations WHERE pws_station_id = 'ISTATION02'"
@@ -745,6 +756,24 @@ def test_rs8_todays_row_keeps_only_yesterday_and_todays_bounds(
         0,
         tzinfo=ZoneInfo(timezone),
     ).astimezone(UTC)
+    # The lane needs P1 records (the daily close is always on): start one
+    # two local days before `local_today` (so the earlier reading's own
+    # bounds check has a real, open record to land in or outside of,
+    # exactly as this test's subject needs) and fill forward to today's.
+    day_before_yesterday_local = local_today - timedelta(days=2)
+    start_site_days(
+        conn,
+        site_id,
+        day_before_yesterday_local,
+        now_utc=datetime(
+            day_before_yesterday_local.year,
+            day_before_yesterday_local.month,
+            day_before_yesterday_local.day,
+            1,
+            tzinfo=ZoneInfo(timezone),
+        ).astimezone(UTC),
+    )
+    ensure_site_days(conn, site_id, now_utc=now)
     _freeze_wind_lane(monkeypatch, now)
 
     today_start, today_end, _ = local_day_slots(local_today, timezone)
@@ -775,6 +804,17 @@ def test_rs8_todays_row_keeps_only_yesterday_and_todays_bounds(
 
     def handler(request: httpx.Request) -> httpx.Response:
         return _five_minute_response(readings)
+
+    assert (
+        check_day_write(
+            conn,
+            site_id,
+            isoformat_utc(earlier_reading),
+            WriteKind.READING,
+            now_utc=now,
+        )
+        is True
+    )
 
     _run_wind_chunk(db, site_id, handler)
 
@@ -864,8 +904,7 @@ def test_bt5_fresh_five_minute_reading_ends_the_pause(
 
     db = _init_tmp_db(tmp_path, monkeypatch)
     conn = db._conn  # noqa: SLF001 -- real writer connection, as other tests do
-    close_off(conn)
-    site_id = day_close_site(conn, close_on=False, with_records=False)
+    site_id = day_close_site(conn)
     conn.execute("UPDATE stations SET enabled = 0 WHERE pws_station_id = 'ISTATION01'")
     station_b = conn.execute(
         "SELECT id FROM stations WHERE pws_station_id = 'ISTATION02'"
@@ -899,8 +938,7 @@ def test_bt5_stale_five_minute_reading_does_not_end_the_pause(
 
     db = _init_tmp_db(tmp_path, monkeypatch)
     conn = db._conn  # noqa: SLF001 -- real writer connection, as other tests do
-    close_off(conn)
-    site_id = day_close_site(conn, close_on=False, with_records=False)
+    site_id = day_close_site(conn)
     conn.execute("UPDATE stations SET enabled = 0 WHERE pws_station_id = 'ISTATION01'")
     station_b = conn.execute(
         "SELECT id FROM stations WHERE pws_station_id = 'ISTATION02'"
@@ -942,8 +980,7 @@ def test_bt5_end_poll_pause_on_fresh_reading_direct_calls(
 
     db = _init_tmp_db(tmp_path, monkeypatch)
     conn = db._conn  # noqa: SLF001 -- real writer connection, as other tests do
-    close_off(conn)
-    day_close_site(conn, close_on=False, with_records=False)
+    day_close_site(conn)
     conn.execute("UPDATE stations SET enabled = 0 WHERE pws_station_id = 'ISTATION01'")
     station_b = conn.execute(
         "SELECT id FROM stations WHERE pws_station_id = 'ISTATION02'"

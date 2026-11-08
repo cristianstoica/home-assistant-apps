@@ -382,7 +382,7 @@ def _rolling_fixture(conn):
     record), ``window_days=5``/``min_n=3`` while the saved settings are
     7/10; its rows put X above Y.
     """
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     _close_through_with_missed(conn, site_id, first_date=_D3, last_closed_date=_D1)
     x = _seed_feed(conn, "X")
     y = _seed_feed(conn, "Y")
@@ -540,7 +540,7 @@ def test_rd3_no_publication_is_empty(window: str) -> None:
     from wxverify.scoring.leaderboard import leaderboard_with_status_in_transaction
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=True)
+    site_id = day_close_site(conn, with_records=True)
     x = _seed_feed(conn, "X")
     _subscribe(conn, site_id, x)
     for day in (D - timedelta(days=2), D - timedelta(days=1), D):
@@ -642,7 +642,7 @@ def test_rd4_ii_nd_window_excludes_a_missed_dates_leftover_day_scores() -> None:
     from wxverify.scoring.leaderboard import leaderboard_with_status_in_transaction
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     x = _seed_feed(conn, "X")
     _subscribe(conn, site_id, x)
 
@@ -795,7 +795,7 @@ def test_rd5_ii_winrate_excludes_a_missed_dates_leftover_forecast_history() -> N
     from wxverify.scoring.winrate import winrate
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     x = _seed_feed(conn, "X")
     y = _seed_feed(conn, "Y")
     _subscribe(conn, site_id, x)
@@ -972,7 +972,7 @@ def test_rd6_wind_serving_filters_by_subscription_then_empty() -> None:
 
     # Paired positive / second half: no publication at all -> {}.
     conn2 = asof_conn()
-    empty_site = day_close_site(conn2, close_on=True, with_records=True)
+    empty_site = day_close_site(conn2, with_records=True)
     conn2.commit()
     serving_empty = load_wind_serving(
         conn2, site_id=empty_site, timezone="UTC", today=D
@@ -1243,7 +1243,7 @@ def test_rd9_download_date_counts_from_the_round_not_the_label() -> None:
     from wxverify.forecast.data import load_future_samples
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=True)
+    site_id = day_close_site(conn, with_records=True)
     x = _seed_feed(conn, "X")
     _subscribe(conn, site_id, x)
 
@@ -1508,10 +1508,7 @@ def test_rd15_substitute_flag_set_only_when_a_stale_chosen_feed_is_left_out() ->
     the only D+3 sample; Y, ranked first at day ahead 3 (skill 0.3, n 5,
     no row for Z there) but FRESH, is chosen-but-absent there too, yet
     ``substitute`` must stay False -- only a STALE chosen-but-absent feed
-    sets it. With the close off, ``substitute`` is False on every cell
-    and tile (plan row RD15, :914; 11.3)."""
-    from wxverify.db.runtime_state import delete_runtime_state
-    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY
+    sets it (plan row RD15, :914; 11.3)."""
     from wxverify.forecast.service import build_forecast
 
     conn = asof_conn()
@@ -1635,18 +1632,6 @@ def test_rd15_substitute_flag_set_only_when_a_stale_chosen_feed_is_left_out() ->
         " from the served set {Z}, which is all the mutant checks)"
     )
 
-    delete_runtime_state(conn, DAILY_CLOSE_ON_KEY)
-    conn.commit()
-    view_off = build_forecast(
-        conn, site_id=site_id, timezone="UTC", rain_threshold_mm=0.2, now=now
-    )
-    for tile in view_off.tiles:
-        assert tile.temp.meta.substitute is False, (
-            "with the close off, substitute is computed for no cell (11.3)"
-        )
-        assert tile.wind.meta.substitute is False
-        assert tile.precip.meta.substitute is False
-
 
 # ---------------------------------------------------------------------------
 # RD16
@@ -1662,7 +1647,7 @@ def test_rd16_download_date_from_the_later_round_not_the_earlier_sample_fetch() 
     from wxverify.forecast.data import load_future_samples
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=True)
+    site_id = day_close_site(conn, with_records=True)
     x = _seed_feed(conn, "X")
     _subscribe(conn, site_id, x)
 
@@ -1743,9 +1728,9 @@ def test_rd17_latest_published_at_is_the_newest_over_active_publications() -> No
         "paired negative: no publication at all -> None"
     )
 
-    site_a = day_close_site(conn, close_on=True, with_records=True)
+    site_a = day_close_site(conn, with_records=True)
     site_b = day_close_site(
-        conn, close_on=True, with_records=True, station_ids=("ISTATION03", "ISTATION04")
+        conn, with_records=True, station_ids=("ISTATION03", "ISTATION04")
     )
 
     t1 = "2030-01-01T00:00:00.000Z"

@@ -25,7 +25,6 @@ from wxverify.core.timeutil import (
     utc_now,
 )
 from wxverify.core.units import ms_to_kmh
-from wxverify.db.site_days import daily_close_on
 from wxverify.forecast import wind_blend
 from wxverify.forecast.aggregate import (
     EXTREMA_COVERAGE_COMPLETE,
@@ -100,9 +99,10 @@ class CellMeta:
     aggregate line is drawn from the extrema set and is uniformly null when
     the cell is suppressed.
 
-    ``extrema_state`` is the same four-valued verdict as ``state``, by the
-    same precedence (:func:`_state_of`), for the feeds the cell's displayed
-    daily values come from (``CellSelection.extrema_feeds``). It is
+    ``extrema_state`` is the same verdict as ``state``, by the same
+    precedence (:func:`_state_of`), for the feeds the cell's displayed daily
+    values come from (``CellSelection.extrema_feeds``); the rain cell's is
+    "rebuilding" for a provisional ranking (:func:`_precip_cell`). It is
     "not_available" for wind, a suppressed cell and an unavailable cell. The
     tile rolls it up with the cells' states into
     ``DayTile.confidence_state``; it never moves ``state``.
@@ -118,10 +118,10 @@ class CellMeta:
     cell's choice is stale and not in the cell's blend set. The choice is the
     first blend-depth confident rows at the cell's representative day ahead,
     in the ladder's order; for weighted wind, every feed with a published
-    weight there. Always False with the daily close off.
+    weight there.
     """
 
-    state: str  # "normal" | "low_confidence" | "rebuilding" | "not_available"
+    state: str  # "normal" | "low_confidence" | "not_available"
     feeds: list[FeedRef]
     partial: bool
     stale: bool
@@ -202,7 +202,7 @@ class DayTile:
     temp: TempCell
     wind: WindCell
     precip: PrecipCell
-    # tile-level: "normal" | "low_confidence" | "rebuilding" | "not_available"
+    # tile-level: "normal" | "low_confidence" | "not_available"
     state: str
     confidence_state: str  # tile.state's rollup over cell and extrema states
     stale: bool
@@ -252,7 +252,6 @@ class PageInputs:
     unknown_ids: set[int]
     depths: dict[str, EffectiveDepth]
     rank_cache: _RankCache
-    close_on: bool
     serving: wind_blend.WindServing
     rain_ranks: dict[int, RainRanks]
 
@@ -282,8 +281,8 @@ def load_page_inputs(
 
     The sample window starts at today's local midnight in ``timezone``, with
     served feeds only. The reads run in :func:`build_forecast`'s order:
-    samples, fingerprint, freshness, depths, the daily-close switch, wind
-    serving, then the published rain ranks.
+    samples, fingerprint, freshness, depths, wind serving, then the
+    published rain ranks.
     """
     samples = load_future_samples(
         conn,
@@ -299,9 +298,6 @@ def load_page_inputs(
         feed_id for feed_id, row in freshness.items() if row.fetch_state == "unknown"
     }
     depths = effective_blend_depths(conn)
-    # One switch per read (9.1): the substitute flag is computed only with
-    # the close on, and stays False otherwise (11.3).
-    close_on = daily_close_on(conn)
     today = at.astimezone(ZoneInfo(timezone)).date()
     serving = wind_blend.load_wind_serving(
         conn, site_id=site_id, timezone=timezone, today=today
@@ -321,7 +317,6 @@ def load_page_inputs(
         unknown_ids=unknown_ids,
         depths=depths,
         rank_cache={},
-        close_on=close_on,
         serving=serving,
         rain_ranks=rain_ranks,
     )
@@ -383,7 +378,6 @@ def build_view(
     unknown_ids = inputs.unknown_ids
     depths = inputs.depths
     rank_cache = inputs.rank_cache
-    close_on = inputs.close_on
     serving = inputs.serving
     rain_ranks = inputs.rain_ranks
     fingerprint = inputs.fingerprint
@@ -406,7 +400,7 @@ def build_view(
             if variable == "precip":
                 continue
             feeds_samples = grouped.get(variable, {}).get(day, {})
-            cell_k = _cell_day_ahead(feeds_samples, timezone) if close_on else None
+            cell_k = _cell_day_ahead(feeds_samples, timezone)
             if variable == "wind":
                 choice = _select_wind(
                     conn,
@@ -432,7 +426,7 @@ def build_view(
                 cells[variable] = (meta, choice.selection, values)
                 wind_weights, wind_note = choice.weights, choice.note
                 continue
-            selection, rebuilding_by_feed = _select(
+            selection = _select(
                 conn,
                 site_id=site_id,
                 variable=variable,
@@ -447,7 +441,6 @@ def build_view(
                 feeds_samples=feeds_samples,
                 stale_ids=stale_ids,
                 unknown_ids=unknown_ids,
-                rebuilding_by_feed=rebuilding_by_feed,
                 substitute=cell_k is not None
                 and _substitute_serves(
                     _ranked_choice(
@@ -559,8 +552,8 @@ def build_hourly(
     intended behavior.
 
     The wind line is the per-hour weighted mean of the eligible feeds (which
-    join the hour axis and ``feeds``), ``states["wind"]`` ignores the ranking
-    rebuild, and the payload carries ``weights`` and ``notes``.
+    join the hour axis and ``feeds``), and the payload carries ``weights``
+    and ``notes``.
 
     It is :func:`hourly_day` over :func:`load_page_inputs`, plus ``feeds``:
     every feed of any variable's selection, in first-selected order, with
@@ -637,7 +630,6 @@ def hourly_day(conn: sqlite3.Connection, inputs: PageInputs, day: int) -> Hourly
     wind_weights: dict[int, float] = {}
 
     selections: dict[str, CellSelection] = {}
-    rebuilding: dict[str, dict[int, bool]] = {}
     for variable in VARIABLES:
         feeds_samples = grouped.get(variable, {}).get(day, {})
         if variable == "wind":
@@ -650,10 +642,10 @@ def hourly_day(conn: sqlite3.Connection, inputs: PageInputs, day: int) -> Hourly
                 rank_cache=rank_cache,
                 weights=serving.weights,
             )
-            selections[variable], rebuilding[variable] = choice.selection, {}
+            selections[variable] = choice.selection
             wind_weights, wind_note = choice.weights, choice.note
             continue
-        selections[variable], rebuilding[variable] = _select(
+        selections[variable] = _select(
             conn,
             site_id=site_id,
             variable=variable,
@@ -741,12 +733,6 @@ def hourly_day(conn: sqlite3.Connection, inputs: PageInputs, day: int) -> Hourly
         variable: _state_of(
             available=selections[variable].available,
             low_confidence=selections[variable].low_confidence,
-            # The leaderboard ranking does not drive weighted wind (§11.4).
-            ranking_rebuilding=(
-                False
-                if variable == "wind"
-                else _any_rebuilding(selections[variable].feeds, rebuilding[variable])
-            ),
         )
         for variable in VARIABLES
     }
@@ -819,28 +805,16 @@ def _feed_series(
     return out
 
 
-def _state_of(
-    *, available: bool, low_confidence: bool, ranking_rebuilding: bool
-) -> str:
-    """One feed set's display state from the three facts it is decided on.
+def _state_of(*, available: bool, low_confidence: bool) -> str:
+    """One feed set's display state from the two facts it is decided on.
 
-    A low-confidence verdict whose ranking is rebuilding reads "rebuilding":
-    a rebuilding ranking has no rows, so its feeds are unconfident because of
-    the rebuild. Shared by the cell ``state``, the drill-down ``states`` and
-    the temperature and precipitation ``extrema_state``, so all three apply
-    one precedence.
+    Shared by the cell ``state``, the drill-down ``states`` and the
+    temperature and precipitation ``extrema_state``, so all three apply one
+    precedence.
     """
     if not available:
         return "not_available"
-    if low_confidence and ranking_rebuilding:
-        return "rebuilding"
     return "low_confidence" if low_confidence else "normal"
-
-
-def _any_rebuilding(
-    feeds: list[CellCandidate], rebuilding_by_feed: dict[int, bool]
-) -> bool:
-    return any(rebuilding_by_feed[c.feed_id] for c in feeds)
 
 
 def relative_ago(timestamp: str, *, now: datetime) -> str:
@@ -878,7 +852,7 @@ def _select(
     feeds_samples: dict[int, list[FutureSampleRow]],
     blend_depth: int,
     rank_cache: _RankCache,
-) -> tuple[CellSelection, dict[int, bool]]:
+) -> CellSelection:
     """Build candidates for one cell and run the fallback ladder.
 
     ``local_date`` is the cell's target local day; each candidate's
@@ -888,7 +862,7 @@ def _select(
     :func:`covers_local_day` otherwise. Temperature and precipitation ask for
     the extrema set; wind never comes through here (see :func:`_select_wind`).
     """
-    candidates, rebuilding_by_feed, _ = _candidates(
+    candidates, _ = _candidates(
         conn,
         site_id=site_id,
         variable=variable,
@@ -897,12 +871,11 @@ def _select(
         feeds_samples=feeds_samples,
         rank_cache=rank_cache,
     )
-    selection = select_cell_feeds(
+    return select_cell_feeds(
         candidates,
         blend_depth=blend_depth,
         extrema_coverage_required=variable in ("temperature", "precip"),
     )
-    return selection, rebuilding_by_feed
 
 
 def _candidates(
@@ -914,18 +887,17 @@ def _candidates(
     local_date: date,
     feeds_samples: dict[int, list[FutureSampleRow]],
     rank_cache: _RankCache,
-) -> tuple[list[CellCandidate], dict[int, bool], dict[int, int]]:
-    """One cell's candidates, their ranking-rebuild flags and representative k.
+) -> tuple[list[CellCandidate], dict[int, int]]:
+    """One cell's candidates and their representative k.
 
-    Returns ``(candidates, rebuilding_by_feed, rep_k)``; ``rep_k`` maps each
-    feed to the representative day-ahead of its samples, the lead its ranking
-    row (and, for weighted wind, its weight) is looked up at. Each sample's
-    day ahead is :func:`sample_day_ahead`'s: from its download date with the
-    daily close on, else from its run label (9.5).
+    Returns ``(candidates, rep_k)``; ``rep_k`` maps each feed to the
+    representative day-ahead of its samples, the lead its ranking row (and,
+    for weighted wind, its weight) is looked up at. Each sample's day ahead
+    is :func:`sample_day_ahead`'s: from its download date when it has one,
+    else from its run label (9.5).
     """
     covers = covers_local_day_exactly if variable == "precip" else covers_local_day
     candidates: list[CellCandidate] = []
-    rebuilding_by_feed: dict[int, bool] = {}
     rep_k: dict[int, int] = {}
     for feed_id, feed_samples in feeds_samples.items():
         rep = representative_day_ahead(
@@ -937,7 +909,6 @@ def _candidates(
             rank_cache[key] = forecast_ranking_with_status(
                 conn, site_id=site_id, variable=variable, day_ahead=rep
             )
-        rebuilding_by_feed[feed_id] = rank_cache[key].status == "rebuilding"
         row = rank_cache[key].rows.get(feed_id)
         candidates.append(
             CellCandidate(
@@ -957,7 +928,7 @@ def _candidates(
                 ),
             )
         )
-    return candidates, rebuilding_by_feed, rep_k
+    return candidates, rep_k
 
 
 def _select_wind(
@@ -971,7 +942,7 @@ def _select_wind(
     weights: wind_blend.WindWeights,
 ) -> wind_blend.WindChoice:
     """The weighted wind choice for one cell."""
-    candidates, _, rep_k = _candidates(
+    candidates, rep_k = _candidates(
         conn,
         site_id=site_id,
         variable="wind",
@@ -1039,9 +1010,8 @@ def _wind_meta_and_values(
 
     Wind does not use the clearing-subset path: the values come from all of
     ``selection.feeds`` (each already has at least ``MIN_RUN_HOURS`` hours),
-    so ``partial`` is never set, and the ranking rebuild does not move the
-    state because the leaderboard does not choose these feeds. ``substitute``
-    is the caller's (11.3); an unavailable cell has none serving, so False.
+    so ``partial`` is never set. ``substitute`` is the caller's (11.3); an
+    unavailable cell has none serving, so False.
     """
     if not selection.available:
         return (
@@ -1066,11 +1036,7 @@ def _wind_meta_and_values(
         dict.fromkeys(candidate.feed_id for candidate in selection.feeds)
     )
     meta = CellMeta(
-        state=_state_of(
-            available=selection.available,
-            low_confidence=False,
-            ranking_rebuilding=False,
-        ),
+        state=_state_of(available=selection.available, low_confidence=False),
         feeds=[
             FeedRef(
                 feed_id=candidate.feed_id,
@@ -1095,13 +1061,12 @@ def _cell_meta_and_values(
     feeds_samples: dict[int, list[FutureSampleRow]],
     stale_ids: set[int],
     unknown_ids: set[int],
-    rebuilding_by_feed: dict[int, bool],
     substitute: bool,
 ) -> tuple[CellMeta, dict[int, list[float]]]:
     """Apply the coverage rules; return cell meta + per-feed value lists.
 
     The >= 18-hour guard (:func:`clearing_subset` over the blend set) sets the
-    orthogonal "partial" badge, the ``state`` rebuilding scan and ``stale``.
+    orthogonal "partial" badge and ``stale``.
     Wind never comes through here (see :func:`_wind_meta_and_values`).
 
     A temperature cell's daily high/low and a precipitation cell's total and
@@ -1148,7 +1113,6 @@ def _cell_meta_and_values(
     extrema_state = _state_of(
         available=selection.extrema_coverage == EXTREMA_COVERAGE_COMPLETE,
         low_confidence=selection.extrema_low_confidence,
-        ranking_rebuilding=_any_rebuilding(selection.extrema_feeds, rebuilding_by_feed),
     )
     values = {
         candidate.feed_id: [s.value for s in feeds_samples[candidate.feed_id]]
@@ -1161,7 +1125,6 @@ def _cell_meta_and_values(
         state=_state_of(
             available=selection.available,
             low_confidence=selection.low_confidence,
-            ranking_rebuilding=_any_rebuilding(agg_feeds, rebuilding_by_feed),
         ),
         feeds=[
             FeedRef(

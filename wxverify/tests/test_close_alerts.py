@@ -58,8 +58,8 @@ from wxverify.db.switch import ensure_site_generation
 _AD_T = datetime(D.year, D.month, D.day, 7, 0, tzinfo=UTC)
 
 
-def _ad_start(conn, *, close_on: bool = True) -> int:
-    site_id = day_close_site(conn, close_on=close_on, with_records=False)
+def _ad_start(conn) -> int:
+    site_id = day_close_site(conn, with_records=False)
     d_minus_3 = D - timedelta(days=3)
     start_site_days(
         conn,
@@ -238,7 +238,7 @@ def test_al1_day_missed_never_attempted() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    day_close_site(conn, close_on=True)
+    day_close_site(conn)
 
     alerts = close_alerts(conn, NOW)
     missed = next(a for a in alerts if a.id == "close_day_missed")
@@ -260,7 +260,7 @@ def test_al2_both_attempts_failed_retry_stage() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     d_minus_1 = D - timedelta(days=1)
     record = day_record(conn, site_id, d_minus_1)
     assert record is not None
@@ -317,7 +317,7 @@ def test_al3_retry_not_run() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     d_minus_1 = D - timedelta(days=1)
     record = day_record(conn, site_id, d_minus_1)
     assert record is not None
@@ -348,7 +348,7 @@ def test_al4_window_clears_after_7_days() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     d_minus_2 = D - timedelta(days=2)
     record = day_record(conn, site_id, d_minus_2)
     assert record is not None and record.done_at is not None
@@ -377,7 +377,7 @@ def test_al5_changeover_day_not_alerted() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     change_date = enter_zone_change(conn, site_id, "Etc/GMT-1", now_utc=NOW)
     assert change_date == D + timedelta(days=1)
     record = day_record(conn, site_id, change_date)
@@ -412,7 +412,7 @@ def test_al6_thin_values_labels_in_order() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     d_minus_3 = D - timedelta(days=3)
     for quantity in ("temperature_high", "temperature_low", "precip_occurrence"):
         _insert_truth(
@@ -452,7 +452,7 @@ def test_al7_every_quantity_eligible_is_ok() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     d_minus_3 = D - timedelta(days=3)
     _full_truth(conn, site_id=site_id, local_date=d_minus_3)
 
@@ -470,7 +470,7 @@ def test_al8_thin_window_clears_after_7_days() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     d_minus_3 = D - timedelta(days=3)
     for quantity in (
         "temperature_high",
@@ -524,7 +524,7 @@ def test_al9_station_nothing_usable_three_days() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     station_b = _station_id(conn, site_id, "ISTATION02")
     for i, d in enumerate(_AL9_DATES):
         _set_answered(conn, station_b, d)
@@ -553,7 +553,7 @@ def test_al10_only_two_counted_days_is_ok() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     station_b = _station_id(conn, site_id, "ISTATION02")
     for i, d in enumerate(_AL9_DATES[:2]):
         _set_answered(conn, station_b, d)
@@ -578,7 +578,7 @@ def test_al11_skipped_day_does_not_break_or_extend_run() -> None:
 
     def _run(skip_setup) -> None:
         conn = asof_conn()
-        site_id = day_close_site(conn, close_on=True, with_records=False)
+        site_id = day_close_site(conn, with_records=False)
         station_b = _station_id(conn, site_id, "ISTATION02")
         all_dates = sorted({*counted, skip_date})
         for i, d in enumerate(all_dates):
@@ -638,7 +638,7 @@ def test_al11_skipped_day_does_not_break_or_extend_run() -> None:
     # date itself.
     older_skip = D - timedelta(days=5)
     conn_older = asof_conn()
-    site_id_older = day_close_site(conn_older, close_on=True, with_records=False)
+    site_id_older = day_close_site(conn_older, with_records=False)
     station_b_older = _station_id(conn_older, site_id_older, "ISTATION02")
     all_dates_older = sorted({*counted, older_skip})
     for i, d in enumerate(all_dates_older):
@@ -672,7 +672,7 @@ def test_al12_usable_judged_per_variable_and_qc_flag() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     station_b = _station_id(conn, site_id, "ISTATION02")
     for i, d in enumerate(_AL9_DATES):
         _set_answered(conn, station_b, d)
@@ -693,7 +693,7 @@ def test_al12_usable_judged_per_variable_and_qc_flag() -> None:
     )
 
     conn2 = asof_conn()
-    site_id2 = day_close_site(conn2, close_on=True, with_records=False)
+    site_id2 = day_close_site(conn2, with_records=False)
     station_b2 = _station_id(conn2, site_id2, "ISTATION02")
     for i, d in enumerate(_AL9_DATES):
         _set_answered(conn2, station_b2, d)
@@ -725,14 +725,13 @@ def test_al13_station_list_is_day_specific() -> None:
     (plan: added effective that day, written before its record is made --
     tested here at the end state the day's own `site_day_stations` row
     gives, since the buffer day a growth call always creates one day
-    ahead (`_close_day`'s docstring) makes the exact creation-order harder
-    to pin without changing what is actually asserted) (M26)."""
+    ahead (`ensure_site_days`'s own fill) makes the exact creation-order
+    harder to pin without changing what is actually asserted) (M26)."""
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
     site_id = day_close_site(
         conn,
-        close_on=True,
         with_records=False,
         station_ids=("ISTATION01", "ISTATION02", "ISTATION03"),
     )
@@ -779,7 +778,7 @@ def test_al14_clears_on_newer_usable_day_and_on_deletion() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     station_b = _station_id(conn, site_id, "ISTATION02")
     for i, d in enumerate(_AL9_DATES):
         _set_answered(conn, station_b, d)
@@ -816,7 +815,7 @@ def test_al15_oldest_within_7_days_of_done_at() -> None:
 
     conn = asof_conn()
     older = D - timedelta(days=9)
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     station_b = _station_id(conn, site_id, "ISTATION02")
 
     _set_answered(conn, station_b, older)
@@ -841,7 +840,7 @@ def test_al16_disabled_sites_and_pre_first_record_days_left_out() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     d_minus_3 = D - timedelta(days=3)
     for quantity in (
         "temperature_high",
@@ -878,7 +877,7 @@ def test_al16_disabled_sites_and_pre_first_record_days_left_out() -> None:
     # A day before the site's first record is never read either (starting
     # history, plan 5.1): a site with no record at all is always ok.
     conn2 = asof_conn()
-    day_close_site(conn2, close_on=True, with_records=False)
+    day_close_site(conn2, with_records=False)
     alerts2 = close_alerts(conn2, NOW)
     for alert_id in ("close_day_missed", "close_day_thin", "station_nothing_usable"):
         alert = next(a for a in alerts2 if a.id == alert_id)
@@ -894,7 +893,7 @@ def test_al17_no_record_holds_now_is_ok_and_raises_nothing() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     d_plus_1 = D + timedelta(days=1)
     start_site_days(conn, site_id, d_plus_1, now_utc=NOW)
     assert current_day(conn, site_id, now_utc=NOW) is None
@@ -1218,7 +1217,7 @@ def test_ad7_day_before_first_record_never_expected() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     d_minus_1 = D - timedelta(days=1)
     start_site_days(
         conn,
@@ -1630,7 +1629,7 @@ def test_dw1_daytime_warning_trips_after_2_refreshes() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     station_a = _station_id(conn, site_id, "ISTATION01")
     store_time = NOW + timedelta(hours=1)
     _store_five_minute(conn, station_a, store_time)
@@ -1661,7 +1660,7 @@ def test_dw2_interval_30_trips_at_60_minutes() -> None:
     from wxverify.settings.keys import set_setting
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     set_setting(conn, "obs_interval_minutes", "30")
     station_a = _station_id(conn, site_id, "ISTATION01")
     store_time = NOW + timedelta(hours=1)
@@ -1688,7 +1687,7 @@ def test_dw3_refused_five_minute_kind_left_out(
     from wxverify.worker.access_hold import record_access_refused
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     station_a = _station_id(conn, site_id, "ISTATION01")
     store_time = NOW + timedelta(hours=1)
     _store_five_minute(conn, station_a, store_time)
@@ -1712,7 +1711,7 @@ def test_dw4_kept_apart_from_station_silence() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     station_a = _station_id(conn, site_id, "ISTATION01")
     station_b = _station_id(conn, site_id, "ISTATION02")
     store_time = NOW + timedelta(hours=1)
@@ -1774,7 +1773,7 @@ def test_dw5_start_of_count_latest_of_worker_and_close_on() -> None:
     eval_now = NOW + timedelta(hours=10)
 
     conn_a = asof_conn()
-    day_close_site(conn_a, close_on=True)
+    day_close_site(conn_a)
     conn_a.execute(
         "INSERT INTO runtime_state (key, value) VALUES ('worker_started_at', ?)"
         " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1789,7 +1788,7 @@ def test_dw5_start_of_count_latest_of_worker_and_close_on() -> None:
     )
 
     conn_b = asof_conn()
-    day_close_site(conn_b, close_on=True)
+    day_close_site(conn_b)
     set_runtime_state(
         conn_b, DAILY_CLOSE_ON_KEY, isoformat_utc(eval_now - timedelta(hours=1))
     )
@@ -1802,7 +1801,7 @@ def test_dw5_start_of_count_latest_of_worker_and_close_on() -> None:
     )
 
     conn_c = asof_conn()
-    day_close_site(conn_c, close_on=True)
+    day_close_site(conn_c)
     conn_c.execute(
         "INSERT INTO runtime_state (key, value) VALUES ('worker_started_at', ?)"
         " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1827,7 +1826,7 @@ def test_dw6_clears_on_new_store() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     station_a = _station_id(conn, site_id, "ISTATION01")
     store_time = NOW + timedelta(hours=1)
     _store_five_minute(conn, station_a, store_time)
@@ -1864,7 +1863,7 @@ def test_dw7_close_alerts_writes_nothing() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     station_a = _station_id(conn, site_id, "ISTATION01")
     store_time = NOW + timedelta(hours=1)
     _store_five_minute(conn, station_a, store_time)
@@ -1902,7 +1901,7 @@ def test_dw8_start_of_count_includes_first_record_start() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     d_plus_1 = D + timedelta(days=1)
     start_site_days(conn, site_id, d_plus_1, now_utc=NOW)
     conn.execute(
@@ -1938,7 +1937,7 @@ def test_pd1_provider_down_since_the_slots_earliest_try() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     station_b = _station_id(conn, site_id, "ISTATION02")
     slot_time = NOW + timedelta(hours=1)
     seed_try(
@@ -1979,7 +1978,7 @@ def test_pd2_answered_or_other_only_slots_are_ok() -> None:
 
     def _run(tries: list[tuple[str, str | None, str | None]]) -> None:
         conn = asof_conn()
-        site_id = day_close_site(conn, close_on=True)
+        site_id = day_close_site(conn)
         station_a = _station_id(conn, site_id, "ISTATION01")
         station_b = _station_id(conn, site_id, "ISTATION02")
         stations = (station_a, station_b)
@@ -2016,7 +2015,7 @@ def test_pd2_answered_or_other_only_slots_are_ok() -> None:
     # all, and a prior down run reads as still ongoing instead of
     # recovered at the no_readings slot.
     conn_recovered = asof_conn()
-    site_id_recovered = day_close_site(conn_recovered, close_on=True)
+    site_id_recovered = day_close_site(conn_recovered)
     station_a_recovered = _station_id(conn_recovered, site_id_recovered, "ISTATION01")
     station_b_recovered = _station_id(conn_recovered, site_id_recovered, "ISTATION02")
     down_time = slot_time
@@ -2067,7 +2066,7 @@ def test_pd3_down_run_survives_other_only_slot() -> None:
     from wxverify.settings.keys import set_setting
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     set_setting(conn, "obs_interval_minutes", "60")
     station_a = _station_id(conn, site_id, "ISTATION01")
     station_b = _station_id(conn, site_id, "ISTATION02")
@@ -2126,7 +2125,7 @@ def test_pd4_recovered_line_for_24_hours() -> None:
     from wxverify.settings.keys import set_setting
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     set_setting(conn, "obs_interval_minutes", "60")
     station_a = _station_id(conn, site_id, "ISTATION01")
     station_b = _station_id(conn, site_id, "ISTATION02")
@@ -2199,7 +2198,7 @@ def test_pd5_grace_applies_to_alert_7() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     station_a = _station_id(conn, site_id, "ISTATION01")
     station_b = _station_id(conn, site_id, "ISTATION02")
     slot_time = NOW + timedelta(hours=1)
@@ -2275,7 +2274,7 @@ def test_pd6_daytime_slots_grouped_by_refresh_interval() -> None:
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     station_a = _station_id(conn, site_id, "ISTATION01")
     station_b = _station_id(conn, site_id, "ISTATION02")
     day_start = datetime(D.year, D.month, D.day, tzinfo=UTC)
@@ -2349,7 +2348,7 @@ def test_pd7_recovered_line_survives_a_later_answered_slot() -> None:
     from wxverify.settings.keys import set_setting
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     set_setting(conn, "obs_interval_minutes", "60")
     station_a = _station_id(conn, site_id, "ISTATION01")
     station_b = _station_id(conn, site_id, "ISTATION02")

@@ -127,7 +127,7 @@ def test_vd1_the_18_hour_minimum_is_the_exact_boundary() -> None:
     from wxverify.verification.truth import evaluate_day_window  # noqa: PLC0415
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     bounds = _bounds()
 
     _seed_hours(conn, site_id, "temperature", range(17), lambda h: 10.0 + h)
@@ -169,7 +169,7 @@ def test_vd2_the_peak_window_is_checked_separately_from_coverage() -> None:
     from wxverify.verification.truth import evaluate_day_window  # noqa: PLC0415
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     bounds = _bounds()
 
     # Case 1: missing 12-17 (6 hours) -- 18 covered, but high's whole peak
@@ -235,7 +235,7 @@ def test_vd3_wind_maximum_near_complete_is_expected_slots_minus_one() -> None:
     from wxverify.verification.truth import evaluate_day_window  # noqa: PLC0415
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     bounds = _bounds()
 
     _seed_hours(conn, site_id, "wind", range(23), lambda h: 5.0 + h)
@@ -284,7 +284,7 @@ def test_vd4_rain_total_never_counts_a_missing_hour_as_zero() -> None:
     from wxverify.verification.truth import evaluate_day_window  # noqa: PLC0415
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     bounds = _bounds()
 
     def _value(h: int) -> float:
@@ -339,7 +339,7 @@ def test_vd5_one_wet_hour_is_never_ignored_a_dry_day_needs_near_complete() -> No
     from wxverify.verification.truth import evaluate_day_window  # noqa: PLC0415
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     conn.execute("UPDATE sites SET rain_threshold_mm = 0.25 WHERE id = ?", (site_id,))
     bounds = _bounds()
     short_hours = range(10)  # well below the 23-hour near-complete threshold
@@ -626,7 +626,7 @@ def test_vd8_write_close_truth_only_accepts_a_closing_day() -> None:
     # open -- no state move: D is left exactly as day_close_site makes it,
     # open, past its own end (after_d_end).
     conn_open = asof_conn()
-    site_open = day_close_site(conn_open, close_on=True, with_records=True)
+    site_open = day_close_site(conn_open, with_records=True)
     _seed_hours(conn_open, site_open, "temperature", range(24), lambda h: 10.0 + h)
     conn_open.commit()
     with pytest.raises(DayStateError):
@@ -647,7 +647,7 @@ def test_vd8_write_close_truth_only_accepts_a_closing_day() -> None:
 
     # retry_due
     conn_retry = asof_conn()
-    site_retry = day_close_site(conn_retry, close_on=True, with_records=True)
+    site_retry = day_close_site(conn_retry, with_records=True)
     _seed_hours(conn_retry, site_retry, "temperature", range(24), lambda h: 10.0 + h)
     conn_retry.commit()
     mark_missed(
@@ -670,7 +670,7 @@ def test_vd8_write_close_truth_only_accepts_a_closing_day() -> None:
     # is a precondition from an earlier step, done with write_close_truth
     # itself (allowed, since D is closing at that point).
     conn_closed = asof_conn()
-    site_closed = day_close_site(conn_closed, close_on=True, with_records=True)
+    site_closed = day_close_site(conn_closed, with_records=True)
     _seed_hours(conn_closed, site_closed, "temperature", range(24), lambda h: 10.0 + h)
     conn_closed.commit()
     mark_missed(
@@ -704,7 +704,7 @@ def test_vd8_write_close_truth_only_accepts_a_closing_day() -> None:
 
     # closing -- allowed
     conn_closing = asof_conn()
-    site_closing = day_close_site(conn_closing, close_on=True, with_records=True)
+    site_closing = day_close_site(conn_closing, with_records=True)
     _seed_hours(
         conn_closing, site_closing, "temperature", range(24), lambda h: 10.0 + h
     )
@@ -768,7 +768,7 @@ def test_vd9_the_split_matches_a_hand_computed_evaluation() -> None:
     from wxverify.verification.truth import evaluate_day_window  # noqa: PLC0415
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     bounds = _bounds()
     _seed_hours(conn, site_id, "temperature", range(24), lambda h: 10.0 + h)
     _seed_hours(conn, site_id, "wind", range(24), lambda h: 5.0 + h)
@@ -847,7 +847,7 @@ def test_ad1_the_basis_judges_every_quantity_not_temperature_alone() -> None:
     from wxverify.verification.truth import evaluate_day_window  # noqa: PLC0415
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     bounds = _bounds()
 
     _seed_hours(conn, site_id, "temperature", range(24), lambda h: 10.0 + h)

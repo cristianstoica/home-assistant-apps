@@ -26,16 +26,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Final
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc
+from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.day_guard_log import warn_refused_instants
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.db.site_days import (
     WriteKind,
     check_date_write,
     current_day,
-    daily_close_on,
     filter_day_writes,
 )
 from wxverify.obs.hourly_values import Quantity, Source, StationReading
@@ -273,12 +271,10 @@ def next_five_minute_try(
     for the current day that lies before the day's end; a retryable row
     whose stamp is NULL or unreadable is due now and gives ``now_utc``. When
     no row has one (every row is done for the day), the day's end. The
-    current day is ``now_utc``'s local date in ``sites.timezone`` while the
-    close is off, P1's record holding ``now_utc`` while it is on; with the
-    close on and no record holding ``now_utc``, the ``day_start_utc`` of the
-    site's first record after it (None when there is none). None when the
-    site has no enabled station, or does not exist or has an unusable zone.
-    Read-only.
+    current day is P1's record holding ``now_utc``; with no record holding
+    ``now_utc``, the ``day_start_utc`` of the site's first record after it
+    (None when there is none). None when the site has no enabled station
+    or does not exist. Read-only.
     """
     if (
         conn.execute(
@@ -288,23 +284,10 @@ def next_five_minute_try(
         is None
     ):
         return None
-    if daily_close_on(conn):
-        record = current_day(conn, site_id, now_utc=now_utc)
-        if record is None:
-            return _first_day_start_after(conn, site_id, now_utc)
-        local_date, day_end = record.local_date, record.day_end_utc
-    else:
-        site = conn.execute(
-            "SELECT timezone FROM sites WHERE id = ?", (site_id,)
-        ).fetchone()
-        if site is None:
-            return None
-        tz_name = str(site[0])
-        try:
-            local_date = now_utc.astimezone(ZoneInfo(tz_name)).date()
-        except (ZoneInfoNotFoundError, ValueError):
-            return None
-        day_end = local_day_slots(local_date, tz_name)[1]
+    record = current_day(conn, site_id, now_utc=now_utc)
+    if record is None:
+        return _first_day_start_after(conn, site_id, now_utc)
+    local_date, day_end = record.local_date, record.day_end_utc
     rows = conn.execute(
         """
         SELECT d.next_attempt_at

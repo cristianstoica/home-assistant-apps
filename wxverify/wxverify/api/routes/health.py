@@ -18,7 +18,6 @@ from wxverify.core.secrets import key_status
 from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import get_db
 from wxverify.db.runtime_state import runtime_status
-from wxverify.db.site_days import daily_close_on
 from wxverify.monitor import build_verdict, error_verdict
 from wxverify.provider_ops import provider_health
 from wxverify.scoring.publication import latest_published_at
@@ -380,11 +379,8 @@ async def worker_status(counts: str = Query("")) -> dict[str, object]:
             )
         # The key Home Assistant's last-score sensor reads: the newest
         # published_at over the sites' active publications, or null before
-        # the first and while the daily close is off (daily-close plan P5,
-        # 9.6).
-        status["last_completed_pair_and_score_at"] = None
-        if daily_close_on(conn):
-            status["last_completed_pair_and_score_at"] = latest_published_at(conn)
+        # the first (daily-close plan P5, 9.6).
+        status["last_completed_pair_and_score_at"] = latest_published_at(conn)
         # Exact counts, opt-in: forecast_history is a WITHOUT ROWID table, so
         # it has no rowid watermark to estimate from, and this route is a
         # five-minutely coordinator-polled core slice that must not carry the

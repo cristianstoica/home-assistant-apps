@@ -22,7 +22,6 @@ from tests.helpers import day_close_site
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.db.connection import Database, close_db, get_db, init_db
-from wxverify.db.runtime_state import set_runtime_state
 
 # C, the cutover day, is chosen well before any real clock reaches it.
 C: Final = date(2024, 6, 10)
@@ -56,7 +55,7 @@ def test_sh1_first_record_date_is_the_minimum_local_date(tmp_path: Path) -> None
     from wxverify.db.switch import first_record_date
 
     conn = _init_tmp_db(tmp_path)._conn  # noqa: SLF001
-    site_id = day_close_site(conn, timezone="UTC", close_on=True, with_records=False)
+    site_id = day_close_site(conn, timezone="UTC", with_records=False)
     assert first_record_date(conn, site_id) is None
 
     f = C
@@ -104,17 +103,16 @@ def test_sh2_the_dashboard_and_overlay_hint_tracks_close_and_record_state(
     """SH2 (plan 17.12): the dashboard and Overlay pages, read through
     ``TestClient`` (``tests/test_close_pages.py``'s ``_make_app``/
     ``_patch_clock`` pattern, built locally here, since that file holds no
-    reusable helper): close off; key set with no record; key set with a
-    record. The hint text (5.4) is absent, absent, then present on both
-    pages.
+    reusable helper): no record yet; then a record. The hint text (5.4) is
+    absent, then present on both pages.
 
     M68 -> at the ``with_record`` assertions below: correct = the hint
-    text present on both pages (close on, a record dated F), mutant =
-    absent (M68 shows the hint with the close off instead, so the only
-    state that should carry it never gets it).
+    text present on both pages (a record dated F), mutant = absent (M68
+    never shows the hint, so the one state that should carry it never
+    gets it).
     """
     conn = _init_tmp_db(tmp_path)._conn  # noqa: SLF001
-    site_id = day_close_site(conn, timezone="UTC", close_on=False, with_records=False)
+    site_id = day_close_site(conn, timezone="UTC", with_records=False)
     conn.commit()
 
     f = C
@@ -131,39 +129,28 @@ def test_sh2_the_dashboard_and_overlay_hint_tracks_close_and_record_state(
         assert overlay.status_code == 200
         return dashboard.text, overlay.text
 
-    from wxverify.core.timeutil import isoformat_utc
-    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY, start_site_days
+    from wxverify.db.site_days import start_site_days
 
     with TestClient(app) as client:
         conn = get_db()._conn  # noqa: SLF001
-        dashboard_close_off, overlay_close_off = _pages(client)
-
-        set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(datetime.now(tz=UTC)))
-        conn.commit()
         dashboard_no_record, overlay_no_record = _pages(client)
 
         start_site_days(conn, site_id, f, now_utc=f_start)
         conn.commit()
         dashboard_with_record, overlay_with_record = _pages(client)
 
-    assert _HINT_INVARIANT_TAIL not in dashboard_close_off, (
-        "the hint must be withheld while the close is off (5.4)"
-    )
-    assert _HINT_INVARIANT_TAIL not in overlay_close_off, (
-        "the hint must be withheld while the close is off (5.4)"
-    )
     assert _HINT_INVARIANT_TAIL not in dashboard_no_record, (
-        "the hint must be withheld with the close on but no record yet (5.4)"
+        "the hint must be withheld with no record yet (5.4)"
     )
     assert _HINT_INVARIANT_TAIL not in overlay_no_record, (
-        "the hint must be withheld with the close on but no record yet (5.4)"
+        "the hint must be withheld with no record yet (5.4)"
     )
 
     expected = _HINT_TEXT.format(f=f.isoformat())
     assert expected in dashboard_with_record, (
         "M68 -> at this assertion: correct = the hint text present on the"
-        f" dashboard page (close on, record at {f.isoformat()}), mutant ="
-        " absent (M68 shows the hint with the close off instead)"
+        f" dashboard page (a record at {f.isoformat()}), mutant = absent"
+        " (M68 never shows the hint)"
     )
     assert expected in overlay_with_record, (
         "M68 -> at this assertion: correct = the hint text present on the"

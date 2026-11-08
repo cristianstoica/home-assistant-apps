@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -41,16 +42,17 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.helpers import close_off
+from tests.helpers import evening_slots_utc
 from wxverify import config
 from wxverify.api.app import create_app
-from wxverify.core.timeutil import isoformat_utc
+from wxverify.core.timeutil import isoformat_utc, local_day_slots
 from wxverify.db.connection import Database, FencedWriter, close_db, init_db
 from wxverify.db.queue import (
     claim_next_current_obs_job,
     enqueue_if_absent,
 )
 from wxverify.db.runtime_state import set_runtime_state
+from wxverify.db.site_days import start_site_days
 from wxverify.worker.access_hold import (
     AccessKind,
     access_hold_key,
@@ -165,6 +167,13 @@ def _freeze(monkeypatch: pytest.MonkeyPatch, when: datetime) -> None:
 
 _AH_DAY = date(2026, 3, 10)
 _AH_TZ = "UTC"
+_AH_DAY_START = local_day_slots(_AH_DAY, _AH_TZ)[0]
+
+
+def _start_ah_day(conn: sqlite3.Connection, site_id: int) -> None:
+    """Give the site a P1 record dated ``_AH_DAY`` (the lane needs one to
+    run at all now that the daily close is always on)."""
+    start_site_days(conn, site_id, _AH_DAY, now_utc=_AH_DAY_START)
 
 
 def _run_wind_days_chunk(
@@ -254,16 +263,14 @@ def test_ah1_a_held_try_sends_nothing_and_moves_to_its_next_slot(
     ``close_try_log`` row per station logs outcome ``held``/reason
     ``refused_access``/detail the hold's ``until``.
     """
-    from wxverify.worker.wind_days import evening_slot_instants  # new name (P2)
-
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
-    close_off(conn)
     site_id = _seed_site(conn)
+    _start_ah_day(conn, site_id)
     station_a = _seed_station(conn, site_id, pws_id="ISTATION01")
     station_b = _seed_station(conn, site_id, pws_id="ISTATION02")
 
-    slots = evening_slot_instants(_AH_DAY, _AH_TZ)
+    slots = evening_slots_utc(_AH_DAY, _AH_TZ)
     slot_2300, slot_2306, slot_2311 = slots[0], slots[1], slots[2]
     original_until = isoformat_utc(slot_2300 + timedelta(minutes=40, seconds=12))
     _set_hold(
@@ -336,16 +343,14 @@ def test_ah2_collection_resumes_at_the_rows_own_next_slot_not_the_holds_end(
     rows are not due again until 23:41, not "as soon as the hold ends");
     at 23:41 each station gets exactly one try.
     """
-    from wxverify.worker.wind_days import evening_slot_instants  # new name (P2)
-
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
-    close_off(conn)
     site_id = _seed_site(conn)
+    _start_ah_day(conn, site_id)
     station_a = _seed_station(conn, site_id, pws_id="ISTATION01")
     station_b = _seed_station(conn, site_id, pws_id="ISTATION02")
 
-    slots = evening_slot_instants(_AH_DAY, _AH_TZ)
+    slots = evening_slots_utc(_AH_DAY, _AH_TZ)
     slot_2300 = slots[0]
     slot_2336 = next(s for s in slots if s == slot_2300 + timedelta(minutes=36))
     slot_2341 = next(s for s in slots if s == slot_2300 + timedelta(minutes=41))
@@ -432,17 +437,15 @@ def test_ah3_a_401_for_the_first_station_holds_the_others_in_the_same_run(
     outcome ``refused``/reason ``refused_access``/detail ``http 401`` while
     the others log outcome ``held``/reason ``refused_access``.
     """
-    from wxverify.worker.wind_days import evening_slot_instants  # new name (P2)
-
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
-    close_off(conn)
     site_id = _seed_site(conn)
+    _start_ah_day(conn, site_id)
     station_1 = _seed_station(conn, site_id, pws_id="ISTATION01")
     station_2 = _seed_station(conn, site_id, pws_id="ISTATION02")
     station_3 = _seed_station(conn, site_id, pws_id="ISTATION03")
 
-    slots = evening_slot_instants(_AH_DAY, _AH_TZ)
+    slots = evening_slots_utc(_AH_DAY, _AH_TZ)
     slot_2300, slot_2306 = slots[0], slots[1]
     for station_id in (station_1, station_2, station_3):
         _insert_today_row(
@@ -534,15 +537,13 @@ def test_ft1_five_minute_refusal_stores_and_shows_providers_reason(
     -- at the "hold row's reason" and "last_error ends with" assertions
     below: correct = the message text, mutant = None/absent.
     """
-    from wxverify.worker.wind_days import evening_slot_instants  # new name (P2)
-
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
-    close_off(conn)
     site_id = _seed_site(conn)
+    _start_ah_day(conn, site_id)
     station_id = _seed_station(conn, site_id, pws_id="ISTATION01")
 
-    slots = evening_slot_instants(_AH_DAY, _AH_TZ)
+    slots = evening_slots_utc(_AH_DAY, _AH_TZ)
     slot_2300 = slots[0]
     _insert_today_row(
         conn, station_id, _AH_DAY, next_attempt_at=isoformat_utc(slot_2300)
@@ -611,15 +612,13 @@ def test_ah4_a_2xx_clears_only_five_minute_not_current_obs_or_hourly(
     """P2 14.7 AH4: a 2xx on today's row while ``current_obs`` and
     ``hourly`` are held: only ``five_minute`` is cleared (M45: a 2xx on
     today's row clearing every kind)."""
-    from wxverify.worker.wind_days import evening_slot_instants  # new name (P2)
-
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
-    close_off(conn)
     site_id = _seed_site(conn)
+    _start_ah_day(conn, site_id)
     station_id = _seed_station(conn, site_id, pws_id="ISTATION01")
 
-    slots = evening_slot_instants(_AH_DAY, _AH_TZ)
+    slots = evening_slots_utc(_AH_DAY, _AH_TZ)
     slot_2300 = slots[0]
     due_2300 = isoformat_utc(slot_2300)
     _insert_today_row(conn, station_id, _AH_DAY, next_attempt_at=due_2300)
@@ -693,9 +692,11 @@ def test_fm4_each_kinds_hold_leaves_the_other_two_lanes_running(
     _freeze(monkeypatch, now)
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
-    close_off(conn)
 
     site_id = _seed_site(conn)
+    # The lane needs a P1 record holding `now` (the daily close is always
+    # on): dated `now`'s own local date, not _AH_DAY/_AH_TZ.
+    start_site_days(conn, site_id, now.date(), now_utc=now)
     station_id = _seed_station(conn, site_id, pws_id="KTEST001")
     _seed_poll_state(conn, station_id)
     enqueue_if_absent(

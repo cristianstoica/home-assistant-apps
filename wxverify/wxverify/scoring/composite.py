@@ -18,7 +18,7 @@ from wxverify.scoring.publication import (
     published_cells,
 )
 
-CompositeStatus = Literal["hit", "stale", "rebuilding", "empty", "live"]
+CompositeStatus = Literal["hit", "empty", "live"]
 
 
 @dataclass

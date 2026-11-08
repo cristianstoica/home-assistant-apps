@@ -34,7 +34,6 @@ from tests.helpers import (
     NOW,
     MovingClock,
     asof_make_site,
-    close_off,
     disable_other_enqueuers,
     patch_close_clock,
     standard_night,
@@ -49,7 +48,6 @@ from wxverify.db.constant_wind import (
 )
 from wxverify.db.migrations import run_migrations
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
-from wxverify.db.site_days import daily_close_on
 from wxverify.monitor import build_verdict
 from wxverify.obs.constant_wind import Episode, Rule, assess, hour_winds
 from wxverify.settings.keys import set_setting
@@ -364,11 +362,9 @@ def test_at8_source_order() -> None:
 
 
 def _file_conn(tmp_path: Path, name: str) -> sqlite3.Connection:
-    # Left close ON, production's permanent state (the v17 upgrade stamps
-    # DAILY_CLOSE_ON_KEY on every fresh build, tests.helpers.close_off's own
-    # docstring) -- AT6 and AT12's build_verdict calls must see it on, the
-    # same as a live install. AT9-AT11 never call build_verdict, so the
-    # close switch makes no difference to them.
+    # The daily close is always on (the v17 upgrade stamps
+    # DAILY_CLOSE_ON_KEY on every fresh build) -- the same as a live
+    # install, for AT6 and AT12's build_verdict calls.
     conn = sqlite3.connect(str(tmp_path / name))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -432,11 +428,9 @@ def test_at6_one_alert_per_episode_one_station(tmp_path: Path) -> None:
     "recovered"); then windy again (A is still stuck).
 
     Catches: the episode closed by a non-assessable hour (two
-    absent-to-failing turns instead of one); the row built only when the
-    daily close is off.
+    absent-to-failing turns instead of one).
     """
     conn = _file_conn(tmp_path, "at6-one.db")
-    assert daily_close_on(conn) is True, "close on: a fresh database starts this way"
     site_id = _make_site(conn, "at6-one-site")
     station_a = _make_station(conn, site_id, "A")
     others = [_make_station(conn, site_id, letter) for letter in ("B", "C", "D")]
@@ -500,11 +494,9 @@ def test_at6_two_stations_stuck_at_once(tmp_path: Path) -> None:
     of A's readings changes.
 
     Catches: one shared id (B's spell would add no id of its own); one
-    station's clear dropping the other's id; the rows built only when the
-    daily close is off.
+    station's clear dropping the other's id.
     """
     conn = _file_conn(tmp_path, "at6-two.db")
-    assert daily_close_on(conn) is True, "close on: a fresh database starts this way"
     site_id = _make_site(conn, "at6-two-site")
     station_a = _make_station(conn, site_id, "A")
     station_b = _make_station(conn, site_id, "B")
@@ -746,15 +738,13 @@ def test_at11_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_at12_monitor_rows(tmp_path: Path) -> None:
     """AT12: the ``wind_station_constant`` monitor rows, with the daily
-    close on (production's permanent state) and again with it off.
+    close on (production's permanent state).
 
     Catches: one shared id; an ``ok`` row with no episode; a detail naming
-    another station; a disabled station's row counted; the rows built only
-    when the daily close is off.
+    another station; a disabled station's row counted.
     """
     now = _h(100)
     conn = _file_conn(tmp_path, "at12.db")
-    assert daily_close_on(conn) is True, "close on: a fresh database starts this way"
     site_id = _make_site(conn, "at12-site")
     disabled_site_id = _make_site(conn, "at12-disabled-site")
     conn.execute("UPDATE sites SET enabled = 0 WHERE id = ?", (disabled_site_id,))
@@ -769,9 +759,6 @@ def test_at12_monitor_rows(tmp_path: Path) -> None:
         f"wind_station_constant:{pws_a}",
         f"wind_station_constant:{pws_b}",
     )
-
-    def _mode() -> str:
-        return "close on" if daily_close_on(conn) else "close off"
 
     def _verdict(*, pipeline_enabled: bool = True) -> dict[str, object]:
         return build_verdict(
@@ -798,7 +785,7 @@ def test_at12_monitor_rows(tmp_path: Path) -> None:
         ]
 
     assert _wind_ids(_verdict()) == set(), (
-        f"{_mode()}: an empty table must build no condition"
+        "close on: an empty table must build no condition"
     )
 
     _insert_episode_row(conn, station_a, speed_kmh=30.0, since=_h(0), state="suspected")
@@ -821,29 +808,29 @@ def test_at12_monitor_rows(tmp_path: Path) -> None:
     ]
     ids_in_order = [str(c["id"]) for c in conditions]  # type: ignore[index]
     assert ids_in_order == [cond_a_id, cond_b_id], (
-        f"{_mode()}: exactly A's and B's ids, in station order; the disabled"
+        "close on: exactly A's and B's ids, in station order; the disabled"
         " station and the station of the disabled site must have no"
         " condition"
     )
     cond_a, cond_b = conditions
     assert cond_a["ok"] is False and cond_b["ok"] is False, (  # type: ignore[index]
-        f"{_mode()}: both rows must be failing"
+        "close on: both rows must be failing"
     )
     assert pws_a in str(cond_a["detail"]) and pws_b not in str(cond_a["detail"]), (  # type: ignore[index]
-        f"{_mode()}: A's detail must name only A"
+        "close on: A's detail must name only A"
     )
     assert pws_b in str(cond_b["detail"]) and pws_a not in str(cond_b["detail"]), (  # type: ignore[index]
-        f"{_mode()}: B's detail must name only B"
+        "close on: B's detail must name only B"
     )
     assert str(cond_b["detail"]).endswith("(can't assess)"), (  # type: ignore[index]
-        f"{_mode()}: B's detail must show the can't-assess suffix"
+        "close on: B's detail must show the can't-assess suffix"
     )
     assert not str(cond_a["detail"]).endswith("(can't assess)"), (  # type: ignore[index]
-        f"{_mode()}: A's detail must not show the can't-assess suffix"
+        "close on: A's detail must not show the can't-assess suffix"
     )
 
     assert _wind_ids(_verdict(pipeline_enabled=False)) == set(), (
-        f"{_mode()}: monitor_pipeline off must show no wind_station_constant id"
+        "close on: monitor_pipeline off must show no wind_station_constant id"
     )
 
     set_runtime_state(
@@ -856,22 +843,10 @@ def test_at12_monitor_rows(tmp_path: Path) -> None:
         if str(c["id"]).startswith("wind_station_constant")  # type: ignore[index]
     }
     assert grace_conditions[cond_a_id]["ok"] is True, (  # type: ignore[index]
-        f"{_mode()}: the start-up grace must hold A's row ok"
+        "close on: the start-up grace must hold A's row ok"
     )
     assert grace_conditions[cond_b_id]["ok"] is True, (  # type: ignore[index]
-        f"{_mode()}: the start-up grace must hold B's row ok"
-    )
-
-    close_off(conn)
-    conn.commit()
-    assert daily_close_on(conn) is False, "close_off must turn the close off"
-
-    assert _wind_ids_in_order() == [cond_a_id, cond_b_id], (
-        f"{_mode()}: exactly A's and B's ids, in station order, must still"
-        " show with the close off"
-    )
-    assert _wind_ids(_verdict(pipeline_enabled=False)) == set(), (
-        f"{_mode()}: monitor_pipeline off must show no wind_station_constant id"
+        "close on: the start-up grace must hold B's row ok"
     )
 
 

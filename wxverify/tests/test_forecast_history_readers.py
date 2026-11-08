@@ -256,7 +256,7 @@ def _build_readers_scenario(
 
     Returns ``(site_id, feed_x, feed_y, persistence_id)``.
     """
-    site_id = day_close_site(conn, timezone="UTC", close_on=True, with_records=False)
+    site_id = day_close_site(conn, timezone="UTC", with_records=False)
     feed_x = asof_make_real_feed(conn, "fh-reader-x")
     feed_y = asof_make_real_feed(conn, "fh-reader-y")
     persistence_id = asof_persistence_feed_id(conn)
@@ -554,9 +554,7 @@ def test_history_chart_includes_everything_as_pre_close_with_no_record_yet(
     app = create_app(root_path="")
 
     def _build(conn: sqlite3.Connection) -> tuple[int, int]:
-        site_id = day_close_site(
-            conn, timezone="UTC", close_on=True, with_records=False
-        )
+        site_id = day_close_site(conn, timezone="UTC", with_records=False)
         feed_x = asof_make_real_feed(conn, "fh-reader-norecord-x")
         asof_insert_observation(
             conn,
@@ -709,7 +707,7 @@ def _build_two_hour_lead_scenario(conn: sqlite3.Connection) -> tuple[int, int]:
     cells: 24h (source hour 12) and 36h (source hour 0). Returns
     ``(site_id, persistence_id)``.
     """
-    site_id = day_close_site(conn, timezone="UTC", close_on=True, with_records=False)
+    site_id = day_close_site(conn, timezone="UTC", with_records=False)
     persistence_id = asof_persistence_feed_id(conn)
 
     asof_insert_observation(

@@ -27,16 +27,14 @@ from tests.helpers import (
     D,
     asof_conn,
     asof_make_site,
-    close_off,
     day_close_site,
     note_day_clock,
 )
 from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro, parse_utc
 from wxverify.db.migrations import run_migrations
-from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
+from wxverify.db.runtime_state import delete_runtime_state, set_runtime_state
 from wxverify.db.site_days import (
     DAILY_CLOSE_ON_KEY,
-    OFFLINE_COPY_KEY,
     DayStateError,
     WriteKind,
     begin_close,
@@ -44,7 +42,6 @@ from wxverify.db.site_days import (
     check_day_write,
     closed_through,
     current_day_has_other_station,
-    daily_close_on,
     daily_close_on_at,
     day_for_instant,
     day_record,
@@ -56,7 +53,6 @@ from wxverify.db.site_days import (
     finish_close,
     local_clock_utc,
     mark_missed,
-    open_day_on_copy,
     record_station_change,
     start_site_days,
     zone_flagged,
@@ -106,15 +102,6 @@ _TABLE_5_2: dict[str, dict[WriteKind, bool]] = {
     # check_date_write now hard-codes "with no record nothing is allowed"
     # rather than branching on kind).
     "no_record": dict.fromkeys(_ALL_KINDS, False),
-    "close_off": {
-        WriteKind.READING: True,
-        WriteKind.GAP_FILL: False,
-        WriteKind.HOURLY: True,
-        WriteKind.TRUTH: True,
-        WriteKind.DAY_SCORES: False,
-        WriteKind.CLOSE_RECORD: False,
-        WriteKind.RAW_PRUNE: False,
-    },
 }
 
 
@@ -151,12 +138,6 @@ def _ds8_fixture(
     state: str,
 ) -> tuple[sqlite3.Connection, int, str, date]:
     """Build one of DS8's state fixtures; return (conn, site_id, instant, date)."""
-    if state == "close_off":
-        conn = asof_conn()
-        close_off(conn)
-        site_id = day_close_site(conn, close_on=False, with_records=False)
-        return conn, site_id, isoformat_utc(NOW), D
-
     conn = asof_conn()
     site_id = day_close_site(conn)  # UTC, close on, D-3 closed, D-2 missed
     if state == "open":
@@ -202,13 +183,9 @@ def test_ds8_check_day_write_matches_table_5_2(state: str, kind: WriteKind) -> N
     )
 
 
-@pytest.mark.parametrize("state", [s for s in _TABLE_5_2 if s != "close_off"])
+@pytest.mark.parametrize("state", list(_TABLE_5_2))
 @pytest.mark.parametrize("kind", _ALL_KINDS)
 def test_ds8_check_date_write_matches_table_5_2(state: str, kind: WriteKind) -> None:
-    # "close_off" is excluded: check_date_write lost its close-off branch
-    # (storage-release plan 3.2) and now always follows table 5.2's
-    # close-on rule, so that fixture state no longer applies to it.
-    # ``check_day_write``, tested above, still has it via filter_day_writes.
     conn, site_id, _instant, local_date = _ds8_fixture(state)
     assert (
         check_date_write(conn, site_id, local_date, kind, now_utc=NOW)
@@ -1039,8 +1016,7 @@ def test_ds11_station_list_rule() -> None:
 
 def test_ds12_record_station_change_effective_dates() -> None:
     conn = asof_conn()
-    close_off(conn)
-    site_id = day_close_site(conn, close_on=False, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     station_id = int(
         conn.execute(
             "SELECT id FROM stations WHERE site_id = ? ORDER BY id LIMIT 1",
@@ -1055,11 +1031,14 @@ def test_ds12_record_station_change_effective_dates() -> None:
         conn, site_id, station_id, "turned_off", reason="update_station", now_utc=NOW
     )
     assert off_date == D.isoformat()
+    # record_station_change always runs the open-days update now (the
+    # close is always on, so its own guard is gone), so it creates the
+    # site's first record rather than leaving none.
     assert (
         conn.execute(
             "SELECT COUNT(*) FROM site_days WHERE site_id = ?", (site_id,)
         ).fetchone()[0]
-        == 0
+        == 1
     )
 
     conn2 = asof_conn()
@@ -1155,18 +1134,6 @@ def test_ds14_current_day_has_other_station() -> None:
         conn, site_id, b_id, "retired", reason="delete_station", now_utc=NOW
     )
     assert current_day_has_other_station(conn, site_id, a_id, now_utc=NOW) is False
-
-    conn_off = asof_conn()
-    site_off = day_close_site(conn_off, close_on=False, with_records=False)
-    station_off = int(
-        conn_off.execute(
-            "SELECT id FROM stations WHERE site_id = ? LIMIT 1", (site_off,)
-        ).fetchone()[0]
-    )
-    assert (
-        current_day_has_other_station(conn_off, site_off, station_off, now_utc=NOW)
-        is True
-    )
 
     conn_no_record = asof_conn()
     site_no_record = day_close_site(conn_no_record, with_records=False)
@@ -1300,12 +1267,6 @@ def test_ds15c_enter_zone_change_when_no_day_has_started() -> None:
 
 
 def test_ds16_enter_zone_change_refusals_and_acceptance() -> None:
-    conn = asof_conn()
-    close_off(conn)
-    site_id = day_close_site(conn, close_on=False)
-    with pytest.raises(ValueError, match="close"):
-        enter_zone_change(conn, site_id, "Etc/GMT-1", now_utc=NOW)
-
     conn = asof_conn()
     site_id = day_close_site(conn)
     with pytest.raises(ValueError):
@@ -1577,22 +1538,6 @@ def test_ds17b_zone_flag_after_a_change() -> None:
     assert truth_before == truth_after
 
 
-def test_ds18_daily_close_on_not_cached() -> None:
-    conn = asof_conn()
-    close_off(conn)
-    asof_make_site(conn, "no-close-site")
-    assert daily_close_on(conn) is False
-    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(NOW))
-    assert daily_close_on(conn) is True
-
-    conn2 = asof_conn()
-    close_off(conn2)
-    assert daily_close_on(conn2) is False
-    set_runtime_state(conn2, DAILY_CLOSE_ON_KEY, isoformat_utc(NOW))
-    assert daily_close_on(conn2) is True
-    assert daily_close_on(conn2) is True  # a cached first read must not stick
-
-
 def test_ds19_import_rule_of_site_days_module() -> None:
     source_path = Path(wxverify.db.site_days.__file__)
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
@@ -1610,67 +1555,6 @@ def test_ds19_import_rule_of_site_days_module() -> None:
                 assert module in allowed_third_party, (
                     f"unexpected import from {module!r} in db/site_days.py"
                 )
-
-
-def test_ds20_close_off_site_takes_no_write_but_table_tables_stay_empty() -> None:
-    conn = asof_conn()
-    close_off(conn)
-    site_id = day_close_site(conn, close_on=False, with_records=False)
-    ensure_site_days(conn, site_id, now_utc=NOW)
-
-    for kind in _ALL_KINDS:
-        expected = kind in (
-            WriteKind.READING,
-            WriteKind.HOURLY,
-            WriteKind.TRUTH,
-        )
-        assert (
-            check_day_write(conn, site_id, isoformat_utc(NOW), kind, now_utc=NOW)
-            is expected
-        )
-        assert (
-            check_day_write(conn, site_id, "not-an-instant", kind, now_utc=NOW)
-            is expected
-        )
-        # check_date_write is not checked here: it lost its close-off branch
-        # (storage-release plan 3.2) and now always creates the site's
-        # missing day records before applying table 5.2, so it no longer
-        # takes no write while the close is off, and calling it here would
-        # also break the table-stays-empty assertion below.
-        assert filter_day_writes(
-            conn,
-            site_id,
-            (isoformat_utc(NOW), "not-an-instant"),
-            kind,
-            now_utc=NOW,
-        ) == (
-            frozenset({isoformat_utc(NOW), "not-an-instant"})
-            if expected
-            else frozenset()
-        )
-
-    # Asserted last: every call above, including the guard functions, must
-    # have created no record while the close stayed off (M45r: a guard that
-    # runs ``_ensure`` before checking ``daily_close_on`` would have created
-    # them during the loop, not during ``ensure_site_days`` above).
-    assert (
-        conn.execute(
-            "SELECT COUNT(*) FROM site_days WHERE site_id = ?", (site_id,)
-        ).fetchone()[0]
-        == 0
-    )
-    assert (
-        conn.execute(
-            "SELECT COUNT(*) FROM site_day_stations WHERE site_id = ?", (site_id,)
-        ).fetchone()[0]
-        == 0
-    )
-    assert (
-        conn.execute(
-            "SELECT COUNT(*) FROM site_zone_changes WHERE site_id = ?", (site_id,)
-        ).fetchone()[0]
-        == 0
-    )
 
 
 def test_ds22_raw_prune_counted_from_the_later_done_at() -> None:
@@ -1782,9 +1666,12 @@ def test_ds24_start_site_days_refuses_a_second_first_record_and_a_past_date() ->
 
 def test_ds25_daily_close_on_at() -> None:
     conn = asof_conn()
-    close_off(conn)
     asof_make_site(conn, "ds25-site")
-    assert daily_close_on_at(conn) is None
+    # Deletes the key only to reach daily_close_on_at's missing-key error,
+    # not to switch the close off (the switch no longer exists).
+    delete_runtime_state(conn, DAILY_CLOSE_ON_KEY)
+    with pytest.raises(ValueError, match="daily_close_on_at is missing"):
+        daily_close_on_at(conn)
 
     set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(NOW))
     value = daily_close_on_at(conn)
@@ -1795,88 +1682,3 @@ def test_ds25_daily_close_on_at() -> None:
     set_runtime_state(conn2, DAILY_CLOSE_ON_KEY, "not-a-stamp")
     with pytest.raises(ValueError):
         daily_close_on_at(conn2)
-
-
-def test_ds26_open_day_on_copy(tmp_path: Path) -> None:
-    live_path = tmp_path / "live.db"
-    live_conn = sqlite3.connect(str(live_path))
-    live_conn.row_factory = sqlite3.Row
-    live_conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(live_conn)
-    day_close_site(live_conn, close_on=False, with_records=False)
-    live_conn.commit()
-    live_conn.close()
-
-    def _new_copy(name: str) -> tuple[sqlite3.Connection, Path, int]:
-        copy_path = tmp_path / name
-        copy_conn = sqlite3.connect(str(copy_path))
-        copy_conn.row_factory = sqlite3.Row
-        copy_conn.execute("PRAGMA foreign_keys=ON")
-        run_migrations(copy_conn)
-        close_off(copy_conn)
-        site_id = day_close_site(copy_conn, close_on=False, with_records=False)
-        copy_conn.commit()
-        return copy_conn, copy_path, site_id
-
-    marked_conn, marked_path, marked_site = _new_copy("marked.db")
-    set_runtime_state(marked_conn, OFFLINE_COPY_KEY, isoformat_utc(NOW))
-    marked_conn.commit()
-
-    d_minus_5 = D - timedelta(days=5)
-    open_day_on_copy(
-        marked_conn, marked_site, d_minus_5, now_utc=NOW, live_db_path=live_path
-    )
-    row = marked_conn.execute(
-        "SELECT state, day_start_utc, day_end_utc, timezone FROM site_days"
-        " WHERE site_id = ?",
-        (marked_site,),
-    ).fetchone()
-    assert row["state"] == "open"
-    assert row["day_start_utc"] == isoformat_utc(
-        datetime(d_minus_5.year, d_minus_5.month, d_minus_5.day, tzinfo=UTC)
-    )
-    assert row["day_end_utc"] == isoformat_utc(
-        datetime(d_minus_5.year, d_minus_5.month, d_minus_5.day, tzinfo=UTC)
-        + timedelta(days=1)
-    )
-    assert row["timezone"] == "UTC"
-    assert get_runtime_state(marked_conn, DAILY_CLOSE_ON_KEY) == isoformat_utc(NOW)
-
-    with pytest.raises(DayStateError):
-        open_day_on_copy(
-            marked_conn, marked_site, d_minus_5, now_utc=NOW, live_db_path=live_path
-        )
-
-    self_conn, self_path, self_site = _new_copy("live_self.db")
-    set_runtime_state(self_conn, OFFLINE_COPY_KEY, isoformat_utc(NOW))
-    self_conn.commit()
-    with pytest.raises(DayStateError):
-        open_day_on_copy(
-            self_conn, self_site, d_minus_5, now_utc=NOW, live_db_path=self_path
-        )
-    assert (
-        self_conn.execute(
-            "SELECT COUNT(*) FROM site_days WHERE site_id = ?", (self_site,)
-        ).fetchone()[0]
-        == 0
-    )
-    assert get_runtime_state(self_conn, DAILY_CLOSE_ON_KEY) is None
-
-    unmarked_conn, unmarked_path, unmarked_site = _new_copy("unmarked.db")
-    with pytest.raises(DayStateError):
-        open_day_on_copy(
-            unmarked_conn, unmarked_site, d_minus_5, now_utc=NOW, live_db_path=live_path
-        )
-    assert (
-        unmarked_conn.execute(
-            "SELECT COUNT(*) FROM site_days WHERE site_id = ?", (unmarked_site,)
-        ).fetchone()[0]
-        == 0
-    )
-    assert get_runtime_state(unmarked_conn, DAILY_CLOSE_ON_KEY) is None
-
-    fresh_conn, fresh_path, fresh_site = _new_copy("fresh.db")
-    set_runtime_state(fresh_conn, OFFLINE_COPY_KEY, isoformat_utc(NOW))
-    fresh_conn.commit()
-    with pytest.raises(DayStateError):
-        start_site_days(fresh_conn, fresh_site, d_minus_5, now_utc=NOW)

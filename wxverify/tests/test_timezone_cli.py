@@ -58,16 +58,15 @@ def _generations() -> list[dict[str, object]]:
     return get_db().read_sync(_read)
 
 
-def test_do2_change_enters_a_zone_change_while_the_close_is_on(
+def test_do2_change_enters_a_zone_change(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Plan §13.7 DO2: while the close is on, ``timezone change`` enters the
-    zone change through ``enter_zone_change`` instead of
-    ``apply_prospective_change``, ``--effective-from`` is forbidden, and an
-    unknown zone is refused the same way. A fourth sub-case, on a second
-    database whose helper site has ``with_records=False`` and was started
-    at D+1 (as DS15c starts it), prints a first full day with no
-    changeover date.
+    """Plan §13.7 DO2: ``timezone change`` enters the zone change through
+    ``enter_zone_change`` instead of ``apply_prospective_change``,
+    ``--effective-from`` is forbidden, and an unknown zone is refused the
+    same way. A fourth sub-case, on a second database whose helper site has
+    ``with_records=False`` and was started at D+1 (as DS15c starts it),
+    prints a first full day with no changeover date.
 
     ``wxverify.__main__`` imports ``utc_now`` (P1), so this monkeypatch
     fixes the clock the CLI reads. The ``site_days`` rows the change
@@ -80,9 +79,7 @@ def test_do2_change_enters_a_zone_change_while_the_close_is_on(
     _init_tmp_db(tmp_path)
     monkeypatch.setattr("wxverify.__main__.utc_now", lambda: NOW)
     site_id = get_db().write_sync(
-        lambda c: day_close_site(
-            c, timezone=_START_TZ, close_on=True, with_records=True
-        )
+        lambda c: day_close_site(c, timezone=_START_TZ, with_records=True)
     )
 
     rc = main(
@@ -153,9 +150,7 @@ def test_do2_change_enters_a_zone_change_while_the_close_is_on(
     second_dir.mkdir()
     _init_tmp_db(second_dir)
     second_site_id = get_db().write_sync(
-        lambda c: day_close_site(
-            c, timezone=_START_TZ, close_on=True, with_records=False
-        )
+        lambda c: day_close_site(c, timezone=_START_TZ, with_records=False)
     )
     from wxverify.db.site_days import start_site_days
 
@@ -183,21 +178,18 @@ def test_do2_change_enters_a_zone_change_while_the_close_is_on(
     assert changeover_date not in out4
 
 
-def test_do2b_change_on_an_unknown_site_while_the_close_is_on(
+def test_do2b_change_on_an_unknown_site(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Plan §13.7 DO2: an unknown site is refused the same way while the
-    close is on. The existence check inside ``enter_zone_change``
-    (`site_days.py:1227`, via ``_require_site_timezone``) runs before any
-    date logic, so the CLI's ``DayStateError`` catch (`__main__.py:567`)
-    reports it with a message instead of a traceback."""
+    """Plan §13.7 DO2: an unknown site is refused. The existence check
+    inside ``enter_zone_change``, via ``_require_site_timezone``, runs
+    before any date logic, so ``_timezone_change``'s ``DayStateError``
+    catch reports it with a message instead of a traceback."""
     from tests.helpers import day_close_site
 
     _init_tmp_db(tmp_path)
     get_db().write_sync(
-        lambda c: day_close_site(
-            c, timezone=_START_TZ, close_on=True, with_records=False
-        )
+        lambda c: day_close_site(c, timezone=_START_TZ, with_records=False)
     )
 
     rc = main(

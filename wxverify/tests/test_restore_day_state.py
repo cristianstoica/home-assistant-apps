@@ -163,7 +163,7 @@ def _build_post_switch_db(base: Path) -> tuple[sqlite3.Connection, Path, int]:
     config.options_path = str(options_path)
     db = init_db(str(db_path))
     conn = db._conn  # noqa: SLF001
-    site_id = day_close_site(conn, timezone="UTC", close_on=True, with_records=False)
+    site_id = day_close_site(conn, timezone="UTC", with_records=False)
     return conn, db_path, site_id
 
 

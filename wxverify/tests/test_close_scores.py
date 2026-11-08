@@ -11,9 +11,9 @@ nothing in the code under test is mocked. Synthetic data only: stations
 ``synthetic-sd-x``/``synthetic-sd-y``/``synthetic-sd-z``, zone ``UTC``.
 
 Each test calls ``score_day`` directly on a hand-built ``DayRecord`` in the
-``closing`` state (the shape ``tests/test_p4_dormant.py``'s PD2 and P3's
-offline ``close-day`` both use, plan 4.3), rather than running the full
-night chain through ``run_due_jobs`` -- 18.6's "stage 5 ran" is read here as
+``closing`` state (the shape ``tests/test_p4_dormant.py``'s PD2 also uses,
+plan 4.3), rather than running the full night chain through
+``run_due_jobs`` -- 18.6's "stage 5 ran" is read here as
 "score_day's stage-5 call point ran with D's inputs in place", the same
 entry point P3's stage 5 calls (plan 6.1), not a literal scheduler replay.
 This is a deliberate simplification; see the test-authoring report for the
@@ -332,7 +332,7 @@ def _build_base(
     rain_eligible: bool = True,
     obs_skip_hours: frozenset[int] = frozenset(),
 ):
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     generation_id = ensure_site_generation(conn, site_id)
     feeds = {"X": _make_feed(conn, "X"), "Y": _make_feed(conn, "Y")}
     for feed_id in feeds.values():
@@ -1451,7 +1451,7 @@ def test_sd14_closed_day_refused_nothing_written(tmp_path) -> None:  # noqa: ARG
     from wxverify.scoring.close_scores import ScoreDayRefused, score_day
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=True)
+    site_id = day_close_site(conn, with_records=True)
     closed_date = D - timedelta(days=3)
     record = day_record(conn, site_id, closed_date)
     assert record is not None and record.state == "closed"

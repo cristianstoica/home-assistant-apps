@@ -1,6 +1,6 @@
 """Query-plan tests for the two forecast_samples reads the Forecast page
 (step 6) depends on: ``DISPLAY_SAMPLES_SQL`` (``forecast/data.py``) and
-``future_samples_sql(close_on=True)``. Relationship checks, never one
+``future_samples_sql()``. Relationship checks, never one
 planner's exact wording (the pattern of
 ``tests/test_query_plan_regressions.py``): both statements must plan a
 SEARCH of ``forecast_samples`` (shown under its query alias, ``fs``) whose
@@ -107,10 +107,8 @@ def test_display_samples_sql_seeks_forecast_samples_ending_in_valid_at() -> None
     assert not any("SCAN fs" in line for line in plan), plan
 
 
-def test_future_samples_sql_close_on_seeks_forecast_samples_ending_in_valid_at() -> (
-    None
-):
-    """Query plans (half: future_samples_sql(close_on=True)). Catches: a
+def test_future_samples_sql_seeks_forecast_samples_ending_in_valid_at() -> None:
+    """Query plans (half: future_samples_sql()). Catches: a
     SCAN, or a seek that stops before valid_at. Fixture: rain samples on
     both sides of the hour-start boundary used as the ``since_valid_at``
     parameter."""
@@ -131,7 +129,7 @@ def test_future_samples_sql_close_on_seeks_forecast_samples_ending_in_valid_at()
     )
     conn.execute("ANALYZE")
 
-    sql = future_samples_sql(close_on=True)
+    sql = future_samples_sql()
     plan = _plan(conn, sql, (site_id, isoformat_utc(boundary)))
     assert any(_SEEK_RE.search(line) for line in plan), plan
     assert not any("SCAN fs" in line for line in plan), plan

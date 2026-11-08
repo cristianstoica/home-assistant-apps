@@ -13,13 +13,15 @@ not read off the implementation.
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
 
-from tests.helpers import close_off, seed_pair_max_wind
+from tests.helpers import seed_pair_max_wind
 from wxverify import config
 from wxverify.db.connection import close_db, init_db
+from wxverify.db.site_days import record_station_change, start_site_days
 from wxverify.scoring.consensus import (
     StationReading,
     _low_trim,
@@ -316,7 +318,6 @@ def test_materialize_consensus_wind_p90_through_real_write_path(
     tmp_path: Path,
 ) -> None:
     conn = _init_tmp_db(tmp_path)
-    close_off(conn)
     site_id = int(
         conn.execute(
             """
@@ -326,6 +327,12 @@ def test_materialize_consensus_wind_p90_through_real_write_path(
         ).lastrowid
     )
     valid_at = "2026-01-01T00:00:00Z"
+    # A P1 record holding `valid_at` (the close is always on; the closed-day
+    # guard behind write_station_observation/materialize_consensus refuses
+    # the write with no record).
+    start_site_days(
+        conn, site_id, date(2026, 1, 1), now_utc=datetime(2026, 1, 1, tzinfo=UTC)
+    )
     values = [3.0, 3.0, 3.0, 3.0, 20.0]
     for index, value in enumerate(values):
         station_id = int(
@@ -337,6 +344,18 @@ def test_materialize_consensus_wind_p90_through_real_write_path(
                 """,
                 (site_id, f"STATION{index}"),
             ).lastrowid
+        )
+        # Puts the station on the day's saved list (6.2) through the real
+        # record_station_change path, before the P1 record (local_date
+        # 2026-01-01) was started -- 2025-12-31 holds no record, so its
+        # "added" takes effect on the next local date, 2026-01-01.
+        record_station_change(
+            conn,
+            site_id,
+            station_id,
+            "added",
+            reason="test fixture",
+            now_utc=datetime(2025, 12, 31, 12, tzinfo=UTC),
         )
         seed_pair_max_wind(
             conn, site_id=site_id, station_id=station_id, valid_at=valid_at, value=value

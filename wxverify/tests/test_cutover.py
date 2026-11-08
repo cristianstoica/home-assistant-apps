@@ -2,10 +2,10 @@
 §17.3).
 
 CV1-CV7, CV9 and CV10 pinned ``wxverify.worker.cutover``, the one-time
-switch-over machinery that built each site's first publication and flipped
-the ``daily_close_on`` key. The daily close is now permanent (storage-
-release plan 2026-11-02, table 1.B) and that module is gone, so those tests
-pinned removed behaviour and are deleted with it.
+switch-over machinery that built each site's first publication and set the
+switch time. The daily close is now permanent (storage-release plan
+2026-11-02, table 1.B) and that module is gone, so those tests pinned
+removed behaviour and are deleted with it.
 
 CV8 is unrelated to the cutover module itself -- it only pins the
 methodology version, which did not change here -- so it stays.

@@ -307,7 +307,7 @@ def _build_base(tmp_path: Path):
     D-3..D-1 closed), ``rolling_window_days`` 5, ``min_n`` 9.
     """
     db, writer, conn = _make_db(tmp_path)
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     _close_through(conn, site_id, first_date=FIRST_RECORD_DATE, last_closed_date=CUTOFF)
     feed_x = _make_feed(conn, "X")
     set_setting(conn, "rolling_window_days", "5")
@@ -865,7 +865,7 @@ def test_pb8_an_older_publication_is_kept_until_192h_past_its_successor(
         from wxverify.scoring.publication import publish
 
         db, writer, conn = _make_db(tmp_path)
-        site_id = day_close_site(conn, close_on=True, with_records=False)
+        site_id = day_close_site(conn, with_records=False)
         _close_through(
             conn, site_id, first_date=FIRST_RECORD_DATE, last_closed_date=CUTOFF
         )
@@ -1040,7 +1040,7 @@ def test_pb10_coverage_counts_scored_expected_and_starting_days_apart(
         db, writer, conn = _make_db(tmp_path)
         first_date = D - timedelta(days=5)
         cutoff = D - timedelta(days=1)
-        site_id = day_close_site(conn, close_on=True, with_records=False)
+        site_id = day_close_site(conn, with_records=False)
         _close_through(conn, site_id, first_date=first_date, last_closed_date=cutoff)
         feed_x = _make_feed(conn, "X")
         set_setting(conn, "rolling_window_days", "7")
@@ -1340,7 +1340,7 @@ def test_pb17_a_missed_dates_leftover_day_scores_rows_are_excluded(
         from wxverify.scoring.publication import publish
 
         db, writer, conn = _make_db(tmp_path)
-        site_id = day_close_site(conn, close_on=True, with_records=False)
+        site_id = day_close_site(conn, with_records=False)
         missed_date = D - timedelta(days=2)
         _close_through_with_missed(
             conn,

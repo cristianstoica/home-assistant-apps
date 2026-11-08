@@ -37,7 +37,6 @@ from tests.helpers import (
     D,
     asof_insert_observation,
     asof_make_site,
-    close_off,
     day_close_site,
 )
 from wxverify import config
@@ -139,13 +138,9 @@ def _day_list(site_id: int, local_date: str) -> set[int]:
     return {int(r["station_id"]) for r in rows}
 
 
-def _seed_site(
-    site_id_holder: list[int], *, close_on: bool, with_records: bool
-) -> None:
+def _seed_site(site_id_holder: list[int], *, with_records: bool) -> None:
     def _seed(conn: sqlite3.Connection) -> int:
-        return day_close_site(
-            conn, timezone="UTC", close_on=close_on, with_records=with_records
-        )
+        return day_close_site(conn, timezone="UTC", with_records=with_records)
 
     site_id_holder.append(get_db().write_sync(_seed))
 
@@ -182,7 +177,7 @@ def test_lr1_create_station_queues_no_job_and_counts_from_the_next_day(
     with TestClient(app) as client:
         headers = _csrf_headers(client)
         site_ids: list[int] = []
-        _seed_site(site_ids, close_on=True, with_records=True)
+        _seed_site(site_ids, with_records=True)
         site_id = site_ids[0]
 
         resp = client.post(
@@ -215,7 +210,7 @@ def test_lr2_duplicate_station_id_refused(
     with TestClient(app) as client:
         headers = _csrf_headers(client)
         site_ids: list[int] = []
-        _seed_site(site_ids, close_on=False, with_records=False)
+        _seed_site(site_ids, with_records=False)
         site_id = site_ids[0]
 
         other_held_id = "ISTATION04"
@@ -300,7 +295,7 @@ def test_lr3_readd_a_retired_station_at_the_same_site(
     with TestClient(app) as client:
         headers = _csrf_headers(client)
         site_ids: list[int] = []
-        _seed_site(site_ids, close_on=True, with_records=True)
+        _seed_site(site_ids, with_records=True)
         site_id = site_ids[0]
         b_id = _station_db_id(site_id, _STATION_B)
 
@@ -436,7 +431,7 @@ def test_lr4_toggle_writes_only_on_an_actual_flip(
     with TestClient(app) as client:
         headers = _csrf_headers(client)
         site_ids: list[int] = []
-        _seed_site(site_ids, close_on=True, with_records=True)
+        _seed_site(site_ids, with_records=True)
         site_id = site_ids[0]
         b_id = _station_db_id(site_id, _STATION_B)
 
@@ -474,7 +469,7 @@ def test_lr5_toggle_off_does_not_touch_closed_or_open_day_data(
     with TestClient(app) as client:
         headers = _csrf_headers(client)
         site_ids: list[int] = []
-        _seed_site(site_ids, close_on=True, with_records=True)
+        _seed_site(site_ids, with_records=True)
         site_id = site_ids[0]
         b_id = _station_db_id(site_id, _STATION_B)
 
@@ -555,7 +550,7 @@ def test_lr6_cannot_turn_off_or_remove_last_enabled_station(
     with TestClient(app) as client:
         headers = _csrf_headers(client)
         site_ids: list[int] = []
-        _seed_site(site_ids, close_on=False, with_records=False)
+        _seed_site(site_ids, with_records=False)
         site_id = site_ids[0]
         a_id = _station_db_id(site_id, _STATION_A)
         b_id = _station_db_id(site_id, _STATION_B)
@@ -599,7 +594,7 @@ def test_lr7_cannot_empty_the_current_days_list_while_on(
     with TestClient(app) as client:
         headers = _csrf_headers(client)
         site_ids: list[int] = []
-        _seed_site(site_ids, close_on=True, with_records=True)
+        _seed_site(site_ids, with_records=True)
         site_id = site_ids[0]
         a_id = _station_db_id(site_id, _STATION_A)
         b_id = _station_db_id(site_id, _STATION_B)
@@ -631,16 +626,17 @@ def test_lr7_cannot_empty_the_current_days_list_while_on(
         assert "site must keep at least one station counting today" in resp2.text
 
 
-def test_lr7_check_two_does_not_run_while_off(
+def test_lr7_check_two_allows_removal_with_no_day_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Plan §13.5 LR7, off half: the same "only A counts today" setup, but
-    with the close off check 2 must not run -- turning A off answers 200."""
+    """Plan §13.5 LR7, no-record half: the same "only A counts today" setup,
+    but the site has no site_days record yet -- check 2 finds no record
+    holding now, so it never blocks and turning A off answers 200."""
     app = _setup_app(tmp_path, monkeypatch, "lr7b")
     with TestClient(app) as client:
         headers = _csrf_headers(client)
         site_ids: list[int] = []
-        _seed_site(site_ids, close_on=False, with_records=False)
+        _seed_site(site_ids, with_records=False)
         site_id = site_ids[0]
         a_id = _station_db_id(site_id, _STATION_A)
         b_id = _station_db_id(site_id, _STATION_B)
@@ -671,7 +667,7 @@ def test_lr8_delete_is_a_retire_not_an_erase(
     with TestClient(app) as client:
         headers = _csrf_headers(client)
         site_ids: list[int] = []
-        _seed_site(site_ids, close_on=True, with_records=True)
+        _seed_site(site_ids, with_records=True)
         site_id = site_ids[0]
         b_id = _station_db_id(site_id, _STATION_B)
 
@@ -796,7 +792,7 @@ def test_lr9_retired_station_hidden_turned_off_one_stays_visible(
     with TestClient(app) as client:
         headers = _csrf_headers(client)
         site_ids: list[int] = []
-        _seed_site(site_ids, close_on=False, with_records=False)
+        _seed_site(site_ids, with_records=False)
         site_id = site_ids[0]
         b_id = _station_db_id(site_id, _STATION_B)
 
@@ -825,19 +821,12 @@ def test_lr9_retired_station_hidden_turned_off_one_stays_visible(
         assert _STATION_B not in page.text
 
 
-def test_lr10_new_site_record_only_while_on(
+def test_lr10_new_site_gets_a_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from wxverify.core.timeutil import isoformat_utc
-    from wxverify.db.runtime_state import set_runtime_state
-    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY
-
     app = _setup_app(tmp_path, monkeypatch, "lr10")
     with TestClient(app) as client:
         headers = _csrf_headers(client)
-        get_db().write_sync(
-            lambda conn: set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(NOW))
-        )
 
         resp = client.post(
             "/api/sites",
@@ -865,39 +854,6 @@ def test_lr10_new_site_record_only_while_on(
         assert [r["local_date"] for r in rows] == [day_plus_2]
 
 
-def test_lr10_off_site_gets_no_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    app = _setup_app(tmp_path, monkeypatch, "lr10b")
-    with TestClient(app) as client:
-        headers = _csrf_headers(client)
-        # The close is permanently on from the build (storage release 3.2);
-        # this test's subject is close-OFF behaviour, so force it off right
-        # after the database is built, before anything reads the key.
-        get_db().write_sync(close_off)
-
-        resp = client.post(
-            "/api/sites",
-            json={
-                "name": "Off Site",
-                "forecast_lat": 10.0,
-                "forecast_lon": 20.0,
-                "elevation_m": 100.0,
-                "timezone": "UTC",
-            },
-            headers=headers,
-        )
-        assert resp.status_code == 200
-        site_id = resp.json()["id"]
-
-        rows = get_db().read_sync(
-            lambda conn: conn.execute(
-                "SELECT local_date FROM site_days WHERE site_id=?", (site_id,)
-            ).fetchall()
-        )
-        assert [r["local_date"] for r in rows] == []
-
-
 def test_lr11_remove_confirmation_wording(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -905,7 +861,7 @@ def test_lr11_remove_confirmation_wording(
     with TestClient(app) as client:
         _csrf_headers(client)
         site_ids: list[int] = []
-        _seed_site(site_ids, close_on=False, with_records=False)
+        _seed_site(site_ids, with_records=False)
 
         page = client.get("/sites")
         assert page.status_code == 200
@@ -920,7 +876,7 @@ def test_lr12_failed_readd_leaves_every_table_unchanged(
     with TestClient(app) as client:
         headers = _csrf_headers(client)
         site_ids: list[int] = []
-        _seed_site(site_ids, close_on=True, with_records=True)
+        _seed_site(site_ids, with_records=True)
         site_id = site_ids[0]
         b_id = _station_db_id(site_id, _STATION_B)
 

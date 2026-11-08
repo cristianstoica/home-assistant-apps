@@ -16,15 +16,16 @@ from __future__ import annotations
 import ast
 import re
 import sqlite3
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
 
-from tests.helpers import close_off
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database
 from wxverify.db.migrations import run_migrations
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
+from wxverify.db.site_days import record_station_change, start_site_days
 from wxverify.db.wind_basis import PAIR_MAX_SOURCE_PREFIX
 from wxverify.scoring.consensus import (
     insert_station_observation,
@@ -58,6 +59,28 @@ def _make_station(conn: sqlite3.Connection, site_id: int, pws_id: str) -> int:
     )
     assert cur.lastrowid is not None
     return int(cur.lastrowid)
+
+
+_VALID_AT_DAY = date(2026, 7, 1)
+
+
+def _give_day_record(conn: sqlite3.Connection, site_id: int, station_id: int) -> None:
+    """Give the site a P1 record covering the tests' ``valid_at`` day (the
+    close is always on; the write guard refuses an instant with no record
+    holding it), with the day's saved station list holding ``station_id``
+    too, through the real ``record_station_change`` path (6.2), the way a
+    joining station reaches the list."""
+    start_site_days(
+        conn, site_id, _VALID_AT_DAY, now_utc=datetime(2026, 7, 1, tzinfo=UTC)
+    )
+    record_station_change(
+        conn,
+        site_id,
+        station_id,
+        "added",
+        reason="test fixture",
+        now_utc=datetime(2026, 6, 30, 12, tzinfo=UTC),
+    )
 
 
 # --- T23 ---------------------------------------------------------------
@@ -130,9 +153,9 @@ def test_insert_guard_always_accepts_temperature(state: str | None) -> None:
     accidentally covers every ``variable``) would refuse this in every
     state."""
     conn = _make_db()
-    close_off(conn)
     site = _make_site(conn)
     station = _make_station(conn, site, "KTEST001")
+    _give_day_record(conn, site, station)
     _store_wind_key(conn, site, state)
     result = insert_station_observation(
         conn,
@@ -217,9 +240,9 @@ def test_database_open_writes_no_wind_basis_key_on_a_legacy_shaped_file(
 
 def test_write_station_observation_stamps_fetched_at_no_materialize() -> None:
     conn = _make_db()
-    close_off(conn)
     site = _make_site(conn)
     station = _make_station(conn, site, "KTEST001")
+    _give_day_record(conn, site, station)
     changed = write_station_observation(
         conn,
         station_id=station,
@@ -272,9 +295,9 @@ def test_insert_station_observation_does_materialize() -> None:
     not here, or omitted from both) would leave it absent if omitted
     entirely from the guarded caller."""
     conn = _make_db()
-    close_off(conn)
     site = _make_site(conn)
     station = _make_station(conn, site, "KTEST001")
+    _give_day_record(conn, site, station)
     insert_station_observation(
         conn,
         station_id=station,

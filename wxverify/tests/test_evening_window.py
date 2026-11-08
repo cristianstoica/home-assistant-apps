@@ -1,16 +1,16 @@
 """Tests: the 5-minute download's schedule, P2 §4.2 (14.6, EW1-EW15).
 
-``EVENING_SLOTS``, ``evening_slot_instants`` and ``ReservationDeferred``
-live in ``wxverify.worker.wind_days``; ``next_five_minute_try`` in
+``EVENING_SLOTS`` and ``ReservationDeferred`` live in
+``wxverify.worker.wind_days``; ``next_five_minute_try`` in
 ``wxverify.db.station_readings``; ``record_collection_try`` in
 ``wxverify.worker.close_chain``.
 
 Isolation: a real tmp-path ``Database``/``FencedWriter`` + ``httpx.
 MockTransport``, mirroring ``tests/test_wind_days_lane.py``'s ``_t97_*``
-harness. The site comes from P1's ``day_close_site`` (close off unless a
-case says otherwise, per 14.1). Stations and zones are synthetic per
-Projects/CLAUDE.md: ``ISTATION01``-``ISTATION06`` standing for A-F, zones
-``UTC`` and ``Etc/GMT-14`` only; the API key is the CI placeholder.
+harness. The site comes from P1's ``day_close_site`` (the daily close is
+always on). Stations and zones are synthetic per Projects/CLAUDE.md:
+``ISTATION01``-``ISTATION06`` standing for A-F, zones ``UTC`` and
+``Etc/GMT-14`` only; the API key is the CI placeholder.
 """
 
 from __future__ import annotations
@@ -25,7 +25,8 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from tests.helpers import day_close_site
+from tests.helpers import D as _HELPERS_D
+from tests.helpers import day_close_site, evening_slots_utc
 from wxverify import config
 from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc
 from wxverify.db.connection import Database, FencedWriter, close_db, init_db
@@ -38,7 +39,7 @@ from wxverify.worker.scheduler import _enqueue_due_wind_days  # noqa: PLC2701
 from wxverify.worker.wind_days import (  # noqa: PLC2701 -- private, exercised directly
     EVENING_SLOTS,
     WIND_DAYS_JOB_KEY,
-    evening_slot_instants,
+    _day_clock,
     run_wind_days,
 )
 
@@ -163,6 +164,14 @@ def _empty_ok() -> httpx.Response:
     return httpx.Response(200, json={"observations": []})
 
 
+def _give_today_record(conn: sqlite3.Connection, site_id: int, tz: str) -> None:
+    """Give the site a P1 record holding ``_DAY`` (the close is always on;
+    without a record holding it, the lane's guard refuses the row, per
+    EW14), mirroring ``tests/test_access_hold_five_minute.py``."""
+    start_of_day = local_day_slots(_DAY, tz)[0]
+    start_site_days(conn, site_id, _DAY, now_utc=start_of_day)
+
+
 # ---------------------------------------------------------------------------
 # EW1-EW9 -- the live schedule, driven end to end through run_wind_days.
 # ---------------------------------------------------------------------------
@@ -176,7 +185,8 @@ def test_ew1_daytime_cap_at_23_00(
     min): next at 08:10, then 23:00 -- not the old 23:25 final call."""
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
-    site_id = day_close_site(conn, timezone=tz, close_on=False, with_records=False)
+    site_id = day_close_site(conn, timezone=tz, with_records=False)
+    _give_today_record(conn, site_id, tz)
     _disable_station(conn, site_id, "ISTATION02")
     station_id = _station_id(conn, site_id, "ISTATION01")
     start, end, _tzname = local_day_slots(_DAY, tz)
@@ -225,7 +235,8 @@ def test_ew2_no_retries_after_a_success_before_23_56(
     for responses in ([200], [404, 200]):
         db = _init_tmp_db(tmp_path, name=f"db-{len(responses)}")
         conn = db._conn  # noqa: SLF001
-        site_id = day_close_site(conn, timezone=tz, close_on=False, with_records=False)
+        site_id = day_close_site(conn, timezone=tz, with_records=False)
+        _give_today_record(conn, site_id, tz)
         _disable_station(conn, site_id, "ISTATION02")
         station_id = _station_id(conn, site_id, "ISTATION01")
         start, end, _ = local_day_slots(_DAY, tz)
@@ -263,7 +274,8 @@ def test_ew3_every_try_fails_runs_all_15_slots(
     in order, then the row is done for the day with no 16th try."""
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
-    site_id = day_close_site(conn, timezone=tz, close_on=False, with_records=False)
+    site_id = day_close_site(conn, timezone=tz, with_records=False)
+    _give_today_record(conn, site_id, tz)
     _disable_station(conn, site_id, "ISTATION02")
     station_id = _station_id(conn, site_id, "ISTATION01")
     start, end, _ = local_day_slots(_DAY, tz)
@@ -273,7 +285,7 @@ def test_ew3_every_try_fails_runs_all_15_slots(
     def failing(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, request=request)
 
-    slots = evening_slot_instants(_DAY, tz)
+    slots = evening_slots_utc(_DAY, tz)
     assert len(slots) == 15
     now = cap
     seen: list[datetime] = []
@@ -312,7 +324,8 @@ def test_ew4_23_56_always_runs_then_stops_on_success(
 
     db = _init_tmp_db(tmp_path, name="a")
     conn = db._conn  # noqa: SLF001
-    site_id = day_close_site(conn, timezone=tz, close_on=False, with_records=False)
+    site_id = day_close_site(conn, timezone=tz, with_records=False)
+    _give_today_record(conn, site_id, tz)
     _disable_station(conn, site_id, "ISTATION02")
     station_id = _station_id(conn, site_id, "ISTATION01")
     _insert_day(conn, station_id, _DAY, next_attempt_at=isoformat_utc(late_slot))
@@ -334,7 +347,8 @@ def test_ew4_23_56_always_runs_then_stops_on_success(
 
     db2 = _init_tmp_db(tmp_path, name="b")
     conn2 = db2._conn  # noqa: SLF001
-    site_id2 = day_close_site(conn2, timezone=tz, close_on=False, with_records=False)
+    site_id2 = day_close_site(conn2, timezone=tz, with_records=False)
+    _give_today_record(conn2, site_id2, tz)
     _disable_station(conn2, site_id2, "ISTATION02")
     station_id2 = _station_id(conn2, site_id2, "ISTATION01")
     _insert_day(conn2, station_id2, _DAY, next_attempt_at=isoformat_utc(late_slot))
@@ -374,7 +388,8 @@ def test_ew5_204_and_empty_list_are_both_successes(
     chain (M37)."""
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
-    site_id = day_close_site(conn, timezone=tz, close_on=False, with_records=False)
+    site_id = day_close_site(conn, timezone=tz, with_records=False)
+    _give_today_record(conn, site_id, tz)
     station_a = _station_id(conn, site_id, "ISTATION01")
     station_b = _station_id(conn, site_id, "ISTATION02")
     start, end, _ = local_day_slots(_DAY, tz)
@@ -409,7 +424,8 @@ def test_ew6_an_overrun_slot_is_skipped_not_run_late_or_twice(
     (M38)."""
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
-    site_id = day_close_site(conn, timezone=tz, close_on=False, with_records=False)
+    site_id = day_close_site(conn, timezone=tz, with_records=False)
+    _give_today_record(conn, site_id, tz)
     _disable_station(conn, site_id, "ISTATION02")
     station_id = _station_id(conn, site_id, "ISTATION01")
     start, end, _ = local_day_slots(_DAY, tz)
@@ -447,7 +463,8 @@ def test_ew7_window_deferrals_and_a_transport_error_does_not_end_the_run(
     minutes ahead (M39); the lane job is not left pending until 23:31."""
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
-    site_id = day_close_site(conn, timezone=tz, close_on=False, with_records=False)
+    site_id = day_close_site(conn, timezone=tz, with_records=False)
+    _give_today_record(conn, site_id, tz)
     station_a = _station_id(conn, site_id, "ISTATION01")
     station_b = _station_id(conn, site_id, "ISTATION02")
     start, end, _ = local_day_slots(_DAY, tz)
@@ -630,10 +647,15 @@ def test_ew9_the_lanes_job_claims_in_tier_0() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_ew10_the_slot_list_has_15_distinct_ordered_instants() -> None:
+def test_ew10_the_slot_list_has_15_distinct_ordered_instants(tmp_path: Path) -> None:
     """EW10: the slot list for a day: 15 distinct instants in order, from
     local 23:00 to 23:59 (M35: a slot lost or doubled)."""
-    slots = evening_slot_instants(_DAY, _TZ)
+    db = _init_tmp_db(tmp_path, name="ew10")
+    conn = db._conn  # noqa: SLF001
+    site_id = day_close_site(conn, timezone=_TZ)
+    clock = _day_clock(conn, site_id, _HELPERS_D)
+    assert clock is not None, "fixture bug: day_close_site must record _HELPERS_D"
+    slots = clock.slots
     assert len(slots) == 15, (
         f"mutant -> at this assertion: correct = 15, mutant = {len(slots)}"
     )
@@ -642,7 +664,7 @@ def test_ew10_the_slot_list_has_15_distinct_ordered_instants() -> None:
         "mutant -> at this assertion: correct = already in order, mutant ="
         " a slot out of order"
     )
-    start, end, _ = local_day_slots(_DAY, _TZ)
+    start, end, _ = local_day_slots(_HELPERS_D, _TZ)
     assert slots[0] == end - timedelta(hours=1), (
         f"mutant -> at this assertion: correct = 23:00, mutant = {slots[0].isoformat()}"
     )
@@ -654,11 +676,21 @@ def test_ew10_the_slot_list_has_15_distinct_ordered_instants() -> None:
         "mutant -> at this assertion: correct = 15 (hour, minute) pairs,"
         f" mutant = {len(EVENING_SLOTS)}"
     )
+    assert slots == evening_slots_utc(_HELPERS_D, _TZ), (
+        "mutant -> at this assertion: correct = the written-out slot"
+        f" minutes, mutant = {[s.isoformat() for s in slots]}"
+    )
+    close_db()
 
     # Etc/GMT-14 (14.1's second required zone): the slots are LOCAL wall
     # clock, 14 hours ahead of UTC, not a UTC-hardcoded 23:00-23:59.
-    slots_14 = evening_slot_instants(_DAY, _TZ_14)
-    start_14, end_14, _ = local_day_slots(_DAY, _TZ_14)
+    db_14 = _init_tmp_db(tmp_path, name="ew10-14")
+    conn_14 = db_14._conn  # noqa: SLF001
+    site_id_14 = day_close_site(conn_14, timezone=_TZ_14)
+    clock_14 = _day_clock(conn_14, site_id_14, _HELPERS_D)
+    assert clock_14 is not None, "fixture bug: day_close_site must record _HELPERS_D"
+    slots_14 = clock_14.slots
+    start_14, end_14, _ = local_day_slots(_HELPERS_D, _TZ_14)
     assert slots_14[0] == end_14 - timedelta(hours=1), (
         "mutant -> at this assertion: correct = end_14 - 1h (the zone's own"
         " local 23:00), mutant (the slots computed on UTC regardless of"
@@ -668,6 +700,11 @@ def test_ew10_the_slot_list_has_15_distinct_ordered_instants() -> None:
         "fixture bug: Etc/GMT-14 and UTC must give different UTC instants"
         " for the same local slot"
     )
+    assert slots_14 == evening_slots_utc(_HELPERS_D, _TZ_14), (
+        "mutant -> at this assertion: correct = the written-out slot"
+        f" minutes for Etc/GMT-14, mutant = {[s.isoformat() for s in slots_14]}"
+    )
+    close_db()
 
 
 # ---------------------------------------------------------------------------
@@ -689,7 +726,8 @@ def test_ew11_every_try_logs_once_and_never_twice(
     each, and no row for the third (M72, M88)."""
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
-    site_id = day_close_site(conn, timezone=tz, close_on=False, with_records=False)
+    site_id = day_close_site(conn, timezone=tz, with_records=False)
+    _give_today_record(conn, site_id, tz)
     _disable_station(conn, site_id, "ISTATION02")
     station_id = _station_id(conn, site_id, "ISTATION01")
     start, end, _ = local_day_slots(_DAY, tz)
@@ -812,10 +850,10 @@ def test_ew12_next_five_minute_try(tmp_path: Path, tz: str) -> None:
     site_id = day_close_site(
         conn,
         timezone=tz,
-        close_on=False,
         with_records=False,
         station_ids=("ISTATION02", "ISTATION03"),
     )
+    _give_today_record(conn, site_id, tz)
     station_b = _station_id(conn, site_id, "ISTATION02")
     station_c = _station_id(conn, site_id, "ISTATION03")
     start, end, _ = local_day_slots(_DAY, tz)
@@ -870,7 +908,7 @@ def test_ew12_close_on_cutover_uses_the_first_record(tmp_path: Path, tz: str) ->
     ``sites.timezone`` (M81)."""
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
-    site_id = day_close_site(conn, timezone=tz, close_on=True, with_records=False)
+    site_id = day_close_site(conn, timezone=tz, with_records=False)
     first_start, _, _ = local_day_slots(date(2026, 3, 11), tz)
     # Built relative to the first record's own local day boundary, not a
     # fixed UTC literal: a literal noon/midday UTC instant is not "the next
@@ -919,10 +957,10 @@ def test_ew13_a_reservation_deferral_is_caught_per_row(
         site_id = day_close_site(
             conn,
             timezone=_TZ,
-            close_on=False,
             with_records=False,
             station_ids=("ISTATION02", "ISTATION03"),
         )
+        _give_today_record(conn, site_id, _TZ)
         station_b = _station_id(conn, site_id, "ISTATION02")
         station_c = _station_id(conn, site_id, "ISTATION03")
         start, end, _ = local_day_slots(_DAY, _TZ)
@@ -1033,7 +1071,7 @@ def test_ew14_cutover_with_no_record_makes_no_request(
     (M81)."""
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
-    site_id = day_close_site(conn, timezone=tz, close_on=True, with_records=False)
+    site_id = day_close_site(conn, timezone=tz, with_records=False)
     _disable_station(conn, site_id, "ISTATION02")
     station_id = _station_id(conn, site_id, "ISTATION01")
     # Built relative to the first record's own local day, not a fixed UTC
@@ -1103,7 +1141,8 @@ def test_ew15_daytime_deferrals(
 
     db = _init_tmp_db(tmp_path, name="ew15-429")
     conn = db._conn  # noqa: SLF001
-    site_id = day_close_site(conn, timezone=tz, close_on=False, with_records=False)
+    site_id = day_close_site(conn, timezone=tz, with_records=False)
+    _give_today_record(conn, site_id, tz)
     _disable_station(conn, site_id, "ISTATION02")
     station_id = _station_id(conn, site_id, "ISTATION01")
     at_1400 = start + timedelta(hours=14)
@@ -1135,7 +1174,8 @@ def test_ew15_daytime_deferrals(
 
     db = _init_tmp_db(tmp_path, name="ew15-transport")
     conn = db._conn  # noqa: SLF001
-    site_id = day_close_site(conn, timezone=tz, close_on=False, with_records=False)
+    site_id = day_close_site(conn, timezone=tz, with_records=False)
+    _give_today_record(conn, site_id, tz)
     _disable_station(conn, site_id, "ISTATION02")
     station_id = _station_id(conn, site_id, "ISTATION01")
     at_2250 = cap - timedelta(minutes=10)
@@ -1163,7 +1203,8 @@ def test_ew15_daytime_deferrals(
 
     db = _init_tmp_db(tmp_path, name="ew15-404")
     conn = db._conn  # noqa: SLF001
-    site_id = day_close_site(conn, timezone=tz, close_on=False, with_records=False)
+    site_id = day_close_site(conn, timezone=tz, with_records=False)
+    _give_today_record(conn, site_id, tz)
     _disable_station(conn, site_id, "ISTATION02")
     station_id = _station_id(conn, site_id, "ISTATION01")
     at_1000 = start + timedelta(hours=10)

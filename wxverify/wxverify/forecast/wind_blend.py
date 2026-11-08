@@ -203,11 +203,12 @@ def load_wind_serving(
     """The wind weights of the active publication (9.4, 12).
 
     The latest publication's, for the feeds switched on now; ``{}`` with no
-    publication, or with the daily close off, which wind serving reads as
-    "not enough feeds". ``timezone`` and ``today`` are not read.
+    publication, which wind serving reads as "not enough feeds". ``timezone``
+    and ``today`` are not read.
     """
     # Deferred: the publication module imports this one.
     from wxverify.scoring.publication import published_wind_serving
 
-    published = published_wind_serving(conn, site_id=site_id, as_of=None)
-    return WindServing(weights={} if published is None else published)
+    return WindServing(
+        weights=published_wind_serving(conn, site_id=site_id, as_of=None)
+    )

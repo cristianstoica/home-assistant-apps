@@ -54,7 +54,6 @@ from wxverify.db.connection import Database, FencedWriter
 from wxverify.db.site_days import (
     DayRecord,
     current_day,
-    daily_close_on,
     day_record,
     ensure_site_days,
     local_clock_utc,
@@ -358,15 +357,12 @@ def _lane_today(
 ) -> tuple[date, bool]:
     """The lane's today, and whether today's row may be tried (plan 4.2).
 
-    While the close is off, today is ``now``'s local date in the site's zone
-    ``tz``, always open. While it is on, today is the date of P1's record
-    that holds ``now`` (with ``ensure``, after creating the site's missing
-    records). With no such record the site has no current day: today's row
-    is closed (no row is created or tried), and the date returned is
-    ``now``'s date in ``tz``.
+    Today is the date of P1's record that holds ``now`` (with ``ensure``,
+    after creating the site's missing records). With no such record the
+    site has no current day: today's row is closed (no row is created or
+    tried), and the date returned is ``now``'s date in the site's zone
+    ``tz``.
     """
-    if not daily_close_on(conn):
-        return now.astimezone(tz).date(), True
     if ensure:
         ensure_site_days(conn, site_id, now_utc=now)
     record = current_day(conn, site_id, now_utc=now)
@@ -400,51 +396,17 @@ def _clock_from_record(record: DayRecord) -> _DayClock:
     )
 
 
-def _close_off_record(local_date: date, tz_name: str) -> DayRecord:
-    """A stand-in day record for a close-off day: ``local_day_slots``' bounds
-    in ``tz_name``, so P1's ``local_clock_utc`` converts its times."""
-    start, end, _ = local_day_slots(local_date, tz_name)
-    return DayRecord(
-        site_id=0,
-        local_date=local_date,
-        state="open",
-        day_start_utc=start,
-        day_end_utc=end,
-        timezone=tz_name,
-        zone_changeover=False,
-        attempts=0,
-        retry_at=None,
-        last_failure=None,
-        missed_reason=None,
-        done_at=None,
-    )
-
-
-def evening_slot_instants(local_date: date, tz_name: str) -> tuple[datetime, ...]:
-    """The UTC instants of the evening slots of ``local_date`` in ``tz_name``.
-
-    The close-off conversion (plan 4.2): each ``EVENING_SLOTS`` wall time on
-    the date in the zone, by P1's ``local_clock_utc`` rule (a skipped wall
-    time takes the instant the clocks jump, a repeated one the earlier
-    instant), in order and each once. Pure.
-    """
-    return _clock_from_record(_close_off_record(local_date, tz_name)).slots
-
-
 def _day_clock(
-    conn: sqlite3.Connection, site_id: int, local_date: date, tz_name: str
+    conn: sqlite3.Connection, site_id: int, local_date: date
 ) -> _DayClock | None:
     """The clock of today's row dated ``local_date`` (plan 4.2).
 
-    While the close is on, from P1's record of that date, in the zone saved
-    on it; None when the site has no such record (no slot is computed and
-    nothing falls back to ``sites.timezone``). While it is off, the date in
-    ``tz_name`` (``sites.timezone``).
+    From P1's record of that date, in the zone saved on it; None when the
+    site has no such record (no slot is computed and nothing falls back to
+    ``sites.timezone``).
     """
-    if daily_close_on(conn):
-        record = day_record(conn, site_id, local_date)
-        return None if record is None else _clock_from_record(record)
-    return _clock_from_record(_close_off_record(local_date, tz_name))
+    record = day_record(conn, site_id, local_date)
+    return None if record is None else _clock_from_record(record)
 
 
 def wind_evening_due(
@@ -458,7 +420,7 @@ def wind_evening_due(
     today, today_open = _lane_today(conn, site_id, tz, now, ensure=False)
     if not today_open:
         return False
-    clock = _day_clock(conn, site_id, today, tz.key)
+    clock = _day_clock(conn, site_id, today)
     if clock is None or not clock.cap <= now < clock.end:
         return False
     return bool(wind_days_due(conn, site_id, today=today, now=now, limit=1))
@@ -470,8 +432,8 @@ def wind_lane_due(
     """True when the site's lane has work: the scheduler's due test (plan §8.13).
 
     Today's rows are due on their own schedule only; the ``five_minute``
-    hold is not read here (plan 4.4). While the close is on and no record
-    holds ``now``, no today row is due and none is missing (4.2).
+    hold is not read here (plan 4.4). While no record holds ``now``, no
+    today row is due and none is missing (4.2).
     """
     today, today_open = _lane_today(conn, site_id, tz, now, ensure=False)
     if not today_open:
@@ -488,7 +450,7 @@ def wind_lane_due(
 class _JobStart:
     tz_name: str
     today: date
-    #: False while the close is on and no record holds the start time.
+    #: False while no record holds the start time.
     today_open: bool
 
 
@@ -542,7 +504,6 @@ class _Chunk:
     client: httpx.AsyncClient
     site_id: int
     tz_name: str
-    today: date
     api_key: str | None = None
     calls: int = 0
 
@@ -565,7 +526,7 @@ async def _run_fetch_chunk(
     now = utc_now()
     today = start.today
     if not start.today_open:
-        # The close is on and no record holds now: no today try (4.2).
+        # No record holds now: no today try (4.2).
         return
     chunk = _Chunk(
         db=db,
@@ -573,7 +534,6 @@ async def _run_fetch_chunk(
         client=client,
         site_id=site_id,
         tz_name=start.tz_name,
-        today=today,
     )
     rows = await db.read(
         lambda conn: wind_days_due(
@@ -653,7 +613,6 @@ async def _run_row(
     key = chunk.key()
     await pace_station_call(chunk.site_id, row.station_id, chunk.calls)
     site_id = chunk.site_id
-    tz_name = chunk.tz_name
     async with weathercom_call_lock():
         try:
             reservation = await chunk.writer.write(
@@ -673,7 +632,6 @@ async def _run_row(
                     site_id=site_id,
                     station_id=row.station_id,
                     local_date=row.local_date,
-                    tz_name=tz_name,
                     until=until,
                 )
             )
@@ -688,7 +646,6 @@ async def _run_row(
                     site_id=site_id,
                     station_id=row.station_id,
                     local_date=row.local_date,
-                    tz_name=tz_name,
                     reason=reason,
                     deferral_end=deferral_end,
                 )
@@ -735,7 +692,6 @@ async def _run_row(
                     station_id=row.station_id,
                     local_date=row.local_date,
                     tz_name=chunk.tz_name,
-                    today=chunk.today,
                     records=records,
                     no_content=no_content,
                 ),
@@ -752,7 +708,6 @@ async def _run_row(
                     site_id=site_id,
                     station_id=row.station_id,
                     local_date=row.local_date,
-                    tz_name=chunk.tz_name,
                     message=message,
                 ),
             )
@@ -791,7 +746,6 @@ async def _fetch_failed(
     """
     station_id = row.station_id
     local_date = row.local_date
-    tz_name = chunk.tz_name
     site_id = chunk.site_id
 
     def begin(conn: sqlite3.Connection) -> _TodayTry | None:
@@ -806,7 +760,6 @@ async def _fetch_failed(
             site_id=site_id,
             station_id=station_id,
             local_date=local_date,
-            tz_name=tz_name,
             tried=utc_now(),
         )
 
@@ -821,7 +774,6 @@ async def _fetch_failed(
             site_id=site_id,
             station_id=station_id,
             local_date=local_date,
-            tz_name=tz_name,
             message=message,
             daytime_until=daytime_until,
             not_before=not_before,
@@ -1085,11 +1037,10 @@ def _today_try(
     site_id: int,
     station_id: int,
     local_date: date,
-    tz_name: str,
     tried: datetime,
 ) -> _TodayTry:
     """A try of today's row, from its row as read before the outcome write."""
-    clock = _day_clock(conn, site_id, local_date, tz_name)
+    clock = _day_clock(conn, site_id, local_date)
     return _TodayTry(
         site_id=site_id,
         station_id=station_id,
@@ -1139,8 +1090,8 @@ def _next_try_at(
     back-off end, a transport error's try + 15 min, a reservation
     deferral's end), ``min(daytime_until, 23:00)``. In the evening window
     ``_window_next``, with ``not_before`` (a back-off's or reservation
-    deferral's end) when given. None when the row has no clock (the close is
-    on and its date has no record): the row keeps its stamp.
+    deferral's end) when given. None when the row has no clock (its date has
+    no record): the row keeps its stamp.
     """
     clock = attempt.clock
     if clock is None:
@@ -1201,7 +1152,6 @@ def _record_held_try(
     site_id: int,
     station_id: int,
     local_date: date,
-    tz_name: str,
     until: str,
 ) -> _TryLog | None:
     """A try of today's row that met the ``five_minute`` hold (plan 4.4).
@@ -1218,7 +1168,6 @@ def _record_held_try(
         site_id=site_id,
         station_id=station_id,
         local_date=local_date,
-        tz_name=tz_name,
         tried=utc_now(),
     )
     stamp = isoformat_utc(attempt.tried)
@@ -1244,7 +1193,6 @@ def _record_deferred_try(
     site_id: int,
     station_id: int,
     local_date: date,
-    tz_name: str,
     reason: DeferralReason,
     deferral_end: str,
 ) -> _TryLog | None:
@@ -1264,7 +1212,6 @@ def _record_deferred_try(
         site_id=site_id,
         station_id=station_id,
         local_date=local_date,
-        tz_name=tz_name,
         tried=utc_now(),
     )
     end = _parse_due(deferral_end)
@@ -1305,29 +1252,17 @@ def _read_day(
 
 
 def _today_window(
-    conn: sqlite3.Connection,
-    site_id: int,
-    *,
-    today: date,
-    tz_name: str,
-    now: datetime,
+    conn: sqlite3.Connection, site_id: int, *, now: datetime
 ) -> tuple[datetime, datetime] | None:
     """The bounds of today's row's window: yesterday's start to today's end
     (4.1). ``_persist_day`` caps the upper end at now plus ``_FUTURE_SLACK``.
 
-    While the close is off, today and yesterday are local dates in the site's
-    zone ``tz_name`` (``sites.timezone``), bounded by ``local_day_slots``.
-    While it is on, they are P1's record holding ``now`` and the site's record
-    dated the day before it, by their stored bounds, after creating the
-    site's missing records as the guard would; with no record the day before,
-    today's bounds alone. ``None`` while the close is on and no record holds
-    ``now`` (the site has no current day, 4.2): nothing is kept.
+    Today and yesterday are P1's record holding ``now`` and the site's
+    record dated the day before it, by their stored bounds, after creating
+    the site's missing records as the guard would; with no record the day
+    before, today's bounds alone. ``None`` while no record holds ``now``
+    (the site has no current day, 4.2): nothing is kept.
     """
-    if not daily_close_on(conn):
-        return (
-            local_day_slots(today - _ONE_DAY, tz_name)[0],
-            local_day_slots(today, tz_name)[1],
-        )
     ensure_site_days(conn, site_id, now_utc=now)
     current = current_day(conn, site_id, now_utc=now)
     if current is None:
@@ -1344,14 +1279,13 @@ def _persist_day(
     station_id: int,
     local_date: date,
     tz_name: str,
-    today: date,
     records: Sequence[StationReading],
     no_content: bool = False,
 ) -> _TryLog | None:
     """Store today's fetched readings and advance today's row (plan 4.1, 4.2).
 
     The lane selects only the row of the current day (switch-over plan 7.2,
-    R4), so ``local_date`` is ``today``. The try is a successful one: the
+    R4), so ``local_date`` is today's date. The try is a successful one: the
     row stays ``partial``, moves to its next try, and its try is logged in
     this transaction (4.5) with outcome ``stored``, or ``no_readings``
     (``no_content`` for a 204, set by the caller, ``empty`` for an empty
@@ -1369,7 +1303,7 @@ def _persist_day(
     """
     now = utc_now()
     start, end, _ = local_day_slots(local_date, tz_name)
-    bounds = _today_window(conn, site_id, today=today, tz_name=tz_name, now=now)
+    bounds = _today_window(conn, site_id, now=now)
     window = (
         None if bounds is None else (bounds[0], min(bounds[1], now + _FUTURE_SLACK))
     )
@@ -1415,11 +1349,10 @@ def _persist_day(
         site_id=site_id,
         station_id=station_id,
         local_date=local_date,
-        tz_name=tz_name,
         tried=now,
     )
     moved = _next_try_at(conn, attempt, success=True)
-    # No clock (close on, no record of the date): the row keeps its stamp.
+    # No clock (no record of the date): the row keeps its stamp.
     kept_stamp = row["next_attempt_at"]
     next_attempt_at = (
         moved if moved is not None else None if kept_stamp is None else str(kept_stamp)
@@ -1467,7 +1400,6 @@ def _row_failure(
     site_id: int,
     station_id: int,
     local_date: date,
-    tz_name: str,
     message: str,
     daytime_until: datetime | None = None,
     not_before: datetime | None = None,
@@ -1492,7 +1424,6 @@ def _row_failure(
         site_id=site_id,
         station_id=station_id,
         local_date=local_date,
-        tz_name=tz_name,
         tried=now,
     )
     conn.execute(

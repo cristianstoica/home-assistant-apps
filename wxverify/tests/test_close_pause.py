@@ -173,7 +173,7 @@ def _seed_abc_site(tmp_path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[n
 
     from wxverify.db.site_days import ensure_site_days, start_site_days
 
-    site_id = day_close_site(conn, timezone="UTC", close_on=True, with_records=False)
+    site_id = day_close_site(conn, timezone="UTC", with_records=False)
     c_station_id = _add_station_c(conn, site_id)
 
     d_minus_2 = D - timedelta(days=2)

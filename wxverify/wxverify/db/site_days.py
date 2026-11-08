@@ -26,7 +26,6 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
-from pathlib import Path
 from typing import Any, Final, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -36,7 +35,7 @@ from wxverify.core.timeutil import (
     local_day_slots,
     parse_utc,
 )
-from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
+from wxverify.db.runtime_state import get_runtime_state
 
 logger = logging.getLogger(__name__)
 
@@ -72,8 +71,6 @@ RETIRED_CONTROL_MESSAGE: Final = (
     "Each day is collected and closed once after it ends, "
     "and past days are not fetched again."
 )
-# Written by the offline close command into the database copy it makes.
-OFFLINE_COPY_KEY: Final = "offline_close_copy_made_at"
 RETRY_DELAY: Final = timedelta(hours=1)
 RAW_KEEP: Final = timedelta(days=7)
 
@@ -121,12 +118,9 @@ _STATION_CHANGES: Final[tuple[StationChange, ...]] = (
 )
 _JOINING_CHANGES: Final[frozenset[str]] = frozenset({"added", "turned_on"})
 
-# Table 5.2: the kinds the guard allows while the close is off, and in each
-# state that is not done. ``retry_due`` allows nothing; a done day allows
-# only RAW_PRUNE, by the 5.4 rule.
-_CLOSE_OFF_KINDS: Final[frozenset[WriteKind]] = frozenset(
-    {WriteKind.READING, WriteKind.HOURLY, WriteKind.TRUTH}
-)
+# Table 5.2: the kinds the guard allows in each state that is not done.
+# ``retry_due`` allows nothing; a done day allows only RAW_PRUNE, by the 5.4
+# rule.
 _STATE_KINDS: Final[dict[str, frozenset[WriteKind]]] = {
     "open": frozenset({WriteKind.READING, WriteKind.HOURLY, WriteKind.TRUTH}),
     "closing": frozenset(
@@ -459,7 +453,7 @@ def _start(
 
 
 def _ensure(conn: sqlite3.Connection, site_id: int, now: datetime) -> None:
-    """``ensure_site_days`` without the close-on check; a missing site is a no-op."""
+    """``ensure_site_days`` on a UTC ``now``; a missing site is a no-op."""
     site_tz = _site_timezone(conn, site_id)
     if site_tz is None:
         return
@@ -471,25 +465,20 @@ def _ensure(conn: sqlite3.Connection, site_id: int, now: datetime) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The predicate (11.1)
+# The switch time (11.1)
 # ---------------------------------------------------------------------------
 
 
-def daily_close_on(conn: sqlite3.Connection) -> bool:
-    """Whether the daily close is on: ``runtime_state`` holds the key.
+def daily_close_on_at(conn: sqlite3.Connection) -> datetime:
+    """The switch time, parsed from ``DAILY_CLOSE_ON_KEY``.
 
-    Read on every call, never cached. Read-only.
-    """
-    return get_runtime_state(conn, DAILY_CLOSE_ON_KEY) is not None
-
-
-def daily_close_on_at(conn: sqlite3.Connection) -> datetime | None:
-    """The switch time, parsed from ``DAILY_CLOSE_ON_KEY``; ``None`` while off.
-
-    Raises ``ValueError`` when the stored value does not parse. Read-only.
+    Raises ``ValueError`` when the key is missing or its stored value does
+    not parse. Read-only.
     """
     value = get_runtime_state(conn, DAILY_CLOSE_ON_KEY)
-    return None if value is None else parse_utc(value)
+    if value is None:
+        raise ValueError("daily_close_on_at is missing")
+    return parse_utc(value)
 
 
 # ---------------------------------------------------------------------------
@@ -503,11 +492,8 @@ def ensure_site_days(
     """Create the site's missing records through its next local date (4.6).
 
     Idempotent. For a site with no records, starts it at its next local
-    date. Does nothing while the close is off, or for a site that does not
-    exist.
+    date. Does nothing for a site that does not exist.
     """
-    if not daily_close_on(conn):
-        return
     _ensure(conn, site_id, _as_utc(now_utc))
 
 
@@ -530,64 +516,6 @@ def start_site_days(
             f" current local date {current.isoformat()}"
         )
     _start(conn, site_id, first_date, now=now, site_tz=site_tz)
-
-
-def _main_database_file(conn: sqlite3.Connection) -> str:
-    for row in conn.execute("PRAGMA database_list").fetchall():
-        if str(row[1]) == "main":
-            return "" if row[2] is None else str(row[2])
-    return ""
-
-
-def open_day_on_copy(
-    conn: sqlite3.Connection,
-    site_id: int,
-    local_date: date,
-    *,
-    now_utc: datetime,
-    live_db_path: Path,
-) -> None:
-    """Give a site one ``open`` record for a past date, on a database copy only.
-
-    For the offline close command (4.6). Writes ``DAILY_CLOSE_ON_KEY`` with
-    ``now_utc`` when the key is absent. Raises ``DayStateError``, writing
-    nothing, when the connection's main file is not a file or is
-    ``live_db_path``, when the file holds no ``OFFLINE_COPY_KEY``, when the
-    site does not exist or already has a record, or when ``local_date`` is
-    not before the site's current local date.
-    """
-    now = _as_utc(now_utc)
-    main_file = _main_database_file(conn)
-    if not main_file:
-        raise DayStateError("the database is not a file")
-    main_path = Path(main_file)
-    if not main_path.is_file():
-        raise DayStateError("the database is not a file")
-    if main_path.resolve() == live_db_path.resolve():
-        raise DayStateError("refusing to open a past day on the live database")
-    if get_runtime_state(conn, OFFLINE_COPY_KEY) is None:
-        raise DayStateError("the database is not a copy made for an offline close")
-    site_tz = _require_site_timezone(conn, site_id)
-    if _latest_record(conn, site_id) is not None:
-        raise DayStateError(f"site {site_id} already has day records")
-    current = _current_local_date(conn, site_id, now, site_tz)
-    if local_date >= current:
-        raise DayStateError(
-            f"site {site_id}: {local_date.isoformat()} is not before the current"
-            f" local date {current.isoformat()}"
-        )
-    zone = _zone_for_date(conn, site_id, local_date, site_tz)
-    _insert_record(
-        conn,
-        site_id,
-        local_date,
-        start=local_day_slots(local_date, zone)[0],
-        previous=None,
-        site_tz=site_tz,
-        now=now,
-    )
-    if get_runtime_state(conn, DAILY_CLOSE_ON_KEY) is None:
-        set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(now))
 
 
 # ---------------------------------------------------------------------------
@@ -998,20 +926,13 @@ def filter_day_writes(
 ) -> frozenset[str]:
     """The subset of ``instants`` that may be written as ``kind`` (7.1).
 
-    While the close is off, all of them for ``READING``, ``HOURLY`` and
-    ``TRUTH`` and none otherwise. While it is on, creates the
-    site's missing records, then allows an instant only when table 5.2
-    allows ``kind`` for the record whose bounds hold it. An instant that
-    does not parse is refused. Each day is decided once. Never raises for a
-    refusal.
+    Creates the site's missing records, then allows an instant only when
+    table 5.2 allows ``kind`` for the record whose bounds hold it. An
+    instant that does not parse is refused. Each day is decided once. Never
+    raises for a refusal.
     """
     items = list(instants)
     now = _as_utc(now_utc)
-    if not daily_close_on(conn):
-        if kind in _CLOSE_OFF_KINDS:
-            return frozenset(items)
-        _log_declined(site_id, kind, (), len(set(items)))
-        return frozenset()
     _ensure(conn, site_id, now)
 
     parsed: dict[str, datetime] = {}
@@ -1085,9 +1006,7 @@ def check_date_write(
 
     Creates the site's missing records, then follows table 5.2 for the
     record dated ``local_date``; ``RAW_PRUNE`` on a done day follows rule
-    5.4, and with no record nothing is allowed. This holds whether or not
-    ``DAILY_CLOSE_ON_KEY`` is present (storage-release plan 3.2). Never
-    raises for a refusal.
+    5.4, and with no record nothing is allowed. Never raises for a refusal.
     """
     now = _as_utc(now_utc)
     _ensure(conn, site_id, now)
@@ -1115,19 +1034,16 @@ def record_station_change(
     """Log a station change and return its effective local date (8.2).
 
     ``added``/``turned_on`` take effect on the site's next local date,
-    ``turned_off``/``retired`` on its current one. While the close is on,
-    first creates the site's missing records and afterwards recomputes the
-    lists of its ``open`` records dated on or after the effective date.
-    Raises ``ValueError`` for an unknown change and ``DayStateError`` for a
-    site that does not exist.
+    ``turned_off``/``retired`` on its current one. First creates the site's
+    missing records and afterwards recomputes the lists of its ``open``
+    records dated on or after the effective date. Raises ``ValueError`` for
+    an unknown change and ``DayStateError`` for a site that does not exist.
     """
     if change not in _STATION_CHANGES:
         raise ValueError(f"unknown station change {change!r}")
     now = _as_utc(now_utc)
     site_tz = _require_site_timezone(conn, site_id)
-    close_on = daily_close_on(conn)
-    if close_on:
-        _ensure(conn, site_id, now)
+    _ensure(conn, site_id, now)
     current = _current_local_date(conn, site_id, now, site_tz)
     effective = current + _ONE_DAY if change in _JOINING_CHANGES else current
     conn.execute(
@@ -1143,19 +1059,18 @@ def record_station_change(
             isoformat_utc_micro(now),
         ),
     )
-    if close_on:
-        rows = conn.execute(
-            "SELECT local_date FROM site_days WHERE site_id = ? AND state = 'open'"
-            " AND local_date >= ? ORDER BY local_date",
-            (site_id, effective.isoformat()),
-        ).fetchall()
-        for row in rows:
-            day = date.fromisoformat(str(row[0]))
-            conn.execute(
-                "DELETE FROM site_day_stations WHERE site_id = ? AND local_date = ?",
-                (site_id, day.isoformat()),
-            )
-            _write_station_list(conn, site_id, day)
+    rows = conn.execute(
+        "SELECT local_date FROM site_days WHERE site_id = ? AND state = 'open'"
+        " AND local_date >= ? ORDER BY local_date",
+        (site_id, effective.isoformat()),
+    ).fetchall()
+    for row in rows:
+        day = date.fromisoformat(str(row[0]))
+        conn.execute(
+            "DELETE FROM site_day_stations WHERE site_id = ? AND local_date = ?",
+            (site_id, day.isoformat()),
+        )
+        _write_station_list(conn, site_id, day)
     return effective.isoformat()
 
 
@@ -1164,11 +1079,9 @@ def current_day_has_other_station(
 ) -> bool:
     """Whether removing ``station_id`` leaves today's list non-empty (8.5).
 
-    ``True`` while the close is off, when no record holds ``now_utc``, and
-    when the station is not in that day's list. Read-only.
+    ``True`` when no record holds ``now_utc``, and when the station is not
+    in that day's list. Read-only.
     """
-    if not daily_close_on(conn):
-        return True
     holder = _holding_record(conn, site_id, _as_utc(now_utc))
     if holder is None:
         return True
@@ -1189,13 +1102,10 @@ def enter_zone_change(
     """Enter a zone change from the next full local day; returns C (6.4).
 
     Replaces the site's records dated C and later (none has started) under
-    the new zone and sets ``sites.timezone``. Raises ``ValueError`` while
-    the close is off, for an unknown zone, for the zone C already runs
-    under, or when C's span from the current day's end would be 0 h or
-    less, or 48 h or more.
+    the new zone and sets ``sites.timezone``. Raises ``ValueError`` for an
+    unknown zone, for the zone C already runs under, or when C's span from
+    the current day's end would be 0 h or less, or 48 h or more.
     """
-    if not daily_close_on(conn):
-        raise ValueError("a zone change can be entered once the daily close is on")
     now = _as_utc(now_utc)
     site_tz = _require_site_timezone(conn, site_id)
     _ensure(conn, site_id, now)

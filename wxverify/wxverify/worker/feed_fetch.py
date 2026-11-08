@@ -35,7 +35,7 @@ from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.connection import Database, FencedWriter
 from wxverify.db.queue import Job
-from wxverify.db.site_days import daily_close_on, day_for_instant
+from wxverify.db.site_days import day_for_instant
 from wxverify.feeds.registry import build_adapter
 from wxverify.feeds.seam import (
     CostEstimate,
@@ -613,7 +613,7 @@ def record_download_try(
     whole-second, ``isoformat_utc(t.replace(microsecond=0))``, the only form
     import accepts for them (plan 15.2, 15.6); ``fetched_at`` is stored as
     given. ``local_date`` is the local date of the end: the daily-close
-    record holding it while the close is on, else in ``sites.timezone``.
+    record holding it, else in ``sites.timezone``.
     Returns the row id, or ``None`` with nothing written when the site or
     the feed no longer exists.
     """
@@ -666,10 +666,9 @@ def _download_local_date(
 ) -> date | None:
     """The local date of a try's end (plan 4.2); ``None`` for a site that
     does not exist."""
-    if daily_close_on(conn):
-        record = day_for_instant(conn, site_id, isoformat_utc(ended))
-        if record is not None:
-            return record.local_date
+    record = day_for_instant(conn, site_id, isoformat_utc(ended))
+    if record is not None:
+        return record.local_date
     row = conn.execute("SELECT timezone FROM sites WHERE id = ?", (site_id,)).fetchone()
     if row is None:
         return None

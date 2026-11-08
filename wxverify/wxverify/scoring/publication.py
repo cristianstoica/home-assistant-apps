@@ -36,7 +36,7 @@ from typing import Final, Literal, cast
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.connection import Database, FencedWriter
-from wxverify.db.site_days import daily_close_on, day_record
+from wxverify.db.site_days import day_record
 from wxverify.db.snapshot import read_snapshot
 from wxverify.forecast.data import EXCLUDED_FEEDS_SQL
 from wxverify.forecast.rain_pick import (
@@ -1049,29 +1049,22 @@ def published_wind_weights(
 
 def published_wind_serving(
     conn: sqlite3.Connection, *, site_id: int, as_of: str | None
-) -> WindWeights | None:
-    """The wind weights served with the close on, else ``None`` (9.4).
+) -> WindWeights:
+    """The wind weights served (9.4).
 
-    On: the weights of the publication active at ``as_of`` (the latest with
+    The weights of the publication active at ``as_of`` (the latest with
     ``as_of`` None), ``{}`` with no publication. Inside the caller's
-    transaction when one is open; otherwise the switch is read on its own
-    and, only when it is on, again with the rows in one read snapshot, so
-    the close-off path opens no transaction. ``None`` tells the caller to
-    run today's code.
+    transaction when one is open; otherwise in one read snapshot.
     """
     if conn.in_transaction:
         return _published_wind_now(conn, site_id=site_id, as_of=as_of)
-    if not daily_close_on(conn):
-        return None
     with read_snapshot(conn, label="wind_weights"):
         return _published_wind_now(conn, site_id=site_id, as_of=as_of)
 
 
 def _published_wind_now(
     conn: sqlite3.Connection, *, site_id: int, as_of: str | None
-) -> WindWeights | None:
-    if not daily_close_on(conn):
-        return None
+) -> WindWeights:
     pub = active_publication(conn, site_id=site_id, at_utc=as_of)
     return {} if pub is None else published_wind_weights(conn, pub=pub)
 
@@ -1082,23 +1075,18 @@ def published_rain_ranks(
     """The active publication's rain ranking, by day ahead (rain release, C3).
 
     Read as :func:`published_wind_serving` reads the weights: inside the
-    caller's transaction when one is open; otherwise the switch alone, then,
-    only when it is on, the rows in one read snapshot. Empty with the close
-    off, with no publication, and for a publication with no rain rows; a day
-    ahead with no ranked model has no entry, so its tile has no rain
+    caller's transaction when one is open; otherwise in one read snapshot.
+    Empty with no publication, and for a publication with no rain rows; a
+    day ahead with no ranked model has no entry, so its tile has no rain
     forecast. Read-only.
     """
     if conn.in_transaction:
         return _published_rain_now(conn, site_id)
-    if not daily_close_on(conn):
-        return {}
     with read_snapshot(conn, label="rain_ranks"):
         return _published_rain_now(conn, site_id)
 
 
 def _published_rain_now(conn: sqlite3.Connection, site_id: int) -> dict[int, RainRanks]:
-    if not daily_close_on(conn):
-        return {}
     pub = active_publication(conn, site_id=site_id, at_utc=None)
     if pub is None:
         return {}

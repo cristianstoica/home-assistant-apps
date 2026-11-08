@@ -14,9 +14,8 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Final
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify.close_monitor import (
     CloseAlert,
@@ -30,10 +29,8 @@ from wxverify.collection.budget import (
 )
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.secrets import resolve_secret
-from wxverify.core.timeutil import isoformat_utc, local_day_start, parse_utc
+from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.queue import MAIN_LANE_TYPE_SQL
-from wxverify.db.site_days import daily_close_on
-from wxverify.settings.keys import get_number_setting
 from wxverify.worker.access_hold import (
     ACCESS_KIND_LABELS,
     AccessRecord,
@@ -42,8 +39,6 @@ from wxverify.worker.access_hold import (
 
 # --- Hardcoded thresholds (standalone's proven defaults) ---------------------
 FEED_STALE_HOURS = 12
-OBS_STALE_HOURS = 12
-FETCH_OBS_LIVE_HOURS = 8
 FETCH_FEED_LIVE_HOURS = 12
 FAILED_JOB_AGE_HOURS = 48
 STUCK_RUNNING_MINUTES = 20
@@ -52,11 +47,6 @@ MAIN_WORKER_LIVENESS_MINUTES: Final = 15
 OBS_COLLECTION_DELAY_MINUTES: Final = 15
 GRACE_MINUTES = 10
 COSTED_NOOP_MIN_ERRORS = 3
-# wind_history (plan §10): the today checks (e) and (h) wait
-# WIND_TODAY_GRACE_HOURS after local midnight; failed-final rows count over the
-# last _WIND_FAILED_DAYS local days.
-WIND_TODAY_GRACE_HOURS: Final = 6
-_WIND_FAILED_DAYS: Final = 7
 
 _SEVERITY_RANK = {"ok": 0, "warning": 1, "critical": 2}
 
@@ -126,13 +116,6 @@ _ELIGIBLE_FEED_WHERE = """
     AND f.is_virtual = 0
     AND NOT (f.source='meteoblue' AND f.model != 'multimodel')
     AND COALESCE(sfs.enabled, f.default_subscribed) = 1
-"""
-
-_ELIGIBLE_OBS_WHERE = """
-    s.enabled = 1
-    AND EXISTS (
-        SELECT 1 FROM stations st WHERE st.site_id = s.id AND st.enabled = 1
-    )
 """
 
 # Failed arm of problem_jobs: one row per (type, site_id, job_key) scope that
@@ -209,37 +192,6 @@ FAILED_SCOPES_SQL = """
 def _count(conn: sqlite3.Connection, sql: str, params: tuple[object, ...]) -> int:
     row = conn.execute(sql, params).fetchone()
     return 0 if row is None else int(row[0])
-
-
-def _station_history_failures(
-    conn: sqlite3.Connection,
-) -> tuple[int, int, str | None]:
-    """Enabled stations of enabled sites with an unresolved history failure.
-
-    Returns ``(count, worst_rung, earliest_next_attempt_at)``. Keyed on
-    ``history_error_count > 0`` -- unresolved failure -- not on the retry
-    deadline: a station on the 24h rung spends most of each rung with
-    ``history_next_attempt_at`` already in the past and no cycle yet run, so a
-    deadline-keyed count would blink healthy while nothing about the station
-    changed. SQLite's ``MIN`` skips NULLs, so the stamp is the earliest
-    outstanding retry among the failing stations, or NULL if none carries one.
-    """
-    row = conn.execute(
-        """
-        SELECT COUNT(*),
-               COALESCE(MAX(st.history_error_count), 0),
-               MIN(st.history_next_attempt_at)
-        FROM stations st
-        JOIN sites s ON s.id = st.site_id
-        WHERE s.enabled = 1
-          AND st.enabled = 1
-          AND st.history_error_count > 0
-        """
-    ).fetchone()
-    if row is None:
-        return (0, 0, None)
-    newest = row[2]
-    return (int(row[0]), int(row[1]), None if newest is None else str(newest))
 
 
 # The due-scan's failure cooldown for fetch_current_obs, mirrored from
@@ -430,236 +382,22 @@ def _main_liveness_check(
     return (stale and not current, detail)
 
 
-def _has_completed_within(
-    conn: sqlite3.Connection, job_type: str, cutoff: str, *, job_key: str | None
-) -> bool:
-    """A completed ``job_type`` row since ``cutoff``, of ``job_key`` when not None.
-
-    ``job_key`` is required so a reader of a type that carries two lanes
-    (``fetch_obs``: the live ``obs`` stream and the ``wind-days`` lane) must
-    name the one it reads.
-    """
-    if job_key is None:
-        row = conn.execute(
-            """
-            SELECT 1 FROM jobs
-            WHERE status='completed' AND type=? AND updated_at >= ?
-            LIMIT 1
-            """,
-            (job_type, cutoff),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            """
-            SELECT 1 FROM jobs
-            WHERE status='completed' AND type=? AND updated_at >= ?
-              AND job_key = ?
-            LIMIT 1
-            """,
-            (job_type, cutoff, job_key),
-        ).fetchone()
-    return row is not None
-
-
-_WIND_TODAY_ROWS_SQL: Final = """
-    SELECT st.pws_station_id, d.station_id AS day_station,
-           d.record_count, d.last_ok_at
-    FROM stations st
-    LEFT JOIN station_wind_days d
-      ON d.station_id = st.id AND d.local_date = ?
-    WHERE st.site_id = ? AND st.enabled = 1
-    ORDER BY st.id
-"""
-
-
-def _wind_history_trips(
-    conn: sqlite3.Connection, now: datetime
-) -> tuple[int, str | None]:
-    """``(sites tripped, the first tripped site's first reason)`` for wind_history.
-
-    Evaluated per enabled site with at least one enabled station, in site id
-    order, over the checks (c), (e) and (h) of plan §10, in that order, or
-    (f) when the site's time zone is unusable. While the ``five_minute`` kind
-    is among ``refused_kinds``, check (h) names no station. Read-only.
-    """
-    # Read once per call. refused_kinds, not access_held, so the checks also
-    # stay off between a hold's end and the next try, while the stored row
-    # still says the last answer was a refusal.
-    five_minute_refused = any(
-        record.kind == "five_minute" for record in refused_kinds(conn, now)
-    )
-    interval = get_number_setting(conn, "obs_interval_minutes", 180, minimum=30)
-    tripped = 0
-    first: str | None = None
-    sites = conn.execute(
-        f"SELECT s.id, s.timezone FROM sites s WHERE {_ELIGIBLE_OBS_WHERE}"
-        " ORDER BY s.id"
-    ).fetchall()
-    for site in sites:
-        site_id = int(site["id"])
-        reasons: list[str] = []
-        tz_name = str(site["timezone"])
-        try:
-            midnight = local_day_start(now, tz_name)
-            today = now.astimezone(ZoneInfo(tz_name)).date()
-        except (ZoneInfoNotFoundError, ValueError):
-            # (f) the can't-tell verdict, surfaced, never passed.
-            reasons.append("cannot evaluate")
-        else:
-            reasons.extend(_wind_day_reasons(conn, site_id, today))
-            today_rows = conn.execute(
-                _WIND_TODAY_ROWS_SQL, (today.isoformat(), site_id)
-            ).fetchall()
-            today_checks = now - midnight >= timedelta(hours=WIND_TODAY_GRACE_HOURS)
-            # (e) no enabled station has a reading today.
-            if today_checks and not any(
-                row["record_count"] is not None and int(row["record_count"]) > 0
-                for row in today_rows
-            ):
-                reasons.append("no wind readings today from any station")
-            # (h) one station's today refresh keeps failing; skipped while the
-            # five_minute kind is refused, so no station is named for it.
-            if today_checks and not five_minute_refused:
-                reasons.extend(_wind_stale_station_reasons(today_rows, now, interval))
-        if reasons:
-            tripped += 1
-            if first is None:
-                first = reasons[0]
-    return tripped, first
-
-
-def _wind_day_reasons(conn: sqlite3.Connection, site_id: int, today: date) -> list[str]:
-    """wind_history (c) over the site's enabled stations' past rows."""
-    reasons: list[str] = []
-    failed = _count(
-        conn,
+def _has_completed_within(conn: sqlite3.Connection, job_type: str, cutoff: str) -> bool:
+    """A completed ``job_type`` row since ``cutoff``."""
+    row = conn.execute(
         """
-        SELECT COUNT(*) FROM station_wind_days d
-        JOIN stations st ON st.id = d.station_id
-        WHERE st.site_id = ? AND st.enabled = 1
-          AND d.status = 'failed' AND d.attempts >= 3
-          AND d.local_date >= ? AND d.local_date < ?
+        SELECT 1 FROM jobs
+        WHERE status='completed' AND type=? AND updated_at >= ?
+        LIMIT 1
         """,
-        (
-            site_id,
-            (today - timedelta(days=_WIND_FAILED_DAYS)).isoformat(),
-            today.isoformat(),
-        ),
-    )
-    # (c) a station-day that failed for good in the last _WIND_FAILED_DAYS days.
-    if failed > 0:
-        reasons.append(
-            f"wind history: {failed} station-days failed after 3 attempts"
-            f" in the last {_WIND_FAILED_DAYS} days"
-        )
-    return reasons
-
-
-def _wind_stale_station_reasons(
-    today_rows: list[sqlite3.Row], now: datetime, interval_minutes: int
-) -> list[str]:
-    """wind_history (h): one reason per enabled station whose today row is stale.
-
-    Stale is no today row, a NULL or unparseable ``last_ok_at``, or one older
-    than twice the obs interval.
-    """
-    reasons: list[str] = []
-    limit = timedelta(minutes=2 * interval_minutes)
-    for row in today_rows:
-        raw = None if row["day_station"] is None else row["last_ok_at"]
-        last_ok = _parse_or_none(raw)
-        if last_ok is not None and now - last_ok <= limit:
-            continue
-        since = "midnight" if raw is None else str(raw)
-        reasons.append(
-            f"wind for {row['pws_station_id']} has not updated since {since}"
-        )
-    return reasons
-
-
-def _retired_check_results(
-    conn: sqlite3.Connection, now: datetime
-) -> dict[str, tuple[bool, int | None, str]]:
-    """The four pipeline checks the daily close retires, by id.
-
-    Each as ``(tripped, count, detail)`` for ``_cond``. Called only while the
-    close is off (daily-close plan P5 §4.1): with it on, none of these
-    queries runs and none of these rows is built.
-    """
-    obs_cutoff = isoformat_utc(now - timedelta(hours=OBS_STALE_HOURS))
-    fetch_obs_cutoff = isoformat_utc(now - timedelta(hours=FETCH_OBS_LIVE_HOURS))
-
-    # obs_stale: enabled site with >=1 enabled station and last_obs_at >12h/NULL.
-    obs_stale_n = _count(
-        conn,
-        f"""
-        SELECT COUNT(*) FROM sites s
-        WHERE {_ELIGIBLE_OBS_WHERE}
-          AND (s.last_obs_at IS NULL OR s.last_obs_at < ?)
-        """,
-        (obs_cutoff,),
-    )
-    eligible_obs = _count(
-        conn,
-        f"SELECT COUNT(*) FROM sites s WHERE {_ELIGIBLE_OBS_WHERE}",
-        (),
-    )
-
-    # fetch_obs carries two lanes; only the live "obs" stream proves liveness,
-    # so a completing wind-days lane cannot mask a dead live stream.
-    fetch_obs_live_tripped = eligible_obs > 0 and not _has_completed_within(
-        conn, "fetch_obs", fetch_obs_cutoff, job_key="obs"
-    )
-
-    # obs_station_history_failing (Item B.7): enabled stations of enabled sites
-    # whose hourly history is failing. Trips on the first park and clears only
-    # when the station returns a recent observation (B.3 outcome 1), the only
-    # thing that zeroes the counter.
-    (
-        history_failing_n,
-        history_worst_rung,
-        history_next_retry,
-    ) = _station_history_failures(conn)
-
-    # wind_history (plan §10): per enabled site with an enabled station, a
-    # failing station-day, a missed collection before midnight, or a station
-    # whose wind stopped updating today.
-    wind_tripped_n, wind_detail = _wind_history_trips(conn, now)
-
-    return {
-        "obs_stale": (
-            obs_stale_n > 0,
-            obs_stale_n,
-            f"{obs_stale_n} sites not observed >12h",
-        ),
-        "fetch_obs_live": (
-            fetch_obs_live_tripped,
-            None,
-            "no completed fetch_obs in 8h",
-        ),
-        "obs_station_history_failing": (
-            history_failing_n > 0,
-            history_failing_n,
-            f"{history_failing_n} stations with failing hourly history"
-            f" (worst rung {history_worst_rung},"
-            f" earliest retry {history_next_retry})",
-        ),
-        "wind_history": (
-            wind_tripped_n > 0,
-            wind_tripped_n,
-            wind_detail or "wind history needs attention",
-        ),
-    }
+        (job_type, cutoff),
+    ).fetchone()
+    return row is not None
 
 
 def _pipeline_conditions(
     conn: sqlite3.Connection, now: datetime, *, grace_active: bool
 ) -> list[Condition]:
-    # The daily close's switch (daily-close plan P5 §4.1, §5.1). With it on,
-    # the four checks it retires are not built and close_alerts adds its
-    # rows; with it off, every row is built as before.
-    close_on = daily_close_on(conn)
-
     feed_cutoff = isoformat_utc(now - timedelta(hours=FEED_STALE_HOURS))
     fetch_feed_cutoff = isoformat_utc(now - timedelta(hours=FETCH_FEED_LIVE_HOURS))
 
@@ -689,10 +427,7 @@ def _pipeline_conditions(
         (),
     )
     fetch_feed_live_tripped = eligible_feeds > 0 and not _has_completed_within(
-        conn, "fetch_feed", fetch_feed_cutoff, job_key=None
-    )
-    retired: dict[str, tuple[bool, int | None, str]] = (
-        {} if close_on else _retired_check_results(conn, now)
+        conn, "fetch_feed", fetch_feed_cutoff
     )
 
     # problem_jobs = failed scopes + in-flight problems. The failed arm counts
@@ -782,28 +517,26 @@ def _pipeline_conditions(
         _main_liveness_evidence(conn), now
     )
 
-    # station_silent_today (daily-close plan P5 §6.3): built with the close
-    # on and off. close_alerts (§5.1): called only with the close on. Each
-    # call's own `try` keeps a fault in it from dropping the group's other
-    # rows: a sqlite3.Error still reaches the group's `try` in build_verdict
-    # (db_readable), and any other exception becomes one unexpected_error
-    # row in place of that call's rows.
+    # station_silent_today (daily-close plan P5 §6.3) and close_alerts
+    # (§5.1). Each call's own `try` keeps a fault in it from dropping the
+    # group's other rows: a sqlite3.Error still reaches the group's `try` in
+    # build_verdict (db_readable), and any other exception becomes one
+    # unexpected_error row in place of that call's rows.
     silent: CloseAlert | None = None
     close_rows: list[CloseAlert] = []
     close_errors: list[Condition] = []
     try:
-        silent = station_silent(conn, now, close_on=close_on)
+        silent = station_silent(conn, now)
     except sqlite3.Error:
         raise
     except Exception as exc:
         close_errors.append(_close_error_condition(exc))
-    if close_on:
-        try:
-            close_rows = close_alerts(conn, now)
-        except sqlite3.Error:
-            raise
-        except Exception as exc:
-            close_errors.append(_close_error_condition(exc))
+    try:
+        close_rows = close_alerts(conn, now)
+    except sqlite3.Error:
+        raise
+    except Exception as exc:
+        close_errors.append(_close_error_condition(exc))
 
     def _cond(cid: str, tripped: bool, count: int | None, detail: str) -> Condition:
         if grace_active:
@@ -841,12 +574,6 @@ def _pipeline_conditions(
             detail=alert.detail,
         )
 
-    def _retired(cid: str) -> list[Condition]:
-        # A retired check's row in today's place while the close is off;
-        # nothing while it is on.
-        result = retired.get(cid)
-        return [] if result is None else [_cond(cid, *result)]
-
     conditions = [
         _cond(
             "feed_stale",
@@ -854,8 +581,6 @@ def _pipeline_conditions(
             feed_stale_n,
             f"{feed_stale_n} feeds not run >12h",
         ),
-        *_retired("obs_stale"),
-        *_retired("fetch_obs_live"),
         _cond(
             "fetch_feed_live",
             fetch_feed_live_tripped,
@@ -869,7 +594,6 @@ def _pipeline_conditions(
             f"{failed_scopes_n} unresolved failed scopes,"
             f" {inflight_n} stuck/overdue jobs",
         ),
-        *_retired("obs_station_history_failing"),
         _cond(
             "obs_collection_delayed",
             collection_overdue_n > 0,
@@ -880,7 +604,6 @@ def _pipeline_conditions(
             f" {collection_backoff_n} in backoff",
         ),
         _cond("main_worker_liveness", liveness_tripped, None, liveness_detail),
-        *_retired("wind_history"),
     ]
     if silent is not None:
         conditions.append(
@@ -892,9 +615,9 @@ def _pipeline_conditions(
             )
         )
     # wind_station_constant:<station>: one failing row per open stuck-wind
-    # episode of an enabled station of an enabled site, built with the close
-    # on and off; a station with no episode has no row, so its id enters the
-    # failing list when its episode opens and leaves it when it clears.
+    # episode of an enabled station of an enabled site; a station with no
+    # episode has no row, so its id enters the failing list when its episode
+    # opens and leaves it when it clears.
     for row in conn.execute(
         """
         SELECT st.pws_station_id, w.speed_kmh, w.since, w.state
@@ -1022,16 +745,15 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
     # 401/403, listed until 24 h after its hold ended (``refused_kinds``).
     refused = refused_kinds(conn, now)
     access_detail = _access_refused_detail(refused, now) if refused else ""
-    # With the daily close on, its part of the row is appended: the next try
-    # and the days affected (daily-close plan P5 §6.4), read only while a
-    # kind is listed, since only then does the row show a detail. With the
-    # close off the detail is 0.16.13's line, unchanged. The call's own `try`
-    # keeps a fault in it from dropping the group's other rows (§5.1): a
-    # sqlite3.Error still reaches the group's `try` in build_verdict
+    # The daily close's part of the row is appended: the next try and the
+    # days affected (daily-close plan P5 §6.4), read only while a kind is
+    # listed, since only then does the row show a detail. The call's own
+    # `try` keeps a fault in it from dropping the group's other rows (§5.1):
+    # a sqlite3.Error still reaches the group's `try` in build_verdict
     # (db_readable), and any other exception becomes one unexpected_error row
     # and leaves 0.16.13's line as it is.
     close_errors: list[Condition] = []
-    if refused and daily_close_on(conn):
+    if refused:
         try:
             access_detail += access_days_affected(conn, now).detail_suffix()
         except sqlite3.Error:
@@ -1200,22 +922,9 @@ def _grace_active(conn: sqlite3.Connection, now: datetime) -> bool:
 
 
 # The pipeline group's skipped list while monitor_pipeline is off (daily-close
-# plan P5 §5.1). With the close off: today's nine ids plus
-# station_silent_today. With it on: the five kept pipeline ids,
-# station_silent_today and close_alerts' seven ids, none of the four retired.
-_PIPELINE_SKIPPED_CLOSE_OFF: Final[tuple[str, ...]] = (
-    "feed_stale",
-    "obs_stale",
-    "fetch_obs_live",
-    "fetch_feed_live",
-    "problem_jobs",
-    "obs_station_history_failing",
-    "obs_collection_delayed",
-    "main_worker_liveness",
-    "wind_history",
-    "station_silent_today",
-)
-_PIPELINE_SKIPPED_CLOSE_ON: Final[tuple[str, ...]] = (
+# plan P5 §5.1): the five kept pipeline ids, station_silent_today and
+# close_alerts' seven ids, none of the four retired.
+_PIPELINE_SKIPPED: Final[tuple[str, ...]] = (
     "feed_stale",
     "fetch_feed_live",
     "problem_jobs",
@@ -1261,25 +970,9 @@ def build_verdict(
         except sqlite3.Error:
             db_read_failed = True
     else:
-        # The skipped list follows the close switch, read in its own narrow
-        # `try` (daily-close plan P5 §5.1). On sqlite3.Error the switch is
-        # unknown, so no list is guessed: db_read_failed makes db_readable
-        # report the failed read, and the sweeper row still reaches the
-        # verdict. Any other exception propagates: a code fault never turns
-        # into a fallback list.
-        try:
-            close_on = daily_close_on(conn)
-        except sqlite3.Error:
-            db_read_failed = True
-        else:
-            conditions.extend(
-                _skipped(cid, "pipeline", "warning")
-                for cid in (
-                    _PIPELINE_SKIPPED_CLOSE_ON
-                    if close_on
-                    else _PIPELINE_SKIPPED_CLOSE_OFF
-                )
-            )
+        conditions.extend(
+            _skipped(cid, "pipeline", "warning") for cid in _PIPELINE_SKIPPED
+        )
 
     if budget_enabled:
         try:

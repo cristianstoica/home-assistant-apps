@@ -37,7 +37,6 @@ from wxverify.collection.forecast_validation import (
 from wxverify.collection.precip_labels import precip_label_eligible_sql
 from wxverify.core.timeutil import day_ahead as issue_day_ahead
 from wxverify.core.timeutil import parse_utc
-from wxverify.db.site_days import daily_close_on
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.scoring.leaderboard import (
     LeaderboardRow,
@@ -57,8 +56,8 @@ class FutureSampleRow:
     """One validated, latest-run forecast sample with feed identity attached.
 
     ``download_date`` (9.5) is the local date of the latest download that
-    brought the sample's run label, set only with the daily close on; None
-    keeps the issue-time day ahead (:func:`sample_day_ahead`).
+    brought the sample's run label; None keeps the issue-time day ahead
+    (:func:`sample_day_ahead`).
     """
 
     feed_id: int
@@ -161,24 +160,17 @@ def load_future_samples(
     the read, in Python, leaving the statement untouched. The simulation
     passes False because it filters to its pinned roster.
 
-    With the daily close on (9.5) each row also carries ``download_date``
-    (:func:`_download_dates`); the statement then also selects
-    ``fetched_at``. With the close off the
-    statement is unchanged and ``download_date`` stays None. The statement
-    is :func:`future_samples_sql`'s.
+    Each row also carries ``download_date`` (9.5, :func:`_download_dates`);
+    the statement selects ``fetched_at`` for it. The statement is
+    :func:`future_samples_sql`'s.
     """
-    close_on = daily_close_on(conn)
     rows = conn.execute(
-        future_samples_sql(close_on=close_on),
+        future_samples_sql(),
         (site_id, since_valid_at),
     ).fetchall()
     served = served_feed_ids(conn, site_id=site_id) if served_only else None
     kept = [row for row in rows if served is None or int(row["feed_id"]) in served]
-    download_dates = (
-        _download_dates(conn, site_id=site_id, rows=kept)
-        if close_on
-        else [None] * len(kept)
-    )
+    download_dates = _download_dates(conn, site_id=site_id, rows=kept)
     return [
         FutureSampleRow(
             feed_id=int(row["feed_id"]),
@@ -194,23 +186,20 @@ def load_future_samples(
     ]
 
 
-def future_samples_sql(*, close_on: bool) -> str:
-    """The statement :func:`load_future_samples` runs, for one close state.
+def future_samples_sql() -> str:
+    """The statement :func:`load_future_samples` runs.
 
-    Module-level so a query-plan test plans the text that ships. With
-    ``close_on`` both select lists also carry ``fetched_at`` (9.5); the
-    rest of the text is the same for both states.
+    Module-level so a query-plan test plans the text that ships. Both
+    select lists carry ``fetched_at`` (9.5).
     """
     invalid = invalid_forecast_sample_sql("fs")
     eligible = precip_label_eligible_sql("fs", "f")
     variables = ", ".join(f"'{variable}'" for variable in FORECAST_VARIABLES)
-    outer_extra = ", fetched_at" if close_on else ""
-    inner_extra = ", fs.fetched_at" if close_on else ""
     return f"""
-        SELECT feed_id, source, model, variable, issued_at, valid_at, value{outer_extra}
+        SELECT feed_id, source, model, variable, issued_at, valid_at, value, fetched_at
         FROM (
             SELECT fs.feed_id, f.source, f.model, fs.variable, fs.issued_at,
-                   fs.valid_at, fs.value{inner_extra},
+                   fs.valid_at, fs.value, fs.fetched_at,
                    ROW_NUMBER() OVER (
                        PARTITION BY fs.feed_id, fs.variable, fs.valid_at
                        ORDER BY fs.issued_at DESC
@@ -283,9 +272,9 @@ def load_display_samples(
 def sample_day_ahead(sample: FutureSampleRow, timezone: str) -> int:
     """The day ahead a sample is looked up at (9.5).
 
-    From its ``download_date`` when it has one (the close on): the days from
-    that date to the sample's local valid date in ``timezone``. Otherwise the
-    issue-time day ahead, from its run label. The served forecast reads it.
+    From its ``download_date`` when it has one: the days from that date to
+    the sample's local valid date in ``timezone``. Otherwise the issue-time
+    day ahead, from its run label. The served forecast reads it.
     """
     if sample.download_date is None:
         return issue_day_ahead(sample.issued_at, sample.valid_at, timezone)
@@ -521,13 +510,13 @@ def forecast_fingerprint(conn: sqlite3.Connection, *, site_id: int) -> str:
     one stamp moves to another whole second, though stamps moving in opposite
     directions can cancel out; a move within the same whole second changes
     neither the token nor the whole-second "Last fetched" label. With no
-    parseable stamp the token is :func:`samples_fingerprint` alone, so a site
-    with no samples and no stamps stays ``"0"``. An unchanged token lets the
-    tiles fragment answer 204 and leave the open drill-down untouched.
+    parseable stamp the token is :func:`samples_fingerprint` followed by the
+    publication part, so a site with no samples, no stamps and no publication
+    is ``"0-p0"``. An unchanged token lets the tiles fragment answer 204 and
+    leave the open drill-down untouched.
 
-    With the daily close on the token ends in ``-p<id>``, the active
-    publication's id (``0`` for none), so an open page swaps its tiles when
-    a publication lands (9.5). With the close off it is unchanged.
+    The token ends in ``-p<id>``, the active publication's id (``0`` for
+    none), so an open page swaps its tiles when a publication lands (9.5).
     """
     samples = samples_fingerprint(conn, site_id=site_id)
     rows = conn.execute(
@@ -552,9 +541,7 @@ def forecast_fingerprint(conn: sqlite3.Connection, *, site_id: int) -> str:
 
 
 def _publication_token(conn: sqlite3.Connection, *, site_id: int) -> str:
-    """``-p<id>`` of the active publication with the close on, else empty."""
-    if not daily_close_on(conn):
-        return ""
+    """``-p<id>`` of the active publication, ``-p0`` with none."""
     # Deferred: the publication module imports this one.
     from wxverify.scoring.publication import active_publication
 

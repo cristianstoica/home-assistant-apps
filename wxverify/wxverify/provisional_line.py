@@ -31,7 +31,6 @@ from wxverify.db.site_days import (
     MissedReason,
     closed_through,
     current_day,
-    daily_close_on,
     day_for_instant,
     day_rain_station_ids,
     day_record,
@@ -80,8 +79,7 @@ class ProvisionalLine:
     days not yet done. ``values`` holds the site value of each of those hours
     that has one, in °C, mm or m/s; an hour without one is absent, never 0.
     ``latest_reading_at`` is the latest of P2's ``latest_reading_at`` over the
-    stations and days drawn (plan §8.4), ``None`` when there is none. With the
-    close off all three are empty.
+    stations and days drawn (plan §8.4), ``None`` when there is none.
     """
 
     valid_at: tuple[datetime, ...]
@@ -161,8 +159,7 @@ def day_spans(
     range starts before the site's first record, that first record; the
     walk then reads each next date with ``day_record`` until a day starts at
     or after ``end_utc``. Instants before the site's first record, the
-    starting history, give no span. Records are read as they are, whatever
-    the switch: a caller asks ``daily_close_on`` itself. Empty when
+    starting history, give no span. Records are read as they are. Empty when
     ``end_utc`` is not after ``start_utc``. Read-only.
     """
     start = _as_utc(start_utc)
@@ -289,23 +286,22 @@ def provisional_site_hours(
 ) -> ProvisionalLine:
     """Section 8's provisional line for one site and variable (plan §8, §9.1).
 
-    Empty with the close off (``daily_close_on``), for a variable other than
-    ``temperature``, ``precip`` or ``wind``, and for a site that does not
-    exist. Otherwise it covers the site's days that have started and are not
-    done (``open``, ``closing`` or ``retry_due``), oldest first. Per day,
-    ``hourly_values`` gives each listed station's values: for the day that
-    holds ``now``, only the hours before ``now`` rounded down to the whole
-    UTC hour; for an earlier day, every hour. Each hour's station values go
-    through the close's jump check and, the ``ok`` ones, to
-    ``compute_consensus`` with the stations' and the site's elevations and
-    ``MAD_FLOORS``; an hour with no consensus has no value. Rain reads only
-    the day's rain-counted stations (``day_rain_station_ids``), as the close
-    does. A station's previous value carries across the days drawn.
-    Read-only.
+    Empty for a variable other than ``temperature``, ``precip`` or ``wind``,
+    and for a site that does not exist. Otherwise it covers the site's days
+    that have started and are not done (``open``, ``closing`` or
+    ``retry_due``), oldest first. Per day, ``hourly_values`` gives each
+    listed station's values: for the day that holds ``now``, only the hours
+    before ``now`` rounded down to the whole UTC hour; for an earlier day,
+    every hour. Each hour's station values go through the close's jump check
+    and, the ``ok`` ones, to ``compute_consensus`` with the stations' and
+    the site's elevations and ``MAD_FLOORS``; an hour with no consensus has
+    no value. Rain reads only the day's rain-counted stations
+    (``day_rain_station_ids``), as the close does. A station's previous
+    value carries across the days drawn. Read-only.
     """
     now = _as_utc(now_utc)
     quantity = _QUANTITY_BY_VARIABLE.get(variable)
-    if quantity is None or not daily_close_on(conn):
+    if quantity is None:
         return _empty_line()
     site = conn.execute(
         "SELECT elevation_m FROM sites WHERE id = ?", (site_id,)

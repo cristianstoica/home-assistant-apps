@@ -29,7 +29,6 @@ from wxverify.core.timeutil import isoformat_utc, local_day_slots
 from wxverify.db.queue import enqueue_if_absent, enqueue_if_absent_with_cooldown
 from wxverify.db.site_days import (
     DayRecord,
-    daily_close_on,
     day_record,
     local_clock_utc,
 )
@@ -171,30 +170,29 @@ def schedule_day(
 ) -> DayRecord:
     """The day every round and daytime instant of ``local_date`` is taken from (4.4).
 
-    Read-only; makes no record. With the close on, the date's record when it
-    exists; else, when the site's latest record L is dated before it, L with
-    the date and bounds of ``local_date`` in L's zone (from L's end when the
-    date follows L), the record ``ensure_site_days`` will make. Otherwise (the
-    close off, or a date before the site's first record) a stand-in in
+    Read-only; makes no record. The date's record when it exists; else, when
+    the site's latest record L is dated before it, L with the date and
+    bounds of ``local_date`` in L's zone (from L's end when the date follows
+    L), the record ``ensure_site_days`` will make. Otherwise (a date before
+    the site's first record, or a site with no record) a stand-in in
     ``sites.timezone``. Raises ``ValueError`` for a missing site, and
     ``ValueError`` or ``ZoneInfoNotFoundError`` for a zone that does not load.
     """
-    if daily_close_on(conn):
-        record = day_record(conn, site_id, local_date)
-        if record is not None:
-            return record
-        latest = _latest_record(conn, site_id)
-        if latest is not None and latest.local_date < local_date:
-            start, end, _ = local_day_slots(local_date, latest.timezone)
-            if local_date == latest.local_date + _ONE_DAY:
-                start = latest.day_end_utc
-            return dataclasses.replace(
-                latest,
-                local_date=local_date,
-                day_start_utc=start,
-                day_end_utc=end,
-                zone_changeover=False,
-            )
+    record = day_record(conn, site_id, local_date)
+    if record is not None:
+        return record
+    latest = _latest_record(conn, site_id)
+    if latest is not None and latest.local_date < local_date:
+        start, end, _ = local_day_slots(local_date, latest.timezone)
+        if local_date == latest.local_date + _ONE_DAY:
+            start = latest.day_end_utc
+        return dataclasses.replace(
+            latest,
+            local_date=local_date,
+            day_start_utc=start,
+            day_end_utc=end,
+            zone_changeover=False,
+        )
     timezone = _site_timezone(conn, site_id)
     start, end, _ = local_day_slots(local_date, timezone)
     return DayRecord(

@@ -243,7 +243,7 @@ def _seed_forecasts(
 def _build_scenario(conn: sqlite3.Connection):
     """One closing day D with X and Y's scored temperature forecasts at day
     aheads 0 and 1, four hours each."""
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     generation_id = ensure_site_generation(conn, site_id)
     feeds = {"X": _make_feed(conn, "X"), "Y": _make_feed(conn, "Y")}
     for feed_id in feeds.values():

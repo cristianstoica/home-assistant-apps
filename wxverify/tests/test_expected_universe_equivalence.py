@@ -3,13 +3,13 @@
 The equivalence tests that used to live here (``_expected_active_cells``,
 ``_expected_active_feed_ids`` and ``_scoring_feeds`` each checked against an
 independent DISTINCT-form reference query) all ran composite/leaderboard
-helpers with the daily close off (no ``day_close_site`` call, and
-``_scoring_feeds(close_on=False)`` explicitly) -- the add-on's only install
-runs with the close on, where ``composite_with_status``/
-``leaderboard_with_status`` take the published-only branch instead
+helpers against the retired score-cache path (no ``day_close_site`` call,
+and ``_scoring_feeds`` taking an explicit flag to reach it) -- the daily
+close is permanent now, so ``composite_with_status``/
+``leaderboard_with_status`` always take the published-only branch instead
 (composite.py/leaderboard.py). Removed along with their three
 DISTINCT-reference helpers and the stray/out-of-range score_cache guard
-tests, which exercised the same close-off cache-backed path.
+tests, which exercised the same retired cache-backed path.
 
 ``test_cell_grid_lead_bound_matches_schema_check`` pinned
 ``_expected_active_cells``/``cell_grid_cte()``, the grid+EXISTS rewrite's own

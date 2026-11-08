@@ -1,6 +1,7 @@
 """Pages (daily-close plan 2026-10-22-daily-close-alerts-and-pages.md §9;
-test IDs PG1-PG14 of this file's §13.9; PG13 and PG14 needed the owner's
-open questions of 17.2 answered first (2026-10-31) and are added here now).
+test IDs PG1, PG2, PG4-PG7, PG9, PG11-PG14 of this file's §13.9; PG13 and
+PG14 needed the owner's open questions of 17.2 answered first
+(2026-10-31) and are added here now).
 
 Written before P5's page changes exist: every test below imports a name P5
 adds (or reaches new JSON/HTML it has not yet produced) inside its own body
@@ -30,7 +31,6 @@ from tests.helpers import (
     NOW,
     D,
     asof_make_real_feed,
-    close_off,
     day_close_site,
     seed_active_publication,
     seed_coverage,
@@ -164,7 +164,7 @@ def test_pg1_closed_day_history_replaces_forecast_pairs(
     closed-day row and the starting-history row now live in
     ``forecast_history``."""
     conn = _init_tmp_db(tmp_path)
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     feed_id = asof_make_real_feed(conn, "pg-feed")
     ensure_site_generation(conn, site_id)
     _patch_clock(monkeypatch, NOW)
@@ -265,7 +265,7 @@ def test_pg2_provisional_keys_present_with_close_on(
     `provisional_valid_at`/`provisional`/`provisional_latest_reading_at`,
     non-null once today has a reading (M88)."""
     conn = _init_tmp_db(tmp_path)
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     station_a = _station_id(conn, site_id, "ISTATION01")
     feed_id = asof_make_real_feed(conn, "pg2-feed")
     _patch_clock(monkeypatch, NOW)
@@ -301,7 +301,7 @@ def test_pg4_zone_changeover_day_and_zone_flagged_days(
     "zone changeover", never "missed"; D-3, closed under the old zone,
     is listed in `zone_days` (M90)."""
     conn = _init_tmp_db(tmp_path)
-    site_id = day_close_site(conn, close_on=True, with_records=False)
+    site_id = day_close_site(conn, with_records=False)
     feed_id = asof_make_real_feed(conn, "pg4-feed")
     _patch_clock(monkeypatch, NOW)
 
@@ -433,7 +433,7 @@ def test_pg6_station_trust_closed_and_history_only(
     from wxverify.web.context import load_station_trust
 
     conn = _init_tmp_db(tmp_path)
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     station_a = _station_id(conn, site_id, "ISTATION01")
     _patch_clock(monkeypatch, NOW)
 
@@ -482,7 +482,7 @@ def test_pg7_coverage_table_next_to_the_rankings(
     "none yet" (not "0 of 0") for an expected count of 0 (M93, M94, M122,
     M123)."""
     conn = _init_tmp_db(tmp_path)
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     feed_x = asof_make_real_feed(conn, "pg7-x")
     feed_y = asof_make_real_feed(conn, "pg7-y")
     _patch_clock(monkeypatch, NOW)
@@ -578,86 +578,6 @@ def test_pg7_coverage_table_next_to_the_rankings(
     )
 
 
-def test_pg8_dashboard_close_off_no_coverage(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """PG8 (plan §13.9, §9.4): the dashboard with the close off shows no
-    coverage table and no "Scored" column (M95).
-
-    The original version of this test seeded no active publication at
-    all, so the dashboard's publication lookup found nothing to show
-    regardless of the close flag -- M95's dropped ``daily_close_on(conn)``
-    check was unobservable. This seeds a real active publication and a
-    coverage row (PG7's pattern) with the close off, so the lookup would
-    actually find something if the guard were gone. The two coverage
-    checks still can't see M95 either way (with the close off the
-    Leaderboard never reads the publication's rankings, so the coverage
-    table is None regardless), so a third assertion checks the
-    "evidence-through" line instead, which M95 does change because it
-    comes straight from the (wrongly found) publication lookup.
-    """
-    conn = _init_tmp_db(tmp_path)
-    close_off(conn)
-    site_id = day_close_site(conn, close_on=False)
-    feed_id = asof_make_real_feed(conn, "pg8-feed")
-    _patch_clock(monkeypatch, NOW)
-
-    pub_id = seed_active_publication(
-        conn,
-        site_id=site_id,
-        cutoff=D - timedelta(days=1),
-        published_at=NOW,
-        window_days=30,
-    )
-    seed_coverage(
-        conn,
-        publication_id=pub_id,
-        variable="temperature",
-        window_key="w:30",
-        day_ahead=3,
-        feed_id=feed_id,
-        scored=7,
-        expected=7,
-    )
-    _seed_ranking(
-        conn,
-        publication_id=pub_id,
-        feed_id=feed_id,
-        variable="temperature",
-        day_ahead=3,
-        window_key="w:30",
-        n=7,
-        skill_score=50.0,
-    )
-
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        response = client.get(
-            "/dashboard", params={"site": site_id, "window": "rolling", "lead": "D+3"}
-        )
-    assert response.status_code == 200
-    text = response.text
-    assert "Forecasts scored in this window" not in text, (
-        "M95 -> at this assertion: correct = no coverage table with the"
-        " close off, even though a real active publication and coverage"
-        " row exist, mutant = the publication lookup drops"
-        " `and daily_close_on(conn)`, so it would find the seeded"
-        " publication and this text would show"
-    )
-    assert ">Scored<" not in text, (
-        "M95 -> at this assertion: correct = no 'Scored' column with the"
-        " close off, mutant = the publication lookup drops"
-        " `and daily_close_on(conn)`, so the Leaderboard's 'Scored' column"
-        " would show here too"
-    )
-    assert 'id="evidence-through"' not in text, (
-        "M95 -> at this assertion: correct = no 'Rankings use … days"
-        " through' line with the close off (no publication is read, plan"
-        " 9.1), mutant = the lookup finds the seeded publication, so"
-        " evidence_through is its cutoff and the line shows"
-    )
-
-
 def test_pg9_worker_status_newest_published_at_with_close_on(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -665,10 +585,8 @@ def test_pg9_worker_status_newest_published_at_with_close_on(
     reports the newest `published_at` over active publications, not the
     (now stale) last completed `pair_and_score` run (M96)."""
     conn = _init_tmp_db(tmp_path)
-    site_a = day_close_site(conn, close_on=True)
-    site_b = day_close_site(
-        conn, close_on=True, station_ids=("ISTATION03", "ISTATION04")
-    )
+    site_a = day_close_site(conn)
+    site_b = day_close_site(conn, station_ids=("ISTATION03", "ISTATION04"))
     _patch_clock(monkeypatch, NOW)
 
     older = NOW - timedelta(hours=5)
@@ -692,32 +610,6 @@ def test_pg9_worker_status_newest_published_at_with_close_on(
     )
 
 
-def test_pg10_worker_status_close_off_unchanged(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """PG10 (plan §13.9, §9.6): with the close off, `last_completed_pair_
-    and_score_at` is always null, regardless of any completed
-    `pair_and_score` job (M97)."""
-    conn = _init_tmp_db(tmp_path)
-    close_off(conn)
-    site_id = day_close_site(conn, close_on=False)
-    _patch_clock(monkeypatch, NOW)
-    completed_at = isoformat_utc(NOW - timedelta(minutes=10))
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, payload, status, updated_at,"
-        " created_at)"
-        " VALUES ('pair_and_score', ?, 'pair_and_score', '{}', 'completed', ?, ?)",
-        (site_id, completed_at, completed_at),
-    )
-
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        response = client.get("/api/worker/status")
-    assert response.status_code == 200
-    body = response.json()
-    assert body.get("last_completed_pair_and_score_at") is None
-
-
 def test_pg11_overlay_lists_active_feeds_without_forecast_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -726,7 +618,7 @@ def test_pg11_overlay_lists_active_feeds_without_forecast_history(
     a site whose only history is a closed day's history still lists its
     feeds and renders the chart (M117)."""
     conn = _init_tmp_db(tmp_path)
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     feed_1 = asof_make_real_feed(conn, "pg11-a")
     feed_2 = asof_make_real_feed(conn, "pg11-b")
     _patch_clock(monkeypatch, NOW)
@@ -775,7 +667,7 @@ def test_pg12_lead_default_excludes_day_ahead_zero_starting_history(
     unrelated to `issued_at`: the default lead still filters the starting
     history by day ahead."""
     conn = _init_tmp_db(tmp_path)
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     feed_id = asof_make_real_feed(conn, "pg12-feed")
     _patch_clock(monkeypatch, NOW)
 
@@ -913,7 +805,7 @@ def test_pg13_typed_nd_window_shows_no_coverage(
     absence claim is not resting on an ambient coincidence.
     """
     conn = _init_tmp_db(tmp_path)
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     feed_x = asof_make_real_feed(conn, "pg13-x")
     _patch_clock(monkeypatch, NOW)
 
@@ -991,7 +883,7 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
     `tests/test_forecast_history_readers.py::test_history_chart_shows_rebuilt_persistence_at_the_longest_lead`.
     """
     conn = _init_tmp_db(tmp_path)
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn)
     feed_x = asof_make_real_feed(conn, "pg14-x")
     ensure_site_generation(conn, site_id)
     _patch_clock(monkeypatch, NOW)

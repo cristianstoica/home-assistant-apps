@@ -27,7 +27,6 @@ the reused helpers' own fixtures), timezone "UTC", dates in 2035/2026.
 from __future__ import annotations
 
 import ast
-import json
 import sqlite3
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -36,7 +35,6 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import wxverify
-from tests.helpers import close_off
 from tests.test_forecast_service import (
     _feed_id,
     _hours,
@@ -48,8 +46,8 @@ from tests.test_forecast_service import (
 )
 from wxverify.db.migrations import run_migrations, seed_default_sources
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
+from wxverify.db.site_days import record_station_change, start_site_days
 from wxverify.forecast.service import build_forecast, build_hourly
-from wxverify.monitor import _wind_history_trips  # noqa: PLC2701
 from wxverify.obs.pws_adapter import observations_from_payload
 from wxverify.scoring.consensus import insert_station_observation, materialize_consensus
 from wxverify.web.context import (
@@ -176,11 +174,26 @@ def test_d2_materialize_admits_the_pair_max_row_regardless_of_the_key(
     tree has no such filter: the one seeded reading always becomes the
     consensus observation."""
     conn = _wa_make_db()
-    close_off(conn)
     site_id = _wa_make_site(conn)
     station_id = _wa_make_station(conn, site_id, "WSTATION01")
     set_runtime_state(conn, f"wind_basis:{site_id}", key_value)
     valid_at = "2035-07-01T00:00:00Z"
+    # A P1 record holding `valid_at` (the close is always on; the closed-day
+    # guard behind materialize_consensus refuses the write with no record).
+    start_site_days(
+        conn, site_id, date(2035, 7, 1), now_utc=datetime(2035, 7, 1, tzinfo=UTC)
+    )
+    # Puts the station on the day's saved list (6.2) through the real
+    # record_station_change path -- 2035-06-30 holds no record yet, so its
+    # "added" takes effect on the next local date, 2035-07-01.
+    record_station_change(
+        conn,
+        site_id,
+        station_id,
+        "added",
+        reason="test fixture",
+        now_utc=datetime(2035, 6, 30, 12, tzinfo=UTC),
+    )
     conn.execute(
         """
         INSERT INTO station_observations
@@ -255,10 +268,10 @@ def test_d4_hourly_wind_blend_is_weighted_regardless_of_the_key() -> None:
     }
     assert payload["notes"] == {"wind": None}
     # Both trained feeds have no score_cache row, so base's generic ladder
-    # reads the leaderboard as "rebuilding" and low_confidence, which the
-    # (low_confidence AND ranking_rebuilding) rule turns into "rebuilding".
-    # The removal tree's weighted choice never sets low_confidence for an
-    # eligible pair and forces ranking_rebuilding False for wind either way.
+    # reads the leaderboard as "rebuilding" and low_confidence, which base's
+    # combined rule turns into a "rebuilding" state for wind. The removal
+    # tree's weighted choice never sets low_confidence for an eligible
+    # pair, and wind has no per-feed "rebuilding" state to force either way.
     assert payload["states"]["wind"] == "normal"
 
 
@@ -352,41 +365,6 @@ def test_d5_wind_banner_absent_and_station_trust_includes_wind() -> None:
 
 
 # ---------------------------------------------------------------------------
-# D6 -- the ops monitor's wind-rebuild-blocked trip.
-# ---------------------------------------------------------------------------
-
-
-def test_d6_monitor_today_checks_run_under_a_blocked_switching_key() -> None:
-    """Base's checks (a)/(b) read the ``wind_basis:<site>`` and
-    ``wind_basis_blocked:<site>`` keys: under "switching" with a blocked
-    JSON object, (a) trips first with "wind rebuild blocked: <reason>",
-    before the (e) today check is even reached (base's ``today_checks``
-    also excludes "switching"/"rescoring"). The removal tree's
-    ``_wind_history_trips`` reads neither key -- with a no-readings today
-    row past the grace period, the first (and only exposed) reason is (e)'s
-    "no wind readings today from any station", which never starts with
-    "wind rebuild"."""
-    conn = _wa_make_db()
-    site_id = _wa_make_site(conn)
-    _wa_make_station(conn, site_id, "WSTATION01")
-    now = datetime(2035, 7, 1, 12, tzinfo=UTC)
-    # No station_wind_days row for today: the (e) no-readings-today check
-    # is the one under test, past WIND_TODAY_GRACE_HOURS after midnight.
-    set_runtime_state(conn, f"wind_basis:{site_id}", "switching")
-    set_runtime_state(
-        conn, f"wind_basis_blocked:{site_id}", json.dumps({"reason": "stub reason"})
-    )
-    conn.commit()
-
-    tripped, first = _wind_history_trips(conn, now)
-
-    assert tripped == 1
-    assert first == "no wind readings today from any station"
-    assert first is not None
-    assert not first.startswith("wind rebuild")
-
-
-# ---------------------------------------------------------------------------
 # D11 -- _persist_day's stamp of wind-switch progress.
 # ---------------------------------------------------------------------------
 
@@ -401,7 +379,6 @@ def test_d11_persist_day_writes_no_wind_basis_progress_key() -> None:
     conn = _wa_make_db()
     site_id = _wa_make_site(conn)
     station_id = _wa_make_station(conn, site_id, "WSTATION01")
-    today = date(2035, 7, 10)
     local_date = date(2035, 7, 1)
     _wa_insert_day(conn, station_id, local_date, status="pending")
     conn.commit()
@@ -412,7 +389,6 @@ def test_d11_persist_day_writes_no_wind_basis_progress_key() -> None:
         station_id=station_id,
         local_date=local_date,
         tz_name="UTC",
-        today=today,
         records=[],
     )
 
