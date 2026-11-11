@@ -485,15 +485,10 @@ def test_scheduler_tick_accepts_exact_integral_real_fetch_interval_minutes(
     test_accepts_exact_integral_real."""
     conn = _init_tmp_db(tmp_path)
     site_id = _insert_site(conn)
-    feed_id = _feed_id(conn, "meteoblue", "multimodel")
-    past = isoformat_utc(utc_now() - timedelta(days=30))
-    conn.execute(
-        """
-        INSERT INTO site_feed_state (site_id, feed_id, enabled, last_run_at)
-        VALUES (?, ?, 1, ?)
-        """,
-        (site_id, feed_id, past),
-    )
+    # open-meteo/ecmwf_ifs is default_subscribed, so no site_feed_state row is
+    # needed for it to be due; its daytime slots (round 00:10 + 360-minute
+    # steps) put it due at _SLOT_NOW regardless of last_run_at.
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     conn.execute(
         "UPDATE feeds SET fetch_interval_minutes = 360.0 WHERE id = ?", (feed_id,)
     )

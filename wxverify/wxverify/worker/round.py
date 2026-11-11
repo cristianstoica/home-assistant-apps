@@ -3,7 +3,8 @@
 
 Each night's round fetches every scheduled feed at the setting
 ``scoring_round_local_time`` with up to three quick retries; each feed's
-daytime downloads follow at fixed local times counted from the round. Every
+daytime downloads follow at fixed local times counted from the round, except
+the meteoblue package's, which use ``METEOBLUE_DAYTIME_LOCAL_TIMES``. Every
 round and slot instant is a local wall time on one day's ``schedule_day``,
 through P1's ``local_clock_utc``.
 
@@ -20,6 +21,7 @@ import dataclasses
 import logging
 import re
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Final
@@ -67,6 +69,12 @@ _TRY_OFFSETS: Final = (timedelta(0), *ROUND_RETRY_OFFSETS)
 # _DUE_JOB_FAILURE_COOLDOWN, which this module cannot import (16.1).
 DAYTIME_MAX_RETRIES: Final = 3
 DAYTIME_FAILURE_COOLDOWN: Final = timedelta(hours=1)
+
+#: The meteoblue package's daytime calls, as site-local (hour, minute), in
+#: clock order: the round is the day's first call, and the latest round
+#: time (05:00) is before the first of these. Retries give up the last one
+#: first. A trial; each change ships with a release.
+METEOBLUE_DAYTIME_LOCAL_TIMES: Final = ((9, 10), (12, 10), (21, 10))
 
 _LOCAL_TIME_RE: Final = re.compile(r"([01]\d|2[0-3]):([0-5]\d)")
 _MINUTES_PER_DAY: Final = 24 * 60
@@ -478,6 +486,22 @@ def enqueue_due_round_tries(conn: sqlite3.Connection, *, now_utc: datetime) -> N
 # ---------------------------------------------------------------------------
 
 
+def _slots_at(
+    day: DayRecord, clock_minutes: Iterable[int]
+) -> list[tuple[str, datetime]]:
+    """Each minutes-after-midnight as ``("HH:MM", instant)``. A wall time
+    outside the day's stored bounds is not a slot of the day."""
+    slots: list[tuple[str, datetime]] = []
+    for minutes in clock_minutes:
+        hour, minute = divmod(minutes, 60)
+        try:
+            instant = local_clock_utc(day, hour, minute)
+        except ValueError:
+            continue
+        slots.append((f"{hour:02d}:{minute:02d}", instant))
+    return slots
+
+
 def _daytime_slots(
     day: DayRecord, round_minutes: int, interval_minutes: int
 ) -> list[tuple[str, datetime]]:
@@ -485,18 +509,14 @@ def _daytime_slots(
     its interval, n = 1, 2, ..., while the slot falls on the day, each as
     ``("HH:MM", instant)``. A wall time outside the day's stored bounds is
     not a slot of the day."""
-    slots: list[tuple[str, datetime]] = []
-    minutes = round_minutes + interval_minutes
-    while minutes < _MINUTES_PER_DAY:
-        hour, minute = divmod(minutes, 60)
-        try:
-            instant = local_clock_utc(day, hour, minute)
-        except ValueError:
-            instant = None
-        if instant is not None:
-            slots.append((f"{hour:02d}:{minute:02d}", instant))
-        minutes += interval_minutes
-    return slots
+    return _slots_at(
+        day, range(round_minutes + interval_minutes, _MINUTES_PER_DAY, interval_minutes)
+    )
+
+
+def _package_daytime_slots(day: DayRecord) -> list[tuple[str, datetime]]:
+    """The meteoblue package's daytime slots on ``day``."""
+    return _slots_at(day, [h * 60 + m for h, m in METEOBLUE_DAYTIME_LOCAL_TIMES])
 
 
 def _slot_covered(
@@ -530,9 +550,11 @@ def enqueue_due_daytime_downloads(
     """Enqueue each feed's latest due daytime slot (5.1).
 
     Per enabled site, the slots of the date whose ``schedule_day`` holds
-    ``now_utc``. A slot is due when its instant has passed, no try of the
-    feed has that slot on the date, and no ``unscheduled`` try of the feed on
-    the date started at or after it. Only the latest due slot is fetched, so
+    ``now_utc``: the meteoblue package's set times, every other feed's times
+    counted from the round by its interval. A slot is due when its instant
+    has passed, no try of the feed has that slot on the date, and no
+    ``unscheduled`` try of the feed on the date started at or after it. Only
+    the latest due slot is fetched, so
     earlier missed slots are skipped. meteoblue's package loses one slot per
     round retry of the date, latest first (4.4). The job is ``fetch_feed``
     keyed ``fetch:{feed_id}``, with the due-feed loop's retry cap and failure
@@ -546,7 +568,12 @@ def enqueue_due_daytime_downloads(
                 continue
             hour, minute = scoring_round_local_time(conn)
             planned = [
-                (feed, _daytime_slots(day, hour * 60 + minute, feed.interval_minutes))
+                (
+                    feed,
+                    _package_daytime_slots(day)
+                    if feed.package
+                    else _daytime_slots(day, hour * 60 + minute, feed.interval_minutes),
+                )
                 for feed in _schedule_feeds(conn, site_id)
             ]
         except (ZoneInfoNotFoundError, ValueError):

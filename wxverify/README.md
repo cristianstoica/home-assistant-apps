@@ -744,10 +744,11 @@ The command exits non-zero with a one-line message, for example when the site is
   and download records (log line `meteosource utc fix:`); Meteosource stays off
   until you switch it on.
 - Each meteoblue reply logs one INFO line per model,
-  `meteoblue run: call=… site=… model=… run=… updated=… prev=… new=…`.
+  `meteoblue run: call=… site=… model=… run=… updated=… prev=… new=… local=…`.
   `updated` is meteoblue's own update time for the run, `none` when the reply
   has none, or `unreadable-<kind>`; `prev` is the latest run stored before the
   reply (`none` or `unread` when unknown); `new` is `yes`, `no` or `unknown`.
+  `local` is the call's site time, `unread` when the site's zone does not load.
   The lines hold no key, address or location.
 
 ## Database version 18: the first start after the upgrade
@@ -1031,8 +1032,12 @@ With the default cadences, each enabled site makes:
   shifts over time. ICON-EU covers Europe only and is on by default because the
   add-on's defaults are set for Europe; for a site outside Europe, switch it off
   for that site on the Sites page, under Feed Subscriptions.
-- Meteoblue: one multimodel package call every `360` minutes, or `4` calls per
-  enabled site per day. The current package costs `16000` credits per call.
+- Meteoblue: one multimodel package call at each of four set site times: the
+  scoring round (`00:10` by default), then `09:10`, `12:10` and `21:10`, or `4`
+  calls per enabled site per day. The times are set in the code. The feed's
+  interval no longer moves these calls; it still decides when the feed reads as
+  stale and how long a failed call waits before retrying. The current package
+  costs `16000` credits per call.
 
 The run a forward Open-Meteo forecast is labelled with, and the time it is
 recorded as issued, are estimated from the time of the fetch: the add-on

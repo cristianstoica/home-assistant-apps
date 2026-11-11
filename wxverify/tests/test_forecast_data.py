@@ -323,6 +323,60 @@ def test_stale_boundary_one_second_past_2x_interval_flips_to_stale() -> None:
     )
 
 
+def test_meteoblue_multimodel_feed_seed_fetch_interval_is_360() -> None:
+    """Pin: the seeded ``meteoblue``/``multimodel`` row in ``FEED_SEEDS``
+    keeps its ``fetch_interval_minutes`` at 360 -- the package's set call
+    times do not depend on this value, but its own freshness boundary
+    and retry floor still do, and this release does not change it."""
+    from wxverify import config
+
+    seed = next(
+        s
+        for s in config.FEED_SEEDS
+        if s.source == "meteoblue" and s.model == "multimodel"
+    )
+    assert seed.fetch_interval_minutes == 360, (
+        f"at this assertion: correct = 360, got = {seed.fetch_interval_minutes}"
+    )
+
+
+def test_meteoblue_package_fresh_across_the_autumn_gap_stale_past_12h() -> None:
+    """A subscribed member feed of the package (``meteoblue``/
+    ``multimodel``, the seeded 360-minute interval, a 12-hour 2x boundary),
+    judged on the package's own stamp (its evidence feed) rather than its
+    own. Aged 9 and 10 hours -- the longest gap an autumn clock-change
+    day's three set slots can leave between calls -- the member (riding
+    the package's cadence) stays fresh; at the 12-hour boundary itself
+    still fresh; one second past it, stale."""
+    conn = _make_db()
+    package_id = _feed_id(conn, "meteoblue", "multimodel")
+    member_id = _insert_meteoblue_member(conn, "member_feed")
+    stamp = datetime(2026, 7, 10, 0, 0, tzinfo=UTC)
+    _insert_sample(
+        conn,
+        feed_id=member_id,
+        variable="temperature",
+        issued_at=isoformat_utc(stamp),
+        valid_at="2026-07-11T00:00:00Z",
+        value=10.0,
+    )
+    _stamp_usable_fetch(conn, feed_id=package_id, at=isoformat_utc(stamp))
+
+    for hours, seconds, expected in (
+        (9, 0, "fresh"),
+        (10, 0, "fresh"),
+        (12, 0, "fresh"),
+        (12, 1, "stale"),
+    ):
+        now = stamp + timedelta(hours=hours, seconds=seconds)
+        freshness = load_feed_freshness(conn, site_id=1, now=now)
+        assert freshness[member_id].fetch_state == expected, (
+            f"at this assertion ({hours}h{seconds}s): correct = {expected!r}"
+            " (member, via the package's own evidence), got ="
+            f" {freshness[member_id].fetch_state!r}"
+        )
+
+
 def test_freshness_excludes_virtual_feed_includes_member_feed() -> None:
     conn = _make_db()
     now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)

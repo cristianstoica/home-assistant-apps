@@ -2,9 +2,10 @@
 
 Each line says when the reply came back, the model's run time, the
 provider's own update time for the run when the reply has one, the latest
-run stored for the model before this reply is saved, and whether the run
-is new. The lines are built only from those fields and the site's integer
-id, so no key, address, location or reply text can appear in them.
+run stored for the model before this reply is saved, whether the run is
+new, and the call's site time. The lines are built only from those fields
+and the site's integer id, so no key, address, location or reply text can
+appear in them.
 """
 
 from __future__ import annotations
@@ -15,9 +16,11 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Final
+from zoneinfo import ZoneInfo
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.connection import Database
+from wxverify.db.site_days import day_for_instant
 from wxverify.feeds.seam import ModelRun
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,7 @@ def run_lines(
     *,
     source: str,
     call_at: str,
+    call_local: str,
     site_id: int,
     runs: Sequence[ModelRun],
     stored: Mapping[str, str | None] | None,
@@ -55,7 +59,8 @@ def run_lines(
     stored id is not ``<model>:`` plus a parseable UTC stamp. ``new`` is
     ``yes`` when the run is later than ``prev``, ``no`` when it is the same
     or earlier, and ``unknown`` when ``prev`` is ``none`` or ``unread``;
-    the two are compared as instants, not as text.
+    the two are compared as instants, not as text. ``call_local`` is written
+    as given, last on the line, as ``local``.
     """
     lines: list[str] = []
     for run in runs:
@@ -70,7 +75,7 @@ def run_lines(
         lines.append(
             f"{source} run: call={call_at} site={site_id}"
             f" model={_model_token(run.model)} run={run.run_at}"
-            f" updated={run.updated} prev={prev} new={new}"
+            f" updated={run.updated} prev={prev} new={new} local={call_local}"
         )
     return lines
 
@@ -87,8 +92,10 @@ async def log_model_runs(
 
     Reads the latest stored run of each feed of ``source`` at ``site_id``
     first. A failed read logs one WARNING and the lines go on with every
-    ``prev`` ``unread``; any other failure logs one WARNING and writes no
-    line. Only the exception's type name is logged.
+    ``prev`` ``unread``. The call's site time is a read of its own: if it
+    fails, one WARNING and the lines go on with ``local`` ``unread``. Any
+    other failure logs one WARNING and writes no line. Only the exception's
+    type name is logged.
     """
     try:
         stored: dict[str, str | None] | None
@@ -101,8 +108,23 @@ async def log_model_runs(
                 "%s run log: stored runs not read (%s)", source, type(exc).__name__
             )
             stored = None
+        call_local: str
+        try:
+            call_local = await db.read(
+                lambda conn: _local_stamp(conn, site_id=site_id, call_at=call_at)
+            )
+        except Exception as exc:
+            logger.warning(
+                "%s run log: site time not read (%s)", source, type(exc).__name__
+            )
+            call_local = "unread"
         for line in run_lines(
-            source=source, call_at=call_at, site_id=site_id, runs=runs, stored=stored
+            source=source,
+            call_at=call_at,
+            call_local=call_local,
+            site_id=site_id,
+            runs=runs,
+            stored=stored,
         ):
             logger.info("%s", line)
     except Exception as exc:
@@ -116,6 +138,27 @@ def _stored_runs(
     ``source``. Read-only."""
     rows = conn.execute(STORED_RUNS_SQL, (site_id, source)).fetchall()
     return {str(row[0]): None if row[1] is None else str(row[1]) for row in rows}
+
+
+def _local_stamp(conn: sqlite3.Connection, *, site_id: int, call_at: str) -> str:
+    """``call_at`` as the site's wall time, in whole seconds. Read-only.
+
+    The zone is that of the stored day holding the call, else
+    ``sites.timezone``. A site that does not exist gives ``unread``; a zone
+    that does not load raises.
+    """
+    record = day_for_instant(conn, site_id, call_at)
+    if record is not None:
+        zone = record.timezone
+    else:
+        row = conn.execute(
+            "SELECT timezone FROM sites WHERE id = ?", (site_id,)
+        ).fetchone()
+        if row is None:
+            return "unread"
+        zone = str(row[0])
+    local = parse_utc(call_at).astimezone(ZoneInfo(zone)).replace(tzinfo=None)
+    return local.isoformat(timespec="seconds")
 
 
 def _previous_run(

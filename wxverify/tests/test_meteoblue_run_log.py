@@ -82,6 +82,7 @@ def test_run_lines_prev_new_updated_and_model_name_tokens() -> None:
     lines = run_lines(
         source="meteoblue",
         call_at="2030-06-01T00:00:00Z",
+        call_local="2030-06-01T00:00:00",
         site_id=7,
         runs=runs,
         stored=stored,
@@ -90,21 +91,25 @@ def test_run_lines_prev_new_updated_and_model_name_tokens() -> None:
     assert lines == [
         "meteoblue run: call=2030-06-01T00:00:00Z site=7 model=LATER"
         " run=2030-06-02T00:00:00Z updated=2030-06-02T05:00:00Z"
-        " prev=2030-06-01T00:00:00Z new=yes",
+        " prev=2030-06-01T00:00:00Z new=yes local=2030-06-01T00:00:00",
         "meteoblue run: call=2030-06-01T00:00:00Z site=7 model=EQUAL"
         " run=2030-06-01T00:00:00Z updated=none"
-        " prev=2030-06-01T00:00:00Z new=no",
+        " prev=2030-06-01T00:00:00Z new=no local=2030-06-01T00:00:00",
         "meteoblue run: call=2030-06-01T00:00:00Z site=7 model=EARLIER"
         " run=2030-05-01T00:00:00Z updated=unreadable-array"
-        " prev=2030-06-01T00:00:00Z new=no",
+        " prev=2030-06-01T00:00:00Z new=no local=2030-06-01T00:00:00",
         "meteoblue run: call=2030-06-01T00:00:00Z site=7 model=ABSENT"
-        " run=2030-06-01T00:00:00Z updated=none prev=none new=unknown",
+        " run=2030-06-01T00:00:00Z updated=none prev=none new=unknown"
+        " local=2030-06-01T00:00:00",
         "meteoblue run: call=2030-06-01T00:00:00Z site=7 model=PRUNED"
-        " run=2030-06-01T00:00:00Z updated=none prev=none new=unknown",
+        " run=2030-06-01T00:00:00Z updated=none prev=none new=unknown"
+        " local=2030-06-01T00:00:00",
         "meteoblue run: call=2030-06-01T00:00:00Z site=7 model=GARBLED"
-        " run=2030-06-01T00:00:00Z updated=none prev=unread new=unknown",
+        " run=2030-06-01T00:00:00Z updated=none prev=unread new=unknown"
+        " local=2030-06-01T00:00:00",
         "meteoblue run: call=2030-06-01T00:00:00Z site=7 model=bad_name_"
-        " run=2030-06-01T00:00:00Z updated=none prev=none new=unknown",
+        " run=2030-06-01T00:00:00Z updated=none prev=none new=unknown"
+        " local=2030-06-01T00:00:00",
     ]
 
 
@@ -124,6 +129,7 @@ def test_run_lines_stored_read_failure_marks_every_prev_unread() -> None:
     lines = run_lines(
         source="meteoblue",
         call_at="2030-06-01T00:00:00Z",
+        call_local="2030-06-01T00:00:00",
         site_id=7,
         runs=runs,
         stored=None,
@@ -131,10 +137,11 @@ def test_run_lines_stored_read_failure_marks_every_prev_unread() -> None:
 
     assert lines == [
         "meteoblue run: call=2030-06-01T00:00:00Z site=7 model=X"
-        " run=2030-06-01T00:00:00Z updated=none prev=unread new=unknown",
+        " run=2030-06-01T00:00:00Z updated=none prev=unread new=unknown"
+        " local=2030-06-01T00:00:00",
         "meteoblue run: call=2030-06-01T00:00:00Z site=7 model=Y"
         " run=2030-06-02T00:00:00Z updated=2030-06-02T01:00:00Z"
-        " prev=unread new=unknown",
+        " prev=unread new=unknown local=2030-06-01T00:00:00",
     ]
 
 
@@ -404,9 +411,11 @@ def test_fetch_feed_once_meteoblue_reply_logs_one_line_per_model(
     messages = [r.getMessage() for r in records]
     assert messages == [
         f"meteoblue run: call={_CALL_AT_STR} site={site_id} model=MODEL_A"
-        f" run={r1} updated=none prev={r0} new=yes",
+        f" run={r1} updated=none prev={r0} new=yes"
+        " local=2030-06-10T12:00:00",
         f"meteoblue run: call={_CALL_AT_STR} site={site_id} model=MODEL_B"
-        f" run={r1} updated=none prev=none new=unknown",
+        f" run={r1} updated=none prev=none new=unknown"
+        " local=2030-06-10T12:00:00",
     ]
     for message in messages:
         assert "test-key" not in message
@@ -422,9 +431,9 @@ def test_fetch_feed_once_meteoblue_reply_logs_one_line_per_model(
     repeat_messages = [r.getMessage() for r in _run_log_records(caplog)]
     assert repeat_messages == [
         f"meteoblue run: call={_CALL_AT_STR} site={site_id} model=MODEL_A"
-        f" run={r1} updated=none prev={r1} new=no",
+        f" run={r1} updated=none prev={r1} new=no local=2030-06-10T12:00:00",
         f"meteoblue run: call={_CALL_AT_STR} site={site_id} model=MODEL_B"
-        f" run={r1} updated=none prev={r1} new=no",
+        f" run={r1} updated=none prev={r1} new=no local=2030-06-10T12:00:00",
     ]
 
 
@@ -470,9 +479,11 @@ def test_fetch_feed_once_meteoblue_stored_read_failure_is_contained(
     ]
     assert [r.getMessage() for r in infos] == [
         f"meteoblue run: call={_CALL_AT_STR} site={site_id} model=MODEL_A"
-        " run=2030-06-05T00:00:00Z updated=none prev=unread new=unknown",
+        " run=2030-06-05T00:00:00Z updated=none prev=unread new=unknown"
+        " local=2030-06-10T12:00:00",
         f"meteoblue run: call={_CALL_AT_STR} site={site_id} model=MODEL_B"
-        " run=2030-06-05T00:00:00Z updated=none prev=unread new=unknown",
+        " run=2030-06-05T00:00:00Z updated=none prev=unread new=unknown"
+        " local=2030-06-10T12:00:00",
     ]
 
 
@@ -524,3 +535,90 @@ def test_fetch_feed_once_meteoblue_run_log_write_failure_is_contained(
         (site_id, feed_id),
     ).fetchone()
     assert download["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# New -- the line's ``local`` field (0.16.20 plan's meteoblue-times release)
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_feed_once_meteoblue_run_log_local_time_for_a_fixed_offset_zone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """New: a site on the fixed +14 offset zone ``tests/test_round_
+    schedule.py`` uses for its RS7 case (``Etc/GMT-14``). At
+    ``_CALL_AT_STR`` (2030-06-10T12:00:00Z), the line's ``local`` field
+    reads 2030-06-11T02:00:00 -- the same instant 14 hours ahead.
+    """
+    monkeypatch.setattr("wxverify.core.timeutil.utc_now", lambda: _CALL_AT_DT)
+    conn = _init_tmp_db(tmp_path)
+    site_id = int(
+        conn.execute(
+            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+            " timezone) VALUES ('Testsite', 0.0, 0.0, 0.0, 'Etc/GMT-14')"
+        ).lastrowid
+    )
+    feed_id = _meteoblue_package_feed_id(conn)
+    _subscribe(conn, site_id, feed_id)
+    db = get_db()
+
+    caplog.set_level(logging.INFO, logger=_RUN_LOG_LOGGER)
+    caplog.clear()
+    outcome, _ = _fetch_once(
+        db, site_id, feed_id, _mb_reply_payload("2030-06-05 00:00", "2030-06-05 01:00")
+    )
+    assert outcome == FetchFeedSuccess(inserted=2, usable=2)
+
+    messages = [r.getMessage() for r in _run_log_records(caplog)]
+    assert messages == [
+        f"meteoblue run: call={_CALL_AT_STR} site={site_id} model=MODEL_A"
+        " run=2030-06-05T00:00:00Z updated=none prev=none new=unknown"
+        " local=2030-06-11T02:00:00",
+        f"meteoblue run: call={_CALL_AT_STR} site={site_id} model=MODEL_B"
+        " run=2030-06-05T00:00:00Z updated=none prev=none new=unknown"
+        " local=2030-06-11T02:00:00",
+    ]
+
+
+def test_fetch_feed_once_meteoblue_run_log_unreadable_zone_falls_back_to_unread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """New: a site whose stored ``timezone`` does not load -- ``local``
+    reads ``unread``, the usual lines are still written, and there is
+    exactly one WARNING naming the failure's type. Paired with the
+    positive case above: that one shows ``local`` resolving to a real
+    offset when the zone loads, so this one is not a blanket default.
+    """
+    monkeypatch.setattr("wxverify.core.timeutil.utc_now", lambda: _CALL_AT_DT)
+    conn = _init_tmp_db(tmp_path)
+    site_id = int(
+        conn.execute(
+            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+            " timezone) VALUES ('Testsite', 0.0, 0.0, 0.0, 'Not/AZone')"
+        ).lastrowid
+    )
+    feed_id = _meteoblue_package_feed_id(conn)
+    _subscribe(conn, site_id, feed_id)
+    db = get_db()
+
+    caplog.set_level(logging.INFO, logger=_RUN_LOG_LOGGER)
+    caplog.clear()
+    outcome, _ = _fetch_once(
+        db, site_id, feed_id, _mb_reply_payload("2030-06-05 00:00", "2030-06-05 01:00")
+    )
+    assert outcome == FetchFeedSuccess(inserted=2, usable=2)
+
+    records = _run_log_records(caplog)
+    warnings = [r for r in records if r.levelno == logging.WARNING]
+    infos = [r for r in records if r.levelno == logging.INFO]
+    assert [r.getMessage() for r in warnings] == [
+        "meteoblue run log: site time not read (ZoneInfoNotFoundError)"
+    ]
+    assert [r.getMessage() for r in infos] == [
+        f"meteoblue run: call={_CALL_AT_STR} site={site_id} model=MODEL_A"
+        " run=2030-06-05T00:00:00Z updated=none prev=none new=unknown"
+        " local=unread",
+        f"meteoblue run: call={_CALL_AT_STR} site={site_id} model=MODEL_B"
+        " run=2030-06-05T00:00:00Z updated=none prev=none new=unknown"
+        " local=unread",
+    ]
