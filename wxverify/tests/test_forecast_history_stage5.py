@@ -1,21 +1,9 @@
-"""``forecast_history`` (storage-release plan 2026-11-02-storage-release.md,
-3.1) and stage 5's use of it (3.3, 3.6; W3, plan line 290).
+"""``forecast_history`` and stage 5's use of it.
 
-Written before the table and stage 5's rewrite exist. Test 1 fails at its
-own ``PRAGMA table_xinfo('forecast_history')`` returning no rows (the table
-is absent); tests 2-4 fail inside ``score_day`` itself, which still writes
-``close_pairs`` and has never heard of ``forecast_history`` (a bare
-``sqlite3.OperationalError: no such table: forecast_history`` the moment the
-new SELECT this suite issues runs, or simply an always-empty result because
-stage 5 never wrote a row there); test 5 fails at its own
-``from wxverify.scoring.close_scores import _DELETE_FORECAST_HISTORY_SQL``
-with ``ImportError`` -- the name does not exist yet. These are the failures
-Step 3 accepts.
-
-Names this suite depends on, for the builder:
+Names this suite depends on:
 
 * a table ``forecast_history`` in ``create_tables``
-  (``wxverify/db/migrations.py``), exactly as plan 3.1 gives it: columns
+  (``wxverify/db/migrations.py``): columns
   ``site_id INTEGER NOT NULL``, ``feed_id INTEGER NOT NULL``,
   ``variable TEXT NOT NULL``, ``day_ahead INTEGER NOT NULL``,
   ``valid_at TEXT NOT NULL``, ``local_date TEXT NOT NULL``,
@@ -28,7 +16,7 @@ Names this suite depends on, for the builder:
   ``issued_at`` NULL and ``contributors`` set, no persistence rows.
 * a module-level SQL constant ``_DELETE_FORECAST_HISTORY_SQL`` in
   ``wxverify/scoring/close_scores.py``: the single parameterised retry-delete
-  statement of plan 3.6, taking seven positional parameters in order
+  statement, taking seven positional parameters in order
   ``(site_id, feed_id, variable, day_ahead, valid_at_lo, valid_at_hi,
   local_date)``, searching ``forecast_history`` by its primary key.
 
@@ -38,7 +26,7 @@ under test is mocked. Synthetic data only: feed sources
 ``synthetic-fh-x``/``synthetic-fh-y``, zone UTC, the shared ``D`` fixture
 date from ``tests.helpers``. Scored variable is temperature only (wind and
 rain truth rows are seeded ineligible, so ``scored_variables`` returns only
-``{"temperature"}``, 4.6/6.5) -- this keeps every expected row
+``{"temperature"}``) -- this keeps every expected row
 hand-computable from two plain functions (``_obs``, the ``_BIAS`` table)
 independent of ``close_scores``'s own pair-building helpers.
 """
@@ -152,7 +140,7 @@ def _seed_truth(
 ) -> None:
     """D's five ``daily_truth`` rows: temperature eligible and well covered
     (so ``scored_variables`` counts it), wind and rain explicitly
-    ineligible (so only temperature is scored -- 6.5)."""
+    ineligible (so only temperature is scored)."""
     start = f"{local_date.isoformat()}T00:00:00Z"
     end = isoformat_utc(
         datetime(local_date.year, local_date.month, local_date.day, tzinfo=UTC)
@@ -353,13 +341,13 @@ def _forecast_history_rows(
 
 
 # ---------------------------------------------------------------------------
-# Test 1: the table exists, with the plan's columns, primary key and
+# Test 1: the table exists, with the expected columns, primary key and
 # WITHOUT ROWID.
 # ---------------------------------------------------------------------------
 
 
-def test_forecast_history_table_matches_the_plan() -> None:
-    """``forecast_history`` (plan 3.1): exact column set, NOT NULL flags,
+def test_forecast_history_table_columns_and_key() -> None:
+    """``forecast_history``: exact column set, NOT NULL flags,
     primary key order, and WITHOUT ROWID."""
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -415,7 +403,7 @@ def test_stage5_writes_forecast_history_real_feeds_and_mean_no_persistence() -> 
     """``score_day`` writes ``forecast_history`` rows equal to the
     hand-built expected set: X and Y's real-feed rows, the mean's rows
     (``issued_at`` NULL, ``contributors`` 2), and no persistence rows even
-    though the persistence yardstick feed is considered at D (3.3)."""
+    though the persistence yardstick feed is considered at D."""
     from wxverify.scoring.close_scores import score_day
 
     conn = asof_conn()
@@ -437,7 +425,7 @@ def test_stage5_writes_forecast_history_real_feeds_and_mean_no_persistence() -> 
     assert feeds["X"] in feed_ids_present and feeds["Y"] in feed_ids_present
     assert mean_feed_id in feed_ids_present
     assert persistence_feed_id not in feed_ids_present, (
-        "forecast_history must hold no persistence rows (plan 3.3), but"
+        "forecast_history must hold no persistence rows, but"
         f" feed {persistence_feed_id} (persistence) appears: {actual}"
     )
 
@@ -451,7 +439,7 @@ def test_stage5_writes_forecast_history_real_feeds_and_mean_no_persistence() -> 
 
 
 # ---------------------------------------------------------------------------
-# Test 3: a retry replaces the day's rows exactly (3.6 delete).
+# Test 3: a retry replaces the day's rows exactly.
 # ---------------------------------------------------------------------------
 
 
@@ -535,7 +523,7 @@ def test_stage5_retry_does_not_touch_a_neighbouring_days_rows() -> None:
     compare byte-for-byte before and after D's retry.
 
     The retry delete widens D's ``valid_at`` bounds by one day each side
-    (3.6) and relies on ``AND local_date = ?`` to keep the match to D itself
+    and relies on ``AND local_date = ?`` to keep the match to D itself
     -- a delete missing that clause would still match nothing outside
     [D-1, D+1]. D-1 and D+1 are INSIDE that widened window (D-1's own
     ``valid_at`` sits exactly at the window's low bound, D+1's at its high

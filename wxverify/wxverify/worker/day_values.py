@@ -1,7 +1,7 @@
 """The close's day values: the gap check, the gap fill and the hourly rows.
 
-The functions P3's close calls for one site-day (plan 7.5, 7.7, 12.1), and
-the read P5's provisional line shares with it (12.2):
+The functions the close calls for one site-day, and the read the provisional
+line shares with it:
 
 - ``gap_plan`` (read-only): each listed station's gap hours, no-pair hours
   and the hours the gap fill should ask for.
@@ -12,9 +12,9 @@ the read P5's provisional line shares with it (12.2):
 - ``write_hourly_values`` (in the caller's transaction): the day's station
   rows, exactly the method's, and their consensus hours.
 - ``day_presence`` (read-only): what each station delivered all day, for
-  P3's nightly gap-fill pause.
+  the close's nightly gap-fill pause.
 
-The day's hours, bounds and station list are P1's record for the site-day.
+The day's hours, bounds and station list are those of the site-day's record.
 None of these functions enqueues a job; writers read the clock only through
 their ``now_utc`` argument.
 """
@@ -83,7 +83,7 @@ from wxverify.worker.station_pacing import pace_station_call, weathercom_call_lo
 
 logger = logging.getLogger(__name__)
 
-#: The outcomes of one station's gap fill (plan 4.5, 12.1).
+#: The outcomes of one station's gap fill.
 FillOutcome = Literal[
     "nothing_to_fill",
     "filled",
@@ -101,7 +101,7 @@ _SOURCES: Final[dict[str, Source]] = {
     "hourly": "hourly",
 }
 #: The raw readings read before the day's start: the hour whose source order
-#: picks the wind lookback readings (plan 8.1).
+#: picks the wind lookback readings.
 _LOOKBACK: Final = timedelta(hours=1)
 
 
@@ -110,7 +110,7 @@ _LOOKBACK: Final = timedelta(hours=1)
 
 @dataclass(frozen=True)
 class GapPlan:
-    """One station's gap check for a site-day (plan 7.5).
+    """One station's gap check for a site-day.
 
     ``gap_hours`` have no ``five_minute`` and no ``current_obs`` reading;
     ``no_pair_hours`` have readings but no wind pair; ``to_fill`` are the gap
@@ -126,14 +126,14 @@ class GapPlan:
 
 @dataclass(frozen=True)
 class StationFill:
-    """One station's gap-fill result (plan 4.5, 12.1).
+    """One station's gap-fill result.
 
     ``hours_filled`` holds, per quantity, the ``to_fill`` hours this call
     stored an hourly reading of that quantity for; ``hours_left`` the hours
     still to fill after it. ``next_allowed_at`` is when a held or deferred
     try may call again, None when no hold or back-off is known.
     ``readings_kept`` and ``readings_refused`` are the store's own counts for
-    this call's readings, 0 when nothing was stored (plan 11.2).
+    this call's readings, 0 when nothing was stored.
     """
 
     outcome: FillOutcome
@@ -156,7 +156,7 @@ class GapFillResult:
 
 @dataclass(frozen=True)
 class StationDayValues:
-    """One station's hourly values for a site-day, wind in m/s (plan 12.1).
+    """One station's hourly values for a site-day, wind in m/s.
 
     ``latest_reading_at`` is the latest raw reading inside ``hours``, of any
     source, None when there is none.
@@ -177,7 +177,7 @@ class SiteDayValues:
 
 @dataclass(frozen=True)
 class WriteResult:
-    """``write_hourly_values``' result (plan 7.7).
+    """``write_hourly_values``' result.
 
     ``rows_written`` counts station rows added or changed, ``rows_removed``
     the station rows removed at hours without a value, and
@@ -192,7 +192,7 @@ class WriteResult:
 
 @dataclass(frozen=True)
 class StationPresence:
-    """What one station delivered on a site-day (plan 12.1).
+    """What one station delivered on a site-day.
 
     ``readings`` counts the raw readings inside the day per source, every
     source a key; ``answered`` is whether any 5-minute try of the day was
@@ -286,7 +286,7 @@ def _station_day(
     """The station's hourly values for the record's day, and the readings.
 
     The readings run from an hour before the day's start, for the wind
-    lookback (plan 8.1), to the day's end.
+    lookback, to the day's end.
     """
     readings = _station_readings(
         conn,
@@ -308,7 +308,7 @@ def _to_fill(
     hours: StationHours, readings: list[StationReading]
 ) -> tuple[datetime, ...]:
     """The gap hours with no hourly reading and the no-pair hours with no
-    hourly wind (plan 7.5), in time order."""
+    hourly wind, in time order."""
     hourly = {floor_hour(r.obs_at) for r in readings if r.source == "hourly"}
     hourly_wind = {
         floor_hour(r.obs_at)
@@ -326,9 +326,9 @@ def _to_fill(
 def gap_plan(
     conn: sqlite3.Connection, *, site_id: int, local_date: date
 ) -> dict[int, GapPlan]:
-    """Each listed station's gap check for the site-day (plan 7.5, 12.1).
+    """Each listed station's gap check for the site-day.
 
-    One entry per station on P1's day station list; empty when the site-day
+    One entry per station on the day's station list; empty when the site-day
     has no record. Read-only.
     """
     record = day_record(conn, site_id, local_date)
@@ -381,7 +381,7 @@ def _no_hours() -> dict[Quantity, tuple[datetime, ...]]:
 def _day_refusal(
     conn: sqlite3.Connection, site_id: int, local_date: date, now_utc: datetime
 ) -> str | None:
-    """None when P1's guard takes a gap-fill write to the day, else why not."""
+    """None when the closed-day guard takes the day's gap-fill write, else why not."""
     if check_date_write(conn, site_id, local_date, WriteKind.GAP_FILL, now_utc=now_utc):
         return None
     record = day_record(conn, site_id, local_date)
@@ -396,11 +396,12 @@ def _reserve_fill_call(
     station_id: int,
     now_utc: datetime,
 ) -> _Reserved | _Declined:
-    """Check and reserve one hourly call for a station, in one write (7.5).
+    """Check and reserve one hourly call for a station, in one write.
 
-    In order: P1's guard for a gap-fill write to the day, the station's place
-    on the day's list, the domain back-off, the ``hourly`` hold and the
-    budget. A refusal returns before the budget, so it spends nothing.
+    In order: the closed-day guard for a gap-fill write to the day, the
+    station's place on the day's list, the domain back-off, the ``hourly``
+    hold and the budget. A refusal returns before the budget, so it spends
+    nothing.
     """
     refusal = _day_refusal(conn, site_id, local_date, now_utc)
     if refusal is not None:
@@ -435,7 +436,7 @@ def _reserve_fill_call(
 
 
 def _stored_detail(result: StoreResult) -> str:
-    """The detail of a try that stored readings (plan 4.5)."""
+    """The detail of a try that stored readings."""
     per = result.kept_by_quantity
     return (
         f"temperature={per['temperature']} precip={per['precip']}"
@@ -502,7 +503,7 @@ class _Fill:
             self._client = None
 
     async def station(self, plan: GapPlan) -> StationFill:
-        """Reserve, call and store one station's hourly download (7.5)."""
+        """Reserve, call and store one station's hourly download."""
         key = self.key()
         await pace_station_call(self.site_id, plan.station_id, self.calls)
         record = self.record
@@ -590,7 +591,7 @@ class _Fill:
         response: httpx.Response,
         left: tuple[datetime, ...],
     ) -> StationFill:
-        """A non-2xx reply: 401/403 hold ``hourly``, 429/5xx back off (4.5)."""
+        """A non-2xx reply: 401/403 hold ``hourly``, 429/5xx back off."""
         status = response.status_code
         detail = f"http {status}"
         if status in (401, 403):
@@ -636,7 +637,7 @@ class _Fill:
         plan: GapPlan,
         payload: dict[str, object],
     ) -> StationFill:
-        """Store a 2xx reply's readings of the hours to fill (7.5, 6.4).
+        """Store a 2xx reply's readings of the hours to fill.
 
         One write clears the ``hourly`` hold, stores the readings whose hour
         is in ``to_fill`` and inside the day, and recomputes the station's
@@ -702,18 +703,18 @@ async def fill_gaps(
     now_utc: datetime,
     skip_station_ids: frozenset[int] = frozenset(),
 ) -> GapFillResult:
-    """Fill the site-day's gaps from the hourly download (plan 7.5, 12.1).
+    """Fill the site-day's gaps from the hourly download.
 
     Before the day's end, or with no record for the site-day, returns
     ``ended`` False and calls nothing. Otherwise the gap check is recomputed,
-    so a station already filled is not called again. When P1's guard takes
-    no gap-fill write to the day, every listed station is ``refused``. Else,
-    in station order: a station in ``skip_station_ids`` is ``skipped`` with
-    no call, no reservation and no write; one with nothing to fill is
-    ``nothing_to_fill``; any other gets at most one call, paced, under the
-    shared call lock, after a reservation write that checks the guard, the
-    day's list, the domain back-off, the ``hourly`` hold and the budget.
-    Never raises for a provider outcome; a database error or a bug
+    so a station already filled is not called again. When the closed-day
+    guard takes no gap-fill write to the day, every listed station is
+    ``refused``. Else, in station order: a station in ``skip_station_ids`` is
+    ``skipped`` with no call, no reservation and no write; one with nothing
+    to fill is ``nothing_to_fill``; any other gets at most one call, paced,
+    under the shared call lock, after a reservation write that checks the
+    guard, the day's list, the domain back-off, the ``hourly`` hold and the
+    budget. Never raises for a provider outcome; a database error or a bug
     propagates.
     """
     record = await db.read(lambda conn: day_record(conn, site_id, local_date))
@@ -793,7 +794,7 @@ def hourly_values(
     local_date: date,
     through_utc: datetime | None = None,
 ) -> SiteDayValues:
-    """The site-day's hourly values per listed station (plan 7.1-7.4, 12.1).
+    """The site-day's hourly values per listed station.
 
     The method of ``obs/hourly_values.py`` over the raw table, with wind in
     m/s. With ``through_utc`` only the hours that start before it are
@@ -834,12 +835,12 @@ def hourly_values(
 
 
 def _rounded(value: float) -> str:
-    """``value`` to 2 decimals as ``source_raw`` shows it (plan 7.7)."""
+    """``value`` to 2 decimals as ``source_raw`` shows it."""
     return str(round(value, 2) + 0.0)
 
 
 def _source_raw(quantity: Quantity, value: HourValue) -> str:
-    """The row's ``source_raw``: the method, the value and its source (7.7)."""
+    """The row's ``source_raw``: the method, the value and its source."""
     text = _rounded(value.value)
     if quantity == "temperature":
         return f"hour-mean {text} C n={value.readings} src={value.source}"
@@ -865,9 +866,9 @@ def write_hourly_values(
     local_date: date,
     now_utc: datetime,
 ) -> WriteResult:
-    """Write the site-day's station rows from its raw readings (plan 7.7).
+    """Write the site-day's station rows from its raw readings.
 
-    Returns ``refused`` and writes nothing when P1's guard takes no hourly
+    Returns ``refused`` and writes nothing when the closed-day guard takes no hourly
     write to the day, or the site-day has no record. Otherwise, per listed
     station: the station's rows of the day (temperature, rain and wind) at
     hours where the method has no value are removed first, then each value
@@ -974,9 +975,9 @@ def write_hourly_values(
 def day_presence(
     conn: sqlite3.Connection, *, site_id: int, local_date: date
 ) -> dict[int, StationPresence]:
-    """What each listed station delivered on the site-day (plan 12.1).
+    """What each listed station delivered on the site-day.
 
-    One entry per station on P1's day station list: the raw readings inside
+    One entry per station on the day's station list: the raw readings inside
     the day per source (0 for every source once retention has removed
     them), whether a 5-minute try of the day was answered (the day row's
     ``last_ok_at`` is set) and the day row's ``refused_at``. Read-only.

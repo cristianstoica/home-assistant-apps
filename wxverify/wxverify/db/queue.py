@@ -259,23 +259,21 @@ _CURRENT_OBS_LANE_CLAUSE: Final = "AND +type = 'fetch_current_obs'"
 CHAIN_PROMOTION_AGE: Final = timedelta(minutes=5)
 
 #: The resumable chain types: the claim's tier-2 rule and the reclaim stamp.
-#: Empty since the nightly replay was retired (switch-over plan R12; the
-#: time-zone rebuild went with R14), so both match no row. SQLite accepts an
-#: empty IN list.
+#: Empty since the nightly replay and the time-zone rebuild were retired, so
+#: both match no row. SQLite accepts an empty IN list.
 _CHAIN_TYPES_SQL: Final = "()"
 
-# Tier 0 also holds the wind lane's job (``fetch_obs`` keyed ``wind-days``,
-# daily-close P2 4.6), so an evening slot is claimed before any waiting
-# tier-1 job. The key is written out: worker/wind_days.py (its
-# WIND_DAYS_JOB_KEY) imports this module, so this module cannot import it.
-# The daily close's two kinds, ``day_close`` and ``day_publish`` (daily-close
-# P3 4.3), are tier 0 too, written out because worker/close_chain.py imports
-# this module. They are not chain types, so they never drop to tier 2 and
-# reclaim_all_stale leaves their next_attempt_at alone.
-# The scored round's tries (``fetch_feed`` keyed ``round:{feed_id}``,
-# daily-close P4 4.4) are tier 0 as well, so a quick retry is not queued
-# behind the night's other work; worker/round.py enqueues them and imports
-# this module.
+# Tier 0 also holds the wind lane's job (``fetch_obs`` keyed ``wind-days``),
+# so an evening slot is claimed before any waiting tier-1 job. The key is
+# written out: worker/wind_days.py (its WIND_DAYS_JOB_KEY) imports this
+# module, so this module cannot import it.
+# The daily close's two kinds, ``day_close`` and ``day_publish``, are tier 0
+# too, written out because worker/close_chain.py imports this module. They
+# are not chain types, so they never drop to tier 2 and reclaim_all_stale
+# leaves their next_attempt_at alone.
+# The scored round's tries (``fetch_feed`` keyed ``round:{feed_id}``) are
+# tier 0 as well, so a quick retry is not queued behind the night's other
+# work; worker/round.py enqueues them and imports this module.
 _CLAIM_ORDER_BY: Final = f"""
     ORDER BY
         CASE
@@ -317,7 +315,7 @@ def _claim(conn: sqlite3.Connection, type_clause: str) -> Job | None:
     dispatcher.
 
     Ordering is a type-priority tier, then FIFO by ``created_at, id`` within
-    the tier (§14; the SQL is ``_CLAIM_ORDER_BY``). The daily close's
+    the tier (the SQL is ``_CLAIM_ORDER_BY``). The daily close's
     ``day_close`` / ``day_publish``, the wind lane's ``fetch_obs`` job keyed
     ``wind-days`` and the scored round's ``fetch_feed`` tries keyed
     ``round:{feed_id}`` (tier 0) still claim ahead of everything. A

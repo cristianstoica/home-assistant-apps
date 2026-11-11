@@ -1,6 +1,6 @@
 """Regression pin: meteoblue requests must send windspeed=kmh.
 
-Confirmed bug (systematic-debugging Phase 4): MeteoblueAdapter.fetch_forecast
+Confirmed bug:MeteoblueAdapter.fetch_forecast
 issues its GET to packages/multimodel-1h with no `windspeed` unit parameter.
 meteoblue's documented default unit for windspeed is m/s ("ms-1" in its own
 units block), but VARIABLE_MAP labels the wind variable "km/h" and

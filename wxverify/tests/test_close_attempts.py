@@ -1,22 +1,7 @@
-"""One attempt, one retry, missed days (plan 2026-10-21-daily-close-close-
-job.md section 15.5): AT1 to AT17.
+"""One attempt, one retry, missed days: AT1 to AT17.
 
-Written before ``close_chain.enqueue_due_close_work``, ``close_chain.
-fail_attempt``, ``close_chain.settle_interrupted_closes`` and ``close_p4``
-exist, and before ``verification.truth.write_close_truth`` exists. Every
-test here reaches a call that needs one of them -- either directly (an
-inline/top-level reference to a P3 name that is not there yet, raising
-``ModuleNotFoundError`` or ``AttributeError``) or through
-``tests.helpers.install_round_state_standin``/``install_p4_standins``, which
-patch an attribute of ``wxverify.worker.close_p4`` -- a module that does not
-exist yet. Where neither applies, the test instead fails on a plain
-assertion that needs P3's behaviour: ``scheduler_tick`` has no call to
-``enqueue_due_close_work`` at all until piece 4, so the moved-day, attempt
-or job-row check simply finds nothing moved, started or enqueued.
-
-Section 16.2 of the plan names the mutant each test ID kills; that mapping
-is given inline on the exact assertion it kills at, in
-``tests/test_close_timeline.py``'s own style.
+The mutant each test ID kills is named inline on the exact assertion it
+kills at, in ``tests/test_close_timeline.py``'s own style.
 
 Real SQLite only (``tests.helpers.standard_night``, built on
 ``tests.helpers.day_close_site``, real ``run_migrations`` via ``init_db``
@@ -69,8 +54,8 @@ BOUND = STANDARD_NIGHT_ROUND_BOUND
 @pytest.fixture(autouse=True)
 def _clear_close_chain_log_map() -> None:
     """This file's own autouse wiring of ``clear_close_chain_log_map``
-    (15.1's "The log map.") -- autouse HERE, inside this one P3 test file,
-    never across the whole suite."""
+    -- autouse HERE, inside this one close-chain test file, never across
+    the whole suite."""
     clear_close_chain_log_map()
 
 
@@ -145,11 +130,11 @@ def _trim_station_hours(conn, station_id: int, local_date, drop_hours) -> None: 
 
 
 def _fixed_fill_gaps(result: GapFillResult):  # type: ignore[no-untyped-def]
-    """An async stand-in for ``fill_gaps``, with its real signature (plan
-    §15.5 AT15's wording), that always returns ``result`` and never calls
-    or reserves anything -- patched at ``wxverify.worker.day_values.
-    fill_gaps``, the target ``tests/test_close_timeline.py``'s TL7 already
-    uses for ``close_chain``'s call to it."""
+    """An async stand-in for ``fill_gaps``, with its real signature, that
+    always returns ``result`` and never calls or reserves anything --
+    patched at ``wxverify.worker.day_values.fill_gaps``, the target
+    ``tests/test_close_timeline.py``'s TL7 already uses for
+    ``close_chain``'s call to it."""
 
     async def _standin(
         db,  # noqa: ANN001
@@ -171,16 +156,13 @@ def _fixed_fill_gaps(result: GapFillResult):  # type: ignore[no-untyped-def]
 
 
 def _patch_stage_fault(monkeypatch: pytest.MonkeyPatch, stage: int, p4: dict | None):  # type: ignore[no-untyped-def]
-    """Make stage ``stage`` raise unconditionally, by the plan §15.5 AT1
-    reading of "the stage raises": stage 2 through ``day_values.fill_gaps``
-    (module-qualified, as TL7 patches it); stage 3 through
-    ``day_values.write_hourly_values``; stage 4 through the not-yet-built
-    ``verification.truth.write_close_truth`` (``monkeypatch.setattr`` on a
-    missing attribute raises ``AttributeError`` at once -- an acceptable
-    present-day failure reason in its own right, since that name is P3's);
-    stage 5 through the ``score_day`` P4 stand-in (``p4`` must be the dict
+    """Make stage ``stage`` raise unconditionally: stage 2 through
+    ``day_values.fill_gaps`` (module-qualified, as TL7 patches it); stage 3
+    through ``day_values.write_hourly_values``; stage 4 through
+    ``verification.truth.write_close_truth``; stage 5 through the
+    ``score_day`` stand-in (``p4`` must be the dict
     :func:`tests.helpers.install_p4_standins` returned); stage 6 through
-    P1's own ``finish_close``.
+    ``finish_close``.
     """
     message = f"synthetic stage {stage} failure"
     if stage == 2:
@@ -222,7 +204,7 @@ def test_at1_each_stage_fails_the_attempt_once(
     R 00:45Z. D ``retry_due``, ``retry_at`` R 01:45Z, ``last_failure`` the
     sanitized message; the attempt record ``failed``, ``failed_stage`` k;
     no ``day_close`` job left ``pending``; the stage-log row of k
-    ``failed`` (9.1).
+    ``failed``.
 
     M21 -> at the "no pending day_close job" assertion below: correct =
     no row (the queue never retries a stage job itself, ``max_retries``
@@ -256,7 +238,7 @@ def test_at1_each_stage_fails_the_attempt_once(
         )
         assert record.last_failure is not None and (
             f"synthetic stage {stage} failure" in record.last_failure
-        ), "last_failure must carry the sanitized failure message (9.1)"
+        ), "last_failure must carry the sanitized failure message"
         attempt = await _attempt_row(db, site_id, 1)
         assert attempt is not None
         outcome, failed_stage = attempt["outcome"], attempt["failed_stage"]
@@ -282,8 +264,7 @@ def test_at1_each_stage_fails_the_attempt_once(
 
         rows = await _stage_log_rows(db, site_id, stage)
         assert rows and rows[-1][:2] == (1, "failed"), (
-            f"stage {stage}'s own stage-log row must be outcome='failed'"
-            " for attempt 1 (9.1)"
+            f"stage {stage}'s own stage-log row must be outcome='failed' for attempt 1"
         )
 
     asyncio.run(_run())
@@ -298,7 +279,7 @@ def _fail_hourly_values_once(monkeypatch: pytest.MonkeyPatch, message: str) -> N
     """``day_values.write_hourly_values`` raises on its first call only
     (attempt 1's stage 3), then runs the real function it replaced for
     every later call (attempt 2's retry must actually rebuild the day's
-    hourly rows, plan §5.4)."""
+    hourly rows)."""
     real = day_values.write_hourly_values
     calls = {"n": 0}
 
@@ -317,15 +298,11 @@ def test_at2_the_retry_runs_at_its_own_due_instant_and_closes(
     """AT2: AT1 for k = 3, then ticks to R 01:45Z. The retry starts at R
     01:45Z, not at 01:44Z; stages 2 to 6 run; D ``closed``, ``attempts``
     2; the stand-in ``score_day`` saw attempt 2 with the same truth
-    version stage 4 recorded for it (5.4).
+    version stage 4 recorded for it.
 
-    (Plan wording: "the stand-in score_day saw attempts 1 and 2 with the
-    same truth version." Attempt 1 fails at stage 3, before stage 5, so
-    it never calls score_day; read here as "the one call score_day sees
-    carries attempt 2, with the truth version stage 4 of THAT attempt
-    recorded for it" -- internal consistency between stage 4's write and
-    stage 5's call, not a comparison across two different calls. Flagged
-    as a plan-wording interpretation in the hand-back.)
+    Attempt 1 fails at stage 3, before stage 5, so it never calls
+    score_day; the one call score_day sees carries attempt 2, with the
+    truth version stage 4 of that attempt recorded for it.
 
     M23 -> at the 01:44Z assertion below: correct = ('retry_due', 1) (the
     retry has not fired a minute early), mutant M23 (``retry_at`` taken
@@ -381,7 +358,7 @@ def test_at2_the_retry_runs_at_its_own_due_instant_and_closes(
         assert calls[0].get("attempt") == 2, "score_day's one call must carry attempt 2"
         assert calls[0].get("truth_version") == attempt2["truth_version"], (
             "score_day must be handed the SAME truth version stage 4 of"
-            " attempt 2 recorded (5.4)"
+            " attempt 2 recorded"
         )
 
     asyncio.run(_run())
@@ -454,9 +431,8 @@ def test_at2_the_retry_does_not_re_check_the_round(
 def test_at3_both_attempts_failing_misses_the_day_and_runs_retention(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AT3: both attempts fail. D ``missed``, ``retry_failed``; P2's
-    ``prune_raw_readings`` called after it (8.4); no third ``begin_close``
-    (5.3).
+    """AT3: both attempts fail. D ``missed``, ``retry_failed``;
+    ``prune_raw_readings`` called after it; no third ``begin_close``.
 
     M25 -> at the retention-call assertion below: correct = the prune
     stub was called at least once after D moved to missed, mutant M25
@@ -527,7 +503,7 @@ def test_at3_both_attempts_failing_misses_the_day_and_runs_retention(
                 (site_id, D.isoformat()),
             ).fetchone()
         )
-        assert begin_count[0] == 2, "no third begin_close may ever run (5.3)"
+        assert begin_count[0] == 2, "no third begin_close may ever run"
 
     asyncio.run(_run())
 
@@ -542,7 +518,7 @@ def test_at4_a_day_that_fell_due_before_startup_is_never_attempted(
 ) -> None:
     """AT4: ``worker_started_at`` R 00:41Z (the add-on started after the
     bound). At the first tick D is ``missed``, ``never_attempted``; the
-    gap-fill transport saw no request (5.2, :123).
+    gap-fill transport saw no request.
 
     M26 -> at the state assertion below: correct = ('missed',
     'never_attempted') (the add-on was not running when the first
@@ -614,10 +590,9 @@ def test_at5_a_frozen_process_misses_a_day_closed_hours_late(
     """AT5: the process ran (``worker_started_at`` D 12:00Z) but the first
     tick after R 00:40Z is at (i) R 01:39Z (59 minutes late), (ii) R
     01:41Z (61 minutes late). (i) the attempt starts; (ii) D ``missed``,
-    ``never_attempted`` (5.2). Plan section 16.2's M27 names only these
-    two; this file adds a third case, exactly 60 minutes late (the
-    boundary the rule's own text puts inside: "no later than T plus
-    CLOSE_LATE_LIMIT"), to discriminate M28 on its own.
+    ``never_attempted``. A third case, exactly 60 minutes late (inside
+    the rule: "no later than T plus CLOSE_LATE_LIMIT"), discriminates M28
+    on its own.
 
     M27 -> at the 61-minute assertion below: correct = ('missed', 0,
     'never_attempted'), mutant M27 (the rule without the
@@ -664,8 +639,7 @@ def test_at6_a_retry_not_run_while_the_add_on_was_down_is_missed(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AT6: AT1 for k = 2, then ``worker_started_at`` R 02:00Z (down from
-    R 01:00Z to 02:00Z). At the first tick D ``missed``, ``retry_not_run``
-    (5.2).
+    R 01:00Z to 02:00Z). At the first tick D ``missed``, ``retry_not_run``.
 
     M26 -> at the state assertion below: correct = ('missed',
     'retry_not_run') (the add-on started at R 02:00Z, after the retry's
@@ -735,16 +709,16 @@ def test_at7_an_outage_spanning_several_nights_misses_each_in_date_order(
     """AT7: the add-on down from D - 1 22:00Z to D + 2 03:00Z, then
     started. D - 1, D and D + 1 moved to ``missed``, ``never_attempted``,
     in date order at the first tick; no gap-fill request for any of
-    them; D + 2 closes the next night as usual (5.2).
+    them; D + 2 closes the next night as usual.
 
     M29 -> at the per-day assertion below: correct = D - 1, D and D + 1
     are each read back ``missed``/``never_attempted`` after the one tick
     (processed oldest first, so each earlier day is already done by the
-    time ``mark_missed`` checks the next one, P1 §4.7's
+    time ``mark_missed`` checks the next one, the
     ``_has_earlier_undone`` guard), mutant M29 (missed days moved in
     reverse date order) = NONE of the three is moved: processing D + 1
     first calls ``mark_missed`` while D - 1 and D are still ``open``,
-    which P1's own guard refuses with ``DayStateError``, and 8.5's
+    which that guard refuses with ``DayStateError``, and the tick's
     per-site savepoint then rolls the whole site's step back for this
     tick, leaving all three ``open`` with one ERROR line logged instead.
     """
@@ -873,7 +847,7 @@ def test_at8_a_hold_or_refused_access_or_no_readings_does_not_fail_the_attempt(
     """AT8: the gap fill: (i) A ``held``, B ``filled``; (ii) A ``refused``
     (401), B ``held`` after it; (iii) A ``no_readings``. Each: no
     failure; D ``closed`` in attempt 1 with A's gap hours left empty,
-    values judged on coverage (5.3, 10.3).
+    values judged on coverage.
 
     M30 -> at the closed-state assertion below (case "held"): correct =
     ('closed', 1), mutant M30 (a ``held`` gap-fill station counted as a
@@ -945,7 +919,7 @@ def test_at9_a_technical_gap_fill_failure_fails_the_attempt(
     """AT9: the gap fill: A ``failed`` with (i) ``network``, (ii)
     ``provider``, (iii) ``backoff``, (iv) ``call_limit``. Each: attempt 1
     fails at stage 2, reason naming the station's outcome without its
-    id; retry at +1 h (5.3).
+    id; retry at +1 h.
 
     M32 -> at the state assertion below (reason "network"): correct =
     ('retry_due', 1), mutant M32 (a ``failed``/``network`` station not
@@ -1012,7 +986,7 @@ def test_at10_a_thin_day_closes_with_ineligible_values_not_a_failure(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AT10: A and B with readings in hours 0 to 10 only. D ``closed`` in
-    attempt 1; high and low ``eligible`` 0 (6.2); no retry.
+    attempt 1; high and low ``eligible`` 0; no retry.
 
     Hours 11 to 23 are real gaps here (unlike AT15's stand-in): the
     provider is given a real key and transport, answering every hourly
@@ -1068,7 +1042,7 @@ def test_at10_a_thin_day_closes_with_ineligible_values_not_a_failure(
         assert rows, "stage 4 must have written the day's truth rows"
         assert all(row[1] == 0 for row in rows), (
             "both high and low must be eligible=0 on a day with only 11"
-            " hours of readings (6.2's 18-hour minimum)"
+            " hours of readings (the 18-hour minimum)"
         )
 
     asyncio.run(_run())
@@ -1085,7 +1059,7 @@ def test_at11_a_stalled_claim_fails_the_attempt_before_doing_any_work(
     """AT11: the stage-3 job's claim comes 61 minutes after it was
     enqueued: the clock moves 61 minutes after the helper stamps the
     job's insert and before the claim. Attempt fails at stage 3 with
-    reason ``stalled``, before ``write_hourly_values`` is called (8.3).
+    reason ``stalled``, before ``write_hourly_values`` is called.
 
     M34 -> at the state assertion below: correct = ('retry_due', 1) (the
     queue-wait check fails the attempt before the stage does any work),
@@ -1127,7 +1101,7 @@ def test_at11_a_stalled_claim_fails_the_attempt_before_doing_any_work(
         )
         assert write_calls == [], (
             "write_hourly_values must never be called once the stage is"
-            " found stalled (8.3: the check runs before any work)"
+            " found stalled (the check runs before any work)"
         )
         rows = await _stage_log_rows(db, site_id, 3)
         assert rows and rows[-1] == (1, "failed", "stalled"), (
@@ -1147,11 +1121,11 @@ def test_at12_a_stale_jobs_exception_does_not_touch_the_current_attempt(
 ) -> None:
     """AT12: D ``closing`` in attempt 2 after AT1 for k = 3; a stage-3
     job with payload ``{"attempt": 1}`` inserted and run, whose first
-    read (P1's ``day_record`` as ``close_chain`` calls it) raises once.
+    read (``day_record`` as ``close_chain`` calls it) raises once.
     The job row ``failed``; D still ``closing`` with ``attempts`` 2,
     ``retry_at`` and ``last_failure`` unchanged; attempt 2's record
     ``running``, attempt 1's as it was; no stage-log row added; one
-    WARNING line naming the site, the date, stage 3 and ``closing`` (9.1).
+    WARNING line naming the site, the date, stage 3 and ``closing``.
 
     M76 -> at the unchanged-record assertions below: correct = D's
     record, attempt 2's record and the stage-3 log-row count are all
@@ -1219,7 +1193,7 @@ def test_at12_a_stale_jobs_exception_does_not_touch_the_current_attempt(
         # pending stage-4 job, which the earlier run_due_jobs call just
         # enqueued at this same clock instant (db/queue.py's
         # _CLAIM_ORDER_BY) -- one second is far under CLOSE_LATE_LIMIT (1
-        # hour, 8.3), so it does not make the job read as stalled.
+        # hour), so it does not make the job read as stalled.
         stamp = isoformat_utc(clock.now() - timedelta(seconds=1))
         await db.write(
             lambda c: c.execute(
@@ -1292,9 +1266,9 @@ def test_at12_a_stale_jobs_exception_does_not_touch_the_current_attempt(
 def test_at13_a_recovered_close_reports_no_failed_scope(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AT13: AT2, then the failed-scope count (15.1) read at R + 3 d. 0
+    """AT13: AT2, then the failed-scope count read at R + 3 d. 0
     failed scopes, though attempt 1's stage-3 job row is ``failed`` and
-    older than 48 hours (9.6).
+    older than 48 hours.
 
     M80 -> at the count assertion below: correct = 0 (``day_close`` is
     excluded from the failed arm), mutant M80 (``FAILED_SCOPES_SQL``
@@ -1347,8 +1321,8 @@ def test_at14_a_missed_day_from_a_failed_stage_reports_no_failed_scope(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AT14: AT3 with both attempts failing by an exception in stage 4,
-    then the failed-scope count (15.1) read at R + 3 d. 0 failed scopes;
-    D ``missed``, ``retry_failed`` (9.6).
+    then the failed-scope count read at R + 3 d. 0 failed scopes;
+    D ``missed``, ``retry_failed``.
 
     M81 -> at the count assertion below: correct = 0 (``day_close`` is
     left OUT of the failed arm entirely, never put on the single-row
@@ -1356,11 +1330,6 @@ def test_at14_a_missed_day_from_a_failed_stage_reports_no_failed_scope(
     instead) = a nonzero count, since the allowlist path still counts a
     job once it is the only one of its scope and old enough, exactly
     what leaving it out of the clause altogether is meant to prevent.
-
-    Patches ``verification.truth.write_close_truth`` (plan §6.1), which
-    does not exist before piece 2: the bare ``monkeypatch.setattr`` (no
-    ``raising=False``) raises ``AttributeError`` at once -- the right
-    failure reason for this P3 name today.
     """
 
     async def _run() -> None:
@@ -1421,7 +1390,7 @@ def test_at15_an_outcome_that_does_not_fail_the_attempt_closes_the_day(
     """AT15: ``fill_gaps``, as ``close_chain`` calls it, replaced by a
     stand-in with its signature that returns ``GapFillResult(ended=True,
     ...)`` with B ``filled`` and A (i) ``nothing_to_fill``, (ii)
-    ``not_on_day``. Each: no failure; D ``closed`` in attempt 1 (5.3).
+    ``not_on_day``. Each: no failure; D ``closed`` in attempt 1.
 
     M92/M95/M96 -> at the state assertion below: correct = ('closed', 1)
     for every one of these outcomes, mutant M92 (a ``filled`` station
@@ -1473,7 +1442,7 @@ def test_at15_an_outcome_that_does_not_fail_the_attempt_closes_the_day(
 def test_at16i_a_missing_key_fails_both_attempts_when_there_are_hours_to_fill(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AT16(i): an ``options.json`` without ``weathercom_key`` (15.1); A
+    """AT16(i): an ``options.json`` without ``weathercom_key``; A
     with readings in hours 0 to 20 only, so it has hours to fill. Attempt
     1 fails at stage 2, ``failed_stage`` 2, ``failure_reason`` and
     ``last_failure`` the sanitized message ``weathercom key is not
@@ -1546,8 +1515,7 @@ def test_at16ii_a_missing_key_does_not_matter_with_nothing_to_fill(
 ) -> None:
     """AT16(ii): an ``options.json`` without ``weathercom_key``; A and B
     with full readings, nothing to fill. D ``closed`` in attempt 1 with
-    no request: the key is read only for a station with hours to fill
-    (5.3, 10.1).
+    no request: the key is read only for a station with hours to fill.
 
     M95 -> at the closed-state assertion below: correct = ('closed', 1)
     (neither station has anything to fill, so the key is never even
@@ -1611,14 +1579,14 @@ def test_at17_an_unlisted_outcome_or_reason_fails_the_attempt(
 ) -> None:
     """AT17: AT15's stand-in, B ``filled`` and A (i) ``refused`` with
     reason ``day_guard``, (ii) ``refused`` with reason ``None``, (iii) an
-    outcome outside P2's ``FillOutcome`` (``"other"``, built with
+    outcome outside ``FillOutcome`` (``"other"``, built with
     ``typing.cast``). Each: attempt 1 fails at stage 2, the reason naming
     A's outcome and reason without its id; D ``retry_due``, ``retry_at``
-    1 hour on (5.3, 10.1).
+    1 hour on.
 
     M91 -> at the state assertion below (case "day_guard"): correct =
     ('retry_due', 1) (a ``refused``/``day_guard`` station IS a failure --
-    P1's guard took no write), mutant M91 (``refused`` sorted by outcome
+    the closed-day guard took no write), mutant M91 (``refused`` sorted by outcome
     alone, as a hold) = ('closed', 1) instead.
 
     M94 -> at the state assertion below (cases "none_reason" and

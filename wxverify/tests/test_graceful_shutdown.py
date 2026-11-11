@@ -1134,7 +1134,7 @@ def test_close_runs_only_after_the_reaps_write_commits(
         # (b) The pool is genuinely gone: a post-shutdown read fails loudly.
         with pytest.raises(sqlite3.ProgrammingError):
             await db.read(lambda c: c.execute("SELECT 1").fetchone())
-        # (d)/(e): D5's logging contract -- NOT M1 discriminators. Both hold
+        # (d)/(e): the logging contract -- NOT M1 discriminators. Both hold
         # under the pre-fix ordering too (the close still runs, merely too
         # early), so they pin the log shape, not the sequence.
         info_records = [
@@ -1491,7 +1491,7 @@ def test_startup_failure_after_task_creation_still_closes_the_database(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A startup failure AFTER both tasks exist must still close the
-    database, not merely reap the tasks -- and pins F6's boundary: this is
+    database, not merely reap the tasks -- and pins the boundary: this is
     the failure case that IS covered, since it fires after the
     task-creation ``try`` opens.
 
@@ -1549,8 +1549,8 @@ def test_startup_failure_after_task_creation_still_closes_the_database(
 
 
 # ---------------------------------------------------------------------------
-# D1.2 two-lane supervisor contracts (plan §6.3.1, §14.2 C1-C5 and the two
-# further supervisor cases) plus the app-level stop test and DL4/DL5 (the
+# Two-lane supervisor contracts (C1-C5 and the two further supervisor
+# cases) plus the app-level stop test and DL4/DL5 (the
 # provider-call deadline observed through the history lane and under
 # cancellation). `run_worker` now supervises two lanes -- `_run_main_lane`
 # and `run_current_obs_poller` -- via `asyncio.wait(FIRST_COMPLETED)` +
@@ -1806,7 +1806,7 @@ def test_c3_cancel_during_a_failure_drain_logs_reclaims_once_and_raises_cancelle
 
 
 def test_c3_repeated_cancel_reclaims_exactly_once_under_a_shielded_write() -> None:
-    """C3 (repeated-cancel, code-review finding): `_shutdown_reclaim`'s
+    """C3 (repeated-cancel): `_shutdown_reclaim`'s
     single retained write task stays shielded across N cancellations of the
     caller -- the write is issued exactly once and finishes, however many
     times the awaiting task is cancelled while it is still in flight.

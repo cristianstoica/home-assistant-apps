@@ -283,7 +283,7 @@ def test_missing_recent_index_is_created_by_create_schema(tmp_path: Path) -> Non
 
 
 # ---------------------------------------------------------------------------
-# S9 (0.16.2 plan): case-insensitive idx_samples_invalid lookup (D3).
+# S9: case-insensitive idx_samples_invalid lookup.
 # ---------------------------------------------------------------------------
 
 _S9_STALE_DDL_CASES: tuple[tuple[str, str], ...] = (
@@ -304,7 +304,7 @@ def test_case_variant_stale_index_is_reconciled_and_reads_recover(
     dropped and rebuilt as ``idx_samples_invalid``, and the feed sample-count
     reads that failed before it (``sample_metrics``, ``recent_sample_metrics``)
     succeed and count an invalid sample. The ``mixedcase_anchor`` case also
-    lacks the literal ``ON forecast_samples`` anchor D3 requires, so it pins
+    lacks the literal ``ON forecast_samples`` anchor the lookup requires, so it pins
     that a missing anchor is treated as a mismatch (rebuilt) rather than
     reaching ``_index_predicate`` and raising ``ValueError``.
     """

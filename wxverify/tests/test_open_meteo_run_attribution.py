@@ -1,17 +1,17 @@
-"""Open-Meteo run attribution and per-model fetch cadence -- Item E oracles.
+"""Open-Meteo run attribution and per-model fetch cadence oracles.
 
 Covers ``wxverify.feeds.open_meteo._snap_run``/``_run_shape`` (per-model run
 boundary + availability lag, no silent defaults), ``persist_fetch_result``'s
 newest-write-wins behaviour on the one row per hour ``idx_samples_slot``
-keeps (rain release, Part B), ``config.OPEN_METEO_FETCH_INTERVAL_MINUTES``
+keeps, ``config.OPEN_METEO_FETCH_INTERVAL_MINUTES``
 and ``db.migrations.correct_open_meteo_fetch_intervals`` (the fetch-interval
 counterpart to the horizon correction in
 ``tests/test_open_meteo_horizon_correction.py``), and the scheduler's cadence
 arithmetic for a 12-hourly model.
 
 E-T9 (three-mapping key-set parity) is deliberately NOT duplicated here: it
-extends C-T7 in ``tests/test_open_meteo_horizon_correction.py`` in place, per
-the plan's explicit instruction that C-T7 is updated, not copied.
+lives in ``tests/test_open_meteo_horizon_correction.py``, as
+``test_open_meteo_model_set_and_hours_match_cadence_map_and_feed_seeds``.
 
 All fixtures synthetic: station ids ``ISTATION01`` onward, site timezone
 ``UTC``, coordinates ``0.0``/``0.0``, any host literal ``192.0.2.10``.
@@ -164,10 +164,10 @@ def _interval(conn: sqlite3.Connection, *, source: str, model: str) -> int:
         ("2026-06-02T13:29:59Z", "2026-06-02T00:00:00Z"),
         # Exact 12Z boundary.
         ("2026-06-02T13:30:00Z", "2026-06-02T12:00:00Z"),
-        # The defect-discriminating case (E.7): under the corrected 12-hour
+        # The defect-discriminating case: under the corrected 12-hour
         # cadence, a fetch at 07:30Z (lagged 06:00Z) floors DOWN to 00:00Z --
         # the old flat-6-hour cadence would instead floor this to 06:00Z,
-        # which is exactly the duplicate-label defect Item E fixes.
+        # which is exactly the duplicate-label defect the 12-hour cadence fixes.
         ("2026-06-02T07:30:00Z", "2026-06-02T00:00:00Z"),
     ],
 )
@@ -204,8 +204,8 @@ def test_e_t3_delayed_gem_global_fetch_in_the_same_window_is_the_same_run() -> N
 
 
 # ---------------------------------------------------------------------------
-# E-T4 -- duplicate ingestion: the newest write wins (rain release, Part B:
-# forecast_samples keeps the newest value of each hour).
+# E-T4 -- duplicate ingestion: the newest write wins (forecast_samples keeps
+# the newest value of each hour).
 # ---------------------------------------------------------------------------
 
 
@@ -395,8 +395,9 @@ def test_e_t8_unknown_model_raises_and_names_itself() -> None:
         _snap_run("not_a_model", "2026-06-02T07:30:00Z")
 
 
-# E-T9 -- three-mapping key-set parity. NOT duplicated here: it extends C-T7
-# in tests/test_open_meteo_horizon_correction.py (updated in this commit).
+# E-T9 -- three-mapping key-set parity. NOT duplicated here: it lives in
+# test_open_meteo_horizon_correction.py, as
+# test_open_meteo_model_set_and_hours_match_cadence_map_and_feed_seeds.
 
 
 # ---------------------------------------------------------------------------
@@ -404,9 +405,8 @@ def test_e_t8_unknown_model_raises_and_names_itself() -> None:
 # subsample, pinned as arithmetic on the mappings.
 # ---------------------------------------------------------------------------
 
-# Models deliberately polled at k times their run cadence (owner decision
-# 2026-10-02). They sample roughly every k-th run, with no guarantee of which
-# runs.
+# Models deliberately polled at k times their run cadence. They sample
+# roughly every k-th run, with no guarantee of which runs.
 _SUBSAMPLED_RUNS_PER_POLL: dict[str, int] = {"icon_eu": 2}
 
 
@@ -635,7 +635,7 @@ def test_e_t15_lead_hours_end_to_end_against_the_12_hour_label() -> None:
 
 
 # ---------------------------------------------------------------------------
-# E-T16 (plan C3-T18) -- the slot rule (plan §5.1): a 720-minute-cadence
+# E-T16 -- the slot rule: a 720-minute-cadence
 # feed's only daytime slot is the round's local time (00:10 default) plus
 # one interval, 12:10; before that instant the slot is not due, at or after
 # it the slot is due exactly once. Catches the slot arithmetic being wired
@@ -699,8 +699,8 @@ def test_e_t18_availability_lag_is_a_flat_90_minutes_for_every_model() -> None:
 # ---------------------------------------------------------------------------
 # E-T19 -- the write is per sample, not per response: a later same-label
 # fetch still inserts previously-absent keys alongside an unchanged
-# already-stored one, which it leaves as it is (rain release, Part B: an
-# hour is written only when its value differs).
+# already-stored one, which it leaves as it is (an hour is written only when
+# its value differs).
 # ---------------------------------------------------------------------------
 
 

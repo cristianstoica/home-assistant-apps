@@ -1,17 +1,10 @@
-"""The close and station alerts (daily-close plan 2026-10-22-daily-close-
-alerts-and-pages.md §5, §6; test IDs AL1-AL18 in this file's §13.3; §13.4's
-AD-prefixed rows and §13.7 are appended here by a later writer).
-
-Written before ``wxverify.close_monitor`` exists: every test below imports
-it (or a name it will add) inside its own body, so the rest of this file
-keeps collecting -- each then fails at its own ``ModuleNotFoundError``, the
-failure Step 3 accepts.
+"""The close and station alerts (test IDs AL1-AL18, AD1-AD13, DW1-DW8, PD1-PD7).
 
 Real SQLite throughout (``tests.helpers.asof_conn``, real migrations);
 nothing in the code under test is mocked. Synthetic data only: stations
 ``ISTATION01``/``ISTATION02``/``ISTATION03`` (via ``day_close_site`` and its
 ``station_ids`` override), zone ``UTC``, dates built from the fixture's
-``D``/``NOW``. P1's and P3's own functions move every day state; no test
+``D``/``NOW``. The real day-state functions move every day state; no test
 writes ``site_days`` directly.
 """
 
@@ -46,7 +39,7 @@ from wxverify.db.site_days import (
 from wxverify.db.switch import ensure_site_generation
 
 # ---------------------------------------------------------------------------
-# §13.4/§13.7 fixtures (plan §13.4 lede): T is 07:00 on D in the site's
+# Alert 4 and daytime-download fixtures: T is 07:00 on D in the site's
 # (UTC) zone; each expected instant below is written out, never computed
 # with the code under test. AD1-AD7, AD10, AD12 and AD13 share
 # ``_ad_start``: the helper's own records, started with ``start_site_days``
@@ -101,7 +94,7 @@ def _close_day(conn, site_id: int, local_date, *, first: bool) -> None:
     `local_date` itself. Both calls' internal `_fill` always creates one
     buffer day beyond its target, so any earlier day left `open` is closed
     here too, with no presence at all -- alert 3 skips a closed day with
-    no reading and no answered try either way (plan 5.4), so a bare buffer
+    no reading and no answered try either way, so a bare buffer
     day never counts against, or breaks, a station's run.
     """
     now_for_create = datetime(
@@ -256,7 +249,7 @@ def test_al1_day_missed_never_attempted() -> None:
 
 def test_al2_both_attempts_failed_retry_stage() -> None:
     """AL2: D-1 closing -> retry_due -> closing -> missed, each attempt's
-    record failing at a different stage (R3.4 3; M12)."""
+    record failing at a different stage (M12)."""
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
@@ -722,7 +715,7 @@ def test_al12_usable_judged_per_variable_and_qc_flag() -> None:
 
 def test_al13_station_list_is_day_specific() -> None:
     """AL13: AL9 plus station C, on the saved list of the newest day only
-    (plan: added effective that day, written before its record is made --
+    (added effective that day, written before its record is made --
     tested here at the end state the day's own `site_day_stations` row
     gives, since the buffer day a growth call always creates one day
     ahead (`ensure_site_days`'s own fill) makes the exact creation-order
@@ -875,7 +868,7 @@ def test_al16_disabled_sites_and_pre_first_record_days_left_out() -> None:
         )
 
     # A day before the site's first record is never read either (starting
-    # history, plan 5.1): a site with no record at all is always ok.
+    # history): a site with no record at all is always ok.
     conn2 = asof_conn()
     day_close_site(conn2, with_records=False)
     alerts2 = close_alerts(conn2, NOW)
@@ -951,7 +944,7 @@ def test_al18_stage_text() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §13.4: alert 4 and the failed-attempt alert (AD1-AD13)
+# Alert 4 and the failed-attempt alert (AD1-AD13)
 # ---------------------------------------------------------------------------
 
 
@@ -1240,7 +1233,7 @@ def test_ad7_day_before_first_record_never_expected() -> None:
 
 def test_ad8_attempt_1_failed_at_stage_2() -> None:
     """AD8: D-1 retry_due with last_failure "gap fill: network", attempt
-    1's record failing at stage 2 (R3.4 2), retry_at set (M39)."""
+    1's record failing at stage 2, retry_at set (M39)."""
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
@@ -1280,7 +1273,7 @@ def test_ad8_attempt_1_failed_at_stage_2() -> None:
         f"M39 -> at this assertion: correct = tripped, {expected!r} in"
         f" detail, mutant = tripped={stage_failed.tripped}, detail="
         f"{stage_failed.detail!r} (stage taken from the stage log's newest"
-        " row instead of R3.4)"
+        " row instead of the day's blocking stage)"
     )
 
 
@@ -1578,8 +1571,8 @@ def test_ad13_publication_retry_due() -> None:
     late = next(a for a in alerts if a.id == "publication_late")
     assert not late.tripped, (
         "M115 -> at this assertion: correct = publication_late ok (a"
-        " retry-due publication is left out), mutant = 6.2(b) reading"
-        f" failed only, so this path would be missed; tripped="
+        " retry-due publication is left out), mutant = close_stage_failed"
+        f" reading failed only, so this path would be missed; tripped="
         f"{late.tripped}"
     )
     stage_failed = next(a for a in alerts if a.id == "close_stage_failed")
@@ -1589,14 +1582,14 @@ def test_ad13_publication_retry_due() -> None:
     )
     assert stage_failed.tripped and expected in (stage_failed.detail or ""), (
         f"M115 -> at this assertion: correct = tripped, {expected!r} in"
-        f" detail, mutant = 6.2(b) reads 'failed' only, so a retry_due"
+        f" detail, mutant = close_stage_failed reads 'failed' only, so a retry_due"
         f" publication would not be named here; tripped="
         f"{stage_failed.tripped}, detail={stage_failed.detail!r}"
     )
 
 
 # ---------------------------------------------------------------------------
-# §13.7: the daytime-download warning and alert 7 (DW1-DW8, PD1-PD6)
+# The daytime-download warning and alert 7 (DW1-DW8, PD1-PD6)
 # ---------------------------------------------------------------------------
 
 
@@ -1859,7 +1852,7 @@ def test_dw7_close_alerts_writes_nothing() -> None:
     the warning's own ``start`` instant so a consensus write would have
     something to materialize, not a no-op on an empty table; every
     station row, hourly row and stored score of the site, read with
-    SELECT * before and after close_alerts (M67, K32)."""
+    SELECT * before and after close_alerts (M67)."""
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()

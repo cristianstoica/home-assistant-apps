@@ -1,13 +1,7 @@
-"""The wind lane after the switch (daily-close switch-over plan §7.2 row R4,
-R5; test IDs WL1-WL2 of §17.8).
+"""The wind lane after the switch (WL1-WL2).
 
-Written before R4/R5 land: today's base still selects and fetches past
-``station_wind_days`` rows (``WIND_DUE_SQL``'s past-row clause, M50) and
-still derives hourly station rows from every fetched day (``_persist_day``'s
-unconditional ``_derive_days`` call, M51). Both tests drive the real
-``run_wind_days`` job end to end (plan §17.1: "a fake adapter") and fail
-today on a plain assertion against that unremoved behaviour -- never at
-import or on a fixture error.
+Both tests drive the real ``run_wind_days`` job end to end with a fake
+adapter.
 
 Synthetic data only: station id ``ISTATION01``, zone UTC, dates built off a
 fixed synthetic ``_TODAY``.
@@ -188,7 +182,7 @@ def test_wl1_only_todays_row_is_fetched_past_rows_untouched(
     called_history_all = any(_HISTORY_ALL_PATH in url for url in call_log)
     assert called_all_1day, "today's row must be called through fetch_all_1day"
     assert not called_history_all, (
-        "R6 regression guard: correct = no call to the dated history/all"
+        "regression guard: correct = no call to the dated history/all"
         f" endpoint, found = {call_log!r}. M50 is killed by the row"
         " assertions below, not here"
     )
@@ -205,7 +199,7 @@ def test_wl1_only_todays_row_is_fetched_past_rows_untouched(
         f" ({before_d3!r}), mutant = {after_d3!r}"
     )
 
-    # ensure_wind_days must make no past row either (R4's other half; no
+    # ensure_wind_days must make no past row either (no
     # numbered mutant of its own, so a plain assertion).
     before_count = conn.execute(
         "SELECT COUNT(*) FROM station_wind_days WHERE station_id = ?",
@@ -239,8 +233,8 @@ def test_wl2_no_station_observation_and_no_pair_and_score_from_todays_run(
     # Five-minute readings spanning hours 8:00 and 9:00 of today, latest at
     # 10:05, so both hours are "complete" under _derive_hours's H + 1h <=
     # newest rule (worker/wind_days.py:1430) and each adjacent pair is well
-    # inside MAX_PAIR_GAP_SECONDS (wind_pairs.py:17) -- the old,
-    # un-R5'd _persist_day would derive a pair-max station row for each.
+    # inside MAX_PAIR_GAP_SECONDS (wind_pairs.py:17) -- the old
+    # _persist_day would derive a pair-max station row for each.
     start = datetime(_TODAY.year, _TODAY.month, _TODAY.day, 8, 0, 0, tzinfo=UTC)
     reading_times = [start + timedelta(minutes=5 * i) for i in range(26)]  # to 10:05
     assert reading_times[-1] == start + timedelta(hours=2, minutes=5)
@@ -282,15 +276,15 @@ def test_wl2_no_station_observation_and_no_pair_and_score_from_todays_run(
         (station_id,),
     ).fetchone()[0]
     assert station_observation_rows == 0, (
-        "M51 -> at this assertion: correct = 0 (R5 removes _persist_day's"
-        " derive call, so no pair-max station row is written for today),"
+        "M51 -> at this assertion: correct = 0 (_persist_day's derive call"
+        " is gone, so no pair-max station row is written for today),"
         f" mutant = {station_observation_rows} (_persist_day still derives"
         " station rows)"
     )
 
     # With the daily close on, enqueue_scoring_run already queues nothing
-    # (P4's own switch, scoring/engine.py; true before and after R5, so this
-    # is a regression pin, not an independent M51 divergence point).
+    # (true before and after the removal, so this is a regression pin, not
+    # an independent M51 divergence point).
     pair_and_score_rows = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE type = 'pair_and_score' AND site_id = ?",
         (site_id,),

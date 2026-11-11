@@ -41,7 +41,7 @@ class MeteosourceWind(BaseModel):
     model_config = ConfigDict(extra="allow", frozen=True)
 
     speed: float | None = None
-    # Display only (card 7): degrees, "180° means wind from the south".
+    # Display only: degrees, "180° means wind from the south".
     # ``dir`` (compass text) is not used.
     angle: DisplayFloat = None
 
@@ -53,7 +53,7 @@ class MeteosourcePrecipitation(BaseModel):
 
 
 class MeteosourceCloudCover(BaseModel):
-    """Display only (card 7): the total cloud cover in %."""
+    """Display only: the total cloud cover in %."""
 
     model_config = ConfigDict(extra="allow", frozen=True)
 

@@ -586,7 +586,7 @@ class TestPersistPollResult:
 
     def test_offline_next_poll_at_1h_and_stations_untouched(self) -> None:
         """OFFLINE: next_poll_at = now + 1 h, pause columns (1, 'offline')
-        (health release, Part B: the first empty reply waits 1 h, not
+        (the first empty reply waits 1 h, not
         the old 86400-s park); stations.* sentinel unchanged."""
         conn = _make_conn()
         site_id = _seed_site(conn)
@@ -1509,7 +1509,7 @@ class TestEnqueueDueCurrentObs:
 
 
 # ---------------------------------------------------------------------------
-# D0 (0.16.3 §5 / §14.1): the site-aware due-scan WHERE and the orphan
+# D0: the site-aware due-scan WHERE and the orphan
 # warning. A well-formed but non-existent site_id (never a hostile literal --
 # those are covered in test_foreign_data_guards.py) is planted with
 # foreign_keys temporarily OFF, mirroring
@@ -1523,9 +1523,9 @@ _MISSING_SITE_ID = 999999
 
 
 class TestD0SiteAwareDueScan:
-    """D0 (§5): the due-scan's pollable set equals what the claim path
+    """D0: the due-scan's pollable set equals what the claim path
     accepts, and an orphaned station is warned about, not silently dropped
-    or endlessly re-enqueued (plan §14.1)."""
+    or endlessly re-enqueued."""
 
     def _seed_orphan_station(
         self, conn: sqlite3.Connection, *, pws_id: str, enabled: int = 1
@@ -1562,7 +1562,7 @@ class TestD0SiteAwareDueScan:
         gates it is a proxy for: ``_pws_station_id`` returning non-None, and
         ``_reserve_current_obs_call`` not raising ``JobCancelled``. No
         backoff row is seeded and the default per-source budget is
-        untouched, so backoff/budget never enter this equality (§5.2)."""
+        untouched, so backoff/budget never enter this equality."""
         conn = _make_conn()
         pws_id = (
             f"ISTATION-PARITY-{int(station_enabled)}"
@@ -1621,7 +1621,7 @@ class TestD0SiteAwareDueScan:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A station whose site_id names no site: exactly one WARNING
-        containing 'references a missing site', and no job (§5.1).
+        containing 'references a missing site', and no job.
 
         Paired positive: TestEnqueueDueCurrentObs::
         test_station_with_no_poll_state_enqueued_immediately shows the same
@@ -1653,7 +1653,7 @@ class TestD0SiteAwareDueScan:
         due-scan ticks enqueue nothing for the station, the current-obs
         lane's own claim (``claim_next_current_obs_job``) finds nothing to
         run, and the main lane's claim (``claim_next_job``) still claims the
-        verification_run next (§5.2's 'no starvation' case, plan §14.1).
+        verification_run next (the 'no starvation' case).
 
         Two repeated ticks stand in for two poller iterations: the due-scan
         itself never enqueues a job for a disabled-site station, so there is

@@ -1,4 +1,4 @@
-"""Card 29: `migrations.drop_forecast_record` -- start-up cleanup of the
+"""`migrations.drop_forecast_record` -- start-up cleanup of the
 removed daily forecast record (`wxverify/db/migrations.py`, called from
 `run_migrations` on every start).
 

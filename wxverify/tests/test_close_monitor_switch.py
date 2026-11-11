@@ -1,6 +1,4 @@
-"""Retired checks and the keep list (daily-close plan
-2026-10-22-daily-close-alerts-and-pages.md §4, §13.2; test IDs RT2, RT3,
-RT5-RT9).
+"""Retired checks and the keep list (test IDs RT2, RT3, RT5-RT9).
 
 Written before ``wxverify.close_monitor`` exists: most rows import it (or a
 name ``monitor.py`` has not yet added) inside the test body, so the rest of
@@ -59,7 +57,7 @@ def _add_eligible_feed(conn) -> None:
 
 
 def _trip_retired_checks(conn, site_id: int) -> None:
-    """Seed everything RT2 needs each retired check to trip, close on (5.1).
+    """Seed everything RT2 needs each retired check to trip, close on.
 
     ``sites.last_obs_at`` stays NULL (older than 12h by definition);
     a parked station (``history_error_count`` > 0); a wind station-day that
@@ -164,7 +162,7 @@ def test_rt6_close_alerts_unexpected_error_isolated() -> None:
     """RT6: close_alerts replaced by a stand-in that raises ValueError (M8).
 
     The one row that replaces code under test, since no seed reaches an
-    unknown bug (plan 13.2).
+    unknown bug.
     """
     import wxverify.monitor as monitor_module
 

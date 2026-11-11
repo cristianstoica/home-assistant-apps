@@ -1,18 +1,14 @@
-"""Pure rain-model ranking (plan 2026-11-01-rain-release.md, Part C; test IDs
-C1 and the switch-rule half of C2). The DB/service-level half of C2 (the
-incumbent remembered across a 60-cutoff gap, lost at 61), C3-C7 and C8 are
-in ``tests/test_rain_tile.py`` and ``tests/test_rain_history_fill.py``.
+"""Pure rain-model ranking: C1 and the switch-rule half of C2. The
+DB/service-level half of C2 (the incumbent remembered across a 60-cutoff
+gap, lost at 61) and the tile and upgrade-fill cases are in
+``tests/test_rain_tile.py`` and ``tests/test_rain_history_fill.py``.
 
 Written before ``wxverify.forecast.rain_pick`` exists: every test here fails
 at ``ImportError`` until the module is built. No I/O, no clock, no SQLite --
 every fixture is a plain in-memory value. Feed identifiers are synthetic
 ints with made-up ``source``/``model`` strings; nothing real.
 
-Assumed API (``wxverify/forecast/rain_pick.py``), for the builder to match --
-the plan (§9.1 of ``plans/2026-09-29-forecast-method.md``, referenced by
-Part C's C2) gives the ranking rule; this is the plainest reading of its
-inputs/outputs as a pure function, since the module does not exist yet to
-check against:
+Assumed API (``wxverify/forecast/rain_pick.py``), for the builder to match:
 
     @dataclass(frozen=True)
     class ModelSeries:
@@ -21,7 +17,7 @@ check against:
         model: str
         # date -> whether THIS model forecast rain (total >= 0.2 mm,
         # round(total*100) >= 20) for that date, at the day_ahead rank_rain
-        # is called for. Only "counted days" (plan C2's definition: the
+        # is called for. Only "counted days" (the
         # date's truth is known AND this model has a rain_forecast_days row
         # for it at this day_ahead) are present as keys -- an unknown-truth
         # or no-forecast date is simply absent, never a False entry.

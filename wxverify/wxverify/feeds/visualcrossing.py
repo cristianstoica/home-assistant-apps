@@ -36,7 +36,7 @@ class VisualCrossingHour(BaseModel):
     temp: float | None = None
     windspeed: float | None = None
     precip: float | None = None
-    # Display only (card 7): %, km/h ("may be empty"), degrees.
+    # Display only: %, km/h ("may be empty"), degrees.
     cloudcover: DisplayFloat = None
     windgust: DisplayFloat = None
     winddir: DisplayFloat = None

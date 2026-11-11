@@ -1,4 +1,4 @@
-"""Worker-path oracles for the result='ok' success marker (plan §6.5, §9).
+"""Worker-path oracles for the result='ok' success marker.
 
 O14-O16 drive the marker through the real worker loop -- run_worker,
 claim_next_job, dispatch, _fetch_feed, fetch_feed_once,
@@ -9,7 +9,7 @@ one site named 'PatchTest' (via tests.test_011_patch's helpers) at the
 test suite's placeholder coordinates, and the open-meteo feed already
 seeded by init.
 
-This module carries the §6.5 harness and O14, O15 and O16.
+This module carries the worker-loop harness and O14, O15 and O16.
 """
 
 from __future__ import annotations

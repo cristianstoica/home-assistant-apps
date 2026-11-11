@@ -1,20 +1,15 @@
-"""Schema for daily-close P4 piece 1 (plan
-2026-10-22-daily-close-pairs-and-publication.md, section 15, test IDs
-SZ2-SZ3, 18.12): the live, fresh-schema behaviour of P4's twelve new tables
-and their migration -- idempotence on repeat, foreign-key cascade/restrict
-rules. SZ4 (``_validate_upload``'s per-table import checks) has no test
-here. The mutant each test ID must kill is given inline on each
-assertion.
+"""Schema for the daily close's score tables (SZ2-SZ3): the live,
+fresh-schema behaviour of the twelve tables and their migration --
+idempotence on repeat, foreign-key cascade/restrict rules. The mutant each
+test ID must kill is given inline on each assertion.
 
 Real SQLite and real migrations throughout; nothing in the code under test
 is mocked. Synthetic data only: station ids ``ISTATION01``/``ISTATION02``
 (via ``tests.helpers.day_close_site``), site names ``Testsite``/``site-a``/
 ``site-b``, zone ``UTC``, model names ``model-a``/``model-b``.
 
-Column lists for the twelve new tables are taken from the plan's own
-tables (15.2, 4.2, 5.2, 6.3, 6.4, 6.7, 7.1, 7.3); where the plan does not
-state nullability explicitly, every documented column is given a value
-here to avoid relying on an unconfirmed default.
+Each fixture row gives every documented column a value, to avoid relying on
+an unconfirmed default.
 """
 
 from __future__ import annotations
@@ -40,9 +35,8 @@ _STAMP = "2026-07-06T00:00:00Z"
 
 
 def test_sz2_migration_run_twice_adds_nothing_twice(tmp_path: Path) -> None:
-    """SZ2 (first case), re-vehicled from the retired ``download_record_
-    since`` key (health release, Part D5) onto ``storage_compacted_at``,
-    written by the same fresh-build loop: running ``run_migrations`` a
+    """SZ2 (first case), on ``storage_compacted_at``, written by the
+    fresh-build loop: running ``run_migrations`` a
     second time on a file already at the current ``user_version`` raises
     no error (no duplicate table or column) and does not rewrite
     ``storage_compacted_at``. The second run never re-enters
@@ -139,7 +133,7 @@ def test_sz2_migration_rerun_after_a_build_that_crashed_before_the_version_stamp
 def _seed_cascading_p4_rows(
     conn: sqlite3.Connection, *, site_id: int, feed_id: int, local_date: str
 ) -> None:
-    """One row in every P4 table that carries a ``site_id`` or cascades
+    """One row in every score table that carries a ``site_id`` or cascades
     through a parent that does, for ``site_id``/``feed_id`` (SZ3).
     """
     download_id = conn.execute(
@@ -238,12 +232,14 @@ def _seed_cascading_p4_rows(
     )
 
 
-def test_sz3_site_delete_clears_every_p4_row_feed_delete_with_scores_refused() -> None:
-    """SZ3: deleting a site removes every P4 row keyed to it (``site_id``
-    cascades, 15.2) across every table that carries ``site_id`` or cascades
+def test_sz3_site_delete_clears_every_score_row_feed_delete_with_scores_refused() -> (
+    None
+):
+    """SZ3: deleting a site removes every score row keyed to it (``site_id``
+    cascades) across every table that carries ``site_id`` or cascades
     from a parent that does; deleting a feed that still has a ``day_scores``
-    row is refused with ``sqlite3.IntegrityError`` (``feed_id`` restricts,
-    15.2), on a second, untouched site so the first site's cascade cannot
+    row is refused with ``sqlite3.IntegrityError`` (``feed_id`` restricts),
+    on a second, untouched site so the first site's cascade cannot
     remove the row the refusal needs.
     """
     conn = asof_conn()
@@ -285,8 +281,8 @@ def test_sz3_site_delete_clears_every_p4_row_feed_delete_with_scores_refused() -
         ).fetchone()[0]
         assert count == 0, (
             f"M118 -> at this assertion: correct = 0 ({table}.site_id"
-            " references sites(id) ON DELETE CASCADE, 15.2), mutant M118 (a"
-            f" P4 table without ON DELETE CASCADE on site_id) = {table}"
+            " references sites(id) ON DELETE CASCADE), mutant M118 (a"
+            f" score table without ON DELETE CASCADE on site_id) = {table}"
             " still has a row for the deleted site"
         )
 
@@ -295,7 +291,7 @@ def test_sz3_site_delete_clears_every_p4_row_feed_delete_with_scores_refused() -
         count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
         assert count == 0, (
             f"M118 -> at this assertion: correct = 0 ({table} cascades from"
-            " its parent, which itself cascades from sites, 15.2), mutant"
+            " its parent, which itself cascades from sites), mutant"
             f" M118 (a missing ON DELETE CASCADE somewhere in that chain) ="
             f" {table} still has an orphaned row"
         )
@@ -330,9 +326,9 @@ def test_sz3_site_delete_clears_every_p4_row_feed_delete_with_scores_refused() -
     ],
 )
 def test_sz3_the_remaining_tables_declare_the_same_delete_rules(table: str) -> None:
-    """SZ3 (structural twin): the four P4 tables not exercised by row-level
+    """SZ3 (structural twin): the four score tables not exercised by row-level
     delete above still declare ``site_id``/the parent cascade and
-    ``feed_id`` RESTRICT per 15.2, read from ``PRAGMA foreign_key_list``
+    ``feed_id`` RESTRICT, read from ``PRAGMA foreign_key_list``
     rather than by inserting a row -- ``starting_scores`` and
     ``starting_wind_days`` carry ``site_id`` directly;
     ``publication_wind_weights`` and ``publication_coverage`` cascade only
@@ -344,8 +340,8 @@ def test_sz3_the_remaining_tables_declare_the_same_delete_rules(table: str) -> N
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     assert table in names, (
-        f"{table} does not exist yet: P4 piece 1 (plan 15.2) adds it as one"
-        " of the twelve new tables; migrate_v14_daily_close_scores has not"
+        f"{table} does not exist yet: it is one of the twelve tables"
+        " migrate_v14_daily_close_scores adds, and that migration has not"
         " landed"
     )
     fks = conn.execute(f"PRAGMA foreign_key_list({table})").fetchall()
@@ -354,17 +350,17 @@ def test_sz3_the_remaining_tables_declare_the_same_delete_rules(table: str) -> N
     if "site_id" in by_column:
         assert by_column["site_id"]["on_delete"] == "CASCADE", (
             f"M118 -> at this assertion: correct = CASCADE ({table}.site_id"
-            " references sites(id) ON DELETE CASCADE, 15.2), mutant M118"
+            " references sites(id) ON DELETE CASCADE), mutant M118"
             f" (missing ON DELETE CASCADE) = {by_column['site_id']['on_delete']}"
         )
     else:
         assert "publication_id" in by_column, (
-            f"fixture/plan-reading error: {table} has neither site_id nor"
-            " publication_id, 15.2 does not describe this table correctly"
+            f"fixture error: {table} has neither site_id nor"
+            " publication_id, so the table fits no delete rule here"
         )
         assert by_column["publication_id"]["on_delete"] == "CASCADE", (
             f"M118 -> at this assertion: correct = CASCADE ({table}"
-            " cascades from publications, 15.2), mutant M118 (missing"
+            " cascades from publications), mutant M118 (missing"
             " ON DELETE CASCADE) ="
             f" {by_column['publication_id']['on_delete']}"
         )
@@ -372,12 +368,12 @@ def test_sz3_the_remaining_tables_declare_the_same_delete_rules(table: str) -> N
     if "feed_id" in by_column:
         assert by_column["feed_id"]["on_delete"] == "RESTRICT", (
             f"M118 -> at this assertion: correct = RESTRICT ({table}.feed_id"
-            " references feeds(id) ON DELETE RESTRICT, 15.2, as"
+            " references feeds(id) ON DELETE RESTRICT, as"
             " score_cache does), mutant M118 (ON DELETE CASCADE given to"
             f" feed_id instead) = {by_column['feed_id']['on_delete']}"
         )
 
 
-# SZ4 (fresh-file acceptance, BLOB-guarded columns, canonical stamp/date
-# checks on close_pairs/publications) tested only ``_validate_upload``,
-# removed with the database import (storage-release plan 5.5).
+# No test here for fresh-file acceptance, BLOB-guarded columns or canonical
+# stamp/date checks on close_pairs/publications: they tested only
+# ``_validate_upload``, removed with the database import.

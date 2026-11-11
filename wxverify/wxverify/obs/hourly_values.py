@@ -1,6 +1,6 @@
 """One station's hourly values from its raw readings.
 
-The one hourly-value method (plan 7.1-7.4): a station's hourly temperature,
+The one hourly-value method: a station's hourly temperature,
 rain and wind for one site-day, built from its raw readings of every source,
 so the close and the provisional line run the same code. It is pure: no
 database, no clock, no network. It imports only the standard library,
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 Source = Literal["five_minute", "current_obs", "hourly"]
 Quantity = Literal["temperature", "precip", "wind"]
 #: The source of an hour's value: its readings' source, or for a day's last
-#: hour whose rain also used later current-conditions readings, both (7.3).
+#: hour whose rain also used later current-conditions readings, both.
 HourSource = Literal["five_minute", "current_obs", "hourly", "five_minute+current_obs"]
 
 #: Every quantity, in the order values are written.
@@ -92,7 +92,7 @@ class StationHours:
     ``hours`` are the day's hours. ``values`` has a key for every quantity,
     each holding only the hours that have a value. ``gap_hours`` are the
     hours with no ``five_minute`` and no ``current_obs`` reading;
-    ``no_pair_hours`` the other hours that have no wind pair (plan 7.5),
+    ``no_pair_hours`` the other hours that have no wind pair,
     whether or not an hourly wind fills them.
     """
 
@@ -107,7 +107,7 @@ def day_hours(day_start_utc: datetime, day_end_utc: datetime) -> tuple[datetime,
 
     An hour counts when it lies wholly inside the bounds: a 23- or 25-hour
     day has 23 or 25 hours, and a zone whose offset is not a whole hour
-    leaves out the part-hours at either end (plan 5.8, risk 7).
+    leaves out the part-hours at either end.
     """
     hour = floor_hour(day_start_utc)
     if hour < day_start_utc:
@@ -131,12 +131,12 @@ def station_hours(
 
     ``readings`` are the station's readings of every source; those outside
     the day's hours are used only as the wind lookback, the readings in the
-    1200 s before the day's start (plan 8.1). Temperature is the mean of the
-    hour's readings (7.2); rain the rise in the running total from 0 at the
-    day's start (7.3); wind the largest mean of two neighbouring readings at
-    most 1200 s apart, else the hour's latest ``hourly`` wind (7.4). The
+    1200 s before the day's start. Temperature is the mean of the
+    hour's readings; rain the rise in the running total from 0 at the
+    day's start; wind the largest mean of two neighbouring readings at
+    most 1200 s apart, else the hour's latest ``hourly`` wind. The
     day's last hour adds, for rain only, the current-conditions readings
-    later than its last 5-minute rain reading (7.6). An hour with no value
+    later than its last 5-minute rain reading. An hour with no value
     is left out, never 0. A rain reading whose own local date is not
     ``local_date`` is not used; the first one is logged once at WARNING.
     ``station_id`` only names the station in that log line.
@@ -186,7 +186,7 @@ def _pick(
     gap: bool,
     hourly: bool = True,
 ) -> tuple[Source, list[StationReading]] | None:
-    """The hour's readings of one quantity by the source order (plan 7.1).
+    """The hour's readings of one quantity by the source order.
 
     ``hourly`` readings are taken only in a gap hour, and never when
     ``hourly`` is False (wind pairs). None when no source has one.
@@ -207,7 +207,7 @@ def _temperature_values(
     by_hour: dict[datetime, list[StationReading]],
     gaps: frozenset[datetime],
 ) -> dict[datetime, HourValue]:
-    """The plain mean of each hour's temperature readings (plan 7.2)."""
+    """The plain mean of each hour's temperature readings."""
     values: dict[datetime, HourValue] = {}
     for hour in hours:
         pick = _pick(by_hour[hour], _has_temperature, gap=hour in gaps)
@@ -230,7 +230,7 @@ def _has_wind(reading: StationReading) -> bool:
 
 
 def _rain_total(reading: StationReading, local_date: date) -> float | None:
-    """The reading's rain total when rain may use it (plan 7.3, 5.4).
+    """The reading's rain total when rain may use it.
 
     None when it carries no total or its own local date is another date; a
     reading with no local date counts as the day's.
@@ -264,7 +264,7 @@ def _rain_values(
     local_date: date,
     day_end_utc: datetime,
 ) -> dict[datetime, HourValue]:
-    """Each hour's rise in the running total (plan 7.3, 7.6).
+    """Each hour's rise in the running total.
 
     An hour starts from 0 at the day's start when it is the day's first
     hour, else from the last rain reading of the hour before it; with no
@@ -324,7 +324,7 @@ def _warn_other_dates(
     local_date: date,
     station_id: int | None,
 ) -> None:
-    """Log the day's first rain reading of another local date, once (7.3)."""
+    """Log the day's first rain reading of another local date, once."""
     others = [
         reading
         for hour in hours
@@ -355,11 +355,11 @@ def _wind_values(
     *,
     day_start_utc: datetime,
 ) -> tuple[dict[datetime, HourValue], tuple[datetime, ...]]:
-    """Each hour's pair-max wind, else its latest hourly wind (plan 7.4).
+    """Each hour's pair-max wind, else its latest hourly wind.
 
     The readings that pair are each hour's wind readings by the source order
     without ``hourly``, plus the readings in the 1200 s before the day's
-    start, by the source order of the hour before the day (8.1). Returns the
+    start, by the source order of the hour before the day. Returns the
     values and the hours that are not gaps and have no pair.
     """
     previous = [

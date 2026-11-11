@@ -54,10 +54,10 @@ class RuntimeOptions(BaseModel):
 
 
 def depth_option_values(options: RuntimeOptions) -> dict[str, int | None]:
-    """Per-variable blend-depth options keyed by variable name (§15).
+    """Per-variable blend-depth options keyed by variable name.
 
-    Explicit rather than ``getattr(options, f"forecast_blend_depth_{v}")``
-    (NB-4): a renamed or added field is a type error here at check time
+    Explicit rather than ``getattr(options, f"forecast_blend_depth_{v}")``:
+    a renamed or added field is a type error here at check time
     instead of an AttributeError at startup. The keys are the canonical
     ``DEPTH_VARIABLES`` roster — not imported here, to keep this module free
     of settings-layer imports; the settings tests pin the two together.

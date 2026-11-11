@@ -1,23 +1,5 @@
-"""R1 (plan `2026-11-02-storage-release.md` line 245): a v17 database opens
-through the real ``init_db``, and every route in ``app.routes`` answers with
-no ``sqlite3.OperationalError`` and no 5xx.
-
-Written against the version-17 upgrade code (since removed, health release
-U2)/``TARGET_USER_VERSION == 17``, which did not exist yet, so this file's
-one fixture (``_boot_v17_app``) failed first
-today: a fresh ``init_db`` on a ``tmp_path`` file opens at ``user_version``
-16 (today's ``TARGET_USER_VERSION``), which is already what `run_migrations`
-has always produced for an empty file -- that part does not itself error.
-What makes the whole module red today is that this file inserts synthetic
-rows directly into ``forecast_history`` (3.1's new table) and reads them
-back through routes that W4 already moved onto it
-(``/api/winrate``, ``/api/timeseries``) -- those pass already, since W1-W6
-have landed in this worktree (per the dispatch brief). The genuinely new
-red is the R1 grep claim and the route sweep running against an ACTUAL v17
-file (``user_version == 17``, ``forecast_pairs``/``close_pairs``/
-``verification_*`` all absent): today's open always stops at 16, so the
-``assert version == 17`` in ``_boot_v17_app`` fails first, before any route
-is even called.
+"""A v17 database opens through the real ``init_db``, and every route in
+``app.routes`` answers with no ``sqlite3.OperationalError`` and no 5xx.
 
 Isolation: a real, file-backed v17 database under ``tmp_path`` (``init_db``,
 real migrations); the worker lane is an idle stand-in (the
@@ -33,8 +15,7 @@ Skipped (listed here, not silently dropped from the sweep):
   to resolve a station's lat/lon before it ever touches the database; no
   deterministic construction without one.
 - ``PUT /api/record-snapshot-time`` is exercised; its sibling upload/import
-  routes do not exist any more (Q8/5.5, already removed in this worktree)
-  so there is nothing left to skip there.
+  routes do not exist any more, so there is nothing left to skip there.
 """
 
 from __future__ import annotations

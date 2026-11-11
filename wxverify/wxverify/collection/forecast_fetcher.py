@@ -37,7 +37,7 @@ _SAMPLE_IS_VALID_SQL: Final[str] = (
 )
 
 
-#: The newest value (rain release, Part B, B1): one ``forecast_samples`` row
+#: The newest value: one ``forecast_samples`` row
 #: per hour. A sample for a stored hour replaces that row, so a download that
 #: repeats a label updates the hour. The narrower conflict target holds the
 #: old ``UNIQUE(..., issued_at, valid_at)``, so that key never fails on its
@@ -66,7 +66,7 @@ _UPSERT_SAMPLE_SQL: Final = """
        OR forecast_samples.model_run_id IS NOT excluded.model_run_id
 """
 
-#: The scored value (B2): one ``forecast_scored`` row for a valid sample of a
+#: The scored value: one ``forecast_scored`` row for a valid sample of a
 #: day's first stored download, the shared validator evaluated on the
 #: sample's own bound values, as ``_SAMPLE_IS_VALID_SQL`` does. A NaN value
 #: binds as NULL, so the validator reads NULL and no row is written. A row
@@ -83,7 +83,7 @@ _INSERT_SCORED_SQL: Final = f"""
     ON CONFLICT (site_id, feed_id, variable, valid_at, day_ahead) DO NOTHING
 """
 
-#: The day ahead the scored value is kept for: D+0 to D+7 (B2).
+#: The day ahead the scored value is kept for: D+0 to D+7.
 SCORED_DAYS_AHEAD: Final = range(8)
 
 
@@ -93,7 +93,7 @@ class PersistOutcome:
 
     ``usable_sample_count`` counts the scored-roster samples
     (``FORECAST_VARIABLES``) with ``lead_hours >= 1`` the fetch produced (the
-    forward-path no-op predicate); a display sample (card 7) is never
+    forward-path no-op predicate); a display sample is never
     usable. ``inserted_count`` counts the ``forecast_samples`` rows written,
     new or changed, display rows included (an identical re-fetch writes 0
     while still being usable).
@@ -102,12 +102,11 @@ class PersistOutcome:
     package's members under their own feed ids) to the sorted, distinct run
     labels (``issued_at``) of its usable samples; a feed the reply carried
     with no usable sample, display samples only included, maps to an empty
-    tuple. The download record stores it (daily-close P4 plan 4.2).
+    tuple. The download record stores it.
 
     ``samples`` maps each feed to the reply's sample for each hour it
     upserted, one per hour, whether or not the row changed; the fetch path
-    writes a day's first download's scored values from them (rain release,
-    Part B).
+    writes a day's first download's scored values from them.
     """
 
     usable_sample_count: int
@@ -150,7 +149,7 @@ def persist_fetch_result(
     fetched_at: str | None = None,
     advance_last_run_at: bool = True,
 ) -> PersistOutcome:
-    """Store a reply's samples, one row per hour (rain release, Part B, B1).
+    """Store a reply's samples, one row per hour.
 
     Each usable sample (``lead_hours >= 1``) is upserted on its hour
     (``_UPSERT_SAMPLE_SQL``), invalid scored values included: the newest
@@ -160,7 +159,7 @@ def persist_fetch_result(
     binds as NULL) and is skipped, as the old ``INSERT OR IGNORE`` skipped
     it, so the hour keeps its stored row. Then the feed state is stamped.
 
-    Display samples (card 7) are upserted like any other when in range,
+    Display samples are upserted like any other when in range,
     but only scored-roster samples count in ``usable`` and ``labels``, so a
     display-only change moves neither the no-op stamp nor the download
     record. A display value outside its ``DISPLAY_VALUE_RANGES`` range (both
@@ -281,8 +280,7 @@ def write_scored_values(
     fetched_at: str,
 ) -> int:
     """Write the scored values of one feed's download of ``download_date``
-    into ``forecast_scored`` (rain release, Part B, B2); returns the rows
-    written.
+    into ``forecast_scored``; returns the rows written.
 
     The caller has decided the download is that date's first stored one for
     the feed. Each valid sample (the shared validator) is kept at its day

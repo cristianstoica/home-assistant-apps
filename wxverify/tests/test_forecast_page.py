@@ -1,5 +1,4 @@
-"""Tests for the Forecast page's data model (card 7, step 6,
-``wxverify.forecast.page``), per the card 7 plan, §9.
+"""Tests for the Forecast page's data model (``wxverify.forecast.page``).
 
 Pure checks (``block_icon``, ``hour_columns``) need no database. The rest
 build a real, fresh ``:memory:`` database per test (``run_migrations``),
@@ -392,7 +391,7 @@ def test_parity_blend_cells_and_day_totals_equal_build_hourly_and_the_tile() -> 
         assert detail.precip.top.day_total == detail.tile.precip.total_mm
         assert detail.precip.top.day_text == rain_text(detail.tile.precip)
 
-        # One embedded model_label check (step 6's adjustment 4): the model
+        # One embedded model_label check: the model
         # rows, the BLEND tooltip labels, and the rain top row all carry
         # model_label's text, never feed_label's "source / model" form.
         for row in detail.temperature.rows:

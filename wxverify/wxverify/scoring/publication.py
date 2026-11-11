@@ -1,26 +1,25 @@
-"""The publication: P3's stage 7.
+"""The publication: the close chain's stage 7.
 
-Daily-close P4 plan (``plans/2026-10-22-daily-close-pairs-and-publication.md``)
-sections 7 and 8. A publication covers one
+A publication covers one
 site and one cutoff C, the last closed day it includes: rankings for the
 windows ``w:{N}`` and ``w:all``, wind weights over the ``TRAINING_DAYS``
 dates ending at C, coverage, and the rain ranking of each day ahead with its
-selected model (rain release, Part C: ``publication_rain_ranks`` and
+selected model (``publication_rain_ranks`` and
 ``rain_picks``, from ``rain_days`` and ``rain_forecast_days``). The rest is
 summed from stored rows --
 ``day_scores`` for closed record dates, ``starting_scores`` and
 ``starting_wind_days`` for the dates before the site's first record (the
-starting history, 7.3) -- and its rows never change once written.
+starting history) -- and its rows never change once written.
 
-``publish`` (P3's stage 7) reads everything in one read-only snapshot,
-outside the write lock, and swaps the result in with one ``writer.write``
-(8.2, 8.3). Every function reads the
-clock only through ``now_utc`` (16), so both stamps of a publication are
-``now_utc`` to the whole second (7.1, 15.2).
+``publish`` (stage 7) reads everything in one read-only snapshot,
+outside the write lock, and swaps the result in with one ``writer.write``.
+Every function reads the
+clock only through ``now_utc``, so both stamps of a publication are
+``now_utc`` to the whole second.
 
-The readers (sections 9, 12, 13.1 and 16.2) find the active publication and
+The readers find the active publication and
 read its rows for the leaderboard, composite, served forecast, wind serving
-and record, applying each feed's subscription when they read (9.1). They
+and record, applying each feed's subscription when they read. They
 never write and read no clock.
 """
 
@@ -69,10 +68,10 @@ from wxverify.settings.keys import get_number_setting
 from wxverify.verification.methodology import METHODOLOGY_VERSION
 
 #: The swap deletes a site's publication once its successor was published
-#: more than this many hours before the new one (7.5).
+#: more than this many hours before the new one.
 PUBLICATION_KEEP_HOURS: Final = 192
 #: A value-change row is kept this many days by its download's ``ended_at``;
-#: the swap deletes older rows (5.2, 8.3).
+#: the swap deletes older rows.
 VALUE_CHANGE_KEEP_DAYS: Final = 90
 
 PublicationFailure = Literal["cutoff_not_closed", "no_site"]
@@ -81,7 +80,7 @@ _ALL_WINDOW_KEY: Final = "w:all"
 _PUBLICATION_KEEP: Final = timedelta(hours=PUBLICATION_KEEP_HOURS)
 _VALUE_CHANGE_KEEP: Final = timedelta(days=VALUE_CHANGE_KEEP_DAYS)
 # The constants at ``forecast/wind_blend.py`` a publication's weights are
-# built under, saved on its row (7.1).
+# built under, saved on its row.
 _WIND_CONSTANTS: Final = json.dumps(
     {
         "DAY_AHEADS": list(DAY_AHEADS),
@@ -114,9 +113,9 @@ _PUBLICATION_ID_SQL: Final = (
     "SELECT id FROM publications WHERE site_id = ? AND cutoff = ?"
 )
 _FIRST_RECORD_SQL: Final = "SELECT MIN(local_date) FROM site_days WHERE site_id = ?"
-# Rankings and coverage (8.2 steps 3 and 5): a window's closed record dates.
+# Rankings and coverage: a window's closed record dates.
 # A date counts only once its record is ``closed``: a missed date adds
-# nothing (7.2), whatever an earlier attempt left in ``day_scores``.
+# nothing, whatever an earlier attempt left in ``day_scores``.
 _DAY_SUMS_SQL: Final = """
     SELECT ds.feed_id, ds.variable, ds.day_ahead,
            SUM(ds.n) AS n, SUM(ds.err_n) AS err_n, SUM(ds.err_sum) AS err_sum,
@@ -133,7 +132,7 @@ _DAY_SUMS_SQL: Final = """
       AND sd.state = 'closed'
     GROUP BY ds.feed_id, ds.variable, ds.day_ahead
 """
-# The same, over a window's starting-history dates (7.3).
+# The same, over a window's starting-history dates.
 _STARTING_SUMS_SQL: Final = """
     SELECT feed_id, variable, day_ahead,
            SUM(n) AS n, SUM(err_n) AS err_n, SUM(err_sum) AS err_sum,
@@ -147,7 +146,7 @@ _STARTING_SUMS_SQL: Final = """
     WHERE site_id = ? AND local_date >= ? AND local_date <= ?
     GROUP BY feed_id, variable, day_ahead
 """
-# Wind weights (8.2 step 4), real feeds less the meteoblue package.
+# Wind weights, real feeds less the meteoblue package.
 _CLOSED_WIND_SQL: Final = f"""
     SELECT ds.local_date, ds.feed_id, ds.day_ahead,
            ds.wind_fc_high, ds.wind_fc_hours, ds.wind_obs_high
@@ -191,7 +190,7 @@ _INSERT_COVERAGE_SQL: Final = """
          expected, starting_days)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 """
-# Rain (rain release, C2, C3): the window's known truth days, the models'
+# Rain: the window's known truth days, the models'
 # daily totals, and the picks of the 60 cutoffs before.
 _RAIN_TRUTH_SQL: Final = """
     SELECT local_date, outcome FROM rain_days
@@ -240,9 +239,8 @@ _DELETE_PUBLICATION_SQL: Final = "DELETE FROM publications WHERE id = ?"
 # downloads that can still have value-change rows (every remaining row's
 # download_id is at least the MIN, so the bound drops only downloads with
 # none). NOT INDEXED stops the planner walking the covering index
-# idx_forecast_downloads_day instead (the same idiom as the O16 manifest probe
-# in tests/test_query_plan_regressions.py). With an empty log MIN is NULL and
-# nothing is deleted.
+# idx_forecast_downloads_day instead. With an empty log MIN is NULL and nothing
+# is deleted.
 _DELETE_OLD_VALUE_CHANGES_SQL: Final = (
     "DELETE FROM forecast_value_changes WHERE download_id IN"
     " (SELECT id FROM forecast_downloads NOT INDEXED"
@@ -250,11 +248,11 @@ _DELETE_OLD_VALUE_CHANGES_SQL: Final = (
     "    AND ended_at < ?)"
 )
 
-# Readers (section 9). The defaults the build reads the two ranking
-# settings with (8.2).
+# Readers. The defaults the build reads the two ranking
+# settings with.
 _DEFAULT_WINDOW_DAYS: Final = 30
 _DEFAULT_MIN_N: Final = 30
-# 7.5: the latest cutoff published at or before T; T NULL takes the latest.
+# The latest cutoff published at or before T; T NULL takes the latest.
 _ACTIVE_PUBLICATION_SQL: Final = """
     SELECT id, site_id, cutoff, first_record_date, window_days,
            window_start_date, wind_start_date, settings, methodology_version,
@@ -275,7 +273,7 @@ _LATEST_PUBLISHED_AT_SQL: Final = """
     ORDER BY julianday(p.published_at) DESC, p.published_at DESC
     LIMIT 1
 """
-# A feed switched off now has no row in any read (9.1): each read joins the
+# A feed switched off now has no row in any read: each read joins the
 # feed and its site state to the publication's site, as ``_cached_leaderboard``
 # joins them to the cache's.
 _ACTIVE_AT_PUBLICATION_SITE: Final = active_competitor_clause(site_expr="p.site_id")
@@ -342,10 +340,10 @@ _Values = tuple[object, ...]
 
 
 class PublicationFailed(Exception):
-    """The publication cannot be built or swapped in (8.2, 8.3).
+    """The publication cannot be built or swapped in.
 
     Its message is the reason alone, ``cutoff_not_closed`` or ``no_site``,
-    which P3 saves as the publication record's ``last_failure``.
+    which the close chain saves as the publication record's ``last_failure``.
     """
 
     def __init__(self, reason: PublicationFailure) -> None:
@@ -356,7 +354,7 @@ class PublicationFailed(Exception):
 @dataclass(frozen=True, slots=True)
 class Publication:
     """One ``publications`` row, with ``settings`` parsed into
-    ``rolling_window_days`` and ``min_n`` (9.1)."""
+    ``rolling_window_days`` and ``min_n``."""
 
     id: int
     site_id: int
@@ -393,7 +391,7 @@ class ScoredCell:
 
 @dataclass(frozen=True, slots=True)
 class Coverage:
-    """One feed's coverage in one cell of a publication's window (7.4)."""
+    """One feed's coverage in one cell of a publication's window."""
 
     scored: int
     expected: int
@@ -402,7 +400,7 @@ class Coverage:
 
 @dataclass(frozen=True, slots=True)
 class RainRank:
-    """One ranked rain model of a publication's day ahead (rain release, C3)."""
+    """One ranked rain model of a publication's day ahead."""
 
     feed_id: int
     rank: int
@@ -412,7 +410,7 @@ class RainRank:
 
 @dataclass(frozen=True, slots=True)
 class RainRanks:
-    """A publication's rain ranking of one day ahead (C3), in rank order."""
+    """A publication's rain ranking of one day ahead, in rank order."""
 
     day_ahead: int
     provisional: bool
@@ -421,7 +419,7 @@ class RainRanks:
 
 @dataclass(frozen=True, slots=True)
 class _Build:
-    """What the build read and computed, ready for the swap (8.2)."""
+    """What the build read and computed, ready for the swap."""
 
     window_days: int
     min_n: int
@@ -432,7 +430,7 @@ class _Build:
     coverage: tuple[_Values, ...]
     wind_weights: tuple[_Values, ...]
     #: ``publication_rain_ranks`` rows less the publication id, and one
-    #: (day ahead, selected feed or None) per day ahead (C3).
+    #: (day ahead, selected feed or None) per day ahead.
     rain_ranks: tuple[_Values, ...]
     rain_picks: tuple[tuple[int, int | None], ...]
 
@@ -460,14 +458,14 @@ async def publish(
 ) -> str:
     """Publish the site's rankings, wind weights and coverage up to ``cutoff``.
 
-    P3's stage 7 call point (8.1, 16.1). A cutoff already published returns
-    its id and writes nothing (8.2 step 1). Otherwise one read-only snapshot
+    The close chain's stage 7 call point. A cutoff already published returns
+    its id and writes nothing. Otherwise one read-only snapshot
     reads the settings, requires ``cutoff``'s record to be ``closed`` (else
     ``PublicationFailed("cutoff_not_closed")``) and builds every row; one
-    ``writer.write`` then swaps the publication in (8.3), raising
+    ``writer.write`` then swaps the publication in, raising
     ``PublicationFailed("no_site")`` when the site is gone. Returns the
-    publication's id as text. ``attempt`` is P3's and not read; both stamps
-    are ``now_utc`` to the whole second.
+    publication's id as text. ``attempt`` is the close chain's and not read;
+    both stamps are ``now_utc`` to the whole second.
     """
     return await _publish(
         db,
@@ -479,7 +477,7 @@ async def publish(
 
 
 # ---------------------------------------------------------------------------
-# The build and the swap (section 8)
+# The build and the swap
 # ---------------------------------------------------------------------------
 
 
@@ -491,7 +489,7 @@ async def _publish(
     cutoff: date,
     now_utc: datetime,
 ) -> str:
-    """Repeat check, build snapshot, swap (8.2, 8.3).
+    """Repeat check, build snapshot, swap.
 
     The cutoff's record must be ``closed`` and the first record is read.
     """
@@ -522,7 +520,7 @@ def _build(
     site_id: int,
     cutoff: date,
 ) -> _Build:
-    """8.2 steps 2 to 5, in the caller's read-only snapshot. Never writes.
+    """Build every row, in the caller's read-only snapshot. Never writes.
 
     The settings are read once, here, and every later value comes from
     them. ``compute_wind_weights`` is pure.
@@ -616,7 +614,7 @@ def _build(
 def _rain_rankings(
     conn: sqlite3.Connection, site_id: int, *, cutoff: date
 ) -> list[RainRanking]:
-    """The rain ranking of each day ahead 0 to 7 at ``cutoff`` (C2, C3).
+    """The rain ranking of each day ahead 0 to 7 at ``cutoff``.
 
     Over the site's active real feeds (``active_real_feeds``; no yardstick),
     the window's known truth days from ``cutoff`` - 59 to ``cutoff``
@@ -687,9 +685,9 @@ def _window_cells(
     """The sums and coverage counts of every cell of the window [start, cutoff].
 
     Closed record dates from ``first`` on come from ``day_scores``, with
-    ``scored`` and ``expected`` (7.4); dates before ``first`` from
+    ``scored`` and ``expected``; dates before ``first`` from
     ``starting_scores``, counted apart as ``starting_days``. A window counts
-    calendar dates: a date with no row adds nothing (7.2).
+    calendar dates: a date with no row adds nothing.
     """
     cells: dict[_Key, _Cell] = {}
     closed_from = max(start, first)
@@ -720,7 +718,7 @@ def _wind_training(
     cutoff: date,
     first: date,
 ) -> WindTraining:
-    """The daily highs of the wind window [start, cutoff] (8.2 step 4).
+    """The daily highs of the wind window [start, cutoff].
 
     Closed dates give ``day_scores``' wind columns, a forecast high counting
     only with at least ``MIN_RUN_HOURS`` paired hours; starting dates give
@@ -770,7 +768,7 @@ def _swap(
     build: _Build,
     published: datetime,
 ) -> int:
-    """8.3, in one write: repeat check, site check, the rows, the deletes."""
+    """The swap, in one write: repeat check, site check, the rows, the deletes."""
     existing = _publication_id(conn, site_id, cutoff)
     if existing is not None:
         return existing
@@ -810,7 +808,7 @@ def _swap(
     conn.executemany(
         _INSERT_COVERAGE_SQL, [(publication_id, *row) for row in build.coverage]
     )
-    # C3: the rain ranking, one pick per day ahead, and the picks the next
+    # The rain ranking, one pick per day ahead, and the picks the next
     # incumbent look-back no longer reaches.
     conn.executemany(
         _INSERT_RAIN_RANK_SQL, [(publication_id, *row) for row in build.rain_ranks]
@@ -837,7 +835,7 @@ def _delete_superseded(
     conn: sqlite3.Connection, site_id: int, published: datetime
 ) -> None:
     """Delete each publication whose successor (the next cutoff) was published
-    more than ``PUBLICATION_KEEP_HOURS`` before ``published`` (7.5).
+    more than ``PUBLICATION_KEEP_HOURS`` before ``published``.
 
     The new publication is among the rows, so the one it succeeds is kept;
     children go by ``ON DELETE CASCADE``. A successor whose stamp does not
@@ -854,14 +852,14 @@ def _delete_superseded(
 
 
 # ---------------------------------------------------------------------------
-# Readers (sections 9, 12, 13.1 and 16.2)
+# Readers
 # ---------------------------------------------------------------------------
 
 
 def active_publication(
     conn: sqlite3.Connection, *, site_id: int, at_utc: str | None
 ) -> Publication | None:
-    """The site's publication active at ``at_utc`` (7.5), or ``None``.
+    """The site's publication active at ``at_utc``, or ``None``.
 
     The latest cutoff among the site's publications whose ``published_at``
     is at or before ``at_utc``; ``at_utc`` None takes the latest cutoff.
@@ -874,7 +872,7 @@ def active_publication(
 
 def latest_published_at(conn: sqlite3.Connection) -> str | None:
     """The newest ``published_at`` over the sites' active publications, or
-    ``None`` before the first publication (16.2, for P5)."""
+    ``None`` before the first publication."""
     row = conn.execute(_LATEST_PUBLISHED_AT_SQL).fetchone()
     return None if row is None else str(row["published_at"])
 
@@ -889,7 +887,7 @@ def published_ranking(
 ) -> dict[int, LeaderboardRow]:
     """The publication's ranking for one cell and window, keyed by feed id.
 
-    Only feeds that pass ``active_competitor_clause`` now (9.1), in
+    Only feeds that pass ``active_competitor_clause`` now, in
     ``_cached_leaderboard``'s order (source, model); ``confident`` from the
     publication's ``min_n``. Shared by the leaderboard, the served forecast
     and the record.
@@ -911,7 +909,7 @@ def published_cells(
 ) -> list[ScoredCell]:
     """Every ranking row of the publication's window, for the feeds that
     pass ``active_competitor_clause`` now, ordered by source, model,
-    variable and day ahead (the composite's read, 9.2)."""
+    variable and day ahead (the composite's read)."""
     rows = conn.execute(_PUBLISHED_CELLS_SQL, (pub.id, window_key)).fetchall()
     return [_scored_cell(row) for row in rows]
 
@@ -920,11 +918,12 @@ def live_cells(
     conn: sqlite3.Connection, *, pub: Publication, window_days: int
 ) -> list[ScoredCell]:
     """An ``Nd`` view, summed live over the ``window_days`` dates ending at
-    the publication's cutoff (9.2).
+    the publication's cutoff.
 
-    As 8.2 step 3: ``day_scores`` on the dates from the publication's first
-    record whose record is ``closed`` (a missed date's rows are never read,
-    7.2) and ``starting_scores`` before it, through ``metrics_from_sums``
+    As ``_window_cells`` does: ``day_scores`` on the dates from the
+    publication's first record whose record is ``closed`` (a missed date's
+    rows are never read) and ``starting_scores`` before it, through
+    ``metrics_from_sums``
     with the publication's ``min_n``. Never reaches past the cutoff, so
     never an open day. Only feeds that pass ``active_competitor_clause``
     now, ordered by source, model, variable and day ahead; a cell with no
@@ -995,7 +994,7 @@ def published_coverage(
 ) -> dict[tuple[int, int], Coverage]:
     """The publication's coverage for one variable and window, keyed by
     (feed id, day ahead), for the feeds that pass ``active_competitor_clause``
-    now (9.1, for P5)."""
+    now."""
     rows = conn.execute(_PUBLISHED_COVERAGE_SQL, (pub.id, variable, window_key))
     return {
         (int(row["feed_id"]), int(row["day_ahead"])): Coverage(
@@ -1011,9 +1010,9 @@ def pending_ranking_settings(
     conn: sqlite3.Connection, *, pub: Publication | None
 ) -> dict[str, tuple[int, int]]:
     """``(published, saved)`` for each ranking setting whose saved value
-    differs from ``pub``'s; ``{}`` for ``pub`` None (13.1).
+    differs from ``pub``'s; ``{}`` for ``pub`` None.
 
-    The saved values are read as the build reads them (8.2).
+    The saved values are read as the build reads them.
     """
     if pub is None:
         return {}
@@ -1036,7 +1035,7 @@ def published_wind_weights(
     conn: sqlite3.Connection, *, pub: Publication
 ) -> WindWeights:
     """The publication's wind weights, for the feeds that pass
-    ``active_competitor_clause`` now (9.4, 11.1)."""
+    ``active_competitor_clause`` now."""
     return {
         (int(row["feed_id"]), int(row["day_ahead"])): FeedWeight(
             mae_ms=float(row["mae_ms"]),
@@ -1050,7 +1049,7 @@ def published_wind_weights(
 def published_wind_serving(
     conn: sqlite3.Connection, *, site_id: int, as_of: str | None
 ) -> WindWeights:
-    """The wind weights served (9.4).
+    """The wind weights served.
 
     The weights of the publication active at ``as_of`` (the latest with
     ``as_of`` None), ``{}`` with no publication. Inside the caller's
@@ -1072,7 +1071,7 @@ def _published_wind_now(
 def published_rain_ranks(
     conn: sqlite3.Connection, site_id: int
 ) -> dict[int, RainRanks]:
-    """The active publication's rain ranking, by day ahead (rain release, C3).
+    """The active publication's rain ranking, by day ahead.
 
     Read as :func:`published_wind_serving` reads the weights: inside the
     caller's transaction when one is open; otherwise in one read snapshot.
@@ -1251,6 +1250,6 @@ def _shift(day: date, days: int) -> date:
 
 
 def _whole_second(now_utc: datetime) -> datetime:
-    """``now_utc`` as UTC, to the whole second (7.1, 15.2)."""
+    """``now_utc`` as UTC, to the whole second."""
     aware = now_utc if now_utc.tzinfo is not None else now_utc.replace(tzinfo=UTC)
     return aware.astimezone(UTC).replace(microsecond=0)

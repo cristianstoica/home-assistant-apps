@@ -1,5 +1,5 @@
 """Persistence's one shared definition, and the readers of the forecast
-history (storage-release plan 3.5, 3.6).
+history.
 
 Persistence, the yardstick that forecasts an hour with an earlier hour's own
 value, has one definition here: ``persistence_cells``, which stage 5's day
@@ -13,10 +13,10 @@ agree. These functions touch no database, clock or file.
 
 The two readers, ``winrate_errors`` (the win rate) and ``chart_pairs`` (the
 history chart), read ``forecast_history`` + ``observations`` and work the
-errors out on read (3.6): a site's ``closed`` days and its pre-close days
+errors out on read: a site's ``closed`` days and its pre-close days
 (no record, dated before its first record) together, never a ``missed`` day
-or one not yet done (R8). Persistence is rebuilt from ``observations``
-(3.5): on a closed day only where its persistence ``day_scores`` row of the
+or one not yet done. Persistence is rebuilt from ``observations``:
+on a closed day only where its persistence ``day_scores`` row of the
 variable and day ahead is ``scored``, before the first record at every hour
 with an observation; the win rate takes the shortest lead, the chart the
 longest. Both read inside the caller's read and never write.
@@ -36,8 +36,7 @@ from wxverify.core.timeutil import parse_utc
 from wxverify.db.switch import first_record_date
 from wxverify.scoring.effective import active_feed_cte
 
-#: Persistence's longest lead in hours; leads run from 1 to this (daily-close
-#: P4 plan 4.6).
+#: Persistence's longest lead in hours; leads run from 1 to this.
 PERSISTENCE_MAX_LEAD_HOURS: Final = 168
 # A cell is kept only at day ahead 0 to 7.
 _MAX_DAY_AHEAD: Final = 7
@@ -48,13 +47,13 @@ _SOURCE_DAYS: Final = -(-PERSISTENCE_MAX_LEAD_HOURS // 24)
 # ``local_date < NULL`` would drop every pre-close row.
 _NO_RECORD_BOUND: Final = date(9999, 12, 31)
 
-# The win rate's one read (3.6): one site, variable and day ahead, each
+# The win rate's one read: one site, variable and day ahead, each
 # active feed's stored forecast against the hour's observation, closed and
 # pre-close days together. The primary key makes each hour one row, so
 # nothing is ranked. The ``valid_at`` bounds are the window's dates widened
 # by one day each side and only let the key seek; ``local_date`` decides. A
 # date counts when its record is ``closed``, or when it has no record and
-# lies before the pre-close bound (a ``missed`` date has a record, R8).
+# lies before the pre-close bound (a ``missed`` date has a record).
 # Binds: the two of ``active_feed_cte()``, then site, variable, day ahead,
 # the two ``valid_at`` bounds, the window's first and last date, the
 # pre-close bound. ``CROSS JOIN`` keeps the feeds the outer loop, so each
@@ -85,7 +84,7 @@ _WINRATE_RANGE_SQL: Final = f"""
       AND (sd.state = 'closed'
            OR (sd.site_id IS NULL AND forecast_history.local_date < ?))
 """
-# The history chart's one range read (3.6): one feed, variable and day
+# The history chart's one range read: one feed, variable and day
 # ahead, with the win rate's two joins and its closed/pre-close condition.
 # The ``valid_at`` bounds only let the key seek; the caller's instants
 # decide. Binds: site, feed, variable, day ahead, the two ``valid_at``
@@ -108,7 +107,7 @@ _CHART_RANGE_SQL: Final = """
            OR (sd.site_id IS NULL AND forecast_history.local_date < ?))
 """
 # The closed dates whose persistence ``day_scores`` row of one variable and
-# day ahead is ``scored`` (3.5), with their bounds and zone. Binds: the
+# day ahead is ``scored``, with their bounds and zone. Binds: the
 # persistence feed, variable, day ahead, site, first and last date.
 _SCORED_PERSISTENCE_DAYS_SQL: Final = """
     SELECT sd.day_start_utc, sd.day_end_utc, sd.timezone
@@ -128,7 +127,7 @@ _PERSISTENCE_FEED_SQL: Final = (
     " WHERE source = 'virtual' AND model = '_persistence'"
 )
 # The zone of the site's published time zone generation, the pre-close
-# days' zone (3.5); the site's own zone while it has none.
+# days' zone; the site's own zone while it has none.
 _PRE_CLOSE_ZONE_SQL: Final = """
     SELECT COALESCE(
         (SELECT g.timezone FROM timezone_generations g
@@ -242,7 +241,7 @@ def shortest_lead_cells(
     cells: Iterable[PersistenceCell],
 ) -> dict[tuple[datetime, int], PersistenceCell]:
     """Per (target instant, day ahead), the cell with the smallest
-    ``lead_hours``: the win rate's pick (3.5). Pure."""
+    ``lead_hours``: the win rate's pick. Pure."""
     return _pick_by_lead(cells, longest=False)
 
 
@@ -250,7 +249,7 @@ def longest_lead_cells(
     cells: Iterable[PersistenceCell],
 ) -> dict[tuple[datetime, int], PersistenceCell]:
     """Per (target instant, day ahead), the cell with the largest
-    ``lead_hours``: the history chart's pick (3.5). Pure."""
+    ``lead_hours``: the history chart's pick. Pure."""
     return _pick_by_lead(cells, longest=True)
 
 
@@ -281,7 +280,7 @@ def persistence_picks_at(
     longest: bool,
 ) -> list[PersistenceCell]:
     """Persistence's one cell per requested target hour at ``day_ahead``, at
-    its longest lead (``longest``) or its shortest (3.5), oldest first.
+    its longest lead (``longest``) or its shortest, oldest first.
 
     The same cells, in instant order, as ``longest_lead_cells`` (or
     ``shortest_lead_cells``) of the ``persistence_cells`` cells at
@@ -375,10 +374,10 @@ def winrate_errors(
     end: date,
 ) -> list[HistoryError]:
     """Each active feed's error at every counted hour dated ``start`` (None:
-    no lower bound) to ``end``, at ``day_ahead`` (3.6), in no promised order.
+    no lower bound) to ``end``, at ``day_ahead``, in no promised order.
 
     The stored feeds come from ``_WINRATE_RANGE_SQL``; persistence's errors
-    are rebuilt at the shortest lead (3.5). Read-only.
+    are rebuilt at the shortest lead. Read-only.
     """
     low = date.min if start is None else start
     bound = _pre_close_bound(conn, site_id)
@@ -443,12 +442,12 @@ def chart_pairs(
     high: datetime | None,
 ) -> list[tuple[str, float, float]]:
     """The history chart's ``(valid_at, forecast, observed)`` rows of one
-    feed at ``day_ahead`` (3.6), at every counted hour from ``low`` to
+    feed at ``day_ahead``, at every counted hour from ``low`` to
     ``high`` (both included; None: no bound), oldest first.
 
     A stored feed's rows come from ``_CHART_RANGE_SQL``, kept by parsed
-    instant. ``forecast_history`` holds no persistence row (3.3), so the
-    persistence feed's rows are rebuilt at the longest lead (3.5). A
+    instant. ``forecast_history`` holds no persistence row, so the
+    persistence feed's rows are rebuilt at the longest lead. A
     ``valid_at`` that does not parse is left out. Read-only.
     """
     bound = _pre_close_bound(conn, site_id)
@@ -516,7 +515,7 @@ def _persistence_picks(
     longest: bool,
 ) -> list[PersistenceCell]:
     """Persistence's cells at ``day_ahead`` for the counted hours dated
-    ``low`` to ``high``, one per hour at its longest or shortest lead (3.5),
+    ``low`` to ``high``, one per hour at its longest or shortest lead,
     oldest first.
 
     A closed date's hours count only where its persistence ``day_scores``
@@ -593,7 +592,7 @@ def _pre_close_bound(conn: sqlite3.Connection, site_id: int) -> date:
 
 def _valid_at_bounds(low: date, high: date) -> tuple[str, str]:
     """``valid_at`` text bounds ``[lower, upper)`` for the dates ``low`` to
-    ``high`` widened by one day each side (3.6): a stored stamp's text
+    ``high`` widened by one day each side: a stored stamp's text
     starts with its UTC date, and a local date's hours fall on the UTC
     dates one before to one after it."""
     return _shift(low, -1).isoformat(), _shift(high, 2).isoformat()

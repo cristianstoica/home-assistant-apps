@@ -1,5 +1,4 @@
-"""The current-obs lane's refused-access behaviour (plan 2026-10-27
-refused-access-hold §13.3, CO1-CO5).
+"""The current-obs lane's refused-access behaviour (CO1-CO5).
 
 CO1 — a 401/403 writes the ``current_obs`` hold, defers the job to the
       hold's end, consumes (and does not refund) one budget call, and
@@ -362,7 +361,7 @@ def test_co1_refusal_writes_hold_and_touches_nothing_else(
 
 
 # ---------------------------------------------------------------------------
-# FT1 (health-release plan §6, Part F): a refusal whose body carries the
+# FT1: a refusal whose body carries the
 # provider's own reason stores it, masked, on the current_obs hold.
 # ---------------------------------------------------------------------------
 
@@ -410,16 +409,15 @@ def test_ft1_current_obs_refusal_stores_providers_masked_reason(
     body: bytes,
     expected_reason: str,
 ) -> None:
-    """Part F, FT1 (plan §6): a weather.com 401/403 whose body carries the
+    """FT1: a weather.com 401/403 whose body carries the
     provider's own reason stores it, masked, on the current_obs hold --
     status/until/since are unaffected by the reason's presence, compared
     against the SAME kind rewritten with an empty body at the same frozen
     now.
 
-    Catches: only `_http_status_error` changed so the owner's two real
-    cases are never shown on the hold (TODO item 4) -- at the "the hold
-    row's reason" assertion below: correct = expected_reason, mutant =
-    None.
+    Catches: only `_http_status_error` changed so the provider's reason
+    is never shown on the hold -- at the "the hold row's reason"
+    assertion below: correct = expected_reason, mutant = None.
     """
 
     async def run() -> None:

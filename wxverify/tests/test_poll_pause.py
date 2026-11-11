@@ -1,7 +1,6 @@
-"""Part B: recheck a quiet station after an hour (plan `2026-11-07-health-
-release.md` §2, test IDs BT1-BT4, BT7, BT8; BT5 lives in
-`tests/test_raw_store.py` on its own fixture; BT6 lives below, reusing
-`tests/test_station_lifecycle_routes.py`'s app harness; BT9 lives in
+"""Recheck a quiet station after an hour (test IDs BT1-BT4, BT7, BT8; BT5
+lives in `tests/test_raw_store.py` on its own fixture; BT6 lives below,
+reusing `tests/test_station_lifecycle_routes.py`'s app harness; BT9 lives in
 `tests/test_migration_v18.py`).
 
 BT1-BT4 run `persist_poll_result` directly on `tests/test_sm3_current_obs.py`'s
@@ -71,7 +70,7 @@ def _seed_paused(
     """Seed a `station_poll_state` row with a chosen pause count/reason.
 
     `tests/test_sm3_current_obs.py`'s own `_seed_poll_state` has no
-    pause-column parameters (it predates Part B), so this is a small,
+    pause-column parameters (it predates the pause columns), so this is a small,
     local helper rather than an edit of that file.
     """
     conn.execute(
@@ -108,7 +107,7 @@ def test_bt1_ladder_delay_table() -> None:
 def test_bt1_seven_offline_replies_climb_the_ladder() -> None:
     """Seven OFFLINE outcomes in a row, each at the clock the previous
     reply's own `next_poll_at` landed on. Catches: the 24 h park on the
-    first empty reply (TODO step 2); an off-by-one (the first reply on
+    first empty reply; an off-by-one (the first reply on
     2 h); the setting ignored (the second case below)."""
     conn = _make_conn()
     site_id = _seed_site(conn)
@@ -437,7 +436,7 @@ def test_bt4_fresh_reading_test_60_minute_boundary() -> None:
 
 
 def test_bt4_unparseable_obs_instant_at_count_1() -> None:
-    """Builder choice (not itemized by BT4): an ONLINE outcome whose
+    """An ONLINE outcome whose
     `obs_instant` `parse_utc` rejects, at count 1, gives `last_error`
     `stale observation (age unknown)`. `classify_current_obs` never
     produces this -- it classifies an unparseable obstime TRANSIENT before
@@ -487,9 +486,9 @@ def test_bt4_unparseable_obs_instant_at_count_1() -> None:
 
 
 def test_bt7_poll_status_text_table() -> None:
-    """Catches: empty reply and station error not told apart (the TODO's
-    "told apart"); a wrong boundary between count 1 and count 2 text; the
-    UTC-fallback suffix or the unknown text missing."""
+    """Catches: empty reply and station error not told apart; a wrong
+    boundary between count 1 and count 2 text; the UTC-fallback suffix or
+    the unknown text missing."""
     now_iso = "2026-07-10T13:00:00Z"
     assert poll_status_text("offline", 1, now_iso, zone_name="UTC") == (
         "Rechecking after an empty reply · next check 2026-07-10 13:00"
@@ -937,7 +936,7 @@ def test_bt6_retry_now_route(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
 def test_bt6_missing_site_answers_404(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Builder choice (not itemized by BT6): a station whose site row is
+    """A station whose site row is
     gone answers 404 'site not found', not a 5xx. The site row is removed
     with `foreign_keys` off, since the column's own `ON DELETE CASCADE`
     makes this otherwise unreachable while the pragma is on. Catches: an

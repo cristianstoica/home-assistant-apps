@@ -1,6 +1,5 @@
 """Oracle suite for the ``read_snapshot`` bracket on the leaderboard/composite
-read facades (``wxverify/db/snapshot.py``, plan ``2026-09-20-leaderboard-
-read-snapshot``).
+read facades (``wxverify/db/snapshot.py``).
 
 O1 (the torn-read six-seams oracle, a threaded writer racing a parked
 facade read) and O2 (the statement-shape matrix over score_cache's window
@@ -130,7 +129,7 @@ def test_o3_nesting_refused_outer_survives(tmp_path: Path) -> None:
     with no nesting attempt always succeeds). This test alone proves only
     the refusal half in isolation; the
     positive half is carried by the rest of the module rather than duplicated
-    here, since the plan's nesting-refusal oracle is specifically about the
+    here, since this nesting-refusal oracle is specifically about the
     refusal not silently corrupting an outer transaction already in flight.
     """
     conn = _init_tmp_db(tmp_path)

@@ -1,5 +1,4 @@
-"""The v11 daily-close-days schema's live constraints (plan 2026-10-20-
-daily-close-day-state-and-guard.md §10.2-10.7, test IDs MG5-MG6).
+"""The v11 daily-close-days schema's live constraints (MG5-MG6).
 
 The fixture is a real database built by migrating a fresh ``:memory:``
 connection with ``run_migrations``, then pinned at user_version 17 (see
@@ -7,8 +6,7 @@ connection with ``run_migrations``, then pinned at user_version 17 (see
 v11 additions the way ``tests/test_v8_last_usable_fetch_migration.py``'s
 ``_drop_stamp_column_and_roll_back``/``_v6_db`` still do). It holds
 station A (enabled) and B (turned off) at site 1, and station C (enabled)
-at site 2, per the plan's MG1 fixture note (§10.7-adjacent text above the
-MG table).
+at site 2.
 """
 
 from __future__ import annotations

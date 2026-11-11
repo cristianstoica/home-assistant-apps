@@ -32,7 +32,7 @@ class WeatherApiHour(BaseModel):
     temp_c: float | None = None
     wind_kph: float | None = None
     precip_mm: float | None = None
-    # Display only (card 7): %, km/h, degrees.
+    # Display only: %, km/h, degrees.
     cloud: DisplayFloat = None
     gust_kph: DisplayFloat = None
     wind_degree: DisplayFloat = None

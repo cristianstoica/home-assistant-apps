@@ -1,4 +1,4 @@
-"""Step 2 (card 7): display rosters, the stored-sample validator, the
+"""Display rosters, the stored-sample validator, the
 ``idx_samples_invalid`` reconciliation, and the Ops bad-sample count.
 
 The scored predicate (``invalid_forecast_sample_sql``) is pinned to a
@@ -183,7 +183,7 @@ def test_fresh_file_index_matches_generator_and_old_ddl_is_rebuilt_once(
         invalid_sample_index_ddl()
     )
 
-    # Swap the stored DDL for the pre-card-7 text (the scored-only predicate),
+    # Swap the stored DDL for the older text (the scored-only predicate),
     # the state a database built before this change carries on disk.
     old_ddl = (
         "CREATE INDEX IF NOT EXISTS idx_samples_invalid "
@@ -256,9 +256,9 @@ def test_bad_sample_count_sql_counts_zero_with_only_valid_display_rows() -> None
 
 
 # ---------------------------------------------------------------------------
-# §8 Part H (plan 2026-11-07-health-release.md): out_of_range_display_sql,
-# exercised directly on a bare table rather than through the version 18
-# upgrade's DELETE, where the ANDed invalid_stored_sample_sql predicate
+# out_of_range_display_sql, exercised directly on a bare table rather than
+# through the version 18 upgrade's DELETE, where the ANDed
+# invalid_stored_sample_sql predicate
 # would mask a boundary-row ``<=``/``>=`` slip in this helper alone (a
 # boundary row that fails the index predicate never reaches the DELETE).
 # ---------------------------------------------------------------------------

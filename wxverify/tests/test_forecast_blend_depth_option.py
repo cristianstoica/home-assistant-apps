@@ -186,9 +186,8 @@ def _seed_two_confident_feeds(conn: sqlite3.Connection) -> None:
 
     # The three feeds' far-horizon (temperature, day_ahead=1) skill numbers
     # that used to be written here as forecast_pairs rows are now
-    # hand-derived directly in `_seed_score_cache_for_fixture`'s published
-    # ranking (no pair table is read for scoring any more, W6b, storage
-    # release 3.1).
+    # hand-derived directly in `_seed_published_ranking_for_fixture`'s published
+    # ranking (no pair table is read for scoring any more).
 
 
 _TEST_PUBLICATION_WINDOW_DAYS = 30
@@ -199,7 +198,7 @@ def _ensure_test_publication(conn: sqlite3.Connection, *, min_n: int) -> int:
     """This connection's one site-1 publication, created on first use.
 
     ``leaderboard_with_status``'s ``rolling`` window now always reads the
-    active publication (9.2), never a live recompute. Mirrors
+    active publication, never a live recompute. Mirrors
     ``tests/test_forecast_service.py``'s identically-named helper.
     """
     row = conn.execute(
@@ -217,7 +216,7 @@ def _ensure_test_publication(conn: sqlite3.Connection, *, min_n: int) -> int:
     )
 
 
-def _seed_score_cache_for_fixture(conn: sqlite3.Connection) -> None:
+def _seed_published_ranking_for_fixture(conn: sqlite3.Connection) -> None:
     """Seed a fresh, complete published-ranking snapshot for the
     (temperature, day_ahead=1, w:30) cell `_seed_two_confident_feeds`
     populates.
@@ -284,7 +283,7 @@ def _seed_score_cache_for_fixture(conn: sqlite3.Connection) -> None:
 def test_end_to_end_default_blends_two_explicit_setting_narrows_to_one() -> None:
     """Touch point 6: the resolved ``forecast_blend_depth`` setting reaches
     the BLEND-set selection. `_seed_two_confident_feeds` covers hours 04-23
-    (20 hours) -- short of the complete local day Item F's extrema
+    (20 hours) -- short of the complete local day the extrema
     eligibility rule requires -- so for temperature `tile.temp.meta.feeds`
     now names the (empty) extrema set regardless of blend depth, not the
     depth-narrowed blend set this test is pinning. Read the blend set from
@@ -296,7 +295,7 @@ def test_end_to_end_default_blends_two_explicit_setting_narrows_to_one() -> None
 
     conn_default = _make_db()
     _seed_two_confident_feeds(conn_default)
-    _seed_score_cache_for_fixture(conn_default)
+    _seed_published_ranking_for_fixture(conn_default)
     conn_default.commit()
     view_default = build_forecast(
         conn_default, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
@@ -311,7 +310,7 @@ def test_end_to_end_default_blends_two_explicit_setting_narrows_to_one() -> None
 
     conn_narrow = _make_db()
     _seed_two_confident_feeds(conn_narrow)
-    _seed_score_cache_for_fixture(conn_narrow)
+    _seed_published_ranking_for_fixture(conn_narrow)
     set_setting(conn_narrow, "forecast_blend_depth", "1")
     conn_narrow.commit()
     view_narrow = build_forecast(

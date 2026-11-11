@@ -13,8 +13,8 @@ tests, which exercised the same retired cache-backed path.
 
 ``test_cell_grid_lead_bound_matches_schema_check`` pinned
 ``_expected_active_cells``/``cell_grid_cte()``, the grid+EXISTS rewrite's own
-candidate enumeration -- both removed with the old cache-backed read path
-(storage-release plan 2026-11-02, table 1.B). Removed with them.
+candidate enumeration -- both removed with the old cache-backed read path.
+Removed with them.
 
 Synthetic data only (public repo): fake site name, the repo's existing
 40/-105 lat-lon convention, no real station/device identifiers.

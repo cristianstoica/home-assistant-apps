@@ -1,4 +1,4 @@
-"""Tests: the 5-minute download's schedule, P2 §4.2 (14.6, EW1-EW15).
+"""Tests: the 5-minute download's schedule (EW1-EW15).
 
 ``EVENING_SLOTS`` and ``ReservationDeferred`` live in
 ``wxverify.worker.wind_days``; ``next_five_minute_try`` in
@@ -7,8 +7,8 @@
 
 Isolation: a real tmp-path ``Database``/``FencedWriter`` + ``httpx.
 MockTransport``, mirroring ``tests/test_wind_days_lane.py``'s ``_t97_*``
-harness. The site comes from P1's ``day_close_site`` (the daily close is
-always on). Stations and zones are synthetic per Projects/CLAUDE.md:
+harness. The site comes from ``day_close_site`` (the daily close is
+always on). Stations and zones are synthetic:
 ``ISTATION01``-``ISTATION06`` standing for A-F, zones ``UTC`` and
 ``Etc/GMT-14`` only; the API key is the CI placeholder.
 """
@@ -165,7 +165,7 @@ def _empty_ok() -> httpx.Response:
 
 
 def _give_today_record(conn: sqlite3.Connection, site_id: int, tz: str) -> None:
-    """Give the site a P1 record holding ``_DAY`` (the close is always on;
+    """Give the site a day record holding ``_DAY`` (the close is always on;
     without a record holding it, the lane's guard refuses the row, per
     EW14), mirroring ``tests/test_access_hold_five_minute.py``."""
     start_of_day = local_day_slots(_DAY, tz)[0]
@@ -258,7 +258,7 @@ def test_ew2_no_retries_after_a_success_before_23_56(
             now = parse_utc(str(row["next_attempt_at"]))
         assert now == end - timedelta(minutes=4), (
             "mutant -> at this assertion: correct = 23:56 (a success before"
-            " 23:56 jumps straight there, 4.2, M34), mutant (a further"
+            " 23:56 jumps straight there, M34), mutant (a further"
             f" retry slot scheduled before 23:56) = {now.isoformat()}"
         )
         assert queue == [], "fixture bug: every seeded response must be consumed"
@@ -270,7 +270,7 @@ def test_ew3_every_try_fails_runs_all_15_slots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tz: str
 ) -> None:
     """EW3: every try from 23:00 fails with an error that sets no back-off
-    (an HTTP 404, 4.2's amendment): tries land at the 15 documented slots
+    (an HTTP 404): tries land at the 15 documented slots
     in order, then the row is done for the day with no 16th try."""
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
@@ -558,8 +558,8 @@ def test_ew8_evening_slots_are_not_spaced_by_the_success_cooldown(
 ) -> None:
     """EW8: the lane completed at 23:56; a row due at 23:57: the
     scheduler's 5-minute success-spacing (``WIND_DAYS_SPACING``) must not
-    block the enqueue (M40). The close is permanent (storage-release plan
-    3.2); ``start_site_days`` gives the site its ``_DAY`` record, so
+    block the enqueue (M40). The close is permanent; ``start_site_days``
+    gives the site its ``_DAY`` record, so
     ``_lane_today`` finds today open."""
     import wxverify.db.queue as queue_module
     import wxverify.worker.scheduler as scheduler_module
@@ -636,7 +636,7 @@ def test_ew9_the_lanes_job_claims_in_tier_0() -> None:
     claimed = claim_next_job(conn)
     assert claimed is not None and claimed.job_key == WIND_DAYS_JOB_KEY, (
         "mutant -> at this assertion: correct = the wind-days job (claim"
-        " tier 0, 4.6, beats the older tier-1 job), mutant (M41: the claim"
+        " tier 0 beats the older tier-1 job), mutant (M41: the claim"
         " tier left at 1, so the older pair_and_score job claims first) ="
         f" {claimed.job_key if claimed is not None else None!r}"
     )
@@ -682,7 +682,7 @@ def test_ew10_the_slot_list_has_15_distinct_ordered_instants(tmp_path: Path) -> 
     )
     close_db()
 
-    # Etc/GMT-14 (14.1's second required zone): the slots are LOCAL wall
+    # Etc/GMT-14: the slots are LOCAL wall
     # clock, 14 hours ahead of UTC, not a UTC-hardcoded 23:00-23:59.
     db_14 = _init_tmp_db(tmp_path, name="ew10-14")
     conn_14 = db_14._conn  # noqa: SLF001
@@ -764,7 +764,7 @@ def test_ew11_every_try_logs_once_and_never_twice(
     )
     assert rows[0]["outcome"] == "stored" and rows[0]["readings_kept"] == 1, (
         "mutant -> at this assertion: correct = outcome='stored',"
-        " readings_kept=1 (a reply with readings is stored, 4.5), mutant"
+        " readings_kept=1 (a reply with readings is stored), mutant"
         " (a reply with readings read as no_readings/empty) ="
         f" outcome={rows[0]['outcome']!r} readings_kept={rows[0]['readings_kept']!r}"
     )
@@ -1066,7 +1066,7 @@ def test_ew14_cutover_with_no_record_makes_no_request(
 ) -> None:
     """EW14: the close on, the site's first record starting tomorrow,
     today's row due (on the old sites.timezone schedule) at 23:00: no
-    request, the budget unchanged, the row unchanged -- P1's guard refuses
+    request, the budget unchanged, the row unchanged -- the closed-day guard refuses
     every reading of the cutover day, so no try may be placed on it at all
     (M81)."""
     db = _init_tmp_db(tmp_path)
@@ -1100,7 +1100,7 @@ def test_ew14_cutover_with_no_record_makes_no_request(
     _run(db, site_id, handler, monkeypatch=monkeypatch)
 
     assert calls == [], (
-        "mutant -> at this assertion: correct = no request (P1's guard"
+        "mutant -> at this assertion: correct = no request (the closed-day guard"
         " refuses every reading of the cutover day, so the row is never"
         " tried), mutant (M81: a try placed using sites.timezone's own"
         f" schedule) = {calls}"

@@ -1,10 +1,10 @@
-"""daily_truth materialization + per-quantity eligibility (plan §4/§5/§14.2).
+"""daily_truth materialization + per-quantity eligibility.
 
 Implementation-level coverage: gate boundaries, DST slot counts (23/24/25),
 the asymmetric occurrence rule, consensus-mutation marking, regeneration
-under the row's own generation, and generation-bound reads. qa-engineer's
-§18.4/§18.9 oracle families build on the same seams. All fixture data is
-synthetic.
+under the row's own generation, and generation-bound reads. The oracle
+families in tests/test_daily_truth_oracles.py build on the same seams. All
+fixture data is synthetic.
 """
 
 from __future__ import annotations
@@ -356,7 +356,7 @@ def test_materialize_consensus_marks_affected_truth_rows() -> None:
             )
     conn.commit()
 
-    # A P1 record holding the day (the close is always on; the closed-day
+    # A site_days record holding the day (the close is always on; the closed-day
     # guard behind materialize_consensus refuses the write with no record).
     start_site_days(
         conn, site_id, date(2026, 6, 10), now_utc=datetime(2026, 6, 10, tzinfo=UTC)

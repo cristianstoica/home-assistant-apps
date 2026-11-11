@@ -1,5 +1,4 @@
-"""The verdict and admission (plan 2026-10-21-daily-close-close-job.md
-section 15.8): VD1 to VD9, AD1.
+"""The verdict and admission: VD1 to VD9, AD1.
 
 Written before ``verification.truth.evaluate_day_window``/``DayEvaluation``
 (the public name) and ``verification.truth.write_close_truth`` exist, and
@@ -13,26 +12,20 @@ underscore-prefixed pre-split names). AD1 imports
 
 Each VD row is also compared, field by field, with the CURRENT
 ``_evaluate_day`` called on the same hours under the site's published
-generation (plan 15.8's preamble): VD1-VD5/AD1 do this as their own
+generation: VD1-VD5/AD1 do this as their own
 cross-check (catching drift between the new entry point and the unchanged
 rules it must keep reproducing); VD9 IS this cross-check, directly.
 
-Section 16.2 of the plan names a mutant for VD6 (M48), VD7 (M50), VD8
-(M49/M49b) and AD1 (M52); it names none for VD1-VD5 or VD9, which pin
-today's UNCHANGED coverage minimums (6.2/6.3) as ``evaluate_day_window``'s
-own answer, so their assertions carry plain messages. For AD1's "one hour
-missing in one quantity" case, 16.2's own mutant (M52, "close_admission_basis
-judges temperature only") can only be killed by a case whose missing hour is
-NOT in temperature -- the gap is placed in the wind quantity, flagged
-inline and in the hand-back message as the smallest case that kills it.
+VD6 (M48), VD7 (M50), VD8 (M49/M49b) and AD1 (M52) each name the mutant
+they kill; VD1-VD5 and VD9 pin today's UNCHANGED coverage minimums as
+``evaluate_day_window``'s own answer, so their assertions carry plain
+messages. AD1's "one hour missing in one quantity" case can only kill M52
+("close_admission_basis judges temperature only") with a missing hour that
+is NOT in temperature, so the gap is placed in the wind quantity.
 
-VD4/VD5 read a literal "short by one hour" in the plan prose as giving an
-ineligible/NULL result; the near-complete gate (6.3, ``expected_slots - 1``
-= 23 of 24) actually keeps a single missing hour ELIGIBLE, as VD3's own
-"eligible at 23 of 24" establishes for the identical shortfall. Built with
-two missing hours instead, so the asserted result is actually true of the
-unchanged gate; flagged inline and in the hand-back message as a plan-text
-inconsistency, not a code bug.
+The near-complete gate (``expected_slots - 1`` = 23 of 24) keeps a single
+missing hour ELIGIBLE, as VD3's own "eligible at 23 of 24" establishes, so
+VD4/VD5 build their short days with two missing hours.
 
 Real SQLite only (``tests.helpers.asof_conn``/``day_close_site``, real
 ``run_migrations``). Station ids are synthetic (``ISTATION01``,
@@ -87,8 +80,8 @@ BOUND = STANDARD_NIGHT_ROUND_BOUND
 @pytest.fixture(autouse=True)
 def _clear_close_chain_log_map() -> None:
     """This file's own autouse wiring of ``clear_close_chain_log_map``
-    (15.1's "The log map.") -- autouse HERE, inside this one P3 test file,
-    never across the whole suite."""
+    -- autouse HERE, inside this one close-chain test file, never across
+    the whole suite."""
     clear_close_chain_log_map()
 
 
@@ -120,9 +113,9 @@ def _bounds():  # type: ignore[no-untyped-def]
 
 def test_vd1_the_18_hour_minimum_is_the_exact_boundary() -> None:
     """VD1: readings in hours 0 to 16; then 0 to 17. High and low: 17
-    covered hours give ``eligible`` 0, ``insufficient_coverage``; 18 give 1
-    (6.3). Plan section 16.2 names no mutant for VD1; this pins the
-    unchanged 18-hour minimum as ``evaluate_day_window``'s own answer.
+    covered hours give ``eligible`` 0, ``insufficient_coverage``; 18 give 1.
+    This pins the unchanged 18-hour minimum as ``evaluate_day_window``'s
+    own answer.
     """
     from wxverify.verification.truth import evaluate_day_window  # noqa: PLC0415
 
@@ -164,7 +157,7 @@ def test_vd1_the_18_hour_minimum_is_the_exact_boundary() -> None:
 def test_vd2_the_peak_window_is_checked_separately_from_coverage() -> None:
     """VD2: every hour but 12 to 17; every hour but 12 to 16; every hour
     but 3 to 8. High ``missing_peak_window``; high eligible; low
-    ``missing_peak_window`` (6.3). Plan 16.2 names no mutant for VD2.
+    ``missing_peak_window``.
     """
     from wxverify.verification.truth import evaluate_day_window  # noqa: PLC0415
 
@@ -229,8 +222,7 @@ def test_vd2_the_peak_window_is_checked_separately_from_coverage() -> None:
 
 def test_vd3_wind_maximum_near_complete_is_expected_slots_minus_one() -> None:
     """VD3: readings missing in the last hour, then in the last two. Wind
-    maximum eligible at 23 of 24; ``below_near_complete`` at 22 (6.3).
-    Plan 16.2 names no mutant for VD3.
+    maximum eligible at 23 of 24; ``below_near_complete`` at 22.
     """
     from wxverify.verification.truth import evaluate_day_window  # noqa: PLC0415
 
@@ -273,13 +265,12 @@ def test_vd3_wind_maximum_near_complete_is_expected_slots_minus_one() -> None:
 
 
 def test_vd4_rain_total_never_counts_a_missing_hour_as_zero() -> None:
-    """VD4: rain rising in every hour; then (plan-text deviation, see the
-    module docstring) no readings in the last TWO hours -- a single
-    missing hour stays near-complete and eligible (VD3 establishes 23 of
-    24 as the boundary itself), so "short" here is built to actually
-    breach it. The full day ``eligible`` 1 with the sum of the site's
+    """VD4: rain rising in every hour; then no readings in the last TWO
+    hours -- a single missing hour stays near-complete and eligible (VD3
+    establishes 23 of 24 as the boundary itself), so "short" here is built
+    to actually breach it. The full day ``eligible`` 1 with the sum of the site's
     hourly values; the short day ``eligible`` 0 with the partial sum;
-    never 0 for a missing hour (6.2). Plan 16.2 names no mutant for VD4.
+    never 0 for a missing hour.
     """
     from wxverify.verification.truth import evaluate_day_window  # noqa: PLC0415
 
@@ -330,11 +321,10 @@ def test_vd4_rain_total_never_counts_a_missing_hour_as_zero() -> None:
 
 def test_vd5_one_wet_hour_is_never_ignored_a_dry_day_needs_near_complete() -> None:
     """VD5: threshold 0.25: one hour rising 0.25 (short coverage); the same
-    at 0.24 (short coverage); a full dry day; a dry day short (plan-text
-    deviation, see the module docstring: built with TWO missing hours, not
-    one, so it is actually short of near-complete). Wet, ``eligible`` 1;
-    NULL, ``dry_without_near_complete``; dry ``eligible`` 1; NULL (6.2).
-    Plan 16.2 names no mutant for VD5.
+    at 0.24 (short coverage); a full dry day; a dry day short (built with
+    TWO missing hours, not one, so it is actually short of near-complete).
+    Wet, ``eligible`` 1; NULL, ``dry_without_near_complete``; dry
+    ``eligible`` 1; NULL.
     """
     from wxverify.verification.truth import evaluate_day_window  # noqa: PLC0415
 
@@ -402,7 +392,7 @@ def test_vd6_a_record_bounds_mismatch_fails_the_attempt_at_stage_4(
 ) -> None:
     """VD6: D's record bounds made one hour longer than ``local_day_bounds``
     gives (a seeded record). Stage 4 fails the attempt; no ``daily_truth``
-    row written (6.1).
+    row written.
 
     M48 -> at the attempt-state assertion below: correct = the attempt
     fails at stage 4 (``retry_due``/``failed_stage`` 4) with no
@@ -410,17 +400,13 @@ def test_vd6_a_record_bounds_mismatch_fails_the_attempt_at_stage_4(
     attempt closes normally over a day whose record spans an hour it does
     not actually have.
 
-    Reaches ``install_round_state_standin`` before anything else needing
-    P3's behaviour -- a ``ModuleNotFoundError`` today, since
-    ``wxverify.worker.close_p4`` does not exist.
-
     Isolation fault fixed here: pushing D's ``day_end_utc`` an hour past
     ``standard_night``'s own full 5-minute day (D's exact 24 hours) opens a
     real one-hour gap the stage-2 gap fill tries to fill for both stations
     -- unlike every sibling VD/AD test in this file, which never shifts the
     window and so never needs a key or a transport. Without
     ``write_weathercom_key``/``patch_weathercom_transport``/
-    ``disable_station_pacing`` (as every OTHER P3 test file that reaches a
+    ``disable_station_pacing`` (as every OTHER close-chain test file that reaches a
     real gap-fill call installs, e.g. ``tests/test_close_pause.py``'s
     ``_prepare_chain``), the fill tries a REAL ``httpx.AsyncClient()``
     request to api.weather.com, which the suite's network guard denies (or,
@@ -465,7 +451,7 @@ def test_vd6_a_record_bounds_mismatch_fails_the_attempt_at_stage_4(
         # the attempt cannot begin at the round's own bound (BOUND is still
         # before the mismatched day_end_utc): the clock must reach the
         # record's (mismatched) day_end_utc for D to be eligible to close at
-        # all, per plan line 192 condition 1 ("now_utc >= day_end_utc").
+        # all (now_utc >= day_end_utc).
         clock.set(mismatched_end_dt)
         await run_due_jobs(db, clock)
 
@@ -497,7 +483,7 @@ def test_vd7_a_threshold_change_after_stage_4_never_reaches_a_closed_day(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """VD7: the threshold changed after stage 4. D's rows keep the old
-    threshold; D closes (6.1, 10.4).
+    threshold; D closes.
 
     M50 -> at the stored-threshold assertion below: correct = D's
     ``daily_truth`` rows still carry the OLD threshold (0.2) after the
@@ -511,9 +497,6 @@ def test_vd7_a_threshold_change_after_stage_4_never_reaches_a_closed_day(
     make M50 a no-op: its re-read/UPDATE runs synchronously inside stage
     6's own write, at a moment when the threshold was still 0.2 either
     way, so a later external change could never reach it.
-
-    Reaches ``install_round_state_standin`` before anything else needing
-    P3's behaviour -- a ``ModuleNotFoundError`` today.
     """
 
     async def _run() -> None:
@@ -574,20 +557,20 @@ def test_vd7_a_threshold_change_after_stage_4_never_reaches_a_closed_day(
 def test_vd8_write_close_truth_only_accepts_a_closing_day() -> None:
     """VD8: ``write_close_truth`` called with D ``open``, ``retry_due`` and
     ``closed``, the close on. ``DayStateError`` in each, no row written;
-    allowed in ``closing`` (6.1, P1 §5.2). The ``open`` case is refused by
-    ``write_close_truth``'s own state check: P1's guard alone takes
+    allowed in ``closing``. The ``open`` case is refused by
+    ``write_close_truth``'s own state check: the closed-day guard alone takes
     ``TRUTH`` for an ``open`` day (``db/site_days.py:126-129``).
 
     M49 (``write_close_truth`` without its guard call) is equivalent here:
-    ``write_close_truth`` checks for ``closing`` first, and P1's guard
+    ``write_close_truth`` checks for ``closing`` first, and the closed-day guard
     always allows ``TRUTH`` for a ``closing`` day (``db/site_days.py:126-139``),
     so removing the guard call changes nothing any test can see.
 
     M49b -> at the ``open``-case assertion below: correct = ``DayStateError``
     raised (``write_close_truth``'s OWN state check refuses an ``open``
-    day, since P1's guard alone would accept it), mutant M49b
+    day, since the closed-day guard alone would accept it), mutant M49b
     (``write_close_truth`` without its ``closing`` state check) = no
-    refusal at this point (P1's guard alone takes ``TRUTH`` for ``open``
+    refusal at this point (the closed-day guard alone takes ``TRUTH`` for ``open``
     too), so a row would be written here as well.
     """
     from wxverify.verification.truth import (  # noqa: PLC0415
@@ -641,7 +624,7 @@ def test_vd8_write_close_truth_only_accepts_a_closing_day() -> None:
         "M49b -> at this assertion: correct = 0 (write_close_truth's"
         " OWN closing-state check refuses an open day before the guard is"
         " even asked), mutant M49b (write_close_truth without its closing"
-        " state check) = 5 (P1's guard alone takes TRUTH for an open day"
+        " state check) = 5 (the closed-day guard alone takes TRUTH for an open day"
         " too, so the write proceeds and five rows land)"
     )
 
@@ -725,7 +708,7 @@ def test_vd8_write_close_truth_only_accepts_a_closing_day() -> None:
         now_utc=after_d_end,
     )
     assert _truth_count(conn_closing, site_closing) == 5, (
-        "a closing day must accept the write: one row per quantity (6.1)"
+        "a closing day must accept the write: one row per quantity"
     )
 
 
@@ -745,7 +728,7 @@ def test_vd9_the_split_matches_a_hand_computed_evaluation() -> None:
     Seed: temperature ``10.0 + h``, wind ``5.0 + h``, precip ``0.1 * h``,
     for every UTC hour ``h`` in 0..23 (the zone is UTC, so local hours
     equal UTC hours, 24 expected slots, no DST); the site's rain
-    threshold is 0.2 mm, P1's own column DEFAULT (migrations.py:62),
+    threshold is 0.2 mm, the column's own DEFAULT (migrations.py:62),
     never set explicitly by ``day_close_site``/``asof_make_site``.
 
     Hand-worked expectations:
@@ -827,7 +810,7 @@ def test_vd9_the_split_matches_a_hand_computed_evaluation() -> None:
 def test_ad1_the_basis_judges_every_quantity_not_temperature_alone() -> None:
     """AD1: ``close_admission_basis`` with every quantity complete; with
     one hour missing in one quantity; with none. ``complete``, ``deadline``,
-    ``deadline`` (7.1).
+    ``deadline``.
 
     M52 -> at the one-quantity-short assertion below: correct = ``deadline``
     (ANY quantity short of its expected slots fails completeness), mutant
@@ -835,9 +818,7 @@ def test_ad1_the_basis_judges_every_quantity_not_temperature_alone() -> None:
     instead -- discriminating ONLY because the missing hour here is placed
     in the WIND quantity, not temperature: if it were in temperature, the
     mutant would also read ``deadline`` and this case could not kill it.
-    Plan 15.8's row does not say which quantity to use; wind is the
-    smallest case that actually kills M52, flagged in the hand-back
-    message.
+    Wind is the smallest case that actually kills M52.
     """
     from wxverify.verification.completeness import (  # noqa: PLC0415
         ADMISSION_COMPLETE,

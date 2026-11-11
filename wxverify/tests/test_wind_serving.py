@@ -1,6 +1,5 @@
 """Wind serving: eligibility floor, stored states that no longer close wind,
-the dashboard banner, and build_hourly's weighted axis (plan §11.4, §15.1
-T59, T60, T66).
+the dashboard banner, and build_hourly's weighted axis (T59, T60, T66).
 
 Isolation: fresh ``sqlite3.connect(":memory:")`` + ``run_migrations`` per
 test, mirroring ``tests/test_forecast_service.py`` (site id=1 fixed, the
@@ -213,7 +212,7 @@ def test_t66_weighted_widens_axis_temperature_unchanged_none_at_new_hours() -> N
 
 
 def test_t66_weighted_widens_axis_precip_unchanged_none_at_new_hour() -> None:
-    """Precip side of T66's axis-widening (plan lines 1463-1465): a precip
+    """Precip side of T66's axis-widening: a precip
     feed whose 24 on-the-hour samples exactly cover the local day (making it
     the ``extrema_feeds`` candidate ``covers_local_day_exactly`` requires)
     sits alongside two wind-eligible feeds, one of which also carries a

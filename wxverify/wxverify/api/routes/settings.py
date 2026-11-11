@@ -1,4 +1,4 @@
-"""Settings API: the snapshot wall-clock time (§15).
+"""Settings API: the snapshot wall-clock time.
 
 Sets or clears ``record_snapshot_local_time`` — the global default or a
 per-site override (key ``record_snapshot_local_time:<site_id>``). The time

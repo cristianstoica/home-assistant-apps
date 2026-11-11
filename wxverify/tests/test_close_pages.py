@@ -1,18 +1,11 @@
-"""Pages (daily-close plan 2026-10-22-daily-close-alerts-and-pages.md §9;
-test IDs PG1, PG2, PG4-PG7, PG9, PG11-PG14 of this file's §13.9; PG13 and
-PG14 needed the owner's open questions of 17.2 answered first
-(2026-10-31) and are added here now).
+"""Pages: test IDs PG1, PG2, PG4-PG7, PG9, PG11-PG14.
 
-Written before P5's page changes exist: every test below imports a name P5
-adds (or reaches new JSON/HTML it has not yet produced) inside its own body
-or its own assertions, so each fails today either at import time or at a
-plain assertion against today's unchanged response. Real SQLite throughout
-via a tmp-file database + ``TestClient`` (mirrors ``tests/test_forecast_
-routes.py``'s harness: the app's WAL-mode read pool is a SEPARATE connection
-from whatever writes the fixture rows, so a real file, not ``:memory:``, is
-required for the read side to see the write side's committed data).
-``utc_now`` is monkeypatched in every module on the page's read path (plan
-§13.1). Synthetic data only: stations ``ISTATION01``/``ISTATION02``, zone
+Real SQLite throughout via a tmp-file database + ``TestClient`` (mirrors
+``tests/test_forecast_routes.py``'s harness: the app's WAL-mode read pool is
+a SEPARATE connection from whatever writes the fixture rows, so a real file,
+not ``:memory:``, is required for the read side to see the write side's
+committed data). ``utc_now`` is monkeypatched in every module on the page's
+read path. Synthetic data only: stations ``ISTATION01``/``ISTATION02``, zone
 UTC, dates from the fixture's ``D``/``NOW``.
 """
 
@@ -80,7 +73,7 @@ def _make_app(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 
 def _patch_clock(monkeypatch: pytest.MonkeyPatch, now: datetime) -> None:
-    """Set ``utc_now`` on every module the plan names (§13.1)."""
+    """Set ``utc_now`` on every module on the page's read path."""
     for target in (
         "wxverify.web.context.utc_now",
         "wxverify.api.routes.timeseries.utc_now",
@@ -154,12 +147,11 @@ def _close_day(
 def test_pg1_closed_day_history_replaces_forecast_pairs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PG1 (plan §13.9, §9.2; storage-release plan A3/A4/3.6): closed-day
-    rows (D-3) and the starting history are kept; a missed day (D-2) is
-    dropped and listed in `missed_days`; an open day (D-1) is dropped too
-    (M86, M87). The starting-history row is itself a D+1 forecast
-    (`lead_hours` 24, `issued_at` 24h before its `valid_at`), so the
-    route's default `lead` (D+1) keeps it too (plan row ~812, 9.2).
+    """PG1: closed-day rows (D-3) and the starting history are kept; a
+    missed day (D-2) is dropped and listed in `missed_days`; an open day
+    (D-1) is dropped too (M86, M87). The starting-history row is itself a
+    D+1 forecast (`lead_hours` 24, `issued_at` 24h before its `valid_at`),
+    so the route's default `lead` (D+1) keeps it too.
     Neither ``close_pairs`` nor ``forecast_pairs`` is read; both the
     closed-day row and the starting-history row live in
     ``forecast_history``."""
@@ -261,7 +253,7 @@ def test_pg1_closed_day_history_replaces_forecast_pairs(
 def test_pg2_provisional_keys_present_with_close_on(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PG2 (plan §13.9, §9.2): with the close on, the reply gains
+    """PG2: with the close on, the reply gains
     `provisional_valid_at`/`provisional`/`provisional_latest_reading_at`,
     non-null once today has a reading (M88)."""
     conn = _init_tmp_db(tmp_path)
@@ -297,7 +289,7 @@ def test_pg2_provisional_keys_present_with_close_on(
 def test_pg4_zone_changeover_day_and_zone_flagged_days(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PG4 (plan §13.9, §9.2): a zone change's changeover day shows as
+    """PG4: a zone change's changeover day shows as
     "zone changeover", never "missed"; D-3, closed under the old zone,
     is listed in `zone_days` (M90)."""
     conn = _init_tmp_db(tmp_path)
@@ -374,7 +366,7 @@ def test_pg4_zone_changeover_day_and_zone_flagged_days(
 
 
 def test_pg5_app_js_provisional_series_missed_band_and_summary() -> None:
-    """PG5 (plan §13.9, §9.2): app.js pins the provisional series (dashed),
+    """PG5: app.js pins the provisional series (dashed),
     the missed band, the empty test reading all three, and the summary
     sentences (M91).
 
@@ -427,7 +419,7 @@ def test_pg5_app_js_provisional_series_missed_band_and_summary() -> None:
 def test_pg6_station_trust_closed_and_history_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PG6 (plan §13.9, §9.3): Station Trust, close on, counts the closed
+    """PG6: Station Trust, close on, counts the closed
     day's and the starting history's rows only -- a missed and an open
     day's rows are left out (M92)."""
     from wxverify.web.context import load_station_trust
@@ -476,7 +468,7 @@ def test_pg6_station_trust_closed_and_history_only(
 def test_pg7_coverage_table_next_to_the_rankings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PG7 (plan §13.9, §9.4): the coverage table/"Scored" column reads the
+    """PG7: the coverage table/"Scored" column reads the
     active publication's own `window_days` for "rolling", and "w:all" for
     "All time" -- never the pending `rolling_window_days` setting, and
     "none yet" (not "0 of 0") for an expected count of 0 (M93, M94, M122,
@@ -581,7 +573,7 @@ def test_pg7_coverage_table_next_to_the_rankings(
 def test_pg9_worker_status_newest_published_at_with_close_on(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PG9 (plan §13.9, §9.6): with the close on, `/api/worker/status`
+    """PG9: with the close on, `/api/worker/status`
     reports the newest `published_at` over active publications, not the
     (now stale) last completed `pair_and_score` run (M96)."""
     conn = _init_tmp_db(tmp_path)
@@ -613,7 +605,7 @@ def test_pg9_worker_status_newest_published_at_with_close_on(
 def test_pg11_overlay_lists_active_feeds_without_forecast_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PG11 (plan §13.9, §9.2): with the close on, the Overlay feed list
+    """PG11: with the close on, the Overlay feed list
     comes from the site's active feeds, not a `forecast_history` EXISTS --
     a site whose only history is a closed day's history still lists its
     feeds and renders the chart (M117)."""
@@ -656,12 +648,12 @@ def test_pg11_overlay_lists_active_feeds_without_forecast_history(
 def test_pg12_lead_default_excludes_day_ahead_zero_starting_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PG12 (plan §13.9, §9.2): with no `lead` given, the default (D+1)
+    """PG12: with no `lead` given, the default (D+1)
     excludes the starting history's `day_ahead=0` rows (I1/I2) but keeps
     D-3's closed `day_ahead=1` row.
 
     `issued_at` (M124/M136's original subject) has left the timeseries API
-    entirely (storage-release plan A4) -- passing it now changes nothing,
+    entirely -- passing it now changes nothing,
     which `tests/test_forecast_history_readers.py::test_timeseries_issued_
     at_query_parameter_has_no_effect` covers; this test keeps only the fact
     unrelated to `issued_at`: the default lead still filters the starting
@@ -756,7 +748,7 @@ def _seed_day_score(
     abs_sum: float = 2.0,
     sq_sum: float = 4.0,
 ) -> None:
-    """A closed day's scored cell (P4's ``day_scores``), local to this file
+    """A closed day's scored cell (``day_scores``), local to this file
     (mirrors ``tests/test_publication_readers.py``'s own private helper of
     the same name -- a cross-module import of a private helper between two
     independent test files is awkward, so this is a self-contained copy,
@@ -791,10 +783,10 @@ def _seed_day_score(
 def test_pg13_typed_nd_window_shows_no_coverage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PG13 (plan §13.9, §9.4): a typed `window=14d` view (`live_ranking`,
+    """PG13: a typed `window=14d` view (`live_ranking`,
     summed live) shows the Leaderboard's scored feed but no coverage table,
-    no "Scored" column and no coverage line -- P4 stores coverage for
-    `w:{N}` and `w:all` only, never a live window (owner, 2026-10-31; M126).
+    no "Scored" column and no coverage line -- the publication stores coverage for
+    `w:{N}` and `w:all` only, never a live window (M126).
 
     This PASSES on today's code: `_coverage_table` (`web/context.py:675-
     723`) already guards on `window_key.startswith("w:")` before reading
@@ -861,11 +853,11 @@ def test_pg13_typed_nd_window_shows_no_coverage(
 def test_pg14_lead_pick_parameter_and_overlay_control(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PG14 (plan §13.9, §9.2): the `lead` parameter, the day-ahead pick at
+    """PG14: the `lead` parameter, the day-ahead pick at
     a closed hour, the starting-history pick and the Overlay's lead
     control (M127-M129, M131-M135, M137-M140).
 
-    Storage-release plan A3/A4/3.3: the reads now come from
+    The reads now come from
     `forecast_history` (via `seed_forecast_history`); there is no
     separate close-off path to exercise here. `forecast_history`'s
     primary key is `(site_id, feed_id,
@@ -875,7 +867,7 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
     `forecast_history` rows at once -- only the one row (forecast 5.0, the
     earliest-issued run) is seeded.
 
-    Persistence (feed P) is dropped from this test entirely: under 3.3
+    Persistence (feed P) is dropped from this test entirely:
     `forecast_history` never holds a persistence row, so the original
     M130 check -- two stored leads of the same day ahead, pick the
     largest -- tests a removed behaviour; persistence's longest-lead pick
@@ -1107,8 +1099,8 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
     )
     assert lead_x.json()["detail"] == "lead is not a day ahead from D+0 to D+7"
 
-    # Persistence's longest-lead pick (the old M130 here) is dropped: under
-    # 3.3 forecast_history never holds a persistence row at all, so there
+    # Persistence's longest-lead pick (the old M130 here) is dropped:
+    # forecast_history never holds a persistence row at all, so there
     # is no `_closed_hour_pick` tie to break any more; the pick is now a
     # fixed `longest=True` rebuild, covered by test_forecast_history_
     # readers.py::test_winrate_shortest_lead_differs_from_chart_longest_lead_pick

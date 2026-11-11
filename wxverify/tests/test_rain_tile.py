@@ -1,17 +1,8 @@
-"""The rain tile, service and template (plan 2026-11-01-rain-release.md,
-Part C; test IDs the DB/service half of C2, C3, C4, C5, C6 and C7). The pure
-ranking-rule half of C1/C2 is in ``tests/test_rain_pick.py``; the upgrade
-fill (C8) is in ``tests/test_rain_history_fill.py``.
+"""The rain tile, service and template: the DB/service half of C2, and C3
+to C7. The pure ranking-rule half of C2 is in ``tests/test_rain_pick.py``;
+the upgrade fill is in ``tests/test_rain_history_fill.py``.
 
-Written before the Part C schema (``rain_days``, ``rain_forecast_days``,
-``rain_picks``, ``publication_rain_ranks``, ``station_rain_checks``,
-``site_day_stations.rain_counted``) and the Part C code
-(``scoring.close_scores.score_day`` writing ``rain_days``,
-``scoring.publication`` ranking and publishing rain, ``forecast.service``'s
-rebuilt ``PrecipCell``) exist: every test here fails -- at
-``sqlite3.OperationalError`` (missing table/column) for the DB-seeded
-sections, or on an assertion against today's ``PrecipCell`` shape -- until
-Part C is built. Real SQLite throughout; nothing in the code under test is
+Real SQLite throughout; nothing in the code under test is
 mocked. Synthetic data only: feed sources ``synthetic-rt-*``, station ids
 ``ISTATION-A``..``ISTATION-F``, zone UTC.
 
@@ -189,7 +180,7 @@ def _selected_feed(conn: sqlite3.Connection, publication_id: int) -> int | None:
 def test_incumbent_remembered_across_a_60_cutoff_gap(tmp_path: Path) -> None:
     """A ``rain_picks`` row 60 cutoffs before the publish cutoff names
     WORSE as the prior incumbent. With only a 2-point lead for BEST, the
-    incumbent-stays rule (C2) must keep WORSE selected, proving the
+    incumbent-stays rule must keep WORSE selected, proving the
     60-cutoff-old row was found and honored.
     """
     conn, publication_id, _best, worse = _run_publish_with_old_rain_pick(
@@ -482,7 +473,7 @@ def test_member_with_no_full_day_forecast_counts_in_neither_k_nor_q() -> None:
 
 def _precip_day_text(response_text: str) -> str:
     """The Precipitation grid's top-row day-column text (``page.rain_text``)
-    out of a rendered ``/forecast`` page -- card 7's replacement for the old
+    out of a rendered ``/forecast`` page -- the replacement for the old
     tile row's "Rain" ``<strong>``. Scoped to the Precipitation ``<table>``
     (the selected day's only), so it never picks up another grid's day cell.
     """
@@ -490,7 +481,7 @@ def _precip_day_text(response_text: str) -> str:
     section = section.split("</table>")[0]
     start = section.index('<td class="day">') + len('<td class="day">')
     end = section.index("</td>", start)
-    # The cell's visible text only -- the rain winner's markup (C4) wraps it
+    # The cell's visible text only -- the rain winner's markup wraps it
     # in a <small> and, with an agreement percentage, a
     # <span title="Agreement">: strip every tag, keep what a reader sees.
     return re.sub(r"<[^>]+>", "", section[start:end]).strip()
@@ -502,7 +493,7 @@ def test_forecast_page_rain_tile_shows_the_agreement_tooltip(
     """The template half of C4: the rendered ``/forecast`` page's
     Precipitation row shows the agreement percentage the fixture computes
     (67%, two of three ranked members wet), inside the
-    ``<span title="Agreement">`` tooltip card 7 brought back."""
+    ``<span title="Agreement">`` tooltip."""
     close_db()
     db_path = tmp_path / "wxverify.db"
     config.db_path = str(db_path)
@@ -562,7 +553,7 @@ def test_forecast_page_rain_tile_shows_the_agreement_tooltip(
     monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
     app = create_app(root_path="")
     with TestClient(app) as client:
-        # Card 7 shows only the SELECTED day's grids (day=1, tomorrow, by
+        # The page shows only the SELECTED day's grids (day=1, tomorrow, by
         # default) -- day_ahead 0, where this fixture's ranking lives, needs
         # an explicit day=0.
         response = client.get(f"/forecast?site={site_id}&day=0")
@@ -577,7 +568,7 @@ def test_forecast_page_rain_tile_with_no_agreement_shows_no_percent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Paired negative: with only one ranked feed, ``agreement_pct`` is
-    ``None`` (C4's ``test_single_ranked_feed_shows_no_agreement_pct``), so
+    ``None`` (``test_single_ranked_feed_shows_no_agreement_pct``), so
     the rendered Precipitation row's day text must carry no percentage --
     today and after the change alike.
     """
@@ -791,7 +782,7 @@ def test_forecast_page_shows_ranking_updating_badge_and_no_rain_forecast_text(
     with TestClient(app) as client:
         response = client.get(f"/forecast?site={site_id}")
     assert response.status_code == 200
-    # Card 7's day-warning text is sentence-cased ("Ranking updating"), not
+    # The day-warning text is sentence-cased ("Ranking updating"), not
     # the old lowercase CSS-badge wording.
     assert "Ranking updating" in response.text
     assert "No rain forecast" in response.text
@@ -931,7 +922,7 @@ def _rain_day_outcome(
     (name -> (day total mm, covered hours)), close it through
     :data:`_C7_TARGET`, and return the ``rain_days.outcome`` ``score_day``
     writes for that date. A name in ``excluded`` gets ``rain_counted = 0``
-    on the target day's list row (Part A), so its rain is set aside.
+    on the target day's list row, so its rain is set aside.
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "rain-nearby-site")
@@ -999,8 +990,8 @@ def test_set_aside_station_is_excluded_from_rain_nearby() -> None:
 
 def test_unknown_when_no_station_reaches_22_covered_hours() -> None:
     """Neither station has 22+ covered hours and neither rain threshold is
-    met: the outcome must be 'unknown', never 'dry' (C5's "an unknown truth
-    day is never counted as dry").
+    met: the outcome must be 'unknown', never 'dry' (an unknown truth day
+    is never counted as dry).
     """
     outcome = _rain_day_outcome({"A": (0.1, 10), "B": (0.1, 10)})
     assert outcome == "unknown"

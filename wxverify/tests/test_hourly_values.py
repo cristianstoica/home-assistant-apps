@@ -1,5 +1,4 @@
-"""The pure hourly-value method (plan 2026-10-21-daily-close, 7, 14.4
-HV1-HV13).
+"""The pure hourly-value method (HV1-HV13).
 
 ``obs/hourly_values.py`` is pure: no database, no clock, no network. It
 builds one station's hourly temperature, rain and wind values from its raw
@@ -54,11 +53,11 @@ def _reading(
 
 
 def test_hv1_temperature_is_plain_mean_absent_hours_have_no_key() -> None:
-    """HV1 (plan 14.4): 10/11/12 avg in H, one 20.0 reading in H+1, none in
+    """HV1: 10/11/12 avg in H, one 20.0 reading in H+1, none in
     H+2.
 
-    No mutant is named for HV1 in 15.2; it pins the plain-mean/no-minimum-
-    count rule of 7.2 directly: one reading is enough, an empty hour is
+    No mutant is named for HV1; it pins the plain-mean/no-minimum-
+    count rule directly: one reading is enough, an empty hour is
     absent, not 0.
     """
     h0 = _hour(10)
@@ -86,7 +85,7 @@ def test_hv1_temperature_is_plain_mean_absent_hours_have_no_key() -> None:
 
 
 def test_hv2_source_order_is_per_quantity_not_per_hour() -> None:
-    """HV2 (plan 14.4): per-quantity source order; mixed five_minute and
+    """HV2: per-quantity source order; mixed five_minute and
     current_obs readings in one hour.
 
     mutant_co_before_five_minute (M12) -> at the H0 temperature assertion:
@@ -140,12 +139,12 @@ def test_hv2_source_order_is_per_quantity_not_per_hour() -> None:
 
 
 def test_hv3_hourly_used_only_for_a_gap_hour() -> None:
-    """HV3 (plan 14.4): an hourly reading in a gap hour is used; in a
+    """HV3: an hourly reading in a gap hour is used; in a
     non-gap hour it is not, quantity by quantity.
 
     mutant_hourly_in_non_gap_hour (M14) -> at the N-hour rain assertion:
     correct = N absent from the rain dict (N is not a gap -- it has a
-    current_obs reading -- so step 3 of 7.1 never runs for rain even
+    current_obs reading -- so the hourly fill never runs for rain even
     though current_obs carries no rain total there), mutant (the gap check
     dropped) = N present, using the hourly reading's total as the rise
     from G's hourly-filled total. The fixture's N-hour current_obs reading
@@ -180,16 +179,16 @@ def test_hv3_hourly_used_only_for_a_gap_hour() -> None:
 
 
 def test_hv4_days_first_hour_starts_rain_at_zero() -> None:
-    """HV4 (plan 14.4): D0's rain starts at 0, never at a reading from
+    """HV4: D0's rain starts at 0, never at a reading from
     before the day.
 
     mutant_prev_day_total (M15) -> at the D0 assertion: correct = 0.5 (D0's
-    start is 0, as 5.4/7.3 require for the day's first hour: steps 0->0.2
+    start is 0, as the day's first hour requires: steps 0->0.2
     rise 0.2, 0.2->0.5 rise 0.3, sum 0.5), mutant (the first hour's start
     taken as the previous day's last total, 5.0) = 0.3 (the step 5.0->0.2
     is now a same-value fall, counted as 0, then the step 0.2->0.5 still
     adds 0.3). The fixture's pre-day reading sits in the `readings` passed
-    to `station_hours` (the lookback window 8.1 allows for wind)
+    to `station_hours` (the lookback window allowed for wind)
     specifically so a buggy implementation that reaches past the day's
     bounds for rain finds it; a correct one never consults any reading
     before `day_start_utc` for rain.
@@ -218,14 +217,14 @@ def test_hv4_days_first_hour_starts_rain_at_zero() -> None:
 
 
 def test_hv5_same_date_fall_gives_a_zero_step_not_a_reset() -> None:
-    """HV5 (plan 14.4): a same-date fall is a step of 0, not a running-
+    """HV5: a same-date fall is a step of 0, not a running-
     total reset.
 
     mutant_fall_is_reset (M16) -> at this assertion: correct = 0.3 (the
     step 2.0->1.8 is a fall, counted as 0; the step 1.8->2.1 is a rise of
     0.3; sum 0.3), mutant (a fall treated as a reset, so the fallen
     reading's step becomes its own total instead of 0) = 2.1 (1.8 + 0.3).
-    The fixture's fall (2.0 -> 1.8) is on the SAME local date, so 7.3's
+    The fixture's fall (2.0 -> 1.8) is on the SAME local date, so the
     reset rule (a restart is a change of local date) must not fire, and
     only the two literals' different treatment of the fall distinguishes
     them.
@@ -251,13 +250,13 @@ def test_hv5_same_date_fall_gives_a_zero_step_not_a_reset() -> None:
 
 
 def test_hv6_unfilled_gap_rain_is_absent_never_folded_forward() -> None:
-    """HV6 (plan 14.4): an unfilled rain gap stays absent in both hours;
+    """HV6: an unfilled rain gap stays absent in both hours;
     once filled from the hourly download, the gap's hour becomes its
     neighbour's start.
 
     mutant_reach_past_immediate_predecessor (M17) -> at the H+1 assertion
     in scenario A: correct = H+1 absent (its immediate predecessor H has
-    no rain reading, 7.3), mutant (the start of H+1 taken as the last rain
+    no rain reading), mutant (the start of H+1 taken as the last rain
     reading of ANY age, not just H) = 0.6 (1.6 minus H-1's 1.0, reaching
     past the gap). The fixture's H has no rain reading at all, so only a
     buggy "any age" lookup can reach H-1's 1.0.
@@ -305,13 +304,13 @@ def test_hv6_unfilled_gap_rain_is_absent_never_folded_forward() -> None:
 def test_hv7_reading_with_mismatched_local_date_is_not_used_for_rain(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """HV7 (plan 14.4): a rain reading whose own local date is the day
+    """HV7: a rain reading whose own local date is the day
     before is dropped for rain and logged once at WARNING; a reading with
     the site-day's own date is used normally (the paired positive).
 
     mutant_wrong_date_used (M19) -> at the H1 assertion: correct = H1
     absent (its only rain reading carries the PREVIOUS day's local date
-    and is dropped, 7.3), mutant (readings of another local date used for
+    and is dropped), mutant (readings of another local date used for
     rain) = 8.5 (9.0 minus H0's 0.5). H0's own reading carries the
     site-day's date and IS used (the paired positive, value 0.5), so only
     H1's date mismatch decides the two literals.
@@ -344,7 +343,7 @@ def test_hv7_reading_with_mismatched_local_date_is_not_used_for_rain(
 
 
 def test_hv8_wind_pairs_across_midnight_hourly_never_pairs() -> None:
-    """HV8 (plan 14.4): the lookback before the day's start still pairs; an
+    """HV8: the lookback before the day's start still pairs; an
     hourly reading never joins the pair series.
 
     mutant_lookback_dropped (M21) -> at the H0 assertion: correct = 12.0
@@ -387,7 +386,7 @@ def test_hv8_wind_pairs_across_midnight_hourly_never_pairs() -> None:
 
 
 def test_hv9_hourly_wind_fills_a_no_pair_hour_never_a_paired_one() -> None:
-    """HV9 (plan 14.4): the hourly wind fills an hour with no pair; it
+    """HV9: the hourly wind fills an hour with no pair; it
     never overrides an hour that has one; with neither a pair nor an
     hourly reading the hour has no wind value (the paired negative).
 
@@ -434,7 +433,7 @@ def test_hv9_hourly_wind_fills_a_no_pair_hour_never_a_paired_one() -> None:
 
 
 def test_hv10_day_hours_is_the_days_own_span_not_a_fixed_24() -> None:
-    """HV10 (plan 14.4): `day_hours` returns 23 UTC hours on a 23-hour day
+    """HV10: `day_hours` returns 23 UTC hours on a 23-hour day
     and 25 on a 25-hour day, as plain bounds (no `station_hours`).
 
     mutant_fixed_24 (M24) -> at both assertions: correct = 23 then 25 (the
@@ -460,7 +459,7 @@ def test_hv10_day_hours_is_the_days_own_span_not_a_fixed_24() -> None:
 
 
 def test_hv11_module_imports_only_stdlib_wind_pairs_and_core() -> None:
-    """HV11 (plan 14.4): `obs/hourly_values.py` imports no database or
+    """HV11: `obs/hourly_values.py` imports no database or
     worker module.
 
     mutant_db_import (M25) -> at this assertion: correct = set() (no
@@ -496,7 +495,7 @@ def test_hv11_module_imports_only_stdlib_wind_pairs_and_core() -> None:
 
 
 def test_hv12_last_hours_rain_uses_later_current_obs_readings_too() -> None:
-    """HV12 (plan 14.4): in the day's last hour, rain adds only the
+    """HV12: in the day's last hour, rain adds only the
     current_obs readings later than the last five_minute one, clamped at
     0, and never a reading at or after the day's end; temperature and wind
     stay five_minute-only.
@@ -507,7 +506,7 @@ def test_hv12_last_hours_rain_uses_later_current_obs_readings_too() -> None:
     day's last hour) = 0.5 (the rise alone). At the (iii) assertion:
     correct = 0.7 (0.5 plus 0.2, the 23:54 reading's added rain once the
     23:59 one is excluded for lying at the day's end), mutant = 0.5 again.
-    Case (ii)'s 0.5 only pins the "never negative" clamp (7.3) -- it does
+    Case (ii)'s 0.5 only pins the "never negative" clamp -- it does
     not discriminate M26, since the clamped added rain there is 0 either
     way under both the correct code and this mutant.
     """
@@ -578,7 +577,7 @@ def test_hv12_last_hours_rain_uses_later_current_obs_readings_too() -> None:
 
 
 def test_hv13_next_days_first_hour_never_inherits_the_old_days_total() -> None:
-    """HV13 (plan 14.4): D's last hour has no later reading, so nothing is
+    """HV13: D's last hour has no later reading, so nothing is
     added past the rise to 23:45; the next day's first hour starts fresh
     at 0, never carrying the previous day's lookback reading into its rain
     chain.
@@ -593,7 +592,7 @@ def test_hv13_next_days_first_hour_never_inherits_the_old_days_total() -> None:
     isolating the time boundary from the date check: the two literals
     diverge only if the implementation uses the date instead of
     `day_start_utc` to decide what belongs to the day. No mutant is named
-    for HV13 in 15.2; it pins 7.6's last point directly.
+    for HV13; it pins the last-hour rule directly.
     """
     day_a_start = _hour(23)
     day_a_end = day_a_start + timedelta(hours=1)

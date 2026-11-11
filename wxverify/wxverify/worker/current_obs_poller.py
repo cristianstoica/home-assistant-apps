@@ -88,8 +88,8 @@ async def run_current_obs_poller(db: Database, *, run_job: RunJob) -> None:
     claim returns; only the synchronous claim line runs in between. An error
     from the loop's own write propagates to the supervisor.
 
-    Once a stop has begun (``core.stop.STOP``, storage-release plan 6.3) it
-    claims nothing and goes back to the poll sleep, where the cancel lands.
+    Once a stop has begun (``core.stop.STOP``) it claims nothing and goes
+    back to the poll sleep, where the cancel lands.
     It never returns: a lane that ends on its own is a crash.
     """
     last_heartbeat = 0.0

@@ -1,4 +1,4 @@
-"""Part B -- the migration frame for the rain-label boundary (§11, §19.6).
+"""The migration frame for the rain-label boundary.
 
 ``record_precip_hour_start_boundary`` is a new migration step: it finds the
 newest ``fetched_at`` among Open-Meteo/meteoblue rain samples (the newest row
@@ -179,7 +179,7 @@ def _clear_boundary_and_seed(conn: sqlite3.Connection) -> None:
     """``run_migrations`` already called ``record_precip_hour_start_boundary``
     once (it runs unconditionally after migrations), writing the sentinel.
     Delete the key so the step under test runs again, against freshly seeded
-    rows, as the setup paragraph (§19.6) directs."""
+    rows."""
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
 
     delete_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY)
@@ -418,8 +418,8 @@ def test_m8_loader_gate_sits_before_the_row_number_pick() -> None:
     from wxverify.forecast.data import load_future_samples
 
     conn = _make_db()
-    # Two labels in one hour exist only in a file below v16 (the rain
-    # release, Part B, keeps one row per hour): the pick is a no-op on a
+    # Two labels in one hour exist only in a file below v16 (v16 keeps one
+    # row per hour): the pick is a no-op on a
     # v16 file, and the v16 carry-over keeps the row it picks.
     conn.execute("DROP INDEX idx_samples_slot")
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
@@ -526,7 +526,7 @@ def test_m14_boot_refuses_a_file_newer_than_the_running_app(
 
 # The paired import-side version-fence test
 # (`test_m14_import_rejects_a_backup_newer_than_the_running_app`) was
-# removed with the database import (storage-release plan 5.5).
+# removed with the database import.
 
 
 def test_m14_literal_version_fence_check() -> None:
@@ -602,7 +602,7 @@ def test_m15_missing_key_excludes_affected_rows_and_reopen_recomputes_from_store
     assert any(s.feed_id == google and s.variable == "precip" for s in live)
 
     # 0.16.12: a reopen recomputes the boundary from the stored rows' own
-    # fetched_at rather than leaving the key missing forever (plan §19.6).
+    # fetched_at rather than leaving the key missing forever.
     record_precip_hour_start_boundary(conn)
     assert (
         get_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY)
@@ -627,7 +627,7 @@ def test_m15_missing_key_excludes_affected_rows_and_reopen_recomputes_from_store
 def test_m16_refetch_keeps_the_old_row_and_a_new_run_is_eligible() -> None:
     # An identical refetch of the same model run keeps the old row's
     # fetched_at and excluded status; a genuinely new run replaces the hour
-    # (one row per hour since the rain release, Part B) and is eligible.
+    # (one row per hour since v16) and is eligible.
     from wxverify.collection.forecast_fetcher import (
         persist_fetch_result,
     )
@@ -779,7 +779,7 @@ def _m17_build_forecast_tile(
 
 
 def _m17_seed_rain_ranks(conn: sqlite3.Connection, feed_ids: list[int]) -> None:
-    """Rain release, C4: the published rain ranking for the tile's day ahead
+    """The published rain ranking for the tile's day ahead
     (0: 2026-01-02 is today at the build's clock), first feed selected."""
     from datetime import UTC, datetime
 
@@ -818,7 +818,7 @@ def test_m17a_an_excluded_feed_is_dropped_from_the_blend() -> None:
         value=0.5,
         fetched_at="2026-01-01T13:00:00Z",
     )
-    # Rain release, C4: the excluded feed is even the rain ranking's
+    # The excluded feed is even the rain ranking's
     # selected model; with its rain dropped it has no full day, so the tile
     # follows the next ranked model.
     _m17_seed_rain_ranks(conn, [om, google])
@@ -854,7 +854,7 @@ def test_m17b_a_fully_excluded_rain_feed_is_not_available_not_zero() -> None:
         value=10.0,
         fetched_at="2026-01-01T13:00:00Z",
     )
-    # Rain release, C4: ranked, so not_available comes from the exclusion.
+    # Ranked, so not_available comes from the exclusion.
     _m17_seed_rain_ranks(conn, [om])
 
     tile = _m17_build_forecast_tile(conn)
@@ -892,7 +892,7 @@ def test_m17c_one_eligible_hour_never_substitutes_for_the_day() -> None:
 
     tile = _m17_build_forecast_tile(conn)
 
-    # Rain release, C4: one hour is no full day, so the ranked feed is no
+    # One hour is no full day, so the ranked feed is no
     # winner.
     assert tile.precip.meta.state == "not_available"
     assert tile.precip.total_mm is None

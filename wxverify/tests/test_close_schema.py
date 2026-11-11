@@ -1,13 +1,12 @@
-"""Schema for daily-close piece 1 (plan 2026-10-21-daily-close-close-job.md,
-section 12, test IDs SC3-SC5): the five ``close_*`` tables and the widened
-``jobs`` CHECK, both now unconditional parts of ``create_tables``.
+"""Schema for the daily close (test IDs SC3-SC5): the five ``close_*``
+tables and the widened ``jobs`` CHECK, both now unconditional parts of
+``create_tables``.
 ``migrate_v13_close_jobs``, the migration that originally added them to an
 existing file, is deleted along with every other ``migrate_v2`` ...
 ``migrate_v16`` function -- SC1 and SC2's migration-mechanics tests
 retired with it; what remains (SC3-SC5) exercises the tables' own
-CHECK/foreign-key rules directly. Section 16.2 of the plan
-names the mutant each surviving test ID kills; that mapping is also given
-inline on each assertion, in the file's own style.
+CHECK/foreign-key rules directly. The mutant each surviving test ID kills
+is named inline on its assertion, in the file's own style.
 
 Real SQLite and real migrations throughout; nothing in the code under test
 is mocked. Synthetic data only: station ids ``ISTATION01``/``ISTATION02``
@@ -28,8 +27,8 @@ from wxverify.db.migrations import create_tables
 # --- SC1 ------------------------------------------------------------------
 #
 # A hand-crafted version-12 file (today's narrow jobs CHECK, the five
-# close_* tables absent) used to stand in for a pre-piece-1 database here,
-# built by migrating a fresh file up and then undoing piece 1's additions.
+# close_* tables absent) used to stand in for an older database here,
+# built by migrating a fresh file up and then undoing the additions.
 # That technique has nothing left to undo onto a reachable schema:
 # migrate_v13_close_jobs (and every other migrate_v2 ... migrate_v16
 # function) is deleted, create_tables carries the widened jobs CHECK and
@@ -46,7 +45,7 @@ from wxverify.db.migrations import create_tables
 
 # --- SC1 (extension): the CHECK copy in isolation ---------------------------
 #
-# 12.2 names create_tables' own jobs DDL as one of the places that must
+# create_tables' own jobs DDL is one of the places that must
 # carry the identical widened CHECK list. The fresh-vs-migrated comparison
 # above cannot tell this apart from the copy reached via
 # migrate_v13_close_jobs's rebuild, so this case drives create_tables alone
@@ -119,7 +118,7 @@ def test_sc1_create_tables_copy_of_the_check_admits_both_kinds_alone() -> None:
 
 
 def test_sc3_every_check_of_the_five_tables_refuses_its_bad_row() -> None:
-    """SC3: one insert per CHECK constraint of 12.3, each row valid except
+    """SC3: one insert per CHECK constraint, each row valid except
     for the one constraint it is built to break, and each refused with
     ``sqlite3.IntegrityError``. Catches a missing CHECK (M10a-M10k and
     beyond): with the targeted CHECK dropped, exactly that insert would
@@ -518,7 +517,7 @@ def test_sc4_station_delete_scopes_to_its_rows_site_delete_clears_all_five() -> 
         (site_id, local_date),
     ).fetchone()[0]
     assert try_log_count == 1, (
-        "close_try_log.station_id carries no foreign key (12.3), so a"
+        "close_try_log.station_id carries no foreign key, so a"
         " station-only delete must leave its try row in place"
     )
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []

@@ -1,8 +1,8 @@
-"""Tests for ``wxverify.worker.run_log`` -- card 27 step 1, one meteoblue
-run-log INFO line per model per reply (0.16.20 plan §2).
+"""Tests for ``wxverify.worker.run_log`` -- one meteoblue run-log INFO line
+per model per reply.
 
-Every expected literal below is derived directly from the plan's §2.3 line
-format and §2.2 contract, never recomputed by calling the code under test.
+Every expected literal below is derived directly from the line's format and
+``run_lines``'s contract, never recomputed by calling the code under test.
 
 Convention: ``httpx.MockTransport`` with a synchronous handler, matching
 ``tests/test_meteoblue_wind_unit_regression.py``. All fixture data is
@@ -538,7 +538,7 @@ def test_fetch_feed_once_meteoblue_run_log_write_failure_is_contained(
 
 
 # ---------------------------------------------------------------------------
-# New -- the line's ``local`` field (0.16.20 plan's meteoblue-times release)
+# The line's ``local`` field
 # ---------------------------------------------------------------------------
 
 

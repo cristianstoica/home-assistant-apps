@@ -1,23 +1,22 @@
-"""Phase 8 Round C — the §18 named oracle families for 0.11.0.
+"""The named oracle family for 0.11.0.
 
 One family lives here now, pinned against the mutation it exists to kill
-(named in the test docstring, not just in a report).
+(named in the test docstring).
 
-* **NB-4** — the canonical depth/variable roster. ``DEPTH_VARIABLES`` and its
-  three derived aliases, plus ``depth_option_values()``'s key set, pinned
-  with tuple/set EQUALITY so an added, removed, renamed or REORDERED
-  variable in one module without the others fails loudly.
+* The canonical depth/variable roster. ``DEPTH_VARIABLES`` and its three
+  derived aliases, plus ``depth_option_values()``'s key set, pinned with
+  tuple/set EQUALITY so an added, removed, renamed or REORDERED variable in
+  one module without the others fails loudly.
 
-Family 2 (NB-1, ``_contingency``/``_continuous_metrics`` fail-closed on a
-partial common core) has no test here: both were called only from
-``verification.engine._write_result``, reached only from ``aggregate_run``,
-the nightly replay function. Family 3 (NB-9, ``current_result_basis_
-fingerprint``'s read-only purity) and Family 4/5 (the element-presence
-oracle over the ``/verification`` page) have no test here either.
-``depth_option_values`` (still read by
-``settings/service.py`` on every settings save) is the only one of the
-original three NB-4/NB-9 subjects that survives independent of the
-verification-run layer, alongside NB-4's roster lockstep itself.
+The fail-closed checks on a partial common core
+(``_contingency``/``_continuous_metrics``) have no test here: both were
+called only from ``verification.engine._write_result``, reached only from
+``aggregate_run``, the nightly replay function. The read-only purity of
+``current_result_basis_fingerprint`` and the element-presence oracle over the
+``/verification`` page have no test here either. ``depth_option_values``
+(still read by ``settings/service.py`` on every settings save) is the only
+one of the original subjects that survives independent of the
+verification-run layer, alongside the roster lockstep itself.
 
 Every fixture value is synthetic: invented site names, RFC-5737-style fake
 identifiers, ``UTC``/``Etc/GMT-3`` timezones, and hand-made feed ids.
@@ -33,7 +32,7 @@ from wxverify.forecast.service import VARIABLES as FORECAST_SERVICE_VARIABLES
 from wxverify.settings.depth import DEPTH_VARIABLES
 
 # ===========================================================================
-# Family 1 — NB-4: the depth roster is ONE tuple, pinned by equality.
+# Family 1 — the depth roster is ONE tuple, pinned by equality.
 # ===========================================================================
 
 
@@ -67,7 +66,7 @@ class TestDepthRosterLockstep:
         self, module: str, alias: tuple[str, ...]
     ) -> None:
         """Kills: re-spelling any of the three aliases as its own literal
-        tuple (the drift NB-4 exists to prevent). Order is part of the pin —
+        tuple (the drift this pin exists to prevent). Order is part of the pin —
         the forecast page, sample validation and the record builder iterate
         these tuples, so a reorder is a behavior change.
         """

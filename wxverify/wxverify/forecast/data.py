@@ -14,7 +14,7 @@ incidentally via intersections):
 
 The sample loader adds one more: feeds not served at the site, through
 ``served_only`` on :func:`load_future_samples` (:func:`served_feed_ids`).
-The display loader (:func:`load_display_samples`, card 7) reads the display
+The display loader (:func:`load_display_samples`) reads the display
 roster instead, so it drops invalid rows by
 :func:`invalid_stored_sample_sql` and always drops unserved feeds.
 """
@@ -55,7 +55,7 @@ EXCLUDED_FEEDS_SQL = (
 class FutureSampleRow:
     """One validated, latest-run forecast sample with feed identity attached.
 
-    ``download_date`` (9.5) is the local date of the latest download that
+    ``download_date`` is the local date of the latest download that
     brought the sample's run label; None keeps the issue-time day ahead
     (:func:`sample_day_ahead`).
     """
@@ -160,7 +160,7 @@ def load_future_samples(
     the read, in Python, leaving the statement untouched. The simulation
     passes False because it filters to its pinned roster.
 
-    Each row also carries ``download_date`` (9.5, :func:`_download_dates`);
+    Each row also carries ``download_date`` (:func:`_download_dates`);
     the statement selects ``fetched_at`` for it. The statement is
     :func:`future_samples_sql`'s.
     """
@@ -190,7 +190,7 @@ def future_samples_sql() -> str:
     """The statement :func:`load_future_samples` runs.
 
     Module-level so a query-plan test plans the text that ships. Both
-    select lists carry ``fetched_at`` (9.5).
+    select lists carry ``fetched_at``.
     """
     invalid = invalid_forecast_sample_sql("fs")
     eligible = precip_label_eligible_sql("fs", "f")
@@ -222,7 +222,7 @@ _DISPLAY_VARIABLES_SQL: Final = ", ".join(
     f"'{variable}'" for variable in DISPLAY_VARIABLES
 )
 
-#: The display rows (card 7) :func:`load_display_samples` reads. One row per
+#: The display rows :func:`load_display_samples` reads. One row per
 #: slot (``idx_samples_slot``), so there is no latest-run pick, no rain-label
 #: rule and no download date. Module-level so a query-plan test plans the
 #: text that ships.
@@ -243,7 +243,7 @@ DISPLAY_SAMPLES_SQL: Final = f"""
 def load_display_samples(
     conn: sqlite3.Connection, *, site_id: int, since_valid_at: str
 ) -> list[FutureSampleRow]:
-    """Load a site's display samples (card 7) valid at or after a stamp.
+    """Load a site's display samples valid at or after a stamp.
 
     Runs :data:`DISPLAY_SAMPLES_SQL`: cloud cover, gust and wind direction,
     valid rows only (:func:`invalid_stored_sample_sql`), with the shared feed
@@ -270,7 +270,7 @@ def load_display_samples(
 
 
 def sample_day_ahead(sample: FutureSampleRow, timezone: str) -> int:
-    """The day ahead a sample is looked up at (9.5).
+    """The day ahead a sample is looked up at.
 
     From its ``download_date`` when it has one: the days from that date to
     the sample's local valid date in ``timezone``. Otherwise the issue-time
@@ -288,7 +288,7 @@ def _download_dates(
     site_id: int,
     rows: list[sqlite3.Row],
 ) -> list[date | None]:
-    """Each row's download date (9.5), in ``rows``' order.
+    """Each row's download date, in ``rows``' order.
 
     The ``local_date`` of the latest ``stored`` ``forecast_downloads`` row of
     the site (by ``ended_at``, then ``id``) whose labels for the sample's
@@ -516,7 +516,7 @@ def forecast_fingerprint(conn: sqlite3.Connection, *, site_id: int) -> str:
     leave the open drill-down untouched.
 
     The token ends in ``-p<id>``, the active publication's id (``0`` for
-    none), so an open page swaps its tiles when a publication lands (9.5).
+    none), so an open page swaps its tiles when a publication lands.
     """
     samples = samples_fingerprint(conn, site_id=site_id)
     rows = conn.execute(

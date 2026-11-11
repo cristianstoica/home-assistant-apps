@@ -1,4 +1,4 @@
-"""daily_truth: the close's truth write and staleness marking (§4/§14.2).
+"""daily_truth: the close's truth write and staleness marking.
 
 ``daily_truth`` persists one row per (site, local date, quantity, timezone
 generation): value, per-quantity eligibility, exclusion reason, coverage
@@ -14,8 +14,7 @@ Consensus-mutation contract: every consensus mutation funnels through
 ``scoring.consensus.materialize_consensus`` (the sole ``observations``
 writer), which calls :func:`mark_daily_truth_stale` for the mutated hour —
 affected rows get ``stale = 1``. Nothing regenerates a marked row: the
-nightly replay that did was retired with the daily close (switch-over plan
-R12, R13).
+nightly replay that did was retired with the daily close.
 """
 
 from __future__ import annotations
@@ -75,9 +74,9 @@ def evaluate_day_window(
 ) -> DayEvaluation:
     """Evaluate one (site, local day) in the zone and bounds the caller gives.
 
-    The close's stage 4 calls it with the zone and bounds of the day's record
-    (plan 6.1). Reads the site's rain threshold and the site's observations
-    in ``[bounds.start_utc, bounds.end_utc)``, nothing else.
+    The close's stage 4 calls it with the zone and bounds of the day's record.
+    Reads the site's rain threshold and the site's observations in
+    ``[bounds.start_utc, bounds.end_utc)``, nothing else.
 
     READ-ONLY by construction: every statement here is a SELECT and no
     generation is involved.
@@ -146,19 +145,19 @@ def write_close_truth(
     admission_basis: str,
     now_utc: datetime,
 ) -> None:
-    """Delete-and-recreate one closing day's five truth rows (plan 6.1).
+    """Delete-and-recreate one closing day's five truth rows.
 
     The close's stage 4 writer. Two checks run first, in this order, and
     either refusal raises ``DayStateError`` with nothing written: the day's
-    record must exist and be ``closing`` (P1's guard alone would not do,
-    since it takes ``TRUTH`` for an ``open`` day too); only then is P1's
-    guard asked, and its refusal fails the attempt as well (plan 5.3).
+    record must exist and be ``closing`` (the closed-day guard alone would
+    not do, since it takes ``TRUTH`` for an ``open`` day too); only then is
+    the closed-day guard asked, and its refusal fails the attempt as well.
 
     The rows take the ``daily_truth`` shape through this function's own
     statements: ``stale`` 0, the evaluation's threshold in
     ``rain_threshold_mm`` (a threshold changed later never reaches the
     day), the record's bounds and zone, and ``admission_basis`` as given —
-    ``completeness.close_admission_basis`` (plan 7.1); nothing on disk is
+    ``completeness.close_admission_basis``; nothing on disk is
     preserved. They are keyed by the site's one time zone generation
     (``site_generation_id``), read here. A rerun replaces the rows.
     ``generated_at`` is ``now_utc``, the close's clock.

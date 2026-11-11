@@ -45,7 +45,7 @@ class LeaderboardResult:
     status: LeaderboardStatus
     window_key: str
     window_days: int | None
-    #: The cutoff and id of the publication read (9.6); None with no
+    #: The cutoff and id of the publication read; None with no
     #: publication.
     evidence_through: date | None = None
     publication_id: int | None = None
@@ -112,7 +112,7 @@ def leaderboard_with_status_in_transaction(
     would refuse to nest, and ``leaderboard_in_snapshot`` wraps it. Other
     read paths call the facade.
 
-    The verdict comes from the active publication (9.2): no publication, or
+    The verdict comes from the active publication: no publication, or
     the site disabled, is ``empty``; ``rolling`` and ``all`` are the
     publication's ``w:{N}`` and ``w:all`` rows, ``hit``; an ``Nd`` window is
     summed live over the N closed dates ending at the publication's cutoff,
@@ -136,7 +136,7 @@ def leaderboard_in_snapshot(
     window: str,
 ) -> LeaderboardResult:
     """``leaderboard_with_status`` for a response that reads several
-    rankings inside its own snapshot (9.3: ``/curve`` and the dashboard).
+    rankings inside its own snapshot (``/curve`` and the dashboard).
 
     Raises ``RuntimeError`` when no transaction is open on ``conn``, so it
     can never read outside a caller-held snapshot; the facade serves every

@@ -1,6 +1,5 @@
 """Oracle suite for the read_snapshot rebase of the Forecast page / tiles
-auto-poll / hourly-detail / ranking-dispatch read paths (plan
-2026-09-26-forecast-snapshot-read).
+auto-poll / hourly-detail / ranking-dispatch read paths.
 
 Mirrors tests/test_freshness_read_snapshot.py's and
 tests/test_leaderboard_read_snapshot.py's harness shape: real tmp-file
@@ -57,7 +56,7 @@ from wxverify.settings.keys import get_number_setting, set_setting
 from wxverify.web.routes import _load_forecast_context
 
 # ---------------------------------------------------------------------------
-# Harness (reuse list per plan §11.1; only new, local helpers below).
+# Harness (only new, local helpers below).
 # ---------------------------------------------------------------------------
 
 
@@ -102,7 +101,7 @@ def _seed_s0(conn: sqlite3.Connection) -> Seed:
 
     min_n = get_number_setting(conn, "min_n", 30, minimum=0)
     # leaderboard_with_status's `rolling` window now always reads the
-    # active publication (9.2), never a live recompute, so the three feeds'
+    # active publication, never a live recompute, so the three feeds'
     # rankings land in one site publication instead of score_cache.
     pub_id = seed_active_publication(
         conn,
@@ -209,7 +208,7 @@ def _commit_once(
     return counts
 
 
-#: Card 7's region hx-get now reads "...&fingerprint=<token>&day=<n>" (no
+#: The region's hx-get now reads "...&fingerprint=<token>&day=<n>" (no
 #: longer a closing quote right after the token), so the token is bounded by
 #: the following "&day=" rather than by '"'. Jinja autoescapes the attribute
 #: text, so the rendered HTML carries "&amp;" rather than a bare "&".
@@ -224,7 +223,7 @@ def _token(html: str) -> str:
 
 
 def _site_label(html: str) -> str:
-    """The active site pill's name -- card 7 dropped the per-site subtitle
+    """The active site pill's name -- the page dropped the per-site subtitle
     ("<site> - combined forecast from the best-performing feeds") this used
     to read; the site-picker pill is the one place a specific site's name
     is still rendered, so it is the replacement site-identity check."""
@@ -308,7 +307,7 @@ def _assert_checkpoint_clean(db_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fixture constants (§11.2): predicted, then confirmed by the controls test.
+# Fixture constants: predicted, then confirmed by the controls test.
 # ---------------------------------------------------------------------------
 
 V0 = ["13° / 13°"]
@@ -322,7 +321,7 @@ T1 = "96-p1"
 
 
 # ---------------------------------------------------------------------------
-# Controls: stages 0-4, no injected concurrency. Also confirms §11.2.
+# Controls: stages 0-4, no injected concurrency. Also confirms the fixture constants.
 # ---------------------------------------------------------------------------
 
 
@@ -508,8 +507,8 @@ def test_tc_two_commits_depth_and_token(
             # The depth-1 value (V2 above) already proves the blend-depth
             # write landed together with the fingerprint-moving write in
             # the SAME read; there is no separate depth indicator left on
-            # the page to check a second time (card 7 dropped the
-            # depth-line paragraph).
+            # the page to check a second time (the
+            # depth-line paragraph is gone).
         else:
             assert poll_t0.status_code == 204
 
@@ -751,7 +750,7 @@ def test_th_exception_inside_snapshot_still_rolls_back(
 
 
 # ---------------------------------------------------------------------------
-# T-I: cancellation mid-snapshot rolls back cleanly (O4's shape).
+# T-I: cancellation mid-snapshot rolls back cleanly.
 # ---------------------------------------------------------------------------
 
 
@@ -907,7 +906,7 @@ def test_tk_guard_refuses_without_snapshot(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# T-ros -- moved from the input-epoch tests retired with Part D: the
+# T-ros -- the
 # query_only reset
 # ---------------------------------------------------------------------------
 

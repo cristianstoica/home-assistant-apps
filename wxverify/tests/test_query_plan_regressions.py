@@ -236,7 +236,7 @@ def test_worker_status_count_statements_stay_index_only_scans() -> None:
         "SCAN forecast_samples USING COVERING INDEX" in line for line in samples_plan
     )
 
-    # forecast_history (3.1) is WITHOUT ROWID with no secondary index -- its
+    # forecast_history is WITHOUT ROWID with no secondary index -- its
     # one btree IS the primary key, so there is no separate covering index
     # for the planner to name and "USING COVERING INDEX" can never appear in
     # its plan. Pin what is actually true and useful instead: the exact-count
@@ -509,7 +509,7 @@ def test_idx_samples_recent_column_order_matches_the_query_shape() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §14.6 "S" — Seed EQP (relationship, never a fixed-phrasing pin).
+# Seed EQP (relationship, never a fixed-phrasing pin).
 # ---------------------------------------------------------------------------
 
 
@@ -519,7 +519,7 @@ def test_idx_samples_recent_column_order_matches_the_query_shape() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §3.6 — forecast_history's three readers/writer each seek it by primary
+# forecast_history's three readers/writer each seek it by primary
 # key, never scan it.
 # ---------------------------------------------------------------------------
 
@@ -663,7 +663,7 @@ def test_failed_scopes_lookup_is_indexed_on_the_whole_scope() -> None:
 
 def _claim_subselect_plan(conn: sqlite3.Connection, type_clause: str) -> list[str]:
     """The claim's inner pending-row subselect, isolated from the outer
-    UPDATE ... RETURNING (§6.3.4, ``db/queue.py``'s ``_claim``). The outer
+    UPDATE ... RETURNING (``db/queue.py``'s ``_claim``). The outer
     UPDATE always resolves by rowid regardless of ``type_clause``, so only
     this subselect's plan can move -- imports ``_CLAIM_ORDER_BY`` and uses
     the same ``type_clause`` splice point ``_claim`` uses, so this test

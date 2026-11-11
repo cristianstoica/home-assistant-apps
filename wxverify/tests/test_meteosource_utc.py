@@ -1,7 +1,6 @@
-"""wxverify 0.16.20 Part 1 (card 24), T1-T6: Meteosource is asked for UTC, a
-reply not marked ``"UTC"`` is refused with a fixed message, and the refusal
-is recorded once -- never retried like a transient failure (plan
-`2026-11-08-meteosource-meteoblue-release.md` §1.5).
+"""T1-T6: Meteosource is asked for UTC, a reply not marked ``"UTC"`` is
+refused with a fixed message, and the refusal is recorded once -- never
+retried like a transient failure.
 
 Adapter tests (T1-T3) use ``httpx.MockTransport`` and patch
 ``meteosource_feed.snap_run``, as ``tests/test_new_providers.py:439-487``

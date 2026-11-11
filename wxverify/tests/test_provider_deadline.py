@@ -1,4 +1,4 @@
-"""Provider-call deadline pins (§6.3.9 of the station-health-and-retries plan).
+"""Provider-call deadline pins.
 
 httpx timeouts apply per operation, not to the whole call: a body that
 delivers each chunk before the read timeout expires can keep the call open

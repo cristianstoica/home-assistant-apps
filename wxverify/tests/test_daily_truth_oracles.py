@@ -1,10 +1,9 @@
-"""§18.4/§18.9 oracle families for daily_truth + per-quantity eligibility.
+"""Oracle families for daily_truth + per-quantity eligibility.
 
-Mutation-verified oracles over plan §4 (ground-truth gates), §5 (the shared
-coverage evaluators), §14.2 (daily_truth storage, staleness, regeneration)
-and §13 (generation-bound reads). Each test names the production mutation it
-kills; kills were performed against the live files and the files restored
-byte-identical (shasum-verified). All fixture data is synthetic.
+Mutation-verified oracles over the ground-truth gates, the shared coverage
+evaluators, daily_truth storage, staleness and regeneration, and
+generation-bound reads. Each test names the production mutation it kills. All
+fixture data is synthetic.
 
 Complements tests/test_daily_truth.py (implementer coverage) — no overlap in
 fixture shapes: these probes are built specifically so each named mutant
@@ -270,7 +269,7 @@ def _fall_back_hours() -> list[str]:
 
 
 def test_fold_instants_contribute_independently() -> None:
-    """Both UTC instants of the repeated 03:00 wall-clock hour count (§18.4).
+    """Both UTC instants of the repeated 03:00 wall-clock hour count.
 
     Rain sits ONLY on the two fold instants (2026-10-25T00:00Z and 01:00Z).
     Kills M8 (dedup on local wall-clock: both instants collapse to naive
@@ -306,7 +305,7 @@ def test_fold_instants_contribute_independently() -> None:
 
 
 def test_25_hour_day_near_complete_needs_24() -> None:
-    """On a 25-slot day: 24 covered passes, 23 does not (§18.4)."""
+    """On a 25-slot day: 24 covered passes, 23 does not."""
     hours = _fall_back_hours()
     day = date(2026, 10, 25)
     wind_24 = evaluate_wind(
@@ -420,7 +419,7 @@ def test_hourly_slot_window_is_half_open_at_both_ends() -> None:
     """A sample exactly AT the day's UTC start counts; exactly AT the end
     does not.
 
-    Exercised through the pure evaluator (the §5 forecast-side path), where
+    Exercised through the pure evaluator (the forecast-side path), where
     NO SQL prefilter runs — this is the single load-bearing membership gate
     for caller-assembled samples. Kills M13a (`instant < bounds.end_utc` ->
     `<=`: covered 24 and the 99.0 end decoy becomes the max) and M13b
@@ -549,7 +548,7 @@ def test_consensus_marks_on_upsert_and_delete_branches() -> None:
     )
     _seed_truth_rows(conn, site_id, day)
 
-    # A P1 record holding the day (the close is always on; the closed-day
+    # A site_days record holding the day (the close is always on; the closed-day
     # guard behind materialize_consensus refuses the write with no record).
     start_site_days(
         conn, site_id, date(2026, 6, 10), now_utc=datetime(2026, 6, 10, tzinfo=UTC)
@@ -566,7 +565,7 @@ def test_consensus_marks_on_upsert_and_delete_branches() -> None:
         )
         assert cur.lastrowid is not None
         station_id = int(cur.lastrowid)
-        # Puts the station on the day's saved list (6.2) through the real
+        # Puts the station on the day's saved list through the real
         # record_station_change path -- its "added" takes effect on the next
         # local date, so a day-before now_utc lands it on `day`.
         record_station_change(
@@ -618,7 +617,7 @@ def test_consensus_marks_on_upsert_and_delete_branches() -> None:
 
 
 def test_evaluate_variable_dispatches_to_the_matching_evaluator() -> None:
-    """The shared §4/§5 entry point routes each variable to its evaluator.
+    """The shared entry point routes each variable to its evaluator.
 
     Kills M27 (precip routed to the wind evaluator — the outcomes differ
     in quantity names, wet/dry counts, and the occurrence row's presence).
@@ -649,13 +648,10 @@ def test_evaluate_variable_dispatches_to_the_matching_evaluator() -> None:
 def test_precip_total_is_invariant_to_sample_list_order() -> None:
     """The daily precip total must not depend on ``samples`` list order.
 
-    §14's publish gate re-derives each candidate (stale, in-horizon) day and
-    compares the stored total against the re-derived one by exact equality —
-    if the sum were order-dependent, an unrelated index change that reorders
-    the upstream SQL result could make the gate block publication on data
-    that never changed. The observation fetch in ``truth._evaluate_day``
-    carries no ``ORDER BY``, so SQL row order reaches ``_hourly_slots``
-    unaltered and becomes the addition order of ``sum(slots.values())``.
+    The total must not depend on row order: the observation fetch in
+    ``truth.evaluate_day_window`` carries no ``ORDER BY``, so SQL row order
+    reaches ``_hourly_slots`` unaltered and becomes the addition order of
+    ``sum(slots.values())``.
 
     ONE day is built once and its ``(hour, value)`` pairs are re-ordered
     three ways, so the hour-to-value mapping is identical across cases and
@@ -674,10 +670,8 @@ def test_precip_total_is_invariant_to_sample_list_order() -> None:
     fails, the sum became order-dependent and PRODUCTION must change —
     there is no expected value to update. If only the ``hex()`` pin fails,
     the sum is still order-independent but lands on a different double, so
-    stored ``precip_total`` values no longer re-derive equal and the publish
-    gate would fire across the whole history: re-check persistence
-    compatibility against production data first, and do not update the
-    expected value mechanically.
+    a recomputed total no longer equals the stored ``precip_total`` to the
+    bit: check against real data before changing the expected value.
     """
     day = date(2031, 4, 9)
     hours = [f"2031-04-09T{h:02d}:00:00Z" for h in range(24)]

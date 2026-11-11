@@ -166,8 +166,8 @@ class Database:
         except BaseException:
             self._conn.close()
             raise
-        # Registered while the migrations run, so a stop interrupts them
-        # (storage-release plan 6.2); unregistered before anything else.
+        # Registered while the migrations run, so a stop interrupts them;
+        # unregistered before anything else.
         stop.register(self._conn)
         try:
             try:
@@ -210,9 +210,9 @@ class Database:
             # transaction.
             if self._conn.in_transaction:
                 self._conn.rollback()
-        # The one-time compaction (storage-release plan 4.2), before any
-        # reader opens. Registered like the migrations, so a stop interrupts
-        # it; every other failure is logged inside and the open carries on.
+        # The one-time compaction, before any reader opens. Registered like
+        # the migrations, so a stop interrupts it; every other failure is
+        # logged inside and the open carries on.
         stop.register(self._conn)
         try:
             try:
@@ -529,7 +529,7 @@ class Database:
         return self._run_immediate(fn)
 
     def interrupt_writer(self) -> None:
-        """End the statement running on the writer, if any (plan 6.4).
+        """End the statement running on the writer, if any.
 
         Safe from any thread. The statement fails with
         ``sqlite3.OperationalError: interrupted`` and ``_run_immediate``

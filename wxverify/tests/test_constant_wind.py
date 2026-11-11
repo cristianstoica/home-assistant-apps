@@ -1,10 +1,9 @@
-"""The stuck-wind-station warning (plan `2026-11-07-health-release.md` §1,
-Part A; test IDs AT1-AT13).
+"""The stuck-wind-station warning (test IDs AT1-AT13).
 
 Made-up readings in km/h on whole UTC hours, a site in ``UTC``, stations
 named A-F in prose with obviously made-up ``pws_station_id``s (``TESTA01``
 etc, public repo: no real station id, coordinate, site name or zone name).
-"Others windy" (the plan's own term) is three other stations reading 7.2,
+"Others windy" is three other stations reading 7.2,
 9.0 and 10.8 km/h, in that order, through an hour -- comfortably above the
 trial median gate of 3.6 km/h (1 m/s).
 
@@ -53,7 +52,7 @@ from wxverify.obs.constant_wind import Episode, Rule, assess, hour_winds
 from wxverify.settings.keys import set_setting
 from wxverify.settings.service import apply_plain_settings
 
-#: The rule's trial values (plan §1 A4): 6 hours, 3 other stations, a 1 m/s
+#: The rule's trial values: 6 hours, 3 other stations, a 1 m/s
 #: (3.6 km/h) median.
 _RULE = Rule(hours=6, other_stations=3, median_kmh=3.6)
 
@@ -109,7 +108,7 @@ class _RealDb:
 
 
 # ---------------------------------------------------------------------------
-# AT1-AT5, AT7: the pure rule, ``assess`` (plan §1 A1).
+# AT1-AT5, AT7: the pure rule, ``assess``.
 # ---------------------------------------------------------------------------
 
 
@@ -329,7 +328,7 @@ def test_at7_hour_values_not_aggregate() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AT8: source order, ``hour_winds`` (plan §1 A1).
+# AT8: source order, ``hour_winds``.
 # ---------------------------------------------------------------------------
 
 
@@ -356,7 +355,7 @@ def test_at8_source_order() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AT6, AT9-AT12: the hourly run and the monitor rows (plan §1 A3, A5).
+# AT6, AT9-AT12: the hourly run and the monitor rows.
 # A real, file-backed SQLite database for each test (``run_migrations``).
 # ---------------------------------------------------------------------------
 
@@ -851,8 +850,7 @@ def test_at12_monitor_rows(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AT13: the wiring -- scheduler_tick calls assess_constant_wind (not in the
-# plan; added here).
+# AT13: the wiring -- scheduler_tick calls assess_constant_wind.
 # ---------------------------------------------------------------------------
 
 

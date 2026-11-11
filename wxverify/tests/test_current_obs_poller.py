@@ -1,7 +1,6 @@
 """The current-obs lane: claim partition, poller loop and DL3.
 
-Covers plan §14.2 tests P, P2, X, Q, the idle-poller-seam test, H, W and
-DL3 -- the 2026-09-23 station-health-and-retries plan, commit 5 (D1.2).
+Covers tests P, P2, X, Q, the idle-poller-seam test, H, W and DL3.
 F (the generation-fence capture race) has no test here.
 
 EQP (the query-plan relationship for the two claim clauses) lives in
@@ -272,7 +271,7 @@ def test_x_claim_exclusivity_each_lane_gets_its_own_type(tmp_path: Path) -> None
 
 
 def test_q_partition_claim_does_not_double_claim_at_scale(tmp_path: Path) -> None:
-    """The §4.1 partition differential at reduced test size: every claim
+    """The partition differential at reduced test size: every claim
     lands in exactly one lane, and no job is claimed twice.
     """
 
@@ -323,7 +322,7 @@ def test_run_worker_resolves_poller_via_the_processor_module_attribute(
     """``run_worker`` must call the ``run_current_obs_poller`` NAME bound on
     ``wxverify.worker.processor``, not a fresh import from the poller
     module -- otherwise patching the processor attribute (the whole test
-    seam in §6.3.6) would silently stop working.
+    seam) would silently stop working.
     """
     recorder: dict[str, bool] = {"called": False}
 
@@ -674,7 +673,7 @@ def test_dl3_current_obs_deadline_is_not_refunded_and_fails_transiently(
 
 
 # ---------------------------------------------------------------------------
-# D1.3: poll_lateness_seconds
+# poll_lateness_seconds
 # ---------------------------------------------------------------------------
 
 _FIXED_NOW = datetime(2026, 9, 24, 12, 0, 0, tzinfo=UTC)
@@ -699,7 +698,7 @@ def test_poll_lateness_seconds_past_due_returns_elapsed_seconds() -> None:
 
 
 # ---------------------------------------------------------------------------
-# D1.3: rescheduled classification, prior job, log level -- via
+# Rescheduled classification, prior job, log level -- via
 # _log_claim_lateness on a hand-built ClaimedCurrentObs.
 # ---------------------------------------------------------------------------
 
@@ -752,7 +751,7 @@ def _log_message(
 def test_rescheduled_no_when_next_attempt_equals_created(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Mutant: `next_attempt_at is not None` (the false oracle §6.4.1 names)
+    """Mutant: `next_attempt_at is not None`
     -- next_attempt_at is always populated for a real job, so that mutant
     would render `rescheduled=yes` here where the correct code renders `no`.
     """

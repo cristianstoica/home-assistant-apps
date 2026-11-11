@@ -65,7 +65,7 @@ class WriteKind(StrEnum):
 
 # Value: the switch time, a canonical UTC ``...Z`` stamp.
 DAILY_CLOSE_ON_KEY: Final = "daily_close_on_at"
-#: What every retired control answers with (switch-over plan 7.3).
+#: What every retired control answers with.
 RETIRED_CONTROL_MESSAGE: Final = (
     "This control was retired when the daily close turned on. "
     "Each day is collected and closed once after it ends, "
@@ -118,9 +118,8 @@ _STATION_CHANGES: Final[tuple[StationChange, ...]] = (
 )
 _JOINING_CHANGES: Final[frozenset[str]] = frozenset({"added", "turned_on"})
 
-# Table 5.2: the kinds the guard allows in each state that is not done.
-# ``retry_due`` allows nothing; a done day allows only RAW_PRUNE, by the 5.4
-# rule.
+# The kinds the guard allows in each state that is not done. ``retry_due``
+# allows nothing; a done day allows only RAW_PRUNE, by ``_raw_prune_due``.
 _STATE_KINDS: Final[dict[str, frozenset[WriteKind]]] = {
     "open": frozenset({WriteKind.READING, WriteKind.HOURLY, WriteKind.TRUTH}),
     "closing": frozenset(
@@ -253,7 +252,7 @@ def _holding_record(
 def _current_local_date(
     conn: sqlite3.Connection, site_id: int, now: datetime, site_tz: str
 ) -> date:
-    """The site's current local date (4.6).
+    """The site's current local date.
 
     The date of the record that holds ``now``; when none does, ``now``'s
     date in ``sites.timezone``.
@@ -283,14 +282,14 @@ def _validate_zone(name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Settings per day (6.1, 6.2)
+# Settings per day
 # ---------------------------------------------------------------------------
 
 
 def _zone_for_date(
     conn: sqlite3.Connection, site_id: int, local_date: date, site_tz: str
 ) -> str:
-    """The zone a new record dated ``local_date`` runs under (6.1).
+    """The zone a new record dated ``local_date`` runs under.
 
     The zone of the latest change with ``effective_date <= local_date``,
     latest by ``entered_at`` (parsed), then by ``id``; else
@@ -314,7 +313,7 @@ def _zone_for_date(
 def _station_list(
     conn: sqlite3.Connection, site_id: int, local_date: date
 ) -> list[int]:
-    """The list rule (6.2): stations in the day's list, sorted by id.
+    """The list rule: stations in the day's list, sorted by id.
 
     For each station, among its changes with ``effective_date <= local_date``,
     the one with the latest ``changed_at`` (parsed), then the highest ``id``,
@@ -342,11 +341,11 @@ def _station_list(
 def _write_station_list(
     conn: sqlite3.Connection, site_id: int, local_date: date
 ) -> None:
-    """Write the day's list rows (6.2) with each station's rain flag.
+    """Write the day's list rows with each station's rain flag.
 
     ``rain_counted`` is the ``counted_after`` of the station's latest
     ``station_rain_checks`` row dated before the day, or 1 when there is
-    none (rain release, Part A).
+    none.
     """
     day = local_date.isoformat()
     conn.executemany(
@@ -373,7 +372,7 @@ def _insert_record(
     site_tz: str,
     now: datetime,
 ) -> None:
-    """Create one ``open`` record with its zone, bounds, flag and list (6.1)."""
+    """Create one ``open`` record with its zone, bounds, flag and list."""
     zone = _zone_for_date(conn, site_id, local_date, site_tz)
     midnight, end, _ = local_day_slots(local_date, zone)
     if end <= start:
@@ -465,7 +464,7 @@ def _ensure(conn: sqlite3.Connection, site_id: int, now: datetime) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The switch time (11.1)
+# The switch time
 # ---------------------------------------------------------------------------
 
 
@@ -482,14 +481,14 @@ def daily_close_on_at(conn: sqlite3.Connection) -> datetime:
 
 
 # ---------------------------------------------------------------------------
-# Record creation (4.6)
+# Record creation
 # ---------------------------------------------------------------------------
 
 
 def ensure_site_days(
     conn: sqlite3.Connection, site_id: int, *, now_utc: datetime
 ) -> None:
-    """Create the site's missing records through its next local date (4.6).
+    """Create the site's missing records through its next local date.
 
     Idempotent. For a site with no records, starts it at its next local
     date. Does nothing for a site that does not exist.
@@ -500,7 +499,7 @@ def ensure_site_days(
 def start_site_days(
     conn: sqlite3.Connection, site_id: int, first_date: date, *, now_utc: datetime
 ) -> None:
-    """Create the site's first record, dated ``first_date``, then fill (4.6).
+    """Create the site's first record, dated ``first_date``, then fill.
 
     Raises ``DayStateError`` when the site does not exist, already has a
     record, or ``first_date`` is before the site's current local date.
@@ -519,7 +518,7 @@ def start_site_days(
 
 
 # ---------------------------------------------------------------------------
-# Reads (12.2)
+# Reads
 # ---------------------------------------------------------------------------
 
 
@@ -558,7 +557,7 @@ def current_day(
 def day_station_ids(
     conn: sqlite3.Connection, site_id: int, local_date: date
 ) -> frozenset[int]:
-    """The day's saved station list (6.2). Read-only."""
+    """The day's saved station list. Read-only."""
     rows = conn.execute(
         "SELECT station_id FROM site_day_stations WHERE site_id = ? AND local_date = ?",
         (site_id, local_date.isoformat()),
@@ -569,7 +568,7 @@ def day_station_ids(
 def day_rain_station_ids(
     conn: sqlite3.Connection, site_id: int, local_date: date
 ) -> frozenset[int]:
-    """The listed stations whose rain the day counts (rain release, A1).
+    """The listed stations whose rain the day counts.
 
     The day's saved list without the stations the rain check set aside
     (``rain_counted = 0``). Read-only.
@@ -592,8 +591,8 @@ def set_rain_counted_after(
 ) -> None:
     """Set the station's rain flag on its list rows dated after ``local_date``.
 
-    The rain check's step 3 (rain release, A4): the day's own row is left
-    as it is, so the change takes effect from the next day.
+    The rain check's change to the list: the day's own row is left as it
+    is, so the change takes effect from the next day.
     """
     conn.execute(
         "UPDATE site_day_stations SET rain_counted = ?"
@@ -637,7 +636,7 @@ def local_clock_utc(record: DayRecord, hour: int, minute: int) -> datetime:
 
 
 def closed_through(conn: sqlite3.Connection, site_id: int) -> date | None:
-    """The latest date such that it and every earlier record are done (4.5).
+    """The latest date such that it and every earlier record are done.
 
     ``None`` when the site's first record is not done. Read-only.
     """
@@ -653,7 +652,7 @@ def closed_through(conn: sqlite3.Connection, site_id: int) -> date | None:
 
 
 def zone_flagged(conn: sqlite3.Connection, site_id: int, local_date: date) -> bool:
-    """Whether the day's zone differs from ``sites.timezone`` (6.5).
+    """Whether the day's zone differs from ``sites.timezone``.
 
     ``False`` when the day has no record. Read-only.
     """
@@ -667,7 +666,7 @@ def zone_flagged(conn: sqlite3.Connection, site_id: int, local_date: date) -> bo
 
 
 # ---------------------------------------------------------------------------
-# Transitions (4.7)
+# Transitions
 # ---------------------------------------------------------------------------
 
 
@@ -706,7 +705,7 @@ def _refuse(record: DayRecord, why: str) -> DayStateError:
 def begin_close(
     conn: sqlite3.Connection, site_id: int, local_date: date, *, now_utc: datetime
 ) -> int:
-    """Start a close attempt; returns the attempt now running, 1 or 2 (4.7).
+    """Start a close attempt; returns the attempt now running, 1 or 2.
 
     ``open`` -> ``closing`` once the day has ended, every earlier record is
     done and the day is not a changeover day; ``retry_due`` -> ``closing``
@@ -755,7 +754,7 @@ def fail_close(
     now_utc: datetime,
     reason: str,
 ) -> DayState:
-    """Record a failed close attempt; returns the new state (4.7).
+    """Record a failed close attempt; returns the new state.
 
     After attempt 1 the day is ``retry_due`` with ``retry_at`` one hour on;
     after attempt 2 it is ``missed`` (``retry_failed``). ``reason`` is
@@ -795,7 +794,7 @@ def fail_close(
 def finish_close(
     conn: sqlite3.Connection, site_id: int, local_date: date, *, now_utc: datetime
 ) -> None:
-    """Move a ``closing`` day to ``closed`` (4.7).
+    """Move a ``closing`` day to ``closed``.
 
     Raises ``DayStateError`` unless the day is ``closing``, or when a
     ``daily_truth`` row of the day is marked stale.
@@ -829,7 +828,7 @@ def mark_missed(
     now_utc: datetime,
     reason: MissedReason,
 ) -> None:
-    """Move a day to ``missed`` with ``reason`` (4.7).
+    """Move a day to ``missed`` with ``reason``.
 
     ``open`` takes ``never_attempted`` (not a changeover day) or
     ``zone_changeover`` (a changeover day), once the day has ended and every
@@ -880,7 +879,7 @@ def mark_missed(
 
 
 # ---------------------------------------------------------------------------
-# The guard (7.1)
+# The guard
 # ---------------------------------------------------------------------------
 
 
@@ -898,7 +897,7 @@ def _log_declined(
 
 
 def _raw_prune_due(conn: sqlite3.Connection, record: DayRecord, now: datetime) -> bool:
-    """Rule 5.4: the day and the next are done, 7 days after the later done_at."""
+    """Prunable once the day and the next are done, 7 days after the later done_at."""
     following = day_record(conn, record.site_id, record.local_date + _ONE_DAY)
     if following is None or following.state not in DONE_STATES:
         return False
@@ -924,10 +923,10 @@ def filter_day_writes(
     *,
     now_utc: datetime,
 ) -> frozenset[str]:
-    """The subset of ``instants`` that may be written as ``kind`` (7.1).
+    """The subset of ``instants`` that may be written as ``kind``.
 
     Creates the site's missing records, then allows an instant only when
-    table 5.2 allows ``kind`` for the record whose bounds hold it. An
+    ``kind`` is allowed in the state of the record whose bounds hold it. An
     instant that does not parse is refused. Each day is decided once. Never
     raises for a refusal.
     """
@@ -984,7 +983,7 @@ def check_day_write(
     *,
     now_utc: datetime,
 ) -> bool:
-    """Whether one write keyed by ``instant_utc`` may go ahead (7.1).
+    """Whether one write keyed by ``instant_utc`` may go ahead.
 
     The single-instant form of :func:`filter_day_writes`. Never raises for a
     refusal.
@@ -1002,11 +1001,12 @@ def check_date_write(
     *,
     now_utc: datetime,
 ) -> bool:
-    """Whether one write keyed by ``local_date`` may go ahead (7.1).
+    """Whether one write keyed by ``local_date`` may go ahead.
 
-    Creates the site's missing records, then follows table 5.2 for the
-    record dated ``local_date``; ``RAW_PRUNE`` on a done day follows rule
-    5.4, and with no record nothing is allowed. Never raises for a refusal.
+    Creates the site's missing records, then allows ``kind`` by the state of
+    the record dated ``local_date``; ``RAW_PRUNE`` on a done day follows
+    ``_raw_prune_due``, and with no record nothing is allowed. Never raises
+    for a refusal.
     """
     now = _as_utc(now_utc)
     _ensure(conn, site_id, now)
@@ -1018,7 +1018,7 @@ def check_date_write(
 
 
 # ---------------------------------------------------------------------------
-# Station changes (8.2, 8.5)
+# Station changes
 # ---------------------------------------------------------------------------
 
 
@@ -1031,7 +1031,7 @@ def record_station_change(
     reason: str,
     now_utc: datetime,
 ) -> str:
-    """Log a station change and return its effective local date (8.2).
+    """Log a station change and return its effective local date.
 
     ``added``/``turned_on`` take effect on the site's next local date,
     ``turned_off``/``retired`` on its current one. First creates the site's
@@ -1077,7 +1077,7 @@ def record_station_change(
 def current_day_has_other_station(
     conn: sqlite3.Connection, site_id: int, station_id: int, *, now_utc: datetime
 ) -> bool:
-    """Whether removing ``station_id`` leaves today's list non-empty (8.5).
+    """Whether removing ``station_id`` leaves today's list non-empty.
 
     ``True`` when no record holds ``now_utc``, and when the station is not
     in that day's list. Read-only.
@@ -1092,14 +1092,14 @@ def current_day_has_other_station(
 
 
 # ---------------------------------------------------------------------------
-# Zone change (6.4)
+# Zone change
 # ---------------------------------------------------------------------------
 
 
 def enter_zone_change(
     conn: sqlite3.Connection, site_id: int, timezone: str, *, now_utc: datetime
 ) -> date:
-    """Enter a zone change from the next full local day; returns C (6.4).
+    """Enter a zone change from the next full local day; returns C.
 
     Replaces the site's records dated C and later (none has started) under
     the new zone and sets ``sites.timezone``. Raises ``ValueError`` for an

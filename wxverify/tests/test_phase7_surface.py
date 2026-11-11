@@ -1,4 +1,4 @@
-"""Phase-7 surface tests: §15 per-variable blend depth.
+"""Phase-7 surface tests: per-variable blend depth.
 
 Covers the depth-resolution helper (override wins, invalid falls through,
 provenance), the options→settings clearing rule, the
@@ -94,7 +94,7 @@ def _seed_full_day_precip(
     """A complete 24-hour UTC local day of precip samples, from ``now``'s
     midnight, so ``/forecast`` both renders a real tile (instead of the
     "still collecting" empty state) AND the tile's precip feed is
-    extrema-eligible under G.3 (``covers_local_day_exactly``) -- required
+    extrema-eligible (``covers_local_day_exactly``) -- required
     to reach the Rain ``tile-row``'s tooltip markup, not just its
     unconditional ``<span>Rain</span>`` label (see
     ``test_forecast_page_ride_alongs``).
@@ -133,7 +133,7 @@ def _seed_full_day_precip(
 
 
 # ---------------------------------------------------------------------------
-# §15 — depth resolution, provenance, clearing.
+# Depth resolution, provenance, clearing.
 # ---------------------------------------------------------------------------
 
 
@@ -277,13 +277,13 @@ def test_snapshot_time_setter_endpoint(
 
 
 # ---------------------------------------------------------------------------
-# §16 — forecast ride-alongs.
+# Forecast ride-alongs.
 # ---------------------------------------------------------------------------
 
 
 def _precip_day_text(response_text: str) -> str:
     """The Precipitation grid's top-row day-column text (``page.rain_text``)
-    out of a rendered ``/forecast`` page -- card 7's replacement for the old
+    out of a rendered ``/forecast`` page -- the replacement for the old
     tile row's "Rain" ``<strong>``. Scoped to the Precipitation ``<table>``
     (the selected day's only), so it never picks up another grid's day cell.
     """
@@ -291,7 +291,7 @@ def _precip_day_text(response_text: str) -> str:
     section = section.split("</table>")[0]
     start = section.index('<td class="day">') + len('<td class="day">')
     end = section.index("</td>", start)
-    # The cell's visible text only -- the rain winner's markup (C4) wraps it
+    # The cell's visible text only -- the rain winner's markup wraps it
     # in a <small> and, with an agreement percentage, a
     # <span title="Agreement">: strip every tag, keep what a reader sees.
     return re.sub(r"<[^>]+>", "", section[start:end]).strip()
@@ -320,7 +320,7 @@ def test_forecast_page_ride_alongs(
     # "Precipitation" grid, so the assertion below would silently never
     # execute.
     _seed_full_day_precip(conn, site_id, now=fixed_now)
-    # Rain release, C4: the rain row shows the published rain ranking's
+    # The rain row shows the published rain ranking's
     # winner, so the seeded feed is ranked for today (day ahead 0).
     precip_feed = conn.execute(
         "SELECT id FROM feeds WHERE source = 'open-meteo' AND model = 'ecmwf_ifs'"
@@ -336,7 +336,7 @@ def test_forecast_page_ride_alongs(
 
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
-        # Card 7 shows only the SELECTED day's grids (day=1, tomorrow, by
+        # The page shows only the SELECTED day's grids (day=1, tomorrow, by
         # default) -- today (day=0) is where this fixture's precip lives.
         page = client.get("/forecast?day=0")
         assert page.status_code == 200

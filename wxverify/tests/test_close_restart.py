@@ -1,28 +1,17 @@
-"""Stops and restarts (plan 2026-10-21-daily-close-close-job.md section
-15.6): RS1 to RS6.
-
-Written before ``close_chain.settle_interrupted_closes``,
-``close_chain.run_close_retention`` and ``close_chain.fail_publication``
-exist, and fails first for that reason: every test here either imports one
-of those names inline (an ``ImportError`` today, since ``close_chain.py``
-at this commit holds only ``record_collection_try``) or reaches a plain
-assertion that needs the not-yet-wired ``scheduler_tick``/close-on
-integration (piece 4) to do anything.
+"""Stops and restarts: RS1 to RS6.
 
 Preconditions are built directly against the five close tables and
-``site_days`` (all already migrated in, plan 12.3) rather than by running
-the chain from a live tick: the chain's own stage bodies do not exist yet,
-so "a stop inside stage k" is injected as data -- a ``close_attempts`` row
+``site_days`` rather than by running the chain from a live tick:
+"a stop inside stage k" is injected as data -- a ``close_attempts`` row
 whose ``last_stage`` is the last stage actually saved, and a ``day_close``/
-``day_publish`` job row left ``running`` -- exactly the state 5.5's
-``settle_interrupted_closes`` is specified to act on. This is the same
-style ``tests/test_close_timeline.py``'s TL9 uses for
-``run_close_retention``, applied directly rather than through a tick.
+``day_publish`` job row left ``running`` -- exactly the state
+``settle_interrupted_closes`` acts on. This is the same style
+``tests/test_close_timeline.py``'s TL9 uses for ``run_close_retention``,
+applied directly rather than through a tick.
 
-Section 16.2 names the mutant each test ID kills; the mapping is given
-inline on the exact assertion it kills at. RS4 has no listed mutant
-(16.2 lists none for it), so its assertions carry plain messages,
-never ``M??``.
+The mutant each test ID kills is named inline on the exact assertion it
+kills at. RS4 has no assigned mutant, so its assertions carry plain
+messages, never ``M??``.
 
 Real SQLite only (``tests.helpers.standard_night``/``day_close_site``,
 real ``run_migrations`` via ``init_db`` on a ``tmp_path`` file). Station
@@ -73,8 +62,8 @@ from wxverify.worker.processor import run_claimed_job
 @pytest.fixture(autouse=True)
 def _clear_close_chain_log_map() -> None:
     """This file's own autouse wiring of ``clear_close_chain_log_map``
-    (15.1's "The log map.") -- autouse HERE, inside this one P3 test
-    file, never across the whole suite."""
+    -- autouse HERE, inside this one close-chain test file, never across
+    the whole suite."""
     clear_close_chain_log_map()
 
 
@@ -92,7 +81,7 @@ def _seed_day_close_job(
     status: str = "pending",
 ) -> int:
     """Enqueue the ``day_close`` job of ``stage``/``attempt``, optionally
-    flipped straight to ``running`` (plan 15.1's "Stops": claiming the
+    flipped straight to ``running`` (claiming the
     job, so the row stays running as after a kill)."""
     result = enqueue_if_absent(
         conn,
@@ -237,8 +226,7 @@ async def _publication_count(db, site_id: int, cutoff):  # type: ignore[no-untyp
 
 async def _real_publication_id(db, site_id, cutoff):  # type: ignore[no-untyped-def]
     """The real ``publications`` row's id for ``cutoff``, as text -- the
-    id ``close_p4.publish``'s call-through actually returns, now that
-    P3's stand-in no longer invents one."""
+    id ``close_p4.publish``'s call-through actually returns."""
     row = await db.read(
         lambda c: c.execute(
             "SELECT id FROM publications WHERE site_id = ? AND cutoff = ?",
@@ -263,7 +251,7 @@ def test_rs1_a_stop_mid_stage_is_settled_as_a_failed_attempt(
     ``worker_last_loop_at`` and ``last_progress_at`` seeded to R 00:50Z and
     00:52Z; start at R 01:00Z. ``settle_interrupted_closes``: D
     ``retry_due``, ``retry_at`` R 01:52Z, ``last_failure`` "stopped during
-    stage k"; the reclaimed job completed without running (5.5).
+    stage k"; the reclaimed job completed without running.
 
     One site per stage (k = 2..6), each under its own ``tmp_path``
     subdirectory.
@@ -361,7 +349,7 @@ def test_rs1_a_stop_mid_stage_is_settled_as_a_failed_attempt(
 def test_rs2_a_retry_that_fell_due_while_down_is_missed(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RS2: RS1, start at R 02:00Z. D ``missed``, ``retry_not_run`` (5.5).
+    """RS2: RS1, start at R 02:00Z. D ``missed``, ``retry_not_run``.
 
     Built on one representative stage (3 of 2..6; RS1 already sweeps the
     full range, and this row only varies the start time).
@@ -428,11 +416,11 @@ def test_rs3_a_stop_during_attempt_2_is_missed_never_a_third_attempt(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """RS3: a stop during attempt 2. At start D ``missed``, ``retry_failed``;
-    never a third ``begin_close`` (5.5).
+    never a third ``begin_close``.
 
     M39 -> at the assertion below: correct = ('missed', 'retry_failed', 2)
-    (a stop during the SECOND attempt goes straight to missed, since P1's
-    guard gives only two attempts), mutant M39 (a stop during attempt 2
+    (a stop during the SECOND attempt goes straight to missed, since the
+    day record allows only two attempts), mutant M39 (a stop during attempt 2
     settled as retry_due) = ('retry_due', None, 2), as if a third attempt
     were still possible.
     """
@@ -503,7 +491,7 @@ def test_rs4_a_stop_after_stage_6_leaves_the_closure_and_publishes_once(
     left ``running``). D stays ``closed``; ``settle_interrupted_closes``
     writes nothing for this day or its open publication record; the
     stage-7 job claimed is the one inserted before the stop; one
-    publication (9.5). Plan section 16.2 names no mutant for RS4.
+    publication.
     """
 
     async def _run() -> None:
@@ -561,14 +549,14 @@ def test_rs4_a_stop_after_stage_6_leaves_the_closure_and_publishes_once(
         record = await db.read(lambda c: day_record(c, site_id, D))
         assert record.state == "closed", (
             "a day already closed before the stop must stay closed through"
-            " settle_interrupted_closes (9.5: 'the day is never half-closed')"
+            " settle_interrupted_closes (the day is never half-closed)"
         )
         publication = await _publication_row(db, site_id, D)
         assert publication["state"] == "pending", (
             "an open publication record whose job is merely reclaimed, not"
             " stopped mid-write, must be left untouched by"
             " settle_interrupted_closes (it only treats a BUILDING record as"
-            " a stop, 9.4)"
+            " a stop)"
         )
         stage_log_after = await db.read(
             lambda c: c.execute("SELECT COUNT(*) FROM close_stage_log").fetchone()
@@ -580,9 +568,8 @@ def test_rs4_a_stop_after_stage_6_leaves_the_closure_and_publishes_once(
 
         # The reclaimed stage-6 job is now pending, run it as the worker
         # would, to reach _open_stage's own disposition of a stale job on
-        # an already-closed day (plan 16.2 names no mutant for RS4 itself,
-        # but M89 lives exactly in this path, in close_chain.py's
-        # _open_stage). Claimed directly by id, not through
+        # an already-closed day (M89 lives exactly in this path, in
+        # close_chain.py's _open_stage). Claimed directly by id, not through
         # claim_next_job's own FIFO: the stage-7 day_publish job was
         # enqueued (pending) BEFORE this stage-6 job was even seeded, so a
         # plain claim_next_job would claim stage 7 first -- and nothing in
@@ -630,7 +617,7 @@ def test_rs4_a_stop_after_stage_6_leaves_the_closure_and_publishes_once(
         assert reclaimed_job_row["status"] == "completed", (
             "paired positive: the reclaimed stage-6 job's own row must still"
             " end 'completed' (run_claimed_job always completes the job"
-            " after dispatch returns with no exception, 8.2) -- otherwise"
+            " after dispatch returns with no exception) -- otherwise"
             " the no-new-stage-log-row check above would also pass on a"
             " job that never ran to any disposition at all"
         )
@@ -660,20 +647,18 @@ def test_rs5_a_stop_during_stage_7_never_publishes_twice(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """RS5: a stop during stage 7 after the ``publish`` stand-in returned,
-    before P3's write. At start the record ``retry_due``; the retry calls
+    before the close chain's write. At start the record ``retry_due``; the retry calls
     ``publish`` with the same cutoff and gets the same identifier; the
-    stand-in's publication list has one entry (9.4).
+    stand-in's publication list has one entry.
 
     Runs the standard night through ``run_due_jobs``, real stages 2-6
     closing D, and lets stage 7 itself claim and run (M41 needs the real
     stage-7 body to exist: it is the thing being killed). The stop is made
-    by the ``publish`` stand-in itself: per plan 15.1 "P4.", once P4 is
-    wired in the stand-ins become call-through spies, so a stand-in that
-    raises on its own call is indistinguishable, from stage 7's own code,
-    from "publish ran and returned, then the process died before the
-    result was used" -- the two are the same observable state (no write of
-    the result ever happens either way). This is the guess beyond 9.4's
-    own order: this file has no narrower seam today to interrupt AFTER a
+    by the ``publish`` stand-in itself: a stand-in that raises on its own
+    call is indistinguishable, from stage 7's own code, from "publish ran
+    and returned, then the process died before the result was used" -- the
+    two are the same observable state (no write of the result ever happens
+    either way). This file has no narrower seam today to interrupt AFTER a
     real return and BEFORE stage 7's own completing write, so the
     stand-in raises instead of returning, recording its one call first
     (``AsyncRecordingStandIn`` appends to ``calls`` before checking
@@ -683,8 +668,8 @@ def test_rs5_a_stop_during_stage_7_never_publishes_twice(
     M41 -> at the state assertion below: correct = the publication record
     reads 'retry_due' after settle_interrupted_closes (stage 7 saved
     'building' before calling publish, so the stop lands on a record
-    settle_interrupted_closes recognises as an interrupted publication,
-    9.4), mutant M41 (stage 7 does not save 'building' before calling P4)
+    settle_interrupted_closes recognises as an interrupted publication),
+    mutant M41 (stage 7 does not save 'building' before calling publish)
     = the record is still whatever it was before stage 7 ran (no 'building'
     row for settle_interrupted_closes to act on), so it is never moved to
     'retry_due' at all.
@@ -708,7 +693,7 @@ def test_rs5_a_stop_during_stage_7_never_publishes_twice(
 
         assert len(standins["publish"].calls) == 1, (
             "the stand-in's publication list must have exactly one entry"
-            " (9.4) -- the call that was interrupted, never repeated"
+            " -- the call that was interrupted, never repeated"
         )
 
         stage7_row = await db.read(
@@ -720,7 +705,7 @@ def test_rs5_a_stop_during_stage_7_never_publishes_twice(
         assert stage7_row["status"] == "running", (
             "the stand-in's Stop is a BaseException, so it passes through"
             " dispatch uncaught and the stage-7 job row stays 'running',"
-            " as after a process kill (15.1 'Stops')"
+            " as after a process kill"
         )
 
         stop_at = clock.now()
@@ -740,8 +725,8 @@ def test_rs5_a_stop_during_stage_7_never_publishes_twice(
         assert (publication["attempt"], publication["state"]) == (1, "retry_due"), (
             "M41 -> at this assertion: correct = (1, 'retry_due') (stage 7"
             " saved 'building' before calling publish, so the stop left a"
-            " record settle_interrupted_closes recognises, 9.4), mutant"
-            " M41 (stage 7 does not save 'building' before calling P4) ="
+            " record settle_interrupted_closes recognises), mutant"
+            " M41 (stage 7 does not save 'building' before calling publish) ="
             " the record stays whatever it was before stage 7 ran, never"
             " 'retry_due'"
         )
@@ -759,8 +744,8 @@ def test_rs5_a_stop_during_stage_7_never_publishes_twice(
         )
         expected_pub_id = await _real_publication_id(db, site_id, D)
         assert result == expected_pub_id, (
-            "the retry's call to publish must return P4's real publications"
-            " row id for this cutoff (P4's own idempotence)"
+            "the retry's call to publish must return the real publications"
+            " row id for this cutoff (publish is idempotent)"
         )
         publication_count = await _publication_count(db, site_id, D)
         assert publication_count == 1, (
@@ -779,10 +764,10 @@ def test_rs5_a_stop_during_stage_7_never_publishes_twice(
 def test_rs6_a_retention_failure_does_not_undo_a_closure_or_a_start(
     tmp_path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """RS6: P2's ``prune_raw_readings`` raises a ``RuntimeError`` (i) in
+    """RS6: ``prune_raw_readings`` raises a ``RuntimeError`` (i) in
     stage 6's second write, and (ii) separately in the retention at the
     end of ``settle_interrupted_closes`` after a move to ``missed`` (RS2).
-    Each time: the surrounding write commits; one ERROR line (8.4).
+    Each time: the surrounding write commits; one ERROR line.
 
     M75 -> at each assertion below: correct = the surrounding state
     (closed in (i), missed/retry_not_run in (ii)) is committed despite
@@ -824,7 +809,7 @@ def test_rs6_a_retention_failure_does_not_undo_a_closure_or_a_start(
         assert any(
             "RuntimeError" in rec.message and rec.levelname == "ERROR"
             for rec in caplog.records
-        ), "one ERROR line naming RuntimeError must be written (8.4)"
+        ), "one ERROR line naming RuntimeError must be written"
 
     async def _run_ii() -> None:
         db, _writer, site_id, _stations = standard_night(tmp_path / "ii")
@@ -875,7 +860,7 @@ def test_rs6_a_retention_failure_does_not_undo_a_closure_or_a_start(
         assert any(
             "RuntimeError" in rec.message and rec.levelname == "ERROR"
             for rec in caplog.records
-        ), "one ERROR line naming RuntimeError must be written (8.4)"
+        ), "one ERROR line naming RuntimeError must be written"
 
     asyncio.run(_run_i())
     asyncio.run(_run_ii())

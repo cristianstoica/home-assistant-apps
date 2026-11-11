@@ -1,9 +1,8 @@
-"""Item D1 -- the `icon_eu` Open-Meteo feed (plan §8.2).
+"""The `icon_eu` Open-Meteo feed (cases D1-T1 through D1-T9).
 
-Each case below is named after its plan id (D1-T1 through D1-T9) so a
-reviewer can match test to spec line by line. Fixtures use only the
-existing synthetic helpers (`asof_conn`, `asof_make_site`,
-`asof_make_real_feed`) -- no real coordinates, station ids or place names.
+Fixtures use only the existing synthetic helpers (`asof_conn`,
+`asof_make_site`, `asof_make_real_feed`) -- no real coordinates, station ids
+or place names.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ from wxverify.feeds.open_meteo import (
 from wxverify.feeds.seam import ForecastRequest
 from wxverify.web.context import feed_description
 
-# The seven models seeded before D1 added icon_eu.
+# The seven models seeded before icon_eu was added.
 # (test_open_meteo_horizon_correction.py:28-42)
 _SEVEN_ORIGINAL_MODELS: tuple[str, ...] = (
     "ecmwf_ifs",
@@ -250,8 +249,8 @@ def test_d1_t5_cost_estimate_uses_the_seeded_max_lead_hours() -> None:
 
 
 # ---------------------------------------------------------------------------
-# D1-T9 -- labels are estimates, and they change nothing downstream beyond
-# §3's trace.
+# D1-T9 -- labels are estimates: a label only sets the lead, and nothing cuts
+# at a horizon derived from it.
 # ---------------------------------------------------------------------------
 
 

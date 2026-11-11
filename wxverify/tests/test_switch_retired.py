@@ -1,14 +1,6 @@
-"""Retired routes, commands and code (daily-close switch-over plan §7, §7.3;
-test IDs RE1-RE7 of §17.7).
+"""Retired routes, commands and code (test IDs RE1-RE7).
 
-Written before P6's cutover module and ``db/switch.py`` exist, and before
-section 7's removals land: every row below either imports a P6 name inside
-its own body (``RETIRED_CONTROL_MESSAGE`` from ``wxverify.worker.cutover``,
-which does not exist yet -- ``ModuleNotFoundError``), or asserts an absence
-that today's unremoved code still violates (a route still enqueues, a
-template still posts to a retired control, a retired name is still findable
-in the package). Synthetic data only: no real station id, coordinate, site
-or zone name.
+Synthetic data only: no real station id, coordinate, site or zone name.
 """
 
 from __future__ import annotations
@@ -259,7 +251,7 @@ def test_re3_create_station_enqueues_nothing_key_absent_then_set(
             jobs = get_db().read_sync(_site_jobs)
             assert jobs == [], (
                 f"M43 -> at this assertion (key {key_state}): correct = no "
-                f"job row (R2 removes create_station's fetch_obs enqueue), "
+                f"job row (create_station's fetch_obs enqueue is removed), "
                 f"mutant = {jobs!r}"
             )
 
@@ -482,10 +474,10 @@ _KEPT_KINDS = {
     "day_close",
     "day_publish",
 }
-# pair_and_score: the kind and its close-off enqueues stay in 0.16.14
-# (plan 8.1's table, R17): enqueue_scoring_run, enqueue_score_rescore.
+# pair_and_score: the kind and its close-off enqueues stay in 0.16.14:
+# enqueue_scoring_run, enqueue_score_rescore.
 _RE6_ALLOWED_KINDS = _KEPT_KINDS | {"pair_and_score"}
-# Plan RE6 names its one forwarder by file, enclosing function and argument,
+# RE6 names its one forwarder by file, enclosing function and argument,
 # never by line. Compared as a sorted list, so a second non-literal call in
 # the same function still fails.
 _RE6_KNOWN_FORWARDERS = sorted(
@@ -590,7 +582,7 @@ def test_re6_every_enqueue_and_continuation_names_a_kept_kind() -> None:
         " (worker/scheduler.py, _enqueue_due_wind_days); none found"
     )
     assert into_jobs == ["db/queue.py"], (
-        f"INTO jobs must appear only in db/queue.py (plan 8.5); found {into_jobs!r}"
+        f"INTO jobs must appear only in db/queue.py; found {into_jobs!r}"
     )
 
 

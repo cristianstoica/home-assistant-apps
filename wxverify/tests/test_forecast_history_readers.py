@@ -1,27 +1,18 @@
 """The win rate and the history chart read ``forecast_history`` +
-``observations`` directly, with persistence rebuilt on read (storage-release
-plan 2026-11-02-storage-release.md, 3.5, 3.6, A2-A5; W4, plan line 298).
+``observations`` directly, with persistence rebuilt on read.
 
 ``forecast_history`` itself is already built and is used here only as a
 fixture table -- these tests exercise the READERS, not the table.
 
-This fixture never writes a row into ``forecast_pairs`` or ``close_pairs``:
-today's code (before W4) answers both the win rate and the history chart
-from those two tables, so on this fixture it finds nothing and returns
-empty results where this suite expects hand-computed ones -- a plain
-assertion mismatch, not an exception. The two query-plan pin tests fail at
-their own ``ImportError`` instead: the SQL constants they import do not
-exist in ``wxverify.scoring.history`` yet.
-
-Names this suite depends on, for the builder:
+Names this suite depends on:
 
 * ``wxverify.scoring.history._WINRATE_RANGE_SQL`` -- a new module-level SQL
-  constant, plan 3.6's win-rate statement: closed and pre-close days of one
+  constant, the win-rate statement: closed and pre-close days of one
   (site, variable, day_ahead) together, joining ``forecast_history`` to
   ``observations`` and (via ``LEFT JOIN``) ``site_days``, searching
   ``forecast_history`` by its primary key.
 * ``wxverify.scoring.history._CHART_RANGE_SQL`` -- a new module-level SQL
-  constant, plan 3.6's chart range read: the same two joins and the same
+  constant, the chart range read: the same two joins and the same
   closed/pre-close condition, for one ``feed_id`` rather than the active-feed
   set, also searching ``forecast_history`` by its primary key.
 * ``wxverify.scoring.winrate.winrate_with_evidence`` / ``winrate`` keep their
@@ -30,7 +21,7 @@ Names this suite depends on, for the builder:
   ``model``, ``covered``, ``comparable``, ``wins``, ``win_rate``); internally
   they now read ``_WINRATE_RANGE_SQL`` instead of ``close_pairs`` /
   ``forecast_pairs``, and merge ``scoring.history.persistence_picks_at``
-  (3.5) into the tally in place of a stored persistence row.
+  into the tally in place of a stored persistence row.
 * ``wxverify.api.routes.timeseries.timeseries`` (``GET /api/timeseries``)
   keeps its existing reply keys (``site``, ``variable``, ``feed_id``,
   ``valid_at``, ``forecast``, ``observed``, ``provisional_valid_at``,
@@ -38,10 +29,10 @@ Names this suite depends on, for the builder:
   ``zone_days``) and drops the ``issued_at`` query parameter -- it is no
   longer read, so passing it changes nothing. The feed's series now comes
   from ``_CHART_RANGE_SQL``, with ``scoring.history.persistence_picks_at``
-  (3.5) standing in for the series whenever the requested ``feed_id`` is the
+  standing in for the series whenever the requested ``feed_id`` is the
   persistence yardstick feed (``feeds.source='virtual'``,
   ``feeds.model='_persistence'``), since ``forecast_history`` itself never
-  holds a persistence row (3.3).
+  holds a persistence row.
 * ``wxverify.api.routes.health.worker_status`` (``GET
   /api/worker/status?counts=exact``) reports a new key
   ``forecast_history_rows`` (an exact ``COUNT(*) FROM forecast_history``) in
@@ -71,7 +62,7 @@ throughout -- this keeps every expected value hand-computable from a single
 formula (the previous day's own observation). Feeds X and Y each carry one
 ``forecast_history`` row a day at ``day_ahead=1``; D, D+1 and D+2 are
 ``closed``; D+3 (``M``) is ``missed`` even though it carries
-``forecast_history`` rows (R8); D-3, D-2 and D-1 carry no ``site_days`` row
+``forecast_history`` rows; D-3, D-2 and D-1 carry no ``site_days`` row
 at all (pre-close) and precede the site's first record (D).
 """
 
@@ -110,7 +101,7 @@ from wxverify.db.site_days import (
 
 # ---------------------------------------------------------------------------
 # Shared scenario dates: P0 (persistence-source-only seed), P1-P3 (pre-close,
-# no site_days row), C0-C2 (closed), M (missed, but carries rows -- R8),
+# no site_days row), C0-C2 (closed), M (missed, but carries rows),
 # OPEN_DAY (the one trailing open record "now" lives inside).
 # ---------------------------------------------------------------------------
 
@@ -300,7 +291,7 @@ def _build_readers_scenario(
     _close_day(conn, site_id, C2)
     _miss_day(conn, site_id, M)
 
-    # Persistence's day_scores row (plan 3.5): a closed day's hour counts
+    # Persistence's day_scores row: a closed day's hour counts
     # toward a rebuilt persistence cell only where its own persistence
     # day_scores row of the variable and day ahead is 'scored' -- the exact
     # set stage 5 writes for the day's counted variables. This fixture
@@ -339,14 +330,14 @@ def _init_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str) -> Non
 # ---------------------------------------------------------------------------
 # 1 & 3. Win rate: hand-computed answers across pre-close + closed days,
 # persistence rebuilt at the shortest lead, a missed day shown by neither
-# (R8).
+# reader.
 # ---------------------------------------------------------------------------
 
 
 def test_winrate_reads_forecast_history_with_persistence_and_excludes_missed() -> None:
     """Win rate over P1-C2 (3 pre-close, 3 closed), day_ahead 1, window
     "all": X and Y each win 3 of 6 days, persistence (rebuilt at the
-    shortest lead, 3.5) wins none, and M's rows (a missed day, R8) count
+    shortest lead) wins none, and M's rows (a missed day) count
     nowhere."""
     from wxverify.scoring.winrate import winrate_with_evidence
 
@@ -408,7 +399,7 @@ def test_history_chart_reads_forecast_history_for_a_real_feed_and_excludes_a_mis
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The chart for feed X over P1-M: the 6 pre-close/closed days' own
-    forecast/observed pairs, oldest first; M's rows (missed, R8) absent."""
+    forecast/observed pairs, oldest first; M's rows (missed) absent."""
     _init_app(tmp_path, monkeypatch, "fh-readers-chart-x.db")
     app = create_app(root_path="")
     with TestClient(app) as client:
@@ -439,7 +430,7 @@ def test_history_chart_reads_forecast_history_for_a_real_feed_and_excludes_a_mis
     assert body["observed"] == pytest.approx(expected_observed)
     assert _stamp(M, _HOUR) not in body["valid_at"], (
         "M-fh-chart-missed -> at this assertion: correct = M's hour absent"
-        " from the chart (R8: a missed day's forecast_history rows are"
+        " from the chart (a missed day's forecast_history rows are"
         " shown by neither reader), mutant (the state check is dropped, so"
         f" M's row rides along) = {body['valid_at']}"
     )
@@ -449,7 +440,7 @@ def test_history_chart_shows_rebuilt_persistence_at_the_longest_lead(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The chart for the persistence yardstick feed: ``forecast_history``
-    never stores a persistence row (3.3), so every value here comes from
+    never stores a persistence row, so every value here comes from
     ``persistence_picks_at`` -- the previous day's own observation."""
     _init_app(tmp_path, monkeypatch, "fh-readers-chart-persistence.db")
     app = create_app(root_path="")
@@ -494,7 +485,7 @@ def test_history_chart_shows_rebuilt_persistence_at_the_longest_lead(
 def test_history_chart_omits_persistence_cell_for_an_unscored_closed_day() -> None:
     """Paired negative with the rebuilt-persistence test above: a closed
     day's persistence ``day_scores`` row still exists but is not ``scored``
-    (3.5) -- that day alone drops its persistence cell; the other closed
+    -- that day alone drops its persistence cell; the other closed
     days, whose rows ARE ``scored``, keep theirs."""
     from wxverify.scoring.history import chart_pairs
 
@@ -528,7 +519,7 @@ def test_history_chart_omits_persistence_cell_for_an_unscored_closed_day() -> No
 
 
 # ---------------------------------------------------------------------------
-# 1 (edge case named in W4's own description). With no site_days record at
+# 1 (edge case). With no site_days record at
 # all, the pre-close bound is the literal 9999-12-31, not NULL/skipped.
 # ---------------------------------------------------------------------------
 
@@ -602,10 +593,8 @@ def test_history_chart_includes_everything_as_pre_close_with_no_record_yet(
 def test_timeseries_issued_at_query_parameter_has_no_effect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Today, passing ``issued_at`` with a literal that matches no stored
-    row empties the whole close-on reply (it both filters the starting
-    history and suppresses every closed day). After W4 the parameter is
-    never read, so the reply is identical whether or not it is passed."""
+    """``issued_at`` is never read, so the reply is identical whether or not it
+    is passed, even with a literal that matches no stored row."""
     _init_app(tmp_path, monkeypatch, "fh-readers-issued-at.db")
     app = create_app(root_path="")
     with TestClient(app) as client:
@@ -632,7 +621,7 @@ def test_timeseries_issued_at_query_parameter_has_no_effect(
     assert with_bogus_issued_at.json() == baseline.json(), (
         "M-fh-issued-at-gone -> at this assertion: correct = an identical"
         " reply whether or not issued_at is passed (it has left the"
-        " timeseries API, plan A4), mutant (today's code still reads"
+        " timeseries API), mutant (today's code still reads"
         " issued_at and, matching no row, empties the starting history and"
         f" suppresses every closed day) = {with_bogus_issued_at.json()}"
     )
@@ -647,7 +636,7 @@ def test_worker_status_exact_counts_reports_forecast_history_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``GET /api/worker/status?counts=exact`` reports ``forecast_history_rows``
-    equal to the seeded row count (A5)."""
+    equal to the seeded row count."""
     _init_app(tmp_path, monkeypatch, "fh-readers-health.db")
     app = create_app(root_path="")
     with TestClient(app) as client:
@@ -687,7 +676,7 @@ def test_worker_status_exact_counts_reports_forecast_history_rows(
 # ---------------------------------------------------------------------------
 # 7 & 8. A separate, small scenario with TWO observation hours a day: the
 # shared scenario above has only one, so its one persistence lead at
-# day_ahead 1 is always both the shortest and the longest (3.5's two picks
+# day_ahead 1 is always both the shortest and the longest (the two picks
 # never differ there, see the rebuilt-persistence test's own comment
 # above). The win rate's date filter (``_WINRATE_RANGE_SQL``'s
 # ``forecast_history.local_date BETWEEN ? AND ?`` clause) is also

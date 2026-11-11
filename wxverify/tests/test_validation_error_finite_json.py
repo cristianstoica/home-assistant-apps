@@ -22,12 +22,12 @@ An ordinary validation error (no non-finite input anywhere) is pinned
 BYTE-FOR-BYTE, so this fix cannot be shown to have changed a normal
 response's shape.
 
-Two endpoint-level cases here rely on the SIBLING 0.16.7 fix too (#81's
+Two endpoint-level cases here rely on the SIBLING 0.16.7 fix too (the
 ``allow_inf_nan=False`` on the site schema fields, in
 ``tests/test_site_schema_finite_number.py``): ``create-bare-infinity`` (a bare
 ``Infinity`` on ``rain_threshold_mm``) and
 ``test_create_site_rejects_a_json_number_that_overflows_to_infinity`` (a
-``1e999`` on ``forecast_lat``). Without #81 neither field rejects positive
+``1e999`` on ``forecast_lat``). Without it neither field rejects positive
 infinity: ``forecast_lat`` has no constraint at all, and
 ``rain_threshold_mm``'s ``ge=0`` passes it (``inf >= 0`` is true). The site is
 stored and its success reply fails to render, so these two cases only reach a
@@ -218,7 +218,7 @@ def test_update_site_bare_nan_yields_strict_json_422_and_leaves_threshold(
 # ---------------------------------------------------------------------------
 # 2. A standard JSON number that overflows to infinity while parsing
 #    (``1e999`` -- a valid JSON number token, not the non-standard
-#    ``Infinity`` keyword) needs BOTH 0.16.7 fixes: #81 rejects it
+#    ``Infinity`` keyword) needs BOTH 0.16.7 fixes: the site schema rejects it
 #    (``finite_number``), and this fix renders the resulting 422 without a
 #    500 -- covering the "huge literal" input class distinctly from the
 #    bare-constant forms above.

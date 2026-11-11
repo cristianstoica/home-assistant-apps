@@ -1,5 +1,4 @@
-"""Old-wind-method removal: fails-on-base pins (plan §10.4 D1-D16) plus the
-source scan (plan §10.4's scan row).
+"""Old-wind-method removal: fails-on-base pins plus the source scan.
 
 Every test here imports only names that exist in BOTH the pre-removal tree
 (0.16.10, commit c5f6734) and this tree, so the module collects cleanly on
@@ -11,7 +10,7 @@ as its literal string, e.g. ``f"wind_basis:{site_id}"``.
 
 Expected values are read directly from this tree's current code (the
 removal side) and from the base tree's current code (the pre-removal
-side), not from the plan table's wording, per plan §10.4's instruction.
+side).
 
 Isolation: most pins drive a plain ``sqlite3.connect(":memory:")`` +
 ``run_migrations`` connection directly against the function under test,
@@ -62,7 +61,7 @@ from wxverify.worker.wind_days import (  # noqa: PLC2701
 )
 
 # ---------------------------------------------------------------------------
-# Moved from tests/test_wind_auth_hold.py (R7; that file leaves whole).
+# Moved from tests/test_wind_auth_hold.py.
 # ---------------------------------------------------------------------------
 
 
@@ -178,12 +177,12 @@ def test_d2_materialize_admits_the_pair_max_row_regardless_of_the_key(
     station_id = _wa_make_station(conn, site_id, "WSTATION01")
     set_runtime_state(conn, f"wind_basis:{site_id}", key_value)
     valid_at = "2035-07-01T00:00:00Z"
-    # A P1 record holding `valid_at` (the close is always on; the closed-day
+    # A day record holding `valid_at` (the close is always on; the closed-day
     # guard behind materialize_consensus refuses the write with no record).
     start_site_days(
         conn, site_id, date(2035, 7, 1), now_utc=datetime(2035, 7, 1, tzinfo=UTC)
     )
-    # Puts the station on the day's saved list (6.2) through the real
+    # Puts the station on the day's saved list through the real
     # record_station_change path -- 2035-06-30 holds no record yet, so its
     # "added" takes effect on the next local date, 2035-07-01.
     record_station_change(
@@ -215,10 +214,10 @@ def test_d2_materialize_admits_the_pair_max_row_regardless_of_the_key(
     assert float(row["value"]) == pytest.approx(6.0)
 
 
-# D3 (the pairing, persistence and engine wind_open_clause readers) is
+# The pin of the pairing, persistence and engine wind_open_clause readers is
 # removed: `wxverify.scoring.pairing`, `.persistence` and `.engine` -- the
 # three modules it drove -- are themselves gone with the old pair-and-score
-# pipeline (storage-release plan 2026-11-02, table 1.B).
+# pipeline.
 
 
 # ---------------------------------------------------------------------------

@@ -500,7 +500,7 @@ def _jinja_findings(
     source: str, name: str, env: jinja2.Environment, rel_path: str
 ) -> list[_Finding]:
     findings: list[_Finding] = []
-    # rel_path is the third argument on purpose: it is what a lexer error prints (DB6)
+    # rel_path is the third argument on purpose: it is what a lexer error prints
     for lineno, token_type, value in env.lex(source, name, rel_path):
         if token_type != "comment":
             continue

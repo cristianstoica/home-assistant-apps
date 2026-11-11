@@ -1,17 +1,10 @@
-"""Step 3 tests for the closed-day guard in each writer (plan
-2026-10-20-daily-close-day-state-and-guard.md, Sec 13.3-13.4).
+"""Tests for the closed-day guard in each writer.
 
-``wxverify.db.site_days`` arrives in Step 4 piece 2 of the daily-close plan;
-importing names from it here, at module top, is deliberate: it is the
-authoritative "not built yet" signal for this whole file -- every test below
-collection-errors with the same ``ModuleNotFoundError`` until that module
-exists, which is the right reason for all of them to be red right now.
-
-Each GW test seeds the shared helper site (``tests.helpers.day_close_site``,
-plan Sec 13.1) with the close on: D-3 closed, D-2 missed, D-1 open, D the
+Each GW test seeds the shared helper site (``tests.helpers.day_close_site``)
+with the close on: D-3 closed, D-2 missed, D-1 open, D the
 current day. It then calls the writer the way its job or route does, and
-checks the shared 13.1 oracle (D-3 unchanged across the six day-state tables,
-D-1 written, no exception, exactly one WARNING in the 7.2 form) except where
+checks the shared oracle (D-3 unchanged across the six day-state tables,
+D-1 written, no exception, exactly one guard WARNING) except where
 a GW row names an exception. Only synthetic station ids (``ISTATION01``,
 ``ISTATION02``), the ``UTC``/``Etc/GMT+-N`` zones and a fixed synthetic date
 appear anywhere in this file (public repo).
@@ -223,7 +216,7 @@ def test_gw4_materialize_consensus_leaves_a_closed_days_hour_alone(
 
 
 # ---------------------------------------------------------------------------
-# GW11: W12 (PUT /api/sites/{id}).
+# GW11: PUT /api/sites/{id}.
 # ---------------------------------------------------------------------------
 
 
@@ -257,7 +250,7 @@ def _csrf_headers(client: TestClient) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# GW13/GW13b/GW14: W14, import over HTTP, resume, and the new 10.6 checks.
+# GW13/GW13b/GW14: import over HTTP, resume, and the import's bound checks.
 # ---------------------------------------------------------------------------
 
 
@@ -305,7 +298,7 @@ def test_gw16_delete_site_cascades_every_daily_close_table_after_a_zone_change(
 
 
 # ---------------------------------------------------------------------------
-# GW17: the source-scan writer-list pin (plan Sec 13.4).
+# GW17: the source-scan writer-list pin.
 # ---------------------------------------------------------------------------
 
 _DAY_WRITE_TARGETS: Final = frozenset(
@@ -329,43 +322,41 @@ _SQL_HEAD_RE: Final = re.compile(
     re.IGNORECASE,
 )
 
-# Plan 13.4: "No string holds DELETE FROM stations (8.3)" -- checked over
+# No string holds DELETE FROM stations -- checked over
 # every string constant and flattened f-string, not the raw source text.
 _DELETE_STATIONS_RE: Final = re.compile(r"DELETE\s+FROM\s+stations\b", re.IGNORECASE)
 
-# Plan 13.4's fourth assertion: outside db/migrations.py, a write to any of
-# these lies in db/site_days.py (4.7 and 6.4's state functions).
+# Outside db/migrations.py, a write to any of these lies in
+# db/site_days.py's state functions.
 _STATE_TABLES: Final = frozenset(
     {"site_days", "site_day_stations", "station_changes", "site_zone_changes"}
 )
 
-# One entry per writer of plan Sec 7.3/7.4 and per migration that writes
-# these tables, each with the reason the plan names for it.
+# One entry per writer and per migration that writes these tables, each
+# with the reason for it.
 _GW17_ALLOWLIST: Final = frozenset(
     {
-        # P2's raw-reading writer, through P1's guard (plan 6.4).
+        # The raw-reading writer, through the closed-day guard.
         ("wxverify.db.station_readings", "store_readings"),
-        ("wxverify.scoring.consensus", "write_station_observation"),  # 7.3 backstop
-        ("wxverify.scoring.consensus", "materialize_consensus"),  # 7.3
-        # Daily-close plan 7.7: P3's close, stage 3.
+        ("wxverify.scoring.consensus", "write_station_observation"),  # backstop
+        ("wxverify.scoring.consensus", "materialize_consensus"),
+        # The close, stage 3.
         ("wxverify.worker.day_values", "write_hourly_values"),
-        # Daily-close plan 10.3: P3's run_close_retention.
+        # run_close_retention.
         ("wxverify.db.station_readings", "prune_raw_readings"),
-        # P1 7.3 row: P3's writers, TRUTH.
+        # The close chain's writers, TRUTH.
         ("wxverify.verification.truth", "write_close_truth"),
         # No entries for the import's _rebuild_all, for update_site, or for
         # _invalidate_mean_for_site: none of them writes a guarded table.
-        # P1 state functions, 4.7 and 6.4; also station_changes (its seed
+        # The day-state functions; also station_changes (its seed
         # migration constant and migrate_v15_switch's keep_read_generations,
-        # which wrote it below v15, are both deleted, storage-release plan
-        # 4.1/table 1.B).
+        # which wrote it below v15, are both deleted).
         ("wxverify.db.site_days", "*"),
-        # health-release plan 2026-11-07 §7 Part G: the owner's one-time
-        # wind history prune, run once in the version 18 upgrade, through
+        # The one-time wind history prune, run once in the version 18 upgrade, through
         # no guard of its own (the bound is always before the site's first
         # record, so the old write-kind guard case is gone).
         ("wxverify.db.switch", "prune_wind_history"),
-        # 0.16.20 plan §1.4: the owner's one-time, key-gated deletion of
+        # The one-time, key-gated deletion of
         # every Meteosource row stored before this release's UTC fix.
         ("wxverify.db.migrations", "_prune_meteosource_table"),
         # No entries for _invalidate_consensus_dependents and
@@ -374,7 +365,7 @@ _GW17_ALLOWLIST: Final = frozenset(
         # .persistence and .split), or for the replay/verification-run
         # layer's own writers (runs.py, simulate.py, cleanup.py): none of
         # them writes a guarded table.
-        ("wxverify.verification.truth", "mark_daily_truth_stale"),  # 7.3 notes
+        ("wxverify.verification.truth", "mark_daily_truth_stale"),
     }
 )
 
@@ -406,8 +397,7 @@ def test_gw17_writer_source_scan_matches_the_allowlist() -> None:
                 ) and n in ast.walk(parent):
                     return parent.name
             # Not inside any function: name the module-level constant whose
-            # value holds it, if any (plan 13.4: "enclosing function or
-            # module-level constant").
+            # value holds it, if any.
             for stmt in ast.iter_child_nodes(tree):
                 if isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
                     if n in ast.walk(stmt.value) and isinstance(stmt.target, ast.Name):
@@ -423,7 +413,7 @@ def test_gw17_writer_source_scan_matches_the_allowlist() -> None:
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 assert not _DELETE_STATIONS_RE.search(node.value), (
-                    f"{module}: must never string-delete the stations table (8.3)"
+                    f"{module}: must never string-delete the stations table"
                 )
                 match = _SQL_HEAD_RE.match(node.value)
                 if match:
@@ -449,7 +439,7 @@ def test_gw17_writer_source_scan_matches_the_allowlist() -> None:
                     if isinstance(piece, (ast.Constant, ast.FormattedValue))
                 )
                 assert not _DELETE_STATIONS_RE.search(flat), (
-                    f"{module}: must never string-delete the stations table (8.3)"
+                    f"{module}: must never string-delete the stations table"
                 )
                 match = _SQL_HEAD_RE.match(flat)
                 if match:

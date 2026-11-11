@@ -1,9 +1,9 @@
-"""Google adapter pagination oracles — 0.12.0 §15 families 1-6.
+"""Google adapter pagination oracles (0.12.0).
 
 Covers ``wxverify.feeds.google``'s paginated horizon collection, the
 horizon-derived budget reservation, and partial-sequence budget honesty.
-Families 7-9 (horizon correction, snapshot provenance, composite
-disclosure) are out of scope for this module.
+Horizon correction, snapshot provenance and composite disclosure are out of
+scope for this module.
 
 Every fixture in this file is synthetic: a fake site at ``lat=40.0,
 lon=-105.0`` (``America/Denver`` convention), an obviously-fake API key, and
@@ -19,8 +19,7 @@ Two drive modes are used throughout:
   real ``GoogleAdapter`` (same MockTransport substitution) through the
   actual worker persistence path, against a real temporary SQLite database.
   Used for the oracles that must observe a database effect (persisted rows,
-  ``api_budget`` state), per §15 family 4's "confirm the effect, not the
-  emission."
+  ``api_budget`` state): confirm the effect, not the emission.
 """
 
 from __future__ import annotations
@@ -196,8 +195,7 @@ def _budget_calls(conn: sqlite3.Connection) -> int:
 
 async def _drive_fetch_feed_once(db, site_id: int, feed_id: int, handler):
     """Route a real GoogleAdapter (MockTransport-substituted) through the
-    actual worker fetch+persist path — the "real fetch_feed path" §15
-    family 4 requires.
+    actual worker fetch+persist path — the real fetch_feed path.
     """
     mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     try:
@@ -244,7 +242,7 @@ def test_pagination_assembly_seven_requests_for_168_hour_horizon() -> None:
     request 1 carries none, pageSize=24 on every request, and the assembled
     retained sample set covers a contiguous lead range with no gap/duplicate.
 
-    Regression pin (§15 item 10): fails on bc617be, which makes exactly one
+    Regression pin: fails on bc617be, which makes exactly one
     request and never reads/echoes a pageToken at all.
     """
     monkeypatch = pytest.MonkeyPatch()
@@ -328,7 +326,7 @@ def test_completeness_missing_next_page_token_before_horizon(tmp_path: Path) -> 
     start = _two_page_start()
     chunks = _chunks(48, start)
     # Page 0 (index 0 < pages-1=1) omits its token — the "successful but
-    # short" case the plan names explicitly.
+    # short" case.
     pages = [(chunks[0], None), (chunks[1], None)]
     handler = _make_handler(pages)
 
@@ -465,7 +463,7 @@ def test_raw_sequence_whole_but_retained_sample_count_strictly_smaller() -> None
     ``req.max_lead_hours`` is accepted, and the retained sample count is
     strictly less than the raw record count.
 
-    Regression pin (§15 item 10): a completeness check written against the
+    Regression pin: a completeness check written against the
     retained count (rather than the raw count) fails this oracle.
     """
     monkeypatch = pytest.MonkeyPatch()
@@ -497,9 +495,9 @@ def test_mid_sequence_failure_persists_zero_rows(tmp_path: Path) -> None:
     last page) leaves ``forecast_samples`` at zero — the effect is
     confirmed, not merely that an exception escaped.
 
-    Regression pin (§15 item 10): on bc617be a single-page fetch cannot
+    Regression pin: on bc617be a single-page fetch cannot
     exhibit a "mid-sequence" failure at all (there is only ever one page),
-    so this scenario has no analogue there — see the evidence report.
+    so this scenario has no analogue there.
     """
     start = datetime(2026, 6, 1, 0, 0, 0, tzinfo=UTC)
     chunks = _chunks(72, start)  # 3 pages
@@ -555,10 +553,9 @@ def test_metrics_absent_response_returns_empty_samples_without_raising() -> None
     parses, passes the completeness check, and yields zero samples without
     raising.
 
-    Preservation invariant (§15 item 10): pass-before AND pass-after — the
-    ``is not None`` guards this depends on already existed on bc617be
-    (``google.py:181,195,209`` there); this oracle exists only to prove W2
-    does not disturb it.
+    Preservation invariant: pass-before AND pass-after — the
+    ``is not None`` guards this depends on already existed on bc617be;
+    this oracle exists only to prove pagination does not disturb them.
     """
     start = datetime(2026, 6, 1, 0, 0, 0, tzinfo=UTC)
     records = [_empty_hour(start + timedelta(hours=i)) for i in range(24)]
@@ -697,7 +694,7 @@ def test_snap_run_called_exactly_once_across_a_seven_page_sequence() -> None:
     split ``issued_at``/``model_run_id`` across the sample set.
 
     Preservation half (call count): passes before and after — bc617be calls
-    ``snap_run`` once per fetch too (one request, per §15 item 10).
+    ``snap_run`` once per fetch too (one request).
     Regression-pin half (multi-page assembly): fails on bc617be, which
     makes one request and retains only that page's leads (12-24), never
     leads spanning seven pages.

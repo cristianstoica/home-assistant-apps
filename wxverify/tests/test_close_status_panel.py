@@ -1,16 +1,8 @@
-"""Ops and the close status panel (daily-close plan 2026-10-22-daily-close-
-alerts-and-pages.md §10; test IDs OP2-OP9 in this file's §13.10).
-
-Written before `load_close_status` (and every other P5 name this file
-reaches) exists: every test below imports it inside its own body, so the
-rest of this file keeps collecting -- each then fails at its own
-``ModuleNotFoundError``/``ImportError``, or (where the name under test
-already exists today) at a plain assertion against today's unchanged
-output, the failures Step 3 accepts.
+"""Ops and the close status panel: test IDs OP2-OP9.
 
 Real SQLite throughout (``tests.helpers.asof_conn``). ``utc_now`` is
 monkeypatched on ``wxverify.web.context`` wherever a test needs a fixed
-`now` (plan §13.1). Synthetic data only: stations ``ISTATION01``/
+`now`. Synthetic data only: stations ``ISTATION01``/
 ``ISTATION02``, zone UTC, dates from the fixture's ``D``/``NOW``.
 """
 
@@ -85,7 +77,7 @@ def _station_id(conn: sqlite3.Connection, site_id: int, pws_station_id: str) -> 
 def test_op2_close_status_shows_every_day_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OP2 (plan §13.10, §10.2): "Close Status", with rows for D
+    """OP2: "Close Status", with rows for D
     (collecting), D-1 (waiting for the close), D-2 (missed: the close
     never ran), D-3 (closed) (M99)."""
     monkeypatch.setattr("wxverify.web.context.utc_now", lambda: NOW)
@@ -117,7 +109,7 @@ def test_op2_close_status_shows_every_day_state(
 def test_op3_failed_attempt_shows_retry_and_stage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OP3 (plan §13.10, §10.2): D-1 retry_due with "gap fill: network",
+    """OP3: D-1 retry_due with "gap fill: network",
     attempt 1 failing at stage 2 and a stage-log row -- State, Stage,
     Failure and the stage line all read from the stored records (M100)."""
     monkeypatch.setattr("wxverify.web.context.utc_now", lambda: NOW)
@@ -176,7 +168,7 @@ def test_op3_failed_attempt_shows_retry_and_stage(
     )
     assert day.retry_at == retry_at_text, (
         "M100 -> at this assertion: correct = `day.retry_at` ="
-        f" {retry_at_text!r} (`CloseDayRow.retry_at`, plan §10.2), mutant ="
+        f" {retry_at_text!r} (`CloseDayRow.retry_at`), mutant ="
         " `retry_at` always `None` -- the check above only reads"
         " `_close_day_state`'s own text, built straight from the raw"
         " ``site_days`` record and never touched by this mutant, so it"
@@ -198,7 +190,7 @@ def test_op3_failed_attempt_shows_retry_and_stage(
 def test_op4_publication_state_published_then_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OP4 (plan §13.10, §10.2): a closed day's publication shows
+    """OP4: a closed day's publication shows
     "published <t>", then "publication failed <t>: <reason>" (M101)."""
     monkeypatch.setattr("wxverify.web.context.utc_now", lambda: NOW)
     from wxverify.web.context import load_close_status
@@ -255,7 +247,7 @@ def test_op4_publication_state_published_then_failed(
 def test_op5_zone_changeover_and_own_zone_marks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OP5 (plan §13.10, §10.2): a changeover day still to come shows "zone
+    """OP5: a changeover day still to come shows "zone
     changes on <date>: that day is not scored"; D-3, closed under the old
     zone, shows "scored under its own zone, Etc/GMT-14" (M102)."""
     from wxverify.db.site_days import enter_zone_change
@@ -292,7 +284,7 @@ def test_op5_zone_changeover_and_own_zone_marks(
 def test_op6_no_record_holds_now_shows_not_started(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OP6 (plan §13.10, §10.1, §10.2, §12.2): the AL17 site (no record
+    """OP6: the AL17 site (no record
     holds `now`) shows "no day closed yet; the first day has not started"
     and no collecting row; Observation Status "no day closed yet"; never
     "Close status unavailable" (M103)."""
@@ -330,7 +322,7 @@ def test_op6_no_record_holds_now_shows_not_started(
 def test_op7_observation_status_closed_through_header_and_cell(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OP7 (plan §13.10, §10.1): "Closed through" header and the cell D-2,
+    """OP7: "Closed through" header and the cell D-2,
     once D-2 (not just D-3) is closed (M104)."""
     from wxverify.web.context import load_observation_health
 
@@ -355,7 +347,7 @@ def test_op7_observation_status_closed_through_header_and_cell(
 def test_op8_alert_lines_include_each_tripped_alert(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OP8 (plan §13.10, §10.2): the panel's alert lines include AL1's
+    """OP8: the panel's alert lines include AL1's
     missed-day line, alert 7's recovered line and alert 6's days-affected
     line, all in the same read (M105)."""
     from wxverify.worker.access_hold import record_access_refused
@@ -426,7 +418,7 @@ def test_op8_alert_lines_include_each_tripped_alert(
 def test_op9_load_close_status_catches_any_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OP9 (plan §13.10, §10.2): on a stand-in `close_alerts` that raises,
+    """OP9: on a stand-in `close_alerts` that raises,
     the panel shows "Close status unavailable: <Type>: <msg>"; the other
     panels still render (M106)."""
     monkeypatch.setattr("wxverify.web.context.utc_now", lambda: NOW)

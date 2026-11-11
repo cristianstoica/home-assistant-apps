@@ -45,7 +45,7 @@ def site_generation_id(conn: sqlite3.Connection, site_id: int) -> int | None:
 
 
 def first_record_date(conn: sqlite3.Connection, site_id: int) -> date | None:
-    """The date of the site's first ``site_days`` record, or None (plan 5.4).
+    """The date of the site's first ``site_days`` record, or None.
 
     The earliest ``local_date`` of the site's records: its first closed day,
     before which every date is starting history. None while the site has no
@@ -88,11 +88,11 @@ def ensure_site_generation(conn: sqlite3.Connection, site_id: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# The one-time prune of the wind history (plan section 12)
+# The one-time prune of the wind history
 # ---------------------------------------------------------------------------
 
-# Plan 12.2: what is kept before each site's first closed day F, the wind
-# pair limit, so F's first pair still finds the reading before F's start.
+# What is kept before each site's first closed day F, the wind pair limit,
+# so F's first pair still finds the reading before F's start.
 _HISTORY_MARGIN: Final = timedelta(seconds=MAX_PAIR_GAP_SECONDS)
 
 
@@ -123,7 +123,7 @@ def _sites_with_history(conn: sqlite3.Connection) -> list[int]:
 
 
 def prune_wind_history(conn: sqlite3.Connection) -> WindHistoryPrune:
-    """Delete the old wind history from before each site's first day (12.2).
+    """Delete the old wind history from before each site's first day.
 
     For each site that owns a ``station_wind_records`` row with
     ``fetched_at`` NULL (through ``stations.site_id``), with F its first

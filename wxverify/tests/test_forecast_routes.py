@@ -250,7 +250,7 @@ def test_forecast_day_clamps_and_embeds_clamped_day_in_poll_url(
 # ---------------------------------------------------------------------------
 
 
-def test_forecast_degrades_to_rebuilding_without_score_cache_no_enqueue(
+def test_forecast_degrades_without_a_publication_no_enqueue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """future_samples exist, but no publication is ever seeded. With no
@@ -328,8 +328,8 @@ def test_forecast_degrades_to_rebuilding_without_score_cache_no_enqueue(
         # O5: the rendered tile surface carries the warning that production
         # now returns with no publication -- and NEVER the old "ranking
         # updating" wording, retired with the per-cell "rebuilding"
-        # leaderboard status it depended on. Card 7 dropped the per-tile
-        # "state-<state>" CSS class, so the low-confidence signal is now
+        # leaderboard status it depended on. The per-tile
+        # "state-<state>" CSS class is gone, so the low-confidence signal is now
         # observable only through the day header's warning tooltip text
         # (day_warnings in forecast/page.py).
         rendered = " ".join(tiles_resp.text.split())

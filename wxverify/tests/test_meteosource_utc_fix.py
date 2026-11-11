@@ -1,12 +1,11 @@
-"""wxverify 0.16.20 Part 1 (card 24), T7-T9: the one-time deletion of every
-Meteosource row stored before this release (plan
-`2026-11-08-meteosource-meteoblue-release.md` §1.4, §1.5).
+"""T7-T9: the one-time deletion of every Meteosource row stored before the
+UTC fix.
 
 Isolation: every connection is a real, file-backed SQLite database under
 ``tmp_path``, opened once through ``init_db`` so the schema and the boot
 seed (sources, feeds, settings) are the real ones -- no mocked persistence,
 and no reach into ``wxverify.db.migrations`` module internals beyond the
-two names the plan gives (``delete_pre_utc_meteosource``,
+two public names (``delete_pre_utc_meteosource``,
 ``METEOSOURCE_UTC_FIX_KEY``) and ``METEOSOURCE_PRUNE_TABLES``, the step's
 table-order constant.
 

@@ -1,13 +1,10 @@
-"""Station lifecycle route tests (plan 2026-10-20-daily-close-day-state-and-
-guard.md §13.5, test IDs LR1-LR12).
+"""Station lifecycle route tests (test IDs LR1-LR12).
 
 Routes run through ``TestClient(create_app(root_path=""))`` with the worker
 idled and CSRF headers, exactly as the existing route tests in
 ``tests/test_m1_m5.py`` do. Station validation and elevation lookups are
 faked (network adapters, not the code under test). ``utc_now`` is faked in
-``api/routes/stations.py`` and ``api/routes/sites.py`` -- both modules
-currently have no such attribute, so patching it is itself part of the red
-proof for every test below: ``AttributeError`` until P1 adds the import.
+``api/routes/stations.py`` and ``api/routes/sites.py``.
 
 Real SQLite only (a per-test tmp-file database through the app's own
 ``init_db``/``create_app`` lifespan); nothing in the code under test is
@@ -48,7 +45,7 @@ from wxverify.obs.pws_adapter import PwsStation
 _STATION_A = "ISTATION01"
 _STATION_B = "ISTATION02"
 
-# Plan §13.5 LR2, 8.7's full "station belongs to another site" message.
+# LR2: the full "station belongs to another site" message.
 _ANOTHER_SITE_TEXT = (
     "station belongs to another site: a station stays with the site it was "
     "first added to, even after it is removed"
@@ -81,7 +78,7 @@ def _setup_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str) -> ob
         "wxverify.api.routes.stations.lookup_elevation_m", _fake_lookup_elevation_m
     )
     monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
-    # Both modules import utc_now (P1); patched here so lifecycle-dated
+    # Both modules import utc_now; patched here so lifecycle-dated
     # fixtures run against the test's synthetic NOW, not the real clock.
     monkeypatch.setattr("wxverify.api.routes.stations.utc_now", lambda: NOW)
     monkeypatch.setattr("wxverify.api.routes.sites.utc_now", lambda: NOW)
@@ -187,9 +184,7 @@ def test_lr1_create_station_queues_no_job_and_counts_from_the_next_day(
         )
         assert resp.status_code == 200
 
-        assert _jobs_for_site(site_id) == [], (
-            "R2 (switch-over plan 7.2): create_station queues no job"
-        )
+        assert _jobs_for_site(site_id) == [], "create_station queues no job"
 
         station_id = _station_db_id(site_id, "ISTATION03")
         changes = _station_changes(station_id)
@@ -301,7 +296,7 @@ def test_lr3_readd_a_retired_station_at_the_same_site(
 
         # B's readings on the open day D-1 and the closed day D-3, and the
         # site's observations on those hours set to a value their consensus
-        # does not give (plan §13.5 LR3): seeded before the first request.
+        # does not give (LR3): seeded before the first request.
         lr3_station_value = 12.3
         lr3_obs_value = 999.0
         d_minus_1 = (D - timedelta(days=1)).isoformat()
@@ -475,7 +470,7 @@ def test_lr5_toggle_off_does_not_touch_closed_or_open_day_data(
 
         # B's readings on the open day D-1 and the closed day D-3, and the
         # site's observations on those hours set to a value their consensus
-        # does not give (plan §13.5 LR5): seeded before the request.
+        # does not give (LR5): seeded before the request.
         lr5_station_value = 12.3
         lr5_obs_value = 999.0
         d_minus_1 = (D - timedelta(days=1)).isoformat()
@@ -585,8 +580,8 @@ def test_lr6_cannot_turn_off_or_remove_last_enabled_station(
 def test_lr7_cannot_empty_the_current_days_list_while_on(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Plan §13.5 LR7: "site with A counting today and C added today; turn
-    off A; remove A". Turning B off is immediate (effective D, LR4), which
+    """LR7: site with A counting today and C added today; turn off A; remove
+    A. Turning B off is immediate (effective D, LR4), which
     removes it from today's list; adding C only counts from D+1 (LR1), so
     neither B nor C counts today -- A is today's only counted station, and
     turning it off or removing it must trip check 2."""
@@ -629,7 +624,7 @@ def test_lr7_cannot_empty_the_current_days_list_while_on(
 def test_lr7_check_two_allows_removal_with_no_day_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Plan §13.5 LR7, no-record half: the same "only A counts today" setup,
+    """LR7, no-record half: the same "only A counts today" setup,
     but the site has no site_days record yet -- check 2 finds no record
     holding now, so it never blocks and turning A off answers 200."""
     app = _setup_app(tmp_path, monkeypatch, "lr7b")
@@ -671,8 +666,8 @@ def test_lr8_delete_is_a_retire_not_an_erase(
         site_id = site_ids[0]
         b_id = _station_db_id(site_id, _STATION_B)
 
-        # B's readings, wind records and wind days on the open day D-1 (plan
-        # §13.5 LR8): seeded before the delete so the retire-not-erase
+        # B's readings, wind records and wind days on the open day D-1 (LR8):
+        # seeded before the delete so the retire-not-erase
         # comparison actually compares non-empty state, not two empty lists.
         lr8_station_value = 12.3
         lr8_obs_value = 999.0
@@ -848,8 +843,7 @@ def test_lr10_new_site_gets_a_record(
             ).fetchall()
         )
         # NOW is D 12:00Z; Etc/GMT-14 is UTC+14, so the local date at creation
-        # is D+1 -- a new site starts fresh at its next local date, D+2
-        # (plan 4.6, 8.3).
+        # is D+1 -- a new site starts fresh at its next local date, D+2.
         day_plus_2 = (D + timedelta(days=2)).isoformat()
         assert [r["local_date"] for r in rows] == [day_plus_2]
 

@@ -1,8 +1,6 @@
-"""W6 ("Part B"): the Verification page, its API and its run chain are
-removed, along with the publish hold and close-chain stage 8 (the
-worksheet cleanup) the hold and page depend on. Written before the
-removal lands, so every test here fails today for the stated reason and
-passes once W6's deletions are made.
+"""The Verification page, its API and its run chain are removed, along with
+the publish hold and close-chain stage 8 (the worksheet cleanup) the hold
+and page depend on.
 
 Isolation: HTTP-route oracles drive a real app over ``TestClient`` against
 a file-backed ``tmp_path`` database with an idle worker stand-in,
@@ -159,7 +157,7 @@ def test_a_kept_route_stays_200_proving_the_client_is_not_simply_broken(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Paired positive for the 404 checks above: the SAME client, against
-    the SAME app, still gets 200 from a route untouched by W6
+    the SAME app, still gets 200 from a route untouched by the removal
     (``GET /api/health/keys``). This must stay green before and after the
     removal -- if it ever went red, the 404s above would be meaningless
     (a broken client/app 404s everything)."""
@@ -180,7 +178,7 @@ def test_nav_has_no_verification_link_but_keeps_ops(
 ) -> None:
     """Fails now: ``base.html`` renders
     ``<a ... href="/verification">Verification</a>`` in every page's nav,
-    so the dashboard's rendered HTML carries that href. Passes once W6
+    so the dashboard's rendered HTML carries that href. Passes once the removal
     deletes the nav link (``web/templates/base.html``): the href string is
     gone from the nav while the Ops tab's own link stays, proving the
     negative isn't just a broken nav template."""
@@ -233,7 +231,7 @@ def test_close_chain_ends_at_stage_7_with_published_and_no_stage_8(
     """Fails now: today's chain enqueues a stage-8 ``day_publish`` job
     (``publish:{site}:8``, the worksheet cleanup) after stage 7 completes,
     so ``publish:{site}:8`` is present in the job-key list below. Passes
-    once W6 makes stage 7 (publish) the chain's last stage: no stage-8 job
+    once stage 7 (publish) is the chain's last stage: no stage-8 job
     is ever enqueued, while the stage-7 publish (the positive half of this
     assertion) still runs and the publication still reaches ``published``
     -- a chain that broke publishing entirely would fail this test too,
@@ -284,10 +282,10 @@ def test_ops_page_renders_without_publish_hold_panel_but_keeps_budget_gauges(
     """Fails now: ``web/templates/ops/show.html`` includes
     ``ops/_publish_hold.html``, whose panel carries
     ``id="publish-hold-panel"`` and the heading "Nightly Verification Run
-    Hold" (``tests/test_ops_page_copy.py``'s O44). Passes once W6 removes
+    Hold" (``tests/test_ops_page_copy.py``). Passes once the removal drops
     the Ops panel entry (``web/context.py``) and its template: both
     distinctive markers are gone from the rendered page, while the Budget
-    Gauges panel (untouched by W6) still renders -- proving the page did
+    Gauges panel (untouched by the removal) still renders -- proving the page did
     not simply fail to render at all."""
     app = _boot(tmp_path, "ops.db", monkeypatch)
     with TestClient(app) as client:

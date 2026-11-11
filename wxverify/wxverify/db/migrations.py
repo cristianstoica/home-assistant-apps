@@ -876,7 +876,7 @@ SAMPLES_RECENT_INDEX_DDL = (
     "variable, model_run_id)"
 )
 
-# One forecast_samples row per hour: the newest value (rain release, Part B).
+# One forecast_samples row per hour: the newest value.
 # The forecast_samples upsert names these four columns as its conflict
 # target.
 SAMPLES_SLOT_INDEX_DDL: Final = (
@@ -887,7 +887,7 @@ SAMPLES_SLOT_INDEX_DDL: Final = (
 
 def invalid_sample_index_ddl() -> str:
     """DDL for the partial invalid-sample index, generated from the live
-    stored-sample predicate (both rosters, card 7) so index and query
+    stored-sample predicate (both rosters) so index and query
     (``provider_ops.bad_sample_count_sql``) stay the same string by
     construction. A file built with an older predicate is rebuilt once, at
     the next start, by ``_sync_forecast_sample_index``."""
@@ -1610,7 +1610,7 @@ def migrate_v18(conn: sqlite3.Connection) -> None:
         conn.execute(f"PRAGMA secure_delete = {restored}")
 
 
-# Part B's two station_poll_state columns, as `create_tables` writes them,
+# The two poll-pause station_poll_state columns, as `create_tables` writes them,
 # pause_reason first: the count's CHECK names it.
 _V18_POLL_PAUSE_COLUMNS: Final = (
     (
@@ -1730,7 +1730,7 @@ def _v18_prune_wind_history(conn: sqlite3.Connection) -> None:
 
 
 def _v18_drop_bad_display_values(conn: sqlite3.Connection) -> None:
-    """Delete the stored display values (card 7) outside their range.
+    """Delete the stored display values outside their range.
 
     A sub-step of `migrate_v18`, run inside its savepoint, after
     `create_indexes`. One DELETE on ``forecast_samples`` ``INDEXED BY

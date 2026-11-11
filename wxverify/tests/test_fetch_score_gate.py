@@ -1,9 +1,9 @@
 """A database error inside a download's save rolls the whole save back.
 
-This file once tested the fetch-triggered scoring gate (plan:
-fetch-scoring-gate §11.2): a probe on every download that decided whether to
-call `enqueue_scoring_run`, which enqueues nothing with the daily close on.
-The rain release (Part B) deleted the gate with the close-off code it fed.
+This file once tested the fetch-triggered scoring gate: a probe on every
+download that decided whether to call `enqueue_scoring_run`, which enqueues
+nothing with the daily close on. A later release deleted the gate with the
+close-off code it fed.
 What stays is the live-path rollback test: an error raised inside the save,
 after the samples are written, leaves nothing stored and no transaction
 open. The error is now raised by the save's first-download check

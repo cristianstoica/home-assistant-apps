@@ -1,4 +1,4 @@
-"""Tests for plan Step 7: the Sites page shows each station's observation age.
+"""Tests: the Sites page shows each station's observation age.
 
 Covers the pure boundary function, the loader that builds ``StationView`` via
 ``_load_stations``'s ``LEFT JOIN`` on ``station_poll_state``, and the rendered

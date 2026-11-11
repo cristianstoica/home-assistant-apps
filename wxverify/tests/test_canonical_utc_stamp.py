@@ -1,7 +1,6 @@
-"""Unit oracle for ``is_canonical_utc_stamp`` (O1).
+"""Unit oracle for ``is_canonical_utc_stamp``.
 
-The item-12 truth table (plan `2026-09-23-db-import-timestamp-validation.md`
-Sec 4) as literal ``(value, expected)`` pairs, plus the non-``str`` guard
+The truth table as literal ``(value, expected)`` pairs, plus the non-``str`` guard
 cases. Every value here is written by hand -- never built with
 ``isoformat_utc`` or any other production constant -- so the oracle cannot
 share the formatter it is checking.

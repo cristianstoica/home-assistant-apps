@@ -1,11 +1,11 @@
-"""Item P — parse-cap probe (§11 of the 0.16.0 plan).
+"""Parse-cap probe.
 
 Tests ``wxverify.feeds.parse_cap_probe``: the ``parse_cap_probe`` constructor
 keyword on the three adapters, the ``RuntimeOptions.parse_cap_probe`` field,
 the ``config.yaml`` schema line, and the registry wiring.
 
 Every expected literal below was derived from the real ``_to_fetch_result``
-of each adapter module and from P.2's field definitions — never
+of each adapter module and from the log record's field definitions — never
 recomputed by calling the code under test.
 
 Convention: ``httpx.MockTransport`` with a synchronous handler, matching

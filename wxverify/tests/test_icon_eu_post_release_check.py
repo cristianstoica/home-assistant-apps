@@ -1,4 +1,4 @@
-"""Item D1 -- ``scripts/icon_eu_post_release_check.py`` (plan §8.6/§4.8).
+"""``scripts/icon_eu_post_release_check.py``.
 
 Owner-run, read-only coverage check for the ``icon_eu`` feed, run manually
 7 days after release. No network: it only reads ``forecast_samples`` joined
@@ -392,7 +392,7 @@ def _make_db(tmp_path: Path, *, db_path: Path | None = None) -> tuple[Path, int,
     conn.execute("PRAGMA foreign_keys=ON")
     run_migrations(conn)
     # The check reads each fetch's rows, a shape only a file below v16 holds:
-    # the rain release (Part B) keeps one row per hour (idx_samples_slot), so
+    # a v16 file keeps one row per hour (idx_samples_slot), so
     # on a v16 export a later fetch replaces an earlier one's hours.
     conn.execute("DROP INDEX idx_samples_slot")
     site_id = asof_make_site(conn, "Icon-EU Post-Release Site")
@@ -425,7 +425,7 @@ def _in_window_fetches(count: int, *, site_id: int) -> list[Row]:
     rows: list[Row] = []
     for i in range(count):
         label = datetime(2026, 6, 1, tzinfo=UTC) + timedelta(days=i)
-        # 01:30 -- 1.5 h after the label (plan §8.6's realistic F-L gap),
+        # 01:30 -- 1.5 h after the label (a realistic fetch gap),
         # still inside the first window ([01:00, 02:30)).
         fetched = label + timedelta(hours=1, minutes=30)
         for variable in ("temperature", "wind", "precip"):
@@ -447,7 +447,7 @@ def _in_window_fetches(count: int, *, site_id: int) -> list[Row]:
 def test_main_pass_prints_the_pass_verdict_and_exits_0(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Plan §8.6 line 783: the 8 full in-window fetches are spread over TWO
+    # The 8 full in-window fetches are spread over TWO
     # sites, sharing the same labels and the same fetched_at values. A
     # script that groups fetches by label alone (dropping site_id from the
     # key), or that counts in-window fetches per site instead of pooling
@@ -657,7 +657,7 @@ def test_main_never_prints_the_db_path(
 
 
 # ---------------------------------------------------------------------------
-# Window parity (plan §8.6): this script's own `in_side_window` must agree
+# Window parity: this script's own `in_side_window` must agree
 # with the coverage script's, for both an aware-UTC and a naive datetime
 # under a non-UTC system zone. The post-release script does not import the
 # coverage script (that would load httpx) -- only this TEST file imports
@@ -692,7 +692,7 @@ def test_in_side_window_matches_the_coverage_scripts_copy_aware_and_naive() -> N
 
 
 # ---------------------------------------------------------------------------
-# `_is_full` -- the plan's exact "whole hours" microsecond/second-boundary
+# `_is_full` -- the exact "whole hours" microsecond/second-boundary
 # unit test, in addition to the (differently-constructed) minute-shift case
 # above. `main` can never reach a fractional-second `valid_at` in practice --
 # `invalid_forecast_sample_sql`'s FORECAST_TIMESTAMP_LIKE shape check filters
@@ -713,10 +713,10 @@ def test_is_full_whole_hours_microsecond_and_second_shifts() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Import allowlist (§4.9): stdlib-only, plus `wxverify.collection
+# Import allowlist: stdlib-only, plus `wxverify.collection
 # .forecast_validation` and `wxverify.core.timeutil`. `httpx` must not be
 # imported at all -- the post-release script's defining property, stronger
-# than the coverage script's §4.7 rule.
+# than the coverage script's rule.
 # ---------------------------------------------------------------------------
 
 _ALLOWED_WXVERIFY_MODULES = {
@@ -749,7 +749,7 @@ def test_import_allowlist_static() -> None:
     assert "httpx" not in other_top_level
 
 
-#: §4.9's complete transitive closure: the two allowed modules plus
+#: The complete transitive closure: the two allowed modules plus
 #: everything they are documented to pull in. As in the coverage script's
 #: test, a baseline-subtraction diff cannot see a module one of the
 #: ALLOWED modules itself transitively loads; this subset check can.
@@ -803,7 +803,7 @@ def test_import_allowlist_runtime_never_loads_httpx(tmp_path: Path) -> None:
     loaded = set(ast_module.literal_eval(lines[0]))
     httpx_loaded = lines[1] == "True"
     # Everything the script's import brings into sys.modules must be inside
-    # the §4.9 transitive closure.
+    # the transitive closure above.
     assert loaded <= _ALLOWED_TRANSITIVE_MODULES
     for module in loaded:
         for forbidden in _FORBIDDEN_SUBTREES:
@@ -813,7 +813,7 @@ def test_import_allowlist_runtime_never_loads_httpx(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The remaining §8.6 end-to-end cases, each with the per-case
+# The remaining end-to-end cases, each with the per-case
 # SHA-256-of-main-db-file-unchanged proof and the output-allowlist/no-leak
 # checks.
 # ---------------------------------------------------------------------------
@@ -858,7 +858,7 @@ def test_main_fail_on_a_fetch_missing_the_wind_variable(
 def test_main_pass_with_repeated_labels_under_two_fetch_times_excluded(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Plan §8.6 line 787: the PASS set plus one (site, label) holding a
+    # The PASS set plus one (site, label) holding a
     # full run under one fetched_at and, under a SECOND fetched_at, three
     # precip rows starting two hours after that run's last hour. The whole
     # label is excluded (two distinct fetched_at values under one label);

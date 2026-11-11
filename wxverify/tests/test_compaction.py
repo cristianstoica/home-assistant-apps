@@ -1,4 +1,4 @@
-"""Tests for ``wxverify.db.compaction`` (storage-release plan 4.2) and its
+"""Tests for ``wxverify.db.compaction`` and its
 wiring into ``Database._open`` (``A/wxverify/db/connection.py``).
 
 Fixture precondition: ``_build_fixture_db`` opens a fresh v17 database
@@ -271,7 +271,7 @@ def test_vacuum_error_logs_and_start_carries_on(
 def test_checkpoint_busy_after_vacuum_warns_and_writes_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The middle case of step 3: freelist_count is 0 (VACUUM genuinely ran)
+    """The middle case of the effect check: freelist_count is 0 (VACUUM genuinely ran)
     but the LAST checkpoint is reported busy. Catches: the effect check
     collapsing this three-valued result to only "success" or "error" -- it
     would either skip the WARNING and still claim success silently, or

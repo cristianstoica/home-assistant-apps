@@ -1,12 +1,12 @@
 """The close's rain check: set aside a gauge that reads zero in rain.
 
-Plan ``2026-11-01-rain-release.md``, Part A (A2, A4). Close stage 3 calls
-``check_station_rain`` right after ``write_hourly_values``, in the same
-transaction. It judges every listed station of the day with the pure rules
-of ``obs/rain_check.py`` over the close's own hourly values, writes one
-``station_rain_checks`` row per station and sets each station's rain flag
-on the list rows of the days after. The judged day's own figures never
-change: a set-aside or take-back counts from the next day.
+Close stage 3 calls ``check_station_rain`` right after
+``write_hourly_values``, in the same transaction. It judges every listed
+station of the day with the pure rules of ``obs/rain_check.py`` over the
+close's own hourly values, writes one ``station_rain_checks`` row per
+station and sets each station's rain flag on the list rows of the days
+after. The judged day's own figures never change: a set-aside or take-back
+counts from the next day.
 """
 
 from __future__ import annotations
@@ -152,7 +152,7 @@ def _rematerialize_rain_after(
 
 
 def rain_not_counted_since(conn: sqlite3.Connection, site_id: int) -> dict[int, date]:
-    """The site's stations the rain check holds set aside (A5), by station id.
+    """The site's stations the rain check holds set aside, by station id.
 
     Each maps to the first day its rain is not counted: the day after the
     check row that set it aside. A station whose latest row counts it is
@@ -176,7 +176,7 @@ def rain_not_counted_since(conn: sqlite3.Connection, site_id: int) -> dict[int, 
 def check_station_rain(
     conn: sqlite3.Connection, *, site_id: int, local_date: date, now_utc: datetime
 ) -> None:
-    """Judge the site-day's listed stations and fold each one's state (A4).
+    """Judge the site-day's listed stations and fold each one's state.
 
     1. Deletes the day's own ``station_rain_checks`` rows, so a stage-3
        retry gives the same result.

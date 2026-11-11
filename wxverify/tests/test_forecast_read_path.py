@@ -89,8 +89,8 @@ def test_load_future_samples_picks_latest_run_per_slot() -> None:
     """Two runs covering the same (feed, variable, valid_at) slot; only the
     newer survives -- the ROW_NUMBER() rewrite's headline contract."""
     conn = _make_db()
-    # Two labels in one hour exist only in a file below v16 (the rain
-    # release, Part B, keeps one row per hour): the pick is a no-op on a
+    # Two labels in one hour exist only in a file below v16 (v16
+    # keeps one row per hour): the pick is a no-op on a
     # v16 file, and the v16 carry-over keeps the row it picks.
     conn.execute("DROP INDEX idx_samples_slot")
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
@@ -157,7 +157,7 @@ def test_load_future_samples_newer_invalid_does_not_shadow_valid_older() -> None
 
 
 def test_load_future_samples_invalid_newest_value_shows_as_missing() -> None:
-    """Rain release, Part B (B1): a newer download's invalid value replaces
+    """A newer download's invalid value replaces
     the hour, since the newest value is what the feed last said, and the
     reader leaves it out, so the hour shows as missing, never as the older
     value."""

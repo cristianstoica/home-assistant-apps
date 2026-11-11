@@ -1,10 +1,9 @@
 """The rain check: whether a station's gauge reads zero in rain.
 
-Plan ``2026-11-01-rain-release.md``, Part A (A3). ``judge_day`` judges one
-station's day against its peers, and ``fold`` decides from the station's
-earlier check rows whether the day sets the station aside, takes it back,
-or changes nothing. It is pure: no database, no clock, no network. It
-imports only the standard library.
+``judge_day`` judges one station's day against its peers, and ``fold`` decides
+from the station's earlier check rows whether the day sets the station aside,
+takes it back, or changes nothing. It is pure: no database, no clock, no
+network. It imports only the standard library.
 
 Every constant is a starting value and is not validated. Rain is compared
 in whole hundredths of a millimetre, so a sum such as 0.19999999999999996
@@ -178,7 +177,7 @@ def judge_day(
     *,
     site_temps_before: Mapping[datetime, float | None],
 ) -> JudgeResult:
-    """Judge one station's day against its peers (plan A3, rules 1-9).
+    """Judge one station's day against its peers.
 
     ``hours`` are the day's hours in order; ``peers`` the day's other listed
     stations that are counted; ``site_temps_before`` the site's hourly
@@ -289,7 +288,7 @@ def fold(
     other_new_candidates_today: int = 0,
     other_station_set_aside_today: bool = False,
 ) -> FoldResult:
-    """Whether ``local_date``'s outcome changes the station's state (plan A3).
+    """Whether ``local_date``'s outcome changes the station's state.
 
     ``history`` is the station's earlier rows, in date order; rows dated on
     or after ``local_date`` are ignored. ``counted_before`` is 1 when the

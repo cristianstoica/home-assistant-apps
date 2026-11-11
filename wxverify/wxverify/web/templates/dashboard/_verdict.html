@@ -1,6 +1,6 @@
 {% set lead_word = (lead_options | selectattr("value", "equalto", lead) | map(attribute="word") | first) or lead %}
 {% if variable == "wind" and wind_weights is not none %}
-{# Plan §12.2: wind is served from every feed, weighted by past accuracy,
+{# Wind is served from every feed, weighted by past accuracy,
    so the "best feed" verdict is replaced by the weights. #}
 <section class="panel wide verdict" id="wind-weights-panel">
   <p class="verdict-head">Wind for {{ lead_word }} at {{ site.name }} is the weighted mean of every feed's daily high.</p>

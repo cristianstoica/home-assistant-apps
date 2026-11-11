@@ -6,7 +6,7 @@ from typing import Final
 
 from wxverify.settings.depth import DEPTH_VARIABLES
 
-#: The canonical roster (NB-4) — sample validation accepts exactly the
+#: The canonical roster — sample validation accepts exactly the
 #: variables the rest of the pipeline scores.
 FORECAST_VARIABLES: Final[tuple[str, ...]] = DEPTH_VARIABLES
 FORECAST_VALUE_RANGES: Final[dict[str, tuple[float, float]]] = {
@@ -14,7 +14,7 @@ FORECAST_VALUE_RANGES: Final[dict[str, tuple[float, float]]] = {
     "wind": (0.0, 150.0),
     "precip": (0.0, 500.0),
 }
-#: The display roster (card 7): stored in ``forecast_samples`` for the
+#: The display roster: stored in ``forecast_samples`` for the
 #: Forecast page only, never scored. Cloud cover in %, gust in m/s, wind
 #: direction in degrees the wind comes from.
 DISPLAY_VARIABLES: Final[tuple[str, ...]] = (

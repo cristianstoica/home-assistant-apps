@@ -1,13 +1,10 @@
-"""The version-18 upgrade (plan `2026-11-07-health-release.md` §9, §10;
-test IDs UT1-UT6, BT9, H5). The version 18 upgrade runs under
-`migrate_v18`. Of U4's four sub-steps (``_v18_poll_pause``,
-``_v18_drop_unused_write_state``, ``_v18_prune_wind_history``,
-``_v18_drop_bad_display_values``), all four are now wired in:
-``_v18_poll_pause`` (Part B), ``_v18_drop_unused_write_state`` (Part D),
-``_v18_prune_wind_history`` (Part G) and ``_v18_drop_bad_display_values``
-(Part H, H5). UT1 also checks BT9's ``CHECK`` table (the two poll-pause
-columns) on a fresh file and on an upgraded one, and BT9's own carry-over
-test lives here too. UT2 and UT3 below cover each sub-step in turn.
+"""The version-18 upgrade (test IDs UT1-UT6, BT9, H5). The version 18 upgrade
+runs under `migrate_v18`, which has four sub-steps, all wired in:
+``_v18_poll_pause``, ``_v18_drop_unused_write_state``,
+``_v18_prune_wind_history`` and ``_v18_drop_bad_display_values``. UT1 also
+checks BT9's ``CHECK`` table (the two poll-pause columns) on a fresh file and
+on an upgraded one, and BT9's own carry-over test lives here too. UT2 and UT3
+below cover each sub-step in turn.
 
 Fixture: ``tests/fixtures/v17_schema.sql`` and ``v17_seed.sql``, dumped
 from a fresh 0.16.17 (``6f49f1a``) file the same way the version-16 pair
@@ -19,7 +16,7 @@ Every test below loads both into a fresh ``tmp_path`` file, sets
 ``migrations.run_migrations`` directly on the autocommit connection
 (6f49f1a's ``tests/test_migration_v17.py``/``_run_migrate_v17`` convention: no
 surrounding ``BEGIN``, since ``create_tables``'s own ``executescript``
-ends any outer transaction anyway, per plan §9's "the transaction" note).
+ends any outer transaction anyway).
 
 Isolation: every connection is a real, file-backed SQLite database under
 ``tmp_path``; no mocked persistence. Synthetic data only: the fixture
@@ -96,7 +93,7 @@ def _with_empty_station_wind_constant(
 ) -> dict[str, list[tuple[object, ...]]]:
     """``rows`` plus an empty ``station_wind_constant`` table.
 
-    ``create_tables`` makes ``station_wind_constant`` (Part A, §1 A2) on
+    ``create_tables`` makes ``station_wind_constant`` on
     every open, unconditionally and ahead of the version-17 savepoint, so
     even a run that stops or is denied before `migrate_v18` does anything
     still leaves this one empty table behind on a v17 file that never had
@@ -108,9 +105,8 @@ def _with_empty_station_wind_constant(
 
 
 # ---------------------------------------------------------------------------
-# UT1 (adapted): a fresh file and an upgraded v17 file produce the same
-# table and index names, and the same table_xinfo for every table. BT9's
-# CHECK-table part is not written here -- it lands with step 3 (B).
+# UT1: a fresh file and an upgraded v17 file produce the same table and index
+# names, and the same table_xinfo for every table.
 # ---------------------------------------------------------------------------
 
 
@@ -330,7 +326,7 @@ def test_ut6_secure_delete_reads_1_after_a_stop_before_migrate_v18_runs(
 
 
 # ---------------------------------------------------------------------------
-# U4's first wired-in sub-step: _v18_drop_unused_write_state.
+# The first wired-in sub-step: _v18_drop_unused_write_state.
 # ---------------------------------------------------------------------------
 
 
@@ -628,7 +624,7 @@ def test_ut3_a_denied_runtime_state_delete_rolls_back_the_drop_too(
 
 
 # ---------------------------------------------------------------------------
-# U4's second wired-in sub-step: _v18_poll_pause (BT9, Part B).
+# The second wired-in sub-step: _v18_poll_pause (BT9).
 # ---------------------------------------------------------------------------
 
 
@@ -669,13 +665,13 @@ def test_bt9_carry_over_recheck_for_offline_and_404_stations(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BT9's carry-over, on the v17 fixture file (plan §2's Upgrade needs,
-    U4's ``_v18_poll_pause``). Rows: ``offline`` (``next_poll_at`` 20 h
+    """BT9's carry-over, on the v17 fixture file (``_v18_poll_pause``). Rows:
+    ``offline`` (``next_poll_at`` 20 h
     ahead), ``terminal`` ``http 404`` (``next_poll_at`` unset), ``terminal``
     ``http 410``, ``terminal`` ``http 401``, ``online`` -- the last three
     keep a far-future ``next_poll_at`` that must survive untouched. Catches:
-    a 404 station parked for a day instead of rechecked at once (TODO
-    step 2); every 4xx counted as evidence, not just ``offline``/404; the
+    a 404 station parked for a day instead of rechecked at once; every 4xx
+    counted as evidence, not just ``offline``/404; the
     carry-over reaching the ``online`` row; the INFO line's counts wrong.
     """
     fixed_now = datetime(2026, 11, 7, 6, 0, 0, tzinfo=UTC)
@@ -817,7 +813,7 @@ def test_ut3_a_stop_at_poll_pause_leaves_everything_as_it_was(
 
 
 # ---------------------------------------------------------------------------
-# U4's third wired-in sub-step: _v18_prune_wind_history (plan §7 Part G).
+# The third wired-in sub-step: _v18_prune_wind_history.
 # ---------------------------------------------------------------------------
 
 _UT2_WIND_MARGIN_S: Final = 1200  # MAX_PAIR_GAP_SECONDS (obs/wind_pairs.py)
@@ -907,7 +903,7 @@ def _wind_history_row_exists(
 def test_ut2_prune_wind_history_deletes_only_the_done_sites_old_null_rows(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """UT2 for the ``v18_prune_wind_history`` sub-step (plan §7 G1; §9 UT2).
+    """UT2 for the ``v18_prune_wind_history`` sub-step.
 
     One made-up site whose first ``site_days`` record is closed (done), one
     whose first record is open (not done); each with one station and four
@@ -916,7 +912,8 @@ def test_ut2_prune_wind_history_deletes_only_the_done_sites_old_null_rows(
     rows would survive the upgrade untouched); the delete reaching the
     not-done site's rows (its rows, and the ``kept_sites`` id, would then be
     wrong); the margin bound off by one second (the boundary row, exactly
-    F's start minus 1200 s, would be deleted instead of kept); the sub-step
+    the first record's start minus 1200 s, would be deleted instead of
+    kept); the sub-step
     reaching a row outside ``station_wind_records``.
     """
     conn = _v17_connect(tmp_path / "ut2-wind-prune.db")
@@ -1066,9 +1063,9 @@ def test_ut3_a_stop_at_prune_wind_history_leaves_everything_as_it_was(
 
 
 # ---------------------------------------------------------------------------
-# U4's fourth wired-in sub-step: _v18_drop_bad_display_values (plan §8 Part
-# H; §9 H5). feed_id 1 and 2 are the boot-seed's own (`feeds` rows from
-# `v17_seed.sql`), never created by these tests.
+# The fourth wired-in sub-step: _v18_drop_bad_display_values (H5). feed_id 1
+# and 2 are the boot-seed's own (`feeds` rows from `v17_seed.sql`), never
+# created by these tests.
 # ---------------------------------------------------------------------------
 
 
@@ -1095,8 +1092,8 @@ def _insert_forecast_sample(
 def test_h5_drop_bad_display_values_deletes_only_the_out_of_range_rows(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """H5 / UT2 for the ``v18_drop_bad_display_values`` sub-step (plan §8
-    Part H; §9 H5). Feed X (boot-seeded feed 1) carries display rows at
+    """H5 / UT2 for the ``v18_drop_bad_display_values`` sub-step. Feed X
+    (boot-seeded feed 1) carries display rows at
     eight distinct hours: cloud cover -4, 0, 100, 106, wind direction 361,
     360, wind gust -1, 0, and one in-range cloud cover (50) with a
     malformed ``valid_at``. Feed Y (boot-seeded feed 2) carries one scored
@@ -1283,21 +1280,22 @@ def test_ut3_a_denied_forecast_samples_delete_rolls_back_the_wind_prune_too(
     tmp_path: Path,
 ) -> None:
     """UT3 for the ``v18_drop_bad_display_values`` sub-step, the
-    all-or-nothing half. Catches: ``_v18_prune_wind_history`` (G) and
-    ``_v18_drop_bad_display_values`` (H) not sharing one atomic unit with
+    all-or-nothing half. Catches: ``_v18_prune_wind_history`` and
+    ``_v18_drop_bad_display_values`` not sharing one atomic unit with
     ``migrate_v18``'s SAVEPOINT -- if the wind-history DELETE had already
     committed on its own before the display-values DELETE failed, the old
     wind row would stay gone even though the upgrade as a whole raised and
     the version stayed at 17.
 
     The authorizer denies the ``SQLITE_DELETE`` on ``forecast_samples`` and
-    records, in order, the ``station_wind_records`` DELETE (G's own) and
-    the denied ``forecast_samples`` DELETE (H's own) -- the same
+    records, in order, the ``station_wind_records`` DELETE and the denied
+    ``forecast_samples`` DELETE -- the same
     order-list pattern as
     ``test_ut3_a_denied_runtime_state_delete_rolls_back_the_drop_too``. The
     wind DELETE coming first in ``order`` is this fixture's own
-    precondition check that G ran (and was rolled back) ahead of H's
-    denial, not merely that the denial landed on the right table.
+    precondition check that the wind-history prune ran (and was rolled
+    back) ahead of the display-values denial, not merely that the denial
+    landed on the right table.
     """
     conn = _v17_connect(tmp_path / "ut3-deny-drop-bad-display.db")
     site_id = _seed_bare_site(conn, "UT3 deny drop-bad-display site")

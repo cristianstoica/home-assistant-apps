@@ -1,5 +1,5 @@
 """``wxverify.db.switch.prune_wind_history``, the one-time wind-history
-prune (health-release plan 2026-11-07, §7 Part G; test IDs G1-G3, WP10).
+prune (test IDs G1-G3, WP10).
 
 Real SQLite throughout, via ``wxverify.db.connection.init_db`` on a tmp-file
 database. Zone is ``UTC`` throughout (no DST, so margins compare cleanly).
@@ -32,7 +32,7 @@ from wxverify.db.switch import prune_wind_history
 _ROOT = Path(__file__).resolve().parents[1]
 _PACKAGE_ROOT = _ROOT / "wxverify"
 
-# F, the site's first closed day (plan 4.1): reuse the shared fixture's D so
+# F, the site's first closed day: reuse the shared fixture's D so
 # no second synthetic calendar date needs inventing.
 F: Final = D
 F_START: Final = datetime(F.year, F.month, F.day, tzinfo=UTC)
@@ -129,7 +129,7 @@ def _seed_history(conn: sqlite3.Connection, station_id: int) -> dict[str, dateti
     ``old`` is before the margin (pruned); ``near`` is inside the 1200 s
     margin before F's start (kept); ``inside`` is inside F itself (kept);
     ``set_old`` has ``fetched_at`` set, dated before F (kept regardless of
-    date -- P2's own rows, never this prune's).
+    date -- the collection's own rows, never this prune's).
     """
     times = {
         "old": F_START - MARGIN - timedelta(seconds=800),
@@ -201,7 +201,7 @@ def _all_rows(conn: sqlite3.Connection, station_id: int) -> list[tuple[object, .
 def test_g1_prune_deletes_only_the_margin_bounded_null_rows_of_done_sites(
     tmp_path: Path,
 ) -> None:
-    """G1 (plan §7): the rule, on the whole fixture.
+    """G1: the rule, on the whole fixture.
 
     M -> at the ``deleted`` assertion: correct = 1 (only C's ``old`` row,
     before F's start minus the 1200 s margin, at a site whose F is closed,
@@ -250,7 +250,7 @@ def test_g1_prune_deletes_only_the_margin_bounded_null_rows_of_done_sites(
 
 
 def test_g2_missed_counts_as_done(tmp_path: Path) -> None:
-    """G2 (plan §7): site 1's F marked missed, not closed.
+    """G2: site 1's F marked missed, not closed.
 
     M -> at the ``a_old_gone``/``b_old_gone``/``c_old_gone`` assertions:
     correct = gone (``DONE_STATES`` is ``{'closed', 'missed'}``, so a
@@ -283,7 +283,7 @@ def test_g2_missed_counts_as_done(tmp_path: Path) -> None:
 
 
 def test_g3_a_second_run_right_after_g1_deletes_nothing(tmp_path: Path) -> None:
-    """G3 (plan §7): right after G1's call, a second call.
+    """G3: right after G1's call, a second call.
 
     M -> at the ``deleted`` assertion: correct = 0 (the bound depends only
     on F, which does not move between the two calls), mutant = nonzero (a
@@ -319,7 +319,7 @@ def test_g3_a_second_run_right_after_g1_deletes_nothing(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# WP10, re-targeted (plan §7)
+# WP10, re-targeted
 # ---------------------------------------------------------------------------
 
 
@@ -337,7 +337,7 @@ _ALLOWED_ENCLOSING_FUNCTIONS: Final = {
 
 
 def test_wp10_station_wind_records_and_the_prune_call_are_scoped() -> None:
-    """WP10, re-targeted (plan §7, §12.3, §12.5): text and ``ast`` scans of
+    """WP10, re-targeted: text and ``ast`` scans of
     the package.
 
     M -> at the ``call_sites`` assertion: correct = ``["db/migrations.py"]``

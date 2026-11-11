@@ -109,7 +109,7 @@ def _seed_cell_pairs(
 ) -> None:
     """Record one feed's forecast at one (variable, day_ahead) cell, into
     the caller's OWN local ``forecasts`` dict, for
-    ``_seed_complete_score_cache`` to hand-derive ``MetricSums`` from
+    ``_seed_complete_published_ranking`` to hand-derive ``MetricSums`` from
     (the canonical far-future valid_at/lead_hours trio this fixture always
     uses, so persistence's own error over the same 3 valid_ats stays the
     skill baseline). No row is written: nothing reads a pair table for
@@ -126,8 +126,8 @@ def _seed_cell_pairs(
 
 def test_latest_run_pick_keeps_newest_issued_at_value() -> None:
     conn = _make_db()
-    # Two labels in one hour exist only in a file below v16 (the rain
-    # release, Part B, keeps one row per hour): the pick is a no-op on a
+    # Two labels in one hour exist only in a file below v16 (v16
+    # keeps one row per hour): the pick is a no-op on a
     # v16 file, and the v16 carry-over keeps the row it picks.
     conn.execute("DROP INDEX idx_samples_slot")
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
@@ -294,7 +294,7 @@ def test_stale_boundary_uses_2x_feeds_own_fetch_interval() -> None:
 
 
 def test_stale_boundary_one_second_past_2x_interval_flips_to_stale() -> None:
-    """Plan §14.6 "Boundary": ``now == stamp + 2 x interval`` is fresh; one
+    """Boundary: ``now == stamp + 2 x interval`` is fresh; one
     second later is stale -- the finer-grained sibling of
     ``test_stale_boundary_uses_2x_feeds_own_fetch_interval`` above, which
     pins the same ``<`` (not ``<=``) boundary at minute granularity."""
@@ -483,7 +483,7 @@ def test_freshness_unparseable_text_stamp_reads_unknown_not_raise() -> None:
     a non-str value (``stamp is None`` branch); this one pins ``parse_utc``'s own
     ``ValueError`` branch on a value that passes the isinstance check.
 
-    Mutant (plan §14.6, MX4): removing the ``try/except ValueError`` around
+    Mutant MX4: removing the ``try/except ValueError`` around
     ``parse_utc(stamp)`` would raise instead of returning ``"unknown"``.
     """
     conn = _make_db()
@@ -689,7 +689,7 @@ def test_meteoblue_member_reads_unknown_when_package_has_no_state_row() -> None:
 
 
 def test_polling_phase_boundary_pins_fresh_then_stale_across_days() -> None:
-    """Plan §14.6 "Polling phase" bullet, verbatim scenario: a 360-min (6h)
+    """Polling phase: a 360-min (6h)
     feed whose samples are issued at 06:00Z, fetched (stamped) at 12:44Z the
     same day.
 
@@ -771,7 +771,7 @@ def _seed_ranking_exclusion_fixture(
     conn: sqlite3.Connection,
 ) -> tuple[dict[str, int], dict[int, float]]:
     """Returns ``(ids, forecasts)``: ``forecasts`` is local to this call,
-    for the caller to pass straight into ``_seed_complete_score_cache`` --
+    for the caller to pass straight into ``_seed_complete_published_ranking`` --
     never module-level state, so no connection's values can leak into
     another's."""
     set_setting(conn, "min_n", "3")
@@ -828,11 +828,11 @@ def _ensure_test_publication(conn: sqlite3.Connection, *, min_n: int) -> int:
     """This connection's one site-1 publication, created on first use.
 
     ``forecast_ranking``'s ``rolling`` window now always reads the active
-    publication (9.2), never a live recompute, so every ranking this file
+    publication, never a live recompute, so every ranking this file
     seeds must land in ONE publication -- its ``min_n`` is baked in at
     creation, matching the runtime ``min_n`` setting at that point, so the
     read-time confidence check agrees with what
-    :func:`_seed_complete_score_cache` computed.
+    :func:`_seed_complete_published_ranking` computed.
     """
     row = conn.execute(
         "SELECT id FROM publications WHERE site_id = 1 ORDER BY id DESC LIMIT 1"
@@ -849,7 +849,7 @@ def _ensure_test_publication(conn: sqlite3.Connection, *, min_n: int) -> int:
     )
 
 
-def _seed_complete_score_cache(
+def _seed_complete_published_ranking(
     conn: sqlite3.Connection,
     *,
     forecasts: dict[int, float],
@@ -860,7 +860,7 @@ def _seed_complete_score_cache(
     feeds in `forecasts` at one (variable, day_ahead) cell.
 
     `forecast_ranking_with_status`'s `rolling` window now always reads the
-    active publication (9.2): a feed set that does not match the query's
+    active publication: a feed set that does not match the query's
     expected-active-feed set exactly degrades to a 'rebuilding' empty
     ranking rather than the live-recomputed values these tests assert on.
     The sums below are hand-derived exactly
@@ -911,7 +911,7 @@ def _seed_complete_score_cache(
 def test_forecast_ranking_excludes_virtual_and_meteoblue_package_feeds() -> None:
     conn = _make_db()
     ids, forecasts = _seed_ranking_exclusion_fixture(conn)
-    _seed_complete_score_cache(
+    _seed_complete_published_ranking(
         conn, forecasts=forecasts, variable="temperature", day_ahead=0
     )
 
@@ -939,7 +939,7 @@ def test_forecast_ranking_excludes_virtual_and_meteoblue_package_feeds() -> None
 def test_forecast_ranking_is_keyed_per_day_ahead_cell() -> None:
     conn = _make_db()
     ids, forecasts = _seed_ranking_exclusion_fixture(conn)
-    _seed_complete_score_cache(
+    _seed_complete_published_ranking(
         conn, forecasts=forecasts, variable="temperature", day_ahead=0
     )
     # Pairs (and the published ranking) were seeded only at day_ahead=0; the

@@ -301,8 +301,7 @@ def materialize_consensus(
     """Recompute the consensus observation for one (site, variable, hour).
 
     Every write or delete of ``observations`` goes through here. The daily
-    close scores each closed day from ``observations`` itself
-    (storage-release plan, table 1.B row B6).
+    close scores each closed day from ``observations`` itself.
 
     The closed-day guard (``HOURLY``) checks the hour after the site
     lookup: a refused hour returns before anything is marked or written,
@@ -361,7 +360,7 @@ def materialize_consensus(
         site_elevation_m=float(site["elevation_m"]),
         mad_floor=MAD_FLOORS.get(variable, 0.0),
     )
-    # Plan §4: every consensus mutation (all of which funnel through here,
+    # Every consensus mutation (all of which funnel through here,
     # the sole `observations` writer) marks the affected local day's
     # daily_truth rows stale. Runs for BOTH the upsert and the delete branch
     # below.
@@ -399,10 +398,10 @@ def materialize_consensus(
 def _consensus_station_filter(
     conn: sqlite3.Connection, site_id: int, variable: str, valid_at: str
 ) -> tuple[str, tuple[int, ...]]:
-    """The stations ``materialize_consensus`` reads for the hour (6.3).
+    """The stations ``materialize_consensus`` reads for the hour.
 
     The saved station list of the day that holds the hour, and for
-    ``precip`` only its stations the rain check counts (rain release, A1);
+    ``precip`` only its stations the rain check counts;
     no record or an empty list reads no station.
     """
     record = day_for_instant(conn, site_id, valid_at)

@@ -45,8 +45,7 @@ _DUE_JOB_FAILURE_COOLDOWN = timedelta(hours=1)
 
 def scheduler_tick(conn: sqlite3.Connection) -> None:
     logger.debug("scheduler tick")
-    # The forward downloads: the scored round and the fixed daytime slots
-    # (daily-close P4 4.4, 5.1).
+    # The forward downloads: the scored round and the fixed daytime slots.
     now = utc_now()
     enqueue_due_round_tries(conn, now_utc=now)
     enqueue_due_daytime_downloads(conn, now_utc=now)
@@ -58,11 +57,11 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
 
 
 def _enqueue_due_wind_days(conn: sqlite3.Connection) -> None:
-    """Enqueue the wind-history lane for each site with work (plan §8.13).
+    """Enqueue the wind-history lane for each site with work.
 
     One ``fetch_obs`` job with the ``wind-days`` key per enabled site with an
     enabled station, spaced by ``WIND_DAYS_SPACING`` after a success, except
-    while a today row of the site is due in the evening window (plan 4.2),
+    while a today row of the site is due in the evening window,
     where the spacing would block the 23:57 to 23:59 slots. An unreadable
     success stamp fails open here: the wrapper's success cooldown fails
     closed on it, which would stop the lane for good.

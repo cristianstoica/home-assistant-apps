@@ -1,4 +1,4 @@
-"""Pinning tests for the journal_mode refusal (health release, Part C).
+"""Pinning tests for the journal_mode refusal.
 
 All fixture data is synthetic -- this is a PUBLIC repo.
 """

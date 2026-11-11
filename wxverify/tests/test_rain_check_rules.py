@@ -1,7 +1,6 @@
-"""Pure rules of the rain check (plan 2026-11-01-rain-release.md, Part A;
-test IDs A2-A6; A1 and A7 are covered at the database level in
-``tests/test_rain_check_close.py``, since they need a real close to show a
-list row and an ``observations`` row).
+"""Pure rules of the rain check (test IDs A2-A6; A1 and A7 are covered at
+the database level in ``tests/test_rain_check_close.py``, since they need a
+real close to show a list row and an ``observations`` row).
 
 Written before ``wxverify.obs.rain_check`` exists: every test here fails at
 ``ImportError`` until the module is built. No I/O, no clock, no SQLite --

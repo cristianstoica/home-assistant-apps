@@ -1,5 +1,4 @@
-"""The starting history (switch-over plan 2026-10-22-daily-close-switch-
-over.md section 5; test IDs SH1-SH2 of 17.12).
+"""The starting history (test IDs SH1-SH2).
 
 SH1 (``wxverify.db.switch.first_record_date``) and SH2 (the dashboard/
 overlay hint) check the starting-history date shown to the user. Zone is
@@ -45,7 +44,7 @@ def _init_tmp_db(tmp_path: Path) -> Database:
 
 
 def test_sh1_first_record_date_is_the_minimum_local_date(tmp_path: Path) -> None:
-    """SH1 (plan 17.12): ``first_record_date`` for a site with no record,
+    """SH1: ``first_record_date`` for a site with no record,
     and for one with records F, F + 1.
 
     M67 -> at the ``with_records`` assertion: correct = F (the minimum
@@ -100,10 +99,10 @@ def _sh2_patch_clock(monkeypatch: pytest.MonkeyPatch, now: datetime) -> None:
 def test_sh2_the_dashboard_and_overlay_hint_tracks_close_and_record_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """SH2 (plan 17.12): the dashboard and Overlay pages, read through
+    """SH2: the dashboard and Overlay pages, read through
     ``TestClient`` (``tests/test_close_pages.py``'s ``_make_app``/
     ``_patch_clock`` pattern, built locally here, since that file holds no
-    reusable helper): no record yet; then a record. The hint text (5.4) is
+    reusable helper): no record yet; then a record. The hint text is
     absent, then present on both pages.
 
     M68 -> at the ``with_record`` assertions below: correct = the hint
@@ -140,10 +139,10 @@ def test_sh2_the_dashboard_and_overlay_hint_tracks_close_and_record_state(
         dashboard_with_record, overlay_with_record = _pages(client)
 
     assert _HINT_INVARIANT_TAIL not in dashboard_no_record, (
-        "the hint must be withheld with no record yet (5.4)"
+        "the hint must be withheld with no record yet"
     )
     assert _HINT_INVARIANT_TAIL not in overlay_no_record, (
-        "the hint must be withheld with no record yet (5.4)"
+        "the hint must be withheld with no record yet"
     )
 
     expected = _HINT_TEXT.format(f=f.isoformat())

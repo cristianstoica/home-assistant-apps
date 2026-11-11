@@ -100,7 +100,7 @@ def store_readings(
     fetched_at: datetime,
     now_utc: datetime,
 ) -> StoreResult:
-    """Store one download's readings of one station (plan 6.3, 6.4).
+    """Store one download's readings of one station.
 
     Each reading's site-day is asked through the closed-day guard's batch
     check (``READING`` for ``five_minute`` and ``current_obs``, ``GAP_FILL``
@@ -265,13 +265,13 @@ def _first_day_start_after(
 def next_five_minute_try(
     conn: sqlite3.Connection, *, site_id: int, now_utc: datetime
 ) -> datetime | None:
-    """When the site's next 5-minute download is scheduled (plan 12.2).
+    """When the site's next 5-minute download is scheduled.
 
     The earliest ``next_attempt_at`` among the site's enabled stations' rows
     for the current day that lies before the day's end; a retryable row
     whose stamp is NULL or unreadable is due now and gives ``now_utc``. When
     no row has one (every row is done for the day), the day's end. The
-    current day is P1's record holding ``now_utc``; with no record holding
+    current day is the day record holding ``now_utc``; with no record holding
     ``now_utc``, the ``day_start_utc`` of the site's first record after it
     (None when there is none). None when the site has no enabled station
     or does not exist. Read-only.
@@ -314,7 +314,7 @@ def next_five_minute_try(
     return day_end if earliest is None else earliest
 
 
-# --- the reads (plan 12.2, 12.3) -------------------------------------------
+# --- the reads -------------------------------------------------------------
 
 _SOURCES: Final[dict[str, Source]] = {
     "five_minute": "five_minute",
@@ -325,7 +325,7 @@ _SOURCES: Final[dict[str, Source]] = {
 
 @dataclass(frozen=True)
 class RawReading:
-    """One stored raw reading, as ``raw_readings`` returns it (plan 12.3).
+    """One stored raw reading, as ``raw_readings`` returns it.
 
     Each field is the row's column of that name: ``obs_at`` and
     ``fetched_at`` as UTC instants, ``local_date`` as a date, and a NULL
@@ -420,7 +420,7 @@ def reading_times(
     end_utc: datetime,
     source: Source | None = None,
 ) -> list[tuple[datetime, Source]]:
-    """The station's reading instants and sources in a range (plan 12.2).
+    """The station's reading instants and sources in a range.
 
     ``start_utc`` is included and ``end_utc`` excluded; with ``source``, only
     that source's readings. In time order, and by source name at one
@@ -451,7 +451,7 @@ def reading_times(
 def last_five_minute_store(
     conn: sqlite3.Connection, *, site_id: int
 ) -> datetime | None:
-    """The latest ``fetched_at`` of a ``five_minute`` row of the site (plan 12.2).
+    """The latest ``fetched_at`` of a ``five_minute`` row of the site.
 
     Every station of the site counts, switched off ones included; rows of
     other sources and rows with no ``fetched_at`` do not. None when the site
@@ -499,7 +499,7 @@ def raw_readings(
     start_utc: datetime,
     end_utc: datetime,
 ) -> list[RawReading]:
-    """The station's stored readings in a range, every column (plan 12.3).
+    """The station's stored readings in a range, every column.
 
     ``start_utc`` is included and ``end_utc`` excluded. In time order, and
     by source name at one instant. A row with an unreadable field is left
@@ -526,7 +526,7 @@ def raw_readings(
     return readings
 
 
-# --- retention (plan 10.3) -------------------------------------------------
+# --- retention -------------------------------------------------------------
 
 #: The ``runtime_state`` key prefix of each site's last pruned site-day; the
 #: site id follows it, the value is a local date, ``YYYY-MM-DD``.
@@ -573,7 +573,7 @@ def _days_after(
 
 
 def prune_raw_readings(conn: sqlite3.Connection, *, now_utc: datetime) -> int:
-    """Delete the raw readings of site-days past retention (plan 10.1, 10.3).
+    """Delete the raw readings of site-days past retention.
 
     For each site, walks its site-days after the last one pruned (the
     ``runtime_state`` key ``raw_readings_pruned_through:<site_id>``), oldest

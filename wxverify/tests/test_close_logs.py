@@ -1,5 +1,4 @@
-"""The logs and records: LG1 to LG6 (plan 2026-10-21-daily-close-close-job.md
-section 15.10).
+"""The logs and records: LG1 to LG6.
 
 LG3 (unchanged from the prior batch) is written before
 ``wxverify/worker/close_chain.py`` exists and fails first for that reason:
@@ -14,9 +13,8 @@ anything else -- a ``ModuleNotFoundError`` today, since
 (``close_chain.py`` holds only ``record_collection_try`` today). LG6 imports
 ``close_chain.close_status`` inline, for the same reason.
 
-Section 16.2 of the plan names the mutant each test ID kills; that mapping
-is given inline on the assertion, in ``tests/test_close_timeline.py``'s own
-style.
+The mutant each test ID kills is named inline on the assertion, in
+``tests/test_close_timeline.py``'s own style.
 
 Real SQLite only (``tests.helpers.asof_conn``/``day_close_site``/
 ``standard_night``, real ``run_migrations`` via ``init_db`` on a
@@ -68,12 +66,12 @@ BOUND = STANDARD_NIGHT_ROUND_BOUND
 @pytest.fixture(autouse=True)
 def _clear_close_chain_log_map() -> None:
     """This file's own autouse wiring of ``clear_close_chain_log_map``
-    (15.1's "The log map.") -- autouse HERE, inside this one P3 test file,
-    never across the whole suite."""
+    -- autouse HERE, inside this one close-chain test file, never across
+    the whole suite."""
     clear_close_chain_log_map()
 
 
-# Every outcome and reason of 11.2 and P2 section 4.5: stored, no_readings,
+# Every try-log outcome and reason: stored, no_readings,
 # held, refused, failed (with refused_access, call_limit, backoff, provider,
 # network), plus the gap-fill additions: filled, nothing_to_fill,
 # not_on_day, skipped.
@@ -101,9 +99,9 @@ def test_lg3_every_outcome_and_reason_is_stored_as_given(
     outcome: str,
     reason: str | None,
 ) -> None:
-    """LG3: each of P2's outcomes and reasons, plus the gap-fill additions,
+    """LG3: each collection outcome and reason, plus the gap-fill additions,
     round-trips through ``record_collection_try`` unchanged -- the try log
-    has no CHECK on ``outcome``/``reason`` (12.3's notes), so the writer
+    has no CHECK on ``outcome``/``reason``, so the writer
     itself must not alter the words it is given.
     """
     from wxverify.worker.close_chain import record_collection_try
@@ -147,7 +145,7 @@ def test_lg3_every_outcome_and_reason_is_stored_as_given(
 
 
 def test_lg3_a_gap_fill_slot_without_an_attempt_is_refused() -> None:
-    """LG3: a ``gap_fill`` slot with no ``close_attempt`` breaks 12.3's
+    """LG3: a ``gap_fill`` slot with no ``close_attempt`` breaks the
     ``CHECK((slot = 'gap_fill') = (close_attempt IS NOT NULL))`` --
     ``record_collection_try`` does one INSERT and nothing else, so the
     constraint's own refusal reaches the caller unmodified.
@@ -224,19 +222,17 @@ def test_lg1_the_stage_log_rows_match_the_jobs_that_ran(
     ``enqueued_at`` and ``started_at`` copied from the job row,
     ``queue_wait_s``/``duration_s`` their differences, with ``queue_wait_s``
     0 for every stage of HO1 (the clock does not move inside
-    ``run_due_jobs``, and the job stamps follow it, 15.1), ``outcome``
+    ``run_due_jobs``, and the job stamps follow it), ``outcome``
     ``completed``; stage 5's ``detail`` holds the stand-in's summary; stage
-    7's the identifier (11.1).
+    7's the identifier.
 
-    Plan section 16.2 names no mutant for LG1 directly tied to this
-    HO1-shaped case: every job here is enqueued and claimed at the SAME
-    frozen clock instant (``run_due_jobs`` never advances the clock on its
-    own), so a stage's ``created_at`` and claim-time ``updated_at`` are
-    equal under BOTH the correct code and M59 (``started_at`` taken from
-    ``created_at``) -- M59 is equivalent under this fixture alone. See
+    This HO1-shaped case alone cannot discriminate M59: every job here
+    is enqueued and claimed at the SAME frozen clock instant
+    (``run_due_jobs`` never advances the clock on its own), so a stage's
+    ``created_at`` and claim-time ``updated_at`` are equal under BOTH the
+    correct code and M59 (``started_at`` taken from ``created_at``). See
     ``test_lg1b_queue_wait_uses_the_claim_time_not_the_enqueue_time`` below
-    for the smallest added case that actually kills it (a plan gap: HO1's
-    own "queue_wait_s 0" framing cannot discriminate started_at's source).
+    for the smallest added case that actually kills it.
     """
 
     async def _run() -> None:
@@ -247,9 +243,9 @@ def test_lg1_the_stage_log_rows_match_the_jobs_that_ran(
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        # score_day now calls through to P4's real body (plan 18.13); this
+        # score_day now calls through to the real close_p4 body; this
         # wrapper only records what it actually returned, so the stage-5
-        # detail assertion below can check the log against P4's own
+        # detail assertion below can check the log against its own
         # computed summary instead of a value this test invented.
         captured_summary = []
 
@@ -281,17 +277,17 @@ def test_lg1_the_stage_log_rows_match_the_jobs_that_ran(
 
         stage1 = _stage_log_row(conn, site_id, D, 1)
         assert stage1 is not None, "stage 1's own stage-log row must exist"
-        assert stage1["job_id"] is None, "stage 1 has no job (8.1: job_id NULL)"
+        assert stage1["job_id"] is None, "stage 1 has no job (job_id NULL)"
         assert stage1["enqueued_at"] == d_end_row["day_end_utc"], (
             "stage 1's enqueued_at must be D's own day_end_utc"
         )
         assert stage1["started_at"] == d_end_row["day_end_utc"], (
             "stage 1's started_at must be D's own day_end_utc too"
         )
-        assert stage1["queue_wait_s"] == 0.0, "stage 1's queue wait is always 0 (11.1)"
+        assert stage1["queue_wait_s"] == 0.0, "stage 1's queue wait is always 0"
         assert stage1["duration_s"] > 0, (
             "stage 1's duration is the real span from D's end to the attempt's"
-            " start (11.1), not 0"
+            " start, not 0"
         )
         assert stage1["outcome"] == "completed"
 
@@ -307,16 +303,15 @@ def test_lg1_the_stage_log_rows_match_the_jobs_that_ran(
                 f"stage {stage}'s job_id must be the job that actually ran it"
             )
             assert row["enqueued_at"] == job_row["created_at"], (
-                f"stage {stage}'s enqueued_at must be copied from the job's"
-                " created_at (11.1)"
+                f"stage {stage}'s enqueued_at must be copied from the job's created_at"
             )
             assert row["started_at"] == job_row["updated_at"], (
                 f"stage {stage}'s started_at must be copied from the job's"
-                " updated_at at its claim (11.1)"
+                " updated_at at its claim"
             )
             assert row["queue_wait_s"] == 0.0, (
                 f"stage {stage}'s queue_wait_s must be 0 (the clock never"
-                " moves inside run_due_jobs, 15.1)"
+                " moves inside run_due_jobs)"
             )
             assert row["outcome"] == "completed"
 
@@ -333,11 +328,11 @@ def test_lg1_the_stage_log_rows_match_the_jobs_that_ran(
         assert detail5 == {
             "scored": real_summary.scored,
             "absent": real_summary.absent,
-        }, "stage 5's detail must hold P4's own computed score summary (11.1)"
+        }, "stage 5's detail must hold score_day's own computed summary"
         expected_pub_id = _real_publication_id(conn, site_id, D)
         stage7 = _stage_log_row(conn, site_id, D, 7)
         assert expected_pub_id in stage7["detail"], (
-            "stage 7's detail must hold P4's real publication identifier (11.1)"
+            "stage 7's detail must hold publish's real publication identifier"
         )
 
     asyncio.run(_run())
@@ -346,8 +341,7 @@ def test_lg1_the_stage_log_rows_match_the_jobs_that_ran(
 def test_lg1b_queue_wait_uses_the_claim_time_not_the_enqueue_time(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """LG1's own plan gap (16.2 names no mutant for LG1 and HO1's "clock
-    never moves" framing makes M59 equivalent there, see the test above):
+    """M59 is equivalent under LG1's frozen clock (see the test above):
     the smallest added case that actually distinguishes ``started_at`` =
     the job's claim-time ``updated_at`` from ``started_at`` = the job's
     ``created_at``. Stage 2's job is enqueued at the standard night's
@@ -422,13 +416,7 @@ def _station_fill_with_counts(  # type: ignore[no-untyped-def]
     readings_refused: int,
 ):
     """A ``StationFill`` carrying explicit ``readings_kept``/
-    ``readings_refused`` (plan 11.2: piece 3 adds these two required fields
-    to ``StationFill``, ``worker/day_values.py``). At ``a4a919c`` the
-    dataclass does not have them yet, so this raises ``TypeError`` once
-    reached -- but ``install_round_state_standin`` below raises
-    ``ModuleNotFoundError`` first, before this is ever called, matching
-    every other P3 test file's own "fails first" reason.
-    """
+    ``readings_refused``."""
     return StationFill(
         outcome=outcome,
         reason=reason,
@@ -447,8 +435,7 @@ def test_lg2_the_gap_fill_try_rows_carry_the_station_fills_own_counts(
     """LG2: AT9 (i) -- A ``failed``/``network``, B ``nothing_to_fill``. The
     gap-fill try-log rows: A ``failed``/``network``, ``slot`` ``gap_fill``,
     ``close_attempt`` 1, ``readings_kept``/``readings_refused`` 0 and 0; B's
-    ``readings_kept`` the ``kept`` of B's store and ``readings_refused`` 0
-    (11.2).
+    ``readings_kept`` the ``kept`` of B's store and ``readings_refused`` 0.
 
     M60 -> at the A row-exists assertion below: correct = A's try-log row
     exists with outcome ``failed``/``network`` (the gap fill is logged even
@@ -541,7 +528,7 @@ def test_lg2_the_gap_fill_try_rows_carry_the_station_fills_own_counts(
 # LG4
 # ---------------------------------------------------------------------------
 
-#: 11.4's field order for the truth-version hash, per quantity row.
+#: The field order for the truth-version hash, per quantity row.
 _TRUTH_VERSION_FIELDS: tuple[str, ...] = (
     "quantity",
     "value",
@@ -560,14 +547,11 @@ _TRUTH_VERSION_FIELDS: tuple[str, ...] = (
 
 
 def _truth_version_from_rows(conn, site_id: int, local_date) -> str:  # type: ignore[no-untyped-def]
-    """Independently compute 11.4's truth-version hash from
+    """Independently compute the truth-version hash from
     ``daily_truth``'s stored rows, for comparison against whatever stage 4
-    saved on the attempt record. 11.4 does not spell out whether the hash
-    covers one combined JSON array or a hash-per-row reduced some other
-    way; this builds ONE JSON array of per-row field dicts, in ``quantity``
-    order, and hashes ITS serialisation -- the plain, single reading of
-    "serialised as JSON with sorted keys and no spaces" -- and is flagged
-    as an interpretive choice in the hand-back message.
+    saved on the attempt record. This builds ONE JSON array of per-row
+    field dicts, in ``quantity`` order, and hashes its serialisation
+    (sorted keys, no spaces).
     """
     rows = conn.execute(
         "SELECT " + ", ".join(_TRUTH_VERSION_FIELDS) + " FROM daily_truth"  # noqa: S608
@@ -615,7 +599,7 @@ def test_lg4_the_truth_version_is_a_pure_function_of_the_truth_rows() -> None:
     -- the first and second identical, the third with ``temperature_high``
     1.0 higher. ``close_chain._truth_version``, called directly (the same
     function stage 4 calls to fill ``close_attempts.truth_version``), is
-    compared against this test's own SHA-256 of the same rows (11.4).
+    compared against this test's own SHA-256 of the same rows.
 
     M61 -> at the equality assertion for site A below: correct =
     ``_truth_version`` equals this test's own hash of the same rows
@@ -756,7 +740,7 @@ def test_lg5_the_90_day_cutoff_keeps_the_boundary_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """LG5: log rows at 90 days before stage 6's clock minus 1 s, exactly,
-    plus 1 s. The oldest deleted in each log, the other two kept (11.6).
+    plus 1 s. The oldest deleted in each log, the other two kept.
 
     M62 -> at the close_stage_log-survivors assertion below: correct = the
     EXACT-cutoff and the plus-1s rows survive, the minus-1s row is gone,
@@ -871,16 +855,16 @@ def _insert_attempt_row(  # type: ignore[no-untyped-def]
     )
 
 
-def test_lg6_close_status_fills_every_field_14_2_promises(
+def test_lg6_close_status_fills_every_field(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """LG6: ``close_status`` for a day in each state of 14.2's table:
+    """LG6: ``close_status`` for a day in each state:
     ``open`` before its end, ``open`` after its end, ``closing`` at stage
     3, ``retry_due``, ``closing`` attempt 2, ``closed``, ``missed`` with
     each reason (``retry_failed``, ``never_attempted``, ``retry_not_run``,
-    ``zone_changeover``). Each field present or ``None`` exactly as 14.2's
-    "exists in" column says; ``blocking_stage`` 1, 3, the failed stage,
-    None; the publication item only on ``closed`` (14.2).
+    ``zone_changeover``). Each field present or ``None`` according to
+    the state; ``blocking_stage`` 1, 3, the failed stage, None; the
+    publication item only on ``closed``.
 
     M63 -> at the first ``closing`` assertion below: correct =
     ``blocking_stage`` equals the current attempt's own ``last_stage`` + 1
@@ -931,7 +915,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     assert status_before_end is not None
     assert status_before_end.state == "open"
     assert status_before_end.blocking_stage is None, (
-        "an open day before its own end has no blocking_stage at all (14.2)"
+        "an open day before its own end has no blocking_stage at all"
     )
 
     clock_after = note_day_clock(day_end + timedelta(minutes=5))
@@ -942,7 +926,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     assert status_after_end.state == "open"
     assert status_after_end.blocking_stage == 1, (
         "an open day past its own end is waiting on stage 1 (the round),"
-        " blocking_stage 1 (14.2)"
+        " blocking_stage 1"
     )
 
     begin_close(conn, site_id, D, now_utc=clock_after)
@@ -963,7 +947,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     assert status_closing.state == "closing"
     assert status_closing.blocking_stage == 3, (
         "in closing, blocking_stage is the current attempt's last_stage + 1"
-        " (14.2): last_stage 2 here must give 3. M63 -> at this assertion:"
+        ": last_stage 2 here must give 3. M63 -> at this assertion:"
         " correct = 3, mutant M63 = 2."
     )
 
@@ -985,7 +969,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     assert status_retry_due.last_failure is not None
     assert status_retry_due.blocking_stage == 4, (
         "in retry_due, blocking_stage is the failed attempt's own"
-        " failed_stage (14.2), not last_stage: failed_stage 4 here"
+        " failed_stage, not last_stage: failed_stage 4 here"
     )
 
     retry_due_at = note_day_clock(fail_time + timedelta(hours=1))
@@ -1007,10 +991,10 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     assert status_closing2.state == "closing"
     assert status_closing2.attempts == 2
     assert status_closing2.retry_at is not None, (
-        "retry_at is kept once closing re-enters for attempt 2 (14.2)"
+        "retry_at is kept once closing re-enters for attempt 2"
     )
     assert status_closing2.last_failure is not None, (
-        "last_failure is kept once closing re-enters for attempt 2 (14.2)"
+        "last_failure is kept once closing re-enters for attempt 2"
     )
     assert status_closing2.blocking_stage == 6, (
         "M63 -> at this assertion: correct = 6 (attempt 2's own last_stage 5,"
@@ -1027,8 +1011,8 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     conn.commit()
 
     # Reset to a fresh closed-day scenario on a second site, since the
-    # retry_due site above cannot cleanly reach `closed` without P3's own
-    # stage bodies to run the retry.
+    # retry_due site above cannot cleanly reach `closed` without the close
+    # chain's stage bodies to run the retry.
     site_closed = day_close_site(
         conn, with_records=True, station_ids=("ISTATION03", "ISTATION04")
     )
@@ -1069,11 +1053,9 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     )
     assert status_closed is not None
     assert status_closed.state == "closed"
-    assert status_closed.blocking_stage is None, (
-        "a closed day has no blocking_stage (14.2)"
-    )
+    assert status_closed.blocking_stage is None, "a closed day has no blocking_stage"
     assert status_closed.publication is not None, (
-        "the publication item is present only once the day is closed (14.2)"
+        "the publication item is present only once the day is closed"
     )
 
     # Free ISTATION03/ISTATION04 for reuse by the never_attempted case below.
@@ -1103,18 +1085,18 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     assert status_never_attempted.state == "missed"
     assert status_never_attempted.missed_reason == "never_attempted"
     assert status_never_attempted.attempts == 0, (
-        "never_attempted means no close attempt was ever made (14.2)"
+        "never_attempted means no close attempt was ever made"
     )
     assert status_never_attempted.done_at is not None
     assert status_never_attempted.retry_at is None, (
-        "never_attempted is not among the states retry_at exists in (14.2)"
+        "never_attempted is not among the states retry_at exists in"
     )
     assert status_never_attempted.last_failure is None, (
-        "never_attempted is not among the states last_failure exists in (14.2)"
+        "never_attempted is not among the states last_failure exists in"
     )
     assert status_never_attempted.blocking_stage is None, (
         "never_attempted falls to the derivation rule's 'none of the above'"
-        " case, so blocking_stage is None (14.2)"
+        " case, so blocking_stage is None"
     )
 
     # Free ISTATION03/ISTATION04 again for reuse by the zone_changeover case.
@@ -1148,18 +1130,18 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     assert status_changeover.state == "missed"
     assert status_changeover.missed_reason == "zone_changeover"
     assert status_changeover.attempts == 0, (
-        "zone_changeover means no close attempt was ever made (14.2)"
+        "zone_changeover means no close attempt was ever made"
     )
     assert status_changeover.done_at is not None
     assert status_changeover.retry_at is None, (
-        "zone_changeover is not among the states retry_at exists in (14.2)"
+        "zone_changeover is not among the states retry_at exists in"
     )
     assert status_changeover.last_failure is None, (
-        "zone_changeover is not among the states last_failure exists in (14.2)"
+        "zone_changeover is not among the states last_failure exists in"
     )
     assert status_changeover.blocking_stage is None, (
         "zone_changeover falls to the derivation rule's 'none of the above'"
-        " case, so blocking_stage is None (14.2)"
+        " case, so blocking_stage is None"
     )
 
     # Free ISTATION03/ISTATION04 one more time for reuse by the
@@ -1257,17 +1239,17 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     assert status_retry_not_run.state == "missed"
     assert status_retry_not_run.missed_reason == "retry_not_run"
     assert status_retry_not_run.attempts == 1, (
-        "retry_not_run follows exactly one failed attempt (14.2)"
+        "retry_not_run follows exactly one failed attempt"
     )
     assert status_retry_not_run.done_at is not None
     assert status_retry_not_run.retry_at is not None, (
-        "retry_at is kept in missed/retry_not_run (14.2)"
+        "retry_at is kept in missed/retry_not_run"
     )
     assert status_retry_not_run.last_failure is not None, (
         "retry_not_run keeps attempt 1's failure reason -- mark_missed"
-        " leaves last_failure as it was (14.2, db/site_days.py:903-910)"
+        " leaves last_failure as it was"
     )
     assert status_retry_not_run.blocking_stage is None, (
         "retry_not_run falls to the derivation rule's 'none of the above'"
-        " case, so blocking_stage is None (14.2)"
+        " case, so blocking_stage is None"
     )

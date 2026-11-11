@@ -67,10 +67,10 @@ from wxverify.settings.depth import (
 from wxverify.web.context import feed_label
 
 DAY_COUNT = 8
-#: Page column order = the canonical roster (NB-4).
+#: Page column order = the canonical roster.
 VARIABLES = DEPTH_VARIABLES
 #: The rain icon is "heavy" when the winner's wettest hour is above this,
-#: "light" at or below it (rain release, C4).
+#: "light" at or below it.
 HEAVY_RAIN_MM_PER_HOUR: Final = 1.0
 #: Agreement % is shown only with this many group members with a full day.
 MIN_AGREEMENT_MEMBERS: Final = 2
@@ -114,7 +114,7 @@ class CellMeta:
     usable fetch on record. A wind cell has no clearing subset, so its
     contributors are all of its chosen feeds.
 
-    ``substitute`` (11.3) is True when a substitute serves: a feed of the
+    ``substitute`` is True when a substitute serves: a feed of the
     cell's choice is stale and not in the cell's blend set. The choice is the
     first blend-depth confident rows at the cell's representative day ahead,
     in the ladder's order; for weighted wind, every feed with a published
@@ -151,14 +151,14 @@ class TempCell:
 class WindCell:
     meta: CellMeta
     max_kmh: float | None
-    #: Why the value is "—": too few feeds with a wind track record (§11.6).
+    #: Why the value is "—": too few feeds with a wind track record.
     #: None when served.
     note: str | None
 
 
 @dataclass(frozen=True)
 class PrecipCell:
-    """The rain cell: the winner's own rain (rain release, C4).
+    """The rain cell: the winner's own rain.
 
     The winner is the published rain ranking's selected model at the tile's
     day ahead when its newest samples cover the local day exactly, else the
@@ -183,7 +183,7 @@ class PrecipCell:
 
 @dataclass(frozen=True)
 class _RainChoice:
-    """One tile's rain winner, chosen from the published ranks (C4)."""
+    """One tile's rain winner, chosen from the published ranks."""
 
     winner_id: int | None
     selected_id: int | None
@@ -208,7 +208,7 @@ class DayTile:
     stale: bool
     partial: bool
     fetch_unknown: bool
-    #: True when any populated cell's ``substitute`` is (11.3).
+    #: True when any populated cell's ``substitute`` is.
     substitute: bool
 
 
@@ -302,7 +302,7 @@ def load_page_inputs(
     serving = wind_blend.load_wind_serving(
         conn, site_id=site_id, timezone=timezone, today=today
     )
-    # Rain follows the published rain ranking (rain release, C4), read once.
+    # Rain follows the published rain ranking, read once.
     rain_ranks = published_rain_ranks(conn, site_id)
     return PageInputs(
         site_id=site_id,
@@ -340,7 +340,7 @@ def build_forecast(
 
     Rain does not go through the selection ladder: each tile shows the rain
     of its day ahead's rain winner from the published rain ranking
-    (rain release, C4; :class:`PrecipCell`).
+    (:class:`PrecipCell`).
 
     It is :func:`build_view` over :func:`load_page_inputs`.
     """
@@ -537,7 +537,7 @@ def build_hourly(
     Per-variable winner sets are the SAME selections the tile used. For
     temperature and wind the blend at each hour averages the selected feeds
     that cover that hour. Precipitation's blend line is the tile's rain
-    winner alone (rain release, C4: :func:`_rain_choice` over the published
+    winner alone (:func:`_rain_choice` over the published
     rain ranks), all null with no winner; ``precip_aggregate`` names it and
     ``states["precip"]`` is the tile's (``normal``, or ``not_available``
     with no winner).
@@ -656,7 +656,7 @@ def hourly_day(conn: sqlite3.Connection, inputs: PageInputs, day: int) -> Hourly
             rank_cache=rank_cache,
         )
 
-    # The ranked grid's order (card 7): every candidate of each variable,
+    # The ranked grid's order: every candidate of each variable,
     # over the rankings the selections above cached.
     ladder = {
         variable: ladder_order(
@@ -673,7 +673,7 @@ def hourly_day(conn: sqlite3.Connection, inputs: PageInputs, day: int) -> Hourly
         for variable in VARIABLES
     }
 
-    # The hourly rain line is the tile's rain winner only (rain release, C4).
+    # The hourly rain line is the tile's rain winner only.
     precip_samples = grouped.get("precip", {}).get(day, {})
     rain = _rain_choice(
         inputs.rain_ranks.get(day),
@@ -736,7 +736,7 @@ def hourly_day(conn: sqlite3.Connection, inputs: PageInputs, day: int) -> Hourly
         )
         for variable in VARIABLES
     }
-    # The rain state is the tile's (C4): normal with a winner, else none.
+    # The rain state is the tile's: normal with a winner, else none.
     states["precip"] = "normal" if rain_feeds else "not_available"
     payload: dict[str, object] = {
         "site_id": site_id,
@@ -894,7 +894,7 @@ def _candidates(
     representative day-ahead of its samples, the lead its ranking row (and,
     for weighted wind, its weight) is looked up at. Each sample's day ahead
     is :func:`sample_day_ahead`'s: from its download date when it has one,
-    else from its run label (9.5).
+    else from its run label.
     """
     covers = covers_local_day_exactly if variable == "precip" else covers_local_day
     candidates: list[CellCandidate] = []
@@ -958,7 +958,7 @@ def _cell_day_ahead(
     feeds_samples: dict[int, list[FutureSampleRow]], timezone: str
 ) -> int | None:
     """The cell's representative day ahead over every sample in it, or None
-    for a cell with no sample (11.3)."""
+    for a cell with no sample."""
     leads = [
         sample_day_ahead(sample, timezone)
         for samples in feeds_samples.values()
@@ -976,7 +976,7 @@ def _ranked_choice(
     blend_depth: int,
     rank_cache: _RankCache,
 ) -> list[int]:
-    """The cell's choice (11.3): the first ``blend_depth`` confident rows of
+    """The cell's choice: the first ``blend_depth`` confident rows of
     the ranking at ``day_ahead``, in the ladder's order."""
     key = (variable, day_ahead)
     if key not in rank_cache:
@@ -1010,7 +1010,7 @@ def _wind_meta_and_values(
 
     Wind does not use the clearing-subset path: the values come from all of
     ``selection.feeds`` (each already has at least ``MIN_RUN_HOURS`` hours),
-    so ``partial`` is never set. ``substitute`` is the caller's (11.3); an
+    so ``partial`` is never set. ``substitute`` is the caller's; an
     unavailable cell has none serving, so False.
     """
     if not selection.available:
@@ -1079,7 +1079,7 @@ def _cell_meta_and_values(
     outside the clearing subset, for both variables ``stale`` also covers
     every extrema feed, and ``extrema_state`` is the extrema set's own verdict
     under :func:`_state_of`'s precedence. ``fetch_unknown`` covers the same
-    contributor feeds as ``stale``. ``substitute`` is the caller's (11.3);
+    contributor feeds as ``stale``. ``substitute`` is the caller's;
     an unavailable cell has none serving, so False.
     """
     if not selection.available:
@@ -1151,7 +1151,7 @@ def _rain_choice(
     local_date: date,
     timezone: str,
 ) -> _RainChoice:
-    """One tile's rain winner from its day ahead's published ranks (C4).
+    """One tile's rain winner from its day ahead's published ranks.
 
     A ranked model has a full day when its newest samples cover the local
     day exactly (``covers_local_day_exactly``). The winner is the selected
@@ -1215,15 +1215,15 @@ def _precip_cell(
     stale_ids: set[int],
     unknown_ids: set[int],
 ) -> PrecipCell:
-    """The rain cell of :func:`_rain_choice`'s winner (C4).
+    """The rain cell of :func:`_rain_choice`'s winner.
 
     With no winner the cell is ``not_available`` and every value ``None``.
     With one, ``state`` is ``normal`` and ``extrema_state`` is
-    ``rebuilding`` for a provisional ranking, else ``normal`` (the plan's
-    C4: the provisional ranking shows through ``extrema_state``, as a
-    rebuilding extrema set did); ``feeds`` is the winner; ``stale`` and
+    ``rebuilding`` for a provisional ranking, else ``normal`` (the provisional
+    ranking shows through ``extrema_state``, as a rebuilding extrema set
+    did); ``feeds`` is the winner; ``stale`` and
     ``fetch_unknown`` cover the winner and the agreement members.
-    ``substitute`` (11.3) is set when the selected model is stale and
+    ``substitute`` is set when the selected model is stale and
     another ranked model stands in for it.
     """
     if rain.winner_id is None:

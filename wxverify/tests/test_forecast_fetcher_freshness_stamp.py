@@ -1,5 +1,5 @@
-"""§14.6 "S" writer-side oracles: ``persist_fetch_result``'s
-``site_feed_state.last_usable_fetch_at`` stamp (plan §10.3).
+"""Writer-side oracles: ``persist_fetch_result``'s
+``site_feed_state.last_usable_fetch_at`` stamp.
 
 Covers the "Not a fetch" family (no-op, both all-usable-invalid shapes,
 history persist, error path -- each must leave the stamp untouched), the
@@ -179,7 +179,7 @@ def test_all_usable_samples_nan_leaves_stamp_unchanged_but_last_run_at_advances(
     validator's row reads NULL, not 0 -- and separately, the NOT NULL
     ``forecast_samples.value`` column makes the row-insert itself a no-op
     (INSERT OR IGNORE), so ``inserted_count`` stays 0 even though the
-    sample was counted as "usable" (lead_hours>=1). Mutant (plan §14.6):
+    sample was counted as "usable" (lead_hours>=1). Mutant:
     ``row[0] != 0`` reads True for a NULL row in Python (``None != 0``),
     wrongly admitting the NaN sample and stamping.
     """
@@ -211,8 +211,8 @@ def test_all_usable_samples_nan_leaves_stamp_unchanged_but_last_run_at_advances(
 
 
 def test_all_usable_out_of_range_leaves_stamp_unchanged_last_run_at_advances() -> None:
-    """Out-of-range case: the validator reads a genuine 0, not NULL. Mutant
-    (plan §14.6): ``row[0] is not None`` reads True for 0, wrongly admitting
+    """Out-of-range case: the validator reads a genuine 0, not NULL. Mutant:
+    ``row[0] is not None`` reads True for 0, wrongly admitting
     the out-of-range sample and stamping.
     """
     conn = _make_db()
@@ -301,12 +301,12 @@ def test_error_path_leaves_the_stamp_unchanged() -> None:
 def test_meteoblue_package_fetch_stamps_the_package_row() -> None:
     """A meteoblue fetch is registered against the package feed
     (``fetch_feed_id``) but its samples are routed to per-model MEMBER feed
-    rows via ``_feed_id_for_sample`` (plan §10.3 -- the package carries no
+    rows via ``_feed_id_for_sample`` (the package carries no
     forward samples of its own). The freshness stamp UPDATE must still bind
     ``fetch_feed_id`` (the package), never the per-sample ``feed_id`` left
     over from the persistence loop.
 
-    Mutant (plan §14.6, MX3): binding ``feed_id`` instead of
+    Mutant MX3: binding ``feed_id`` instead of
     ``fetch_feed_id`` in that UPDATE makes the bind value the last sample's
     member id (GFS05) -- the package stamp stays NULL, and the UPDATE
     affects no row in this fixture. Open-meteo tests elsewhere can't
@@ -385,7 +385,7 @@ def test_meteoblue_package_fetch_stamps_the_package_row() -> None:
 
 
 def test_one_valid_sample_after_an_invalid_one_is_enough_to_stamp() -> None:
-    """Mutant (plan §14.6): evaluate only the first usable sample -- the
+    """Mutant: evaluate only the first usable sample -- the
     invalid one here -- and this fetch would never stamp."""
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", _MODEL)

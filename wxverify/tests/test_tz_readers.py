@@ -1,33 +1,21 @@
-"""Readers of a generation after the switch (plan ``2026-10-22-daily-close-
-switch-over.md`` §10.2, §17.6, TZ1-TZ7).
+"""Readers of a generation after the switch (TZ6, TZ7).
 
-TZ1 and TZ3 seed site 1's four-generation shape (G0 retired, G1 published
-with ``effective_to`` set -- a closed prospective change, G2 published and
-the pointer, G3 building) and call every reader named in the row's group
-(plan §17.6): TZ1 adds the mean's existing published rows (G6) to pairing
-candidates (G1); TZ3 adds the as-of exclusions (G11) to wind training
-pairs (G10). TZ2 and TZ4 have no test here: TZ2's live readers (metrics
-aggregation, the leaderboard, the composite, and the win rate) read
-per-day sums from day_scores through the active publication
+Several readers of a generation have no test here. The live readers
+(metrics aggregation, the leaderboard, the composite and the win rate)
+read per-day sums from day_scores through the active publication
 (scoring/publication.py's live_cells -> live_ranking) instead of
-per-generation rows, and the retention half (``forecast_pairs`` pruned by
+per-generation rows; the retention half (``forecast_pairs`` pruned by
 generation, ``keep_read_generations``) does not exist, table and
-function both. TZ4's one reader, ``_stored_pairs``, does not exist.
-``wxverify.db.switch`` is imported at module level above. TZ5 (the gap
-scan's origin resolver and the 07:00 record readers) has no test: the
-daily forecast record it read does not exist. TZ7 imports new
-``wxverify.db.switch``
-names. TZ6 needs no such import: it calls the
-EXISTING function ``write_close_truth`` after directly deleting the site's
-``tz_generation_published:`` pointer key -- exactly what A4 does (plan
-§8.4) -- which breaks it today, since it does not yet resolve the
-generation any other way.
+function both; the timeseries stored-pairs reader ``_stored_pairs`` does
+not exist; and the gap scan's origin resolver and the 07:00 record
+readers read the daily forecast record, which does not exist.
 
-Each TZ row's mutant (M35 through M38) is the same root defect -- A1
-leaving another generation's rows in place, or a reader resolving the
-wrong generation -- for every reader the row names. TZ6 still exercises
-only its one named function, since the plan lists exactly one reader per
-row there.
+TZ7 exercises ``wxverify.db.switch``'s accessors. TZ6 calls
+``write_close_truth`` after directly deleting the site's
+``tz_generation_published:`` pointer key, exactly what the switch does.
+
+Each mutant (M37, M38) is the same root defect: another generation's rows
+left in place, or a reader resolving the wrong generation.
 
 Synthetic data only: stations/feeds are bare synthetic rows; dates are in
 2029-2030.
@@ -57,7 +45,7 @@ def _pointer_key(site_id: int) -> str:
     """The retired time zone pointer's key text (``db/switch.py``'s private
     ``_POINTER_KEY_PREFIX``), kept here since the module that built it no
     longer exists. These tests seed and delete the pre-switch pointer that
-    Part A reads and A4 deletes.
+    the switch migration reads and deletes.
     """
     return f"tz_generation_published:{site_id}"
 
@@ -81,19 +69,19 @@ def _insert_site(conn: sqlite3.Connection, name: str = "tz-site") -> int:
 
 
 # ---------------------------------------------------------------------------
-# TZ2 and TZ4 -- neither has a test here. TZ2's live readers (metrics
+# Two reader groups have no test here. The live readers (metrics
 # aggregation, the leaderboard, the composite, the win rate) read
 # per-day sums now that the daily close is permanent, not per-generation
-# rows; its retention half (``forecast_pairs`` pruned by generation,
+# rows; their retention half (``forecast_pairs`` pruned by generation,
 # ``keep_read_generations``) does not exist, table and function both.
-# TZ4's one reader, the timeseries stored-pairs reader (``_stored_pairs``),
-# does not exist either. Nothing from either row survives to test.
+# The timeseries stored-pairs reader (``_stored_pairs``) does not exist
+# either. Nothing from either group survives to test.
 # ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
 # TZ6 -- stage 4's truth write resolves the site's one kept generation even
-# after its pointer is deleted (A4's unconditional delete); a second write
+# after its pointer is deleted unconditionally; a second write
 # replaces the first's rows under the same generation.
 # ---------------------------------------------------------------------------
 
@@ -124,9 +112,8 @@ def test_tz6_write_close_truth_resolves_without_the_pointer() -> None:
     record = day_record(conn, site_id, closing_date)
     assert record is not None and record.state == "closing"
 
-    # A4 deletes the site's pointer unconditionally (plan §8.4) -- simulated
-    # directly since wxverify.db.switch does not exist yet; the GENERATION
-    # row itself (kept whole by A1) is untouched.
+    # The switch deletes the site's pointer unconditionally -- simulated
+    # directly; the GENERATION row itself is untouched.
     delete_runtime_state(conn, _pointer_key(site_id))
 
     bounds = local_day_bounds(closing_date, "UTC")

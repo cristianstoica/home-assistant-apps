@@ -1,12 +1,11 @@
-"""O1-O9 for task-death notification (0.14.0 plan): the export sweeper's
+"""O1-O9 for task-death notification (0.14.0): the export sweeper's
 death (external ``add_done_callback``, latched in ``db_transfer.py``,
 surfaced as a ``CRITICAL`` log plus one monitor condition, group
 ``process``).
 
 Every mutant a claim below names is verified against a real scratch rebind
 of the production symbol (never a repo edit): the oracle FAILS with the
-mutant applied and PASSES once it is reverted. That run is captured in the
-dispatching QA report, not asserted here as prose.
+mutant applied and PASSES once it is reverted.
 
 Mutant table:
 
@@ -14,10 +13,6 @@ Mutant table:
 | --- | --- | --- |
 | A   ``on_export_sweeper_done``'s ``cancelled()`` guard deleted            | O2 |
 | B   swallows ``CancelledError`` from ``task.exception()`` into ``None``   | O2 |
-
-O16 (the four-file ``_BASE_WORKER_STATUS_KEYS`` / autouse-reset migration)
-and O18/O19 (unmodified re-runs / cross-test isolation) are out of scope for
-this file; they are already satisfied elsewhere.
 """
 
 from __future__ import annotations
@@ -146,7 +141,7 @@ def test_o2_clean_shutdown_does_not_latch_and_callback_never_raises_into_loop(
     a death, must not log CRITICAL, and must not raise into the event loop's
     exception handler.
 
-    The single most important oracle in this plan: mutant A (the
+    The single most important oracle here: mutant A (the
     ``task.cancelled()`` guard deleted) latches nothing and logs nothing —
     the first two assertions below stay green under it — and is caught only
     by the third.
@@ -283,7 +278,7 @@ def test_o5_callback_never_raises_when_rendering_raises(
 
     O5 -> at ``death``: correct = a latched ``SweeperDeath`` with
     ``detail == "BoomError"`` (class-name-only degradation via
-    ``safe_detail``'s guard), mutant (F4's unwrapped ``sanitized_exception``
+    ``safe_detail``'s guard), mutant (an unwrapped ``sanitized_exception``
     call, i.e. not routing through ``safe_detail``'s try/except) = ``None``
     — the render raises before the assignment line runs, so the exception
     reaches the loop's default (not this test's) handler and the latch
@@ -437,7 +432,7 @@ def test_o8_returned_detail_is_exact_with_no_trailing_colon(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The ``returned`` path composes an exact line, with no trailing
-    ``": "`` — pinning the empty-detail branch of D4.
+    ``": "`` — pinning the empty-detail branch.
 
     O8 -> at ``cond["detail"]``: correct =
     ``f"export sweeper returned unexpectedly at {death.at}"``, mutant

@@ -1,14 +1,11 @@
 """The scored download of a feed's local day, and the forecasts it gives.
 
-Daily-close P4 plan (``plans/2026-10-22-daily-close-pairs-and-publication.md``)
-4.1, 4.3 and 4.7. For each feed, site and local day S, the scored download
-of S is the first download of S stored for the feed: the earliest ``stored``
-row of ``forecast_downloads`` (4.2), or, for a day the record does not
-cover, the download inferred from ``forecast_samples`` and the completed
-``fetch_feed`` job rows (4.7).
+For each feed, site and local day S, the scored download of S is the first
+download of S stored for the feed: the earliest ``stored`` row of
+``forecast_downloads``, or, for a day the record does not cover, the download
+inferred from ``forecast_samples`` and the completed ``fetch_feed`` job rows.
 
-Since the rain release (``plans/2026-11-01-rain-release.md``, Part B) the
-close reads the scored values from ``forecast_scored`` (``scored_values``),
+The close reads the scored values from ``forecast_scored`` (``scored_values``),
 which the fetch path writes for a day's first stored download, and
 ``forecast_samples`` keeps one row per hour, the newest value
 (``newest_values``).
@@ -32,7 +29,7 @@ from wxverify.core.timeutil import isoformat_utc
 DownloadSource = Literal["recorded", "inferred"]
 
 # A meteoblue package member's fetch feed is its package row: the package
-# call stores the members' samples and the package's download row (4.2).
+# call stores the members' samples and the package's download row.
 _PACKAGE_OF_MEMBER_SQL: Final = """
     SELECT pkg.id
     FROM feeds AS member
@@ -45,7 +42,7 @@ _PACKAGE_OF_MEMBER_SQL: Final = """
 
 @dataclass(frozen=True, slots=True)
 class StoredSample:
-    """One stored forecast row of a scored version (4.3)."""
+    """One stored forecast row of a scored version."""
 
     variable: str
     issued_at: str
@@ -57,13 +54,13 @@ class StoredSample:
 
 @dataclass(frozen=True)
 class ScoredDownload:
-    """A feed's scored download of one local day (4.3).
+    """A feed's scored download of one local day.
 
     ``labels`` is the download's labels object as the record stores it: for
     each feed id, as a string, whose samples the download carried, its
     sorted run labels. ``fetched_at`` is the download's receipt stamp: the
     record's ``fetched_at``, or for an inferred download a sample's
-    ``fetched_at`` or a job's ``updated_at`` (4.7). ``download_id`` is
+    ``fetched_at`` or a job's ``updated_at``. ``download_id`` is
     ``None`` for an inferred download.
     """
 
@@ -88,7 +85,7 @@ def first_recorded_download(
 
     The fetch path asks it before a download's row is written, to decide
     whether that download is the day's first and so writes the scored
-    values (rain release, Part B). Read-only.
+    values. Read-only.
     """
     return _first_recorded_download(
         conn,
@@ -128,8 +125,7 @@ def scored_values(
     end_utc: datetime,
 ) -> dict[tuple[str, str], StoredSample]:
     """The scored values of ``feed_id`` at ``day_ahead`` with ``valid_at`` in
-    ``[start_utc, end_utc)``, keyed by ``(variable, valid_at)`` (rain
-    release, Part B, B4).
+    ``[start_utc, end_utc)``, keyed by ``(variable, valid_at)``.
 
     Read from ``forecast_scored``: one row per hour, from the first stored
     download of the local day ``day_ahead`` days before the hour's. A lead
@@ -161,7 +157,7 @@ def scored_values_download(
     end_utc: datetime,
 ) -> ScoredDownload | None:
     """The download the :func:`scored_values` of the same arguments came
-    from, or ``None`` when there are none (B4).
+    from, or ``None`` when there are none.
 
     Every scored row of one feed, local day and day ahead comes from one
     download. With its ``download_id`` set it is ``recorded``, with that
@@ -231,7 +227,7 @@ def newest_values(
     end_utc: datetime,
 ) -> dict[tuple[str, str], StoredSample]:
     """The feed's stored newest values with ``valid_at`` in ``[start_utc,
-    end_utc)``, keyed by ``(variable, valid_at)`` (B3).
+    end_utc)``, keyed by ``(variable, valid_at)``.
 
     ``forecast_samples`` holds one row per hour, the value the feed last
     gave. Rows with no ``fetched_at``, a lead outside 1 to the feed's
@@ -281,7 +277,7 @@ def latest_stored_download(
     feed are not empty, ordered by ``ended_at``, then ``id``; or ``None``.
 
     The value-change log reads it before a new download's row exists, as
-    the download that one is compared with (5.2). Only the record is read;
+    the download that one is compared with. Only the record is read;
     a download it does not hold is never returned. Read-only.
     """
     fetch_feed_id = _fetch_feed_id(conn, feed_id)

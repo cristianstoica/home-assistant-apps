@@ -1,4 +1,4 @@
-"""The retired Backfill and Catch up routes (switch-over plan 7.3).
+"""The retired Backfill and Catch up routes.
 
 Both answer 410 with the retirement message whatever the daily close's
 state: path, method and the mutation guard stay, nothing is read, so an

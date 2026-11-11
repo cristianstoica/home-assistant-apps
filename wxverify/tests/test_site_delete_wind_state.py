@@ -78,7 +78,7 @@ def _make_site(conn: sqlite3.Connection, name: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Test A/B/F helpers (plan §6).
+# Test A/B/F helpers.
 # ---------------------------------------------------------------------------
 
 
@@ -98,8 +98,7 @@ def _post_create(client: Any, headers: dict[str, str], name: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Test A: every site key the delete must drop, and a reused id starts fresh
-# (F1-F6).
+# Test A: every site key the delete must drop, and a reused id starts fresh.
 # ---------------------------------------------------------------------------
 
 
@@ -172,8 +171,7 @@ def test_delete_site_drops_all_site_state_and_a_reused_id_starts_fresh(
 
 
 # ---------------------------------------------------------------------------
-# Test B: a create-time clear removes pre-0.16.7 leftovers on a reused id
-# (F7).
+# Test B: a create-time clear removes pre-0.16.7 leftovers on a reused id.
 # ---------------------------------------------------------------------------
 
 

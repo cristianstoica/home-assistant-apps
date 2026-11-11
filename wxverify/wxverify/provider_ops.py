@@ -211,8 +211,7 @@ def set_site_subscription(
     equal to ``enabled`` counts as unchanged: a missing row or a NULL
     ``enabled`` (inherit) is written as a change. An unchanged value writes
     nothing; the fetch rule on enable runs either way. The daily close scores
-    each closed day, so nothing here writes a score (storage-release plan,
-    table 1.B row B13).
+    each closed day, so nothing here writes a score.
     """
     if conn.execute("SELECT 1 FROM sites WHERE id=?", (site_id,)).fetchone() is None:
         raise ProviderOpsError(404, "site not found")
@@ -487,8 +486,7 @@ def bad_sample_count_sql(placeholders: str) -> str:
     instead, turning this into an O(history) scan for the same zero-row
     result. The unaliased `forecast_samples` form keeps this predicate
     textually identical to the one in the index DDL. Both use the
-    stored-sample predicate, so a valid display row (card 7) is not a bad
-    sample.
+    stored-sample predicate, so a valid display row is not a bad sample.
     """
     return f"""
         SELECT COUNT(*) AS bad_sample_count

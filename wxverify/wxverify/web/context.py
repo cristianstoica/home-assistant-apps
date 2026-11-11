@@ -86,7 +86,7 @@ class StationView:
     enabled: bool
     observation_age: str | None
     #: The first day the rain check left the station's rain out, ISO date,
-    #: while it is set aside; None while it is counted (rain release, A5).
+    #: while it is set aside; None while it is counted.
     rain_not_counted_since: str | None
     #: The current-conditions recheck or pause (``poll_status_text``); None
     #: at evidence count 0 and for a disabled station or site.
@@ -138,7 +138,7 @@ class Verdict:
 
 @dataclass(frozen=True)
 class CoverageCell:
-    """One feed's coverage at one day ahead, as the dashboard shows it (9.4).
+    """One feed's coverage at one day ahead, as the dashboard shows it.
 
     ``text`` is "<scored> of <expected>", or "none yet" when nothing is
     expected, with "; <n> earlier days" when the window holds days from
@@ -153,7 +153,7 @@ class CoverageCell:
 
 @dataclass(frozen=True)
 class CoverageRow:
-    """One feed's row of the coverage table: a cell per day ahead (9.4)."""
+    """One feed's row of the coverage table: a cell per day ahead."""
 
     feed_id: int
     label: str
@@ -162,7 +162,7 @@ class CoverageRow:
 
 @dataclass(frozen=True)
 class CoverageTable:
-    """The coverage next to the rankings in view (9.4).
+    """The coverage next to the rankings in view.
 
     ``rows`` follow the Leaderboard's order; ``days`` are the columns, D+0
     to D+7. ``selected`` holds each Leaderboard feed's cell text at the
@@ -257,7 +257,7 @@ class FeedHealthRow:
 @dataclass(frozen=True)
 class BudgetGauge:
     source: str
-    #: The effective cap every reservation defers at (plan §8.6).
+    #: The effective cap every reservation defers at.
     daily_call_limit: int
     #: The stored ``sources.daily_call_limit``; differs where the cap clamps it.
     configured_call_limit: int
@@ -289,30 +289,29 @@ class ObservationHealthRow:
     site_name: str
     status: str
     enabled_station_count: int
-    #: The site's ``closed_through`` date (plan §10.1); None while no day is
-    #: done.
+    #: The site's ``closed_through`` date; None while no day is done.
     closed_through: str | None = None
 
 
 @dataclass(frozen=True)
 class CloseDayRow:
-    """One day on the close status panel (plan §10.2)."""
+    """One day on the close status panel."""
 
     local_date: str
-    #: P1's state in words, e.g. "closing, attempt 1 of 2".
+    #: The day's state in words, e.g. "closing, attempt 1 of 2".
     state: str
-    #: P1's ``attempts``, 0 to 2.
+    #: The day record's ``attempts``, 0 to 2.
     attempts: int
-    #: P1's ``retry_at``, in UTC.
+    #: The day record's ``retry_at``, in UTC.
     retry_at: str | None
-    #: P1's ``last_failure``.
+    #: The day record's ``last_failure``.
     failure: str | None
-    #: The blocking stage (R3.4) through ``stage_text``, for a day not done.
+    #: The blocking stage through ``stage_text``, for a day not done.
     stage: str | None
     #: Since when the stage runs or waits, or a failed stage's start, queue
-    #: wait and end (R3.5).
+    #: wait and end.
     stage_line: str | None
-    #: A closed day's publication record (R3.7) in words, with its time.
+    #: A closed day's publication record in words, with its time.
     publication: str | None
     #: "zone changeover, not scored", "zone changes on <date>: that day is
     #: not scored" or "scored under its own zone, <zone>".
@@ -321,14 +320,14 @@ class CloseDayRow:
 
 @dataclass(frozen=True)
 class ClosePanelRow:
-    """One site on the close status panel (plan §10.2)."""
+    """One site on the close status panel."""
 
     site_id: int
     site_name: str
     enabled: bool
     #: Newest first.
     days: tuple[CloseDayRow, ...]
-    #: The site's newest collection try (R3.6) in words.
+    #: The site's newest collection try in words.
     latest_try: str | None
     #: "no day closed yet", "site disabled", or the zone note.
     note: str | None
@@ -336,7 +335,7 @@ class ClosePanelRow:
 
 @dataclass(frozen=True)
 class ClosePanel:
-    """The close status panel, shown on Ops (§10.2)."""
+    """The close status panel, shown on Ops."""
 
     #: One per site, by name (case-insensitive).
     rows: tuple[ClosePanelRow, ...]
@@ -370,7 +369,7 @@ class WindErrorRow:
 
 @dataclass(frozen=True)
 class WindSiteHistory:
-    """One enabled site's row in the ops Wind History panel (plan §10)."""
+    """One enabled site's row in the ops Wind History panel."""
 
     site_id: int
     site_name: str
@@ -395,7 +394,7 @@ class WindHistoryPanel:
 
 @dataclass(frozen=True)
 class WindWeightRow:
-    """One feed's row in the dashboard wind weights panel (plan §12.2)."""
+    """One feed's row in the dashboard wind weights panel."""
 
     feed_id: int
     label: str
@@ -424,8 +423,7 @@ def load_site(conn: sqlite3.Connection, site_id: int) -> SiteView | None:
     return None if row is None else _site_from_row(conn, row)
 
 
-# The one starting-history hint of the switch-over plan (5.4), shown on the
-# dashboard and the Overlay.
+# The one starting-history hint, shown on the dashboard and the Overlay.
 _STARTING_HISTORY_HINT: Final = (
     "Days before {first_day} are from before the daily close: they keep the"
     " scores they had and were never closed."
@@ -433,7 +431,7 @@ _STARTING_HISTORY_HINT: Final = (
 
 
 def _starting_history_hint(conn: sqlite3.Connection, site_id: int | None) -> str | None:
-    """The starting-history hint for the site, or None (switch-over plan 5.4).
+    """The starting-history hint for the site, or None.
 
     Shown while the site has a record: it names the site's first record date
     (``first_record_date``). None with no site, and for a site with no
@@ -455,16 +453,16 @@ def load_dashboard(
     window: str,
     lead: str,
 ) -> dict[str, object]:
-    """The dashboard page's context, read in one snapshot (9.3).
+    """The dashboard page's context, read in one snapshot.
 
     Opens a ``read_snapshot`` unless the caller already holds a
     transaction, so every part of the page -- every ranking and the wind
     weights -- comes from one publication version. ``rolling_days`` and
     ``min_n`` are the active publication's, so the "Last N days" tab names
     the published window; ``evidence_through`` is its cutoff and
-    ``pending_settings`` the ranking settings saved since (13.1). With no
+    ``pending_settings`` the ranking settings saved since. With no
     active publication they are today's settings, None and ``{}``.
-    ``starting_history_hint`` is the switch-over plan's hint (5.4), None
+    ``starting_history_hint`` is ``_starting_history_hint``'s text, None
     while the site has no record.
     """
     if conn.in_transaction:
@@ -492,7 +490,7 @@ def _load_dashboard(
         else (sites[0] if sites else None)
     )
     # The publication is the one the page's rankings read, in the same
-    # snapshot (9.1); none for a disabled site, as the leaderboard's own read.
+    # snapshot; none for a disabled site, as the leaderboard's own read.
     publication = (
         active_publication(conn, site_id=site.id, at_utc=None)
         if site is not None and site.enabled
@@ -505,7 +503,7 @@ def _load_dashboard(
         rolling_days = get_number_setting(conn, "rolling_window_days", 30, minimum=1)
         min_n = get_number_setting(conn, "min_n", 30, minimum=0)
     evidence_through = None if publication is None else publication.cutoff
-    # 9.5: a cutoff before the site's first record is a starting-history day,
+    # A cutoff before the site's first record is a starting-history day,
     # which the label must not call closed.
     evidence_before_close = (
         publication is not None and publication.cutoff < publication.first_record_date
@@ -612,10 +610,10 @@ def _load_dashboard(
 
 
 def _coverage_text(coverage: Coverage | None) -> str:
-    """A coverage cell as the dashboard writes it (9.4).
+    """A coverage cell as the dashboard writes it.
 
     "<scored> of <expected>", or "none yet" when nothing is expected (a
-    cell P4 stored no row for expects nothing); then "; <n> earlier days"
+    cell with no stored row expects nothing); then "; <n> earlier days"
     when the window holds days from before the daily close.
     """
     if coverage is None or coverage.expected == 0:
@@ -637,9 +635,9 @@ def _coverage_table(
     leaderboard: list[LeaderboardItem],
     day_ahead: int,
 ) -> CoverageTable | None:
-    """The coverage table for the rankings in view, or None (9.4).
+    """The coverage table for the rankings in view, or None.
 
-    P4's stored numbers for the active publication the rankings read, under
+    The stored numbers for the active publication the rankings read, under
     the Leaderboard's own window key, so the table and the rankings name one
     window: ``w:{N}`` for the "Last N days" tab, N the publication's
     ``window_days``, and ``w:all`` for "All time". None with no active
@@ -649,10 +647,8 @@ def _coverage_table(
     if publication is None or not leaderboard:
         return None
     if not window_key.startswith("w:"):
-        # A typed `window=<N>d` view (`live:{N}d`), for which P4 stores no
-        # coverage: no table and no line in its place. The owner left this
-        # view without coverage, and without a line in its place
-        # (2026-10-31).
+        # A typed `window=<N>d` view (`live:{N}d`), for which no coverage is
+        # stored: no table and no line in its place.
         return None
     stored = published_coverage(
         conn, pub=publication, variable=variable, window_key=window_key
@@ -689,7 +685,7 @@ def _coverage_cell(coverage: Coverage | None, day_ahead: int) -> CoverageCell:
 
 
 def load_ops(conn: sqlite3.Connection) -> dict[str, object]:
-    """The Ops page's context (plan §10).
+    """The Ops page's context.
 
     Reads ``now`` once, at its start; ``close_panel`` holds the close status
     panel.
@@ -723,9 +719,9 @@ def load_overlay(
     """The Overlay page's context.
 
     ``lead`` and ``lead_options`` feed the page's lead control and links;
-    ``lead`` is not checked here, as the dashboard does not check it (plan
-    §9.2). ``starting_history_hint`` is the switch-over plan's hint (5.4),
-    as on the dashboard.
+    ``lead`` is not checked here, as the dashboard does not check it.
+    ``starting_history_hint`` is ``_starting_history_hint``'s text, as on the
+    dashboard.
     """
     sites = load_sites(conn, include_disabled=False)
     site = (
@@ -885,7 +881,7 @@ def load_budgets(conn: sqlite3.Connection) -> list[BudgetGauge]:
 
 
 def load_observation_health(conn: sqlite3.Connection) -> list[ObservationHealthRow]:
-    """Each site's Observation Status row (plan §10.1).
+    """Each site's Observation Status row.
 
     The site's ``closed_through`` date and the status "no day closed yet"
     while it is None. "site disabled" and "no enabled stations" come first.
@@ -929,11 +925,11 @@ def load_observation_health(conn: sqlite3.Connection) -> list[ObservationHealthR
 
 
 # A done day shows on the close status panel for this long after its
-# ``done_at``, as alerts 1 and 2 show it (plan §5.1, §10.2).
+# ``done_at``, as alerts 1 and 2 show it.
 _CLOSE_PANEL_DONE_WINDOW: Final = timedelta(days=close_monitor.CLOSE_ALERT_DAYS)
 
 # Alert 6's id: the budget group's condition, whose close part the panel
-# shows (plan §6.4, §10.2).
+# shows.
 _ACCESS_REFUSED_ID: Final = "weathercom_access_refused"
 
 
@@ -966,7 +962,7 @@ def _wait_text(seconds: float) -> str:
 
 
 def _missed_why(record: DayRecord, status: CloseStatus | None) -> str:
-    """Why a day was missed, worded as alert 1 words it (plan §5.2, §10.2).
+    """Why a day was missed, worded as alert 1 words it.
 
     A changeover day, which alert 1 never names, reads "zone changeover".
     """
@@ -995,7 +991,7 @@ def _missed_why(record: DayRecord, status: CloseStatus | None) -> str:
 def _close_day_state(
     record: DayRecord, status: CloseStatus | None, now: datetime
 ) -> str:
-    """P1's state of the day in words (plan §10.2).
+    """The day's state in words.
 
     An ``open`` day reads "collecting", "waiting for the close" once its
     end has passed, and "not started" before its start (a changeover day
@@ -1022,7 +1018,7 @@ def _close_day_stage(
     status: CloseStatus | None,
     now: datetime,
 ) -> tuple[str | None, str | None]:
-    """The blocking stage and the stage line of a day not done (§10.2).
+    """The blocking stage and the stage line of a day not done.
 
     None for a done day and for a day still collecting. A stage running or
     waiting to run (``open`` after its end, ``closing``): "stage <n> <name>
@@ -1072,7 +1068,7 @@ def _close_day_stage(
 
 
 def _publication_text(publication: PublicationRecord | None) -> str | None:
-    """A closed day's publication record (R3.7) in words (plan §10.2)."""
+    """A closed day's publication record in words."""
     if publication is None:
         return None
     reason = (
@@ -1100,7 +1096,7 @@ def _publication_text(publication: PublicationRecord | None) -> str | None:
 def _close_day_marks(
     conn: sqlite3.Connection, record: DayRecord, now: datetime
 ) -> tuple[str, ...]:
-    """The day's zone marks (plan §10.2; P1 6.4, 6.5)."""
+    """The day's zone marks."""
     marks: list[str] = []
     if record.zone_changeover:
         if now < record.day_start_utc:
@@ -1120,7 +1116,7 @@ def _close_day_marks(
 def _close_day_row(
     conn: sqlite3.Connection, record: DayRecord, now: datetime
 ) -> CloseDayRow:
-    """One day on the close status panel (plan §10.2)."""
+    """One day on the close status panel."""
     status = close_status(
         conn, site_id=record.site_id, local_date=record.local_date, now_utc=now
     )
@@ -1149,12 +1145,12 @@ def _close_panel_days(
     current: DayRecord | None,
     now: datetime,
 ) -> list[DayRecord]:
-    """The days the panel shows for one enabled site, newest first (§10.2).
+    """The days the panel shows for one enabled site, newest first.
 
     The day that holds ``now``, every day not done that has ended, every
     done day whose ``done_at`` is within ``CLOSE_ALERT_DAYS`` (one whose
     ``done_at`` does not read is kept), and the next day when it is a
-    changeover day. Walks P1's ``day_record`` date by date, as records
+    changeover day. Walks ``day_record`` date by date, as records
     follow one another one date apart: down from ``closed_through`` for the
     done days, then up from the first day not done; with no day done, that
     is the site's first record, found by walking down from the current day,
@@ -1195,7 +1191,7 @@ def _close_panel_days(
 
 
 def _latest_try_text(tries: list[CollectionTry]) -> str | None:
-    """The newest collection try (R3.6) in words (plan §10.2)."""
+    """The newest collection try in words."""
     if not tries:
         return None
     latest = max(tries, key=lambda attempt: attempt.tried_at)
@@ -1212,7 +1208,7 @@ def _close_panel_row(
     row: sqlite3.Row,
     now: datetime,
 ) -> ClosePanelRow:
-    """One site's part of the close status panel (plan §10.2)."""
+    """One site's part of the close status panel."""
     site_id = int(row["id"])
     site_name = str(row["name"])
     if not bool(row["enabled"]):
@@ -1256,7 +1252,7 @@ def _close_panel_row(
 
 
 def _close_alert_lines(conn: sqlite3.Connection, now: datetime) -> tuple[str, ...]:
-    """The panel's alert lines, read in the caller's read (plan §10.2).
+    """The panel's alert lines, read in the caller's read.
 
     "<id>: <detail>" for each tripped alert of ``close_alerts`` and
     ``station_silent``, alert 7's "recovered" line while it shows, and
@@ -1288,16 +1284,17 @@ def _close_alert_lines(conn: sqlite3.Connection, now: datetime) -> tuple[str, ..
 
 
 def load_close_status(conn: sqlite3.Connection, now: datetime) -> ClosePanel:
-    """The close status panel (plan §10.2).
+    """The close status panel.
 
     One row per site, by name (case-insensitive): a disabled site reads
     "site disabled" and nothing else; an enabled site has its recent days
     (``_close_panel_days``), its newest collection try and its notes. Then
-    the alert lines. Day states come only from P1's reads and the close's
-    from P3's. The whole read is wrapped: an ``Exception`` other than
-    ``sqlite3.Error`` gives a panel that shows only "Close status
-    unavailable: <Type>: <msg>", so the rest of Ops renders; a
-    ``sqlite3.Error`` propagates as every other panel's does.
+    the alert lines. Day states come only from ``wxverify.db.site_days``'s
+    reads and the close's from ``wxverify.worker.close_chain``'s. The whole
+    read is wrapped: an ``Exception`` other than ``sqlite3.Error`` gives a
+    panel that shows only "Close status unavailable: <Type>: <msg>", so the
+    rest of Ops renders; a ``sqlite3.Error`` propagates as every other
+    panel's does.
     """
     try:
         sites = conn.execute(
@@ -1322,14 +1319,14 @@ def load_close_status(conn: sqlite3.Connection, now: datetime) -> ClosePanel:
 def _station_trust_limits(
     conn: sqlite3.Connection, now: datetime
 ) -> tuple[list[tuple[int, str]], list[tuple[int, str, str]]]:
-    """Per site, where Station Trust stops and the missed days it skips (9.3).
+    """Per site, where Station Trust stops and the missed days it skips.
 
     The stop is the end of the site's latest done day (``closed_through``)
     or, with no day done, the start of its first record, so only the
     starting history is read; a site with neither a done day nor a record
     holding ``now`` has no record started and gets no stop. The missed days
     are the site's ``missed`` records up to its latest done day, each as
-    its stored bounds. Both are found by walking down by date with P1's
+    its stored bounds. Both are found by walking down by date with
     ``day_record``: records follow one another one date apart.
     """
     stops: list[tuple[int, str]] = []
@@ -1367,7 +1364,7 @@ def _station_trust_limits(
 def load_station_trust(conn: sqlite3.Connection) -> list[StationTrustRow]:
     """Each station's ``ok`` values against its site's, worst mean gap first.
 
-    Over each site's closed days and starting history only (9.3): rows at or
+    Over each site's closed days and starting history only: rows at or
     after the site's stop and rows on its missed days
     (``_station_trust_limits``) are left out, each list passed as a
     ``VALUES`` table; a list with no row leaves its clause out, as an empty
@@ -1531,7 +1528,7 @@ def _wind_site_history(
 
 
 def load_wind_history(conn: sqlite3.Connection) -> WindHistoryPanel:
-    """The ops Wind History panel (plan §10). Read-only."""
+    """The ops Wind History panel. Read-only."""
     backfill_calls, live_calls = _lane_calls_today(conn)
     sites = [
         _wind_site_history(conn, int(row["id"]), str(row["name"]))
@@ -1878,7 +1875,7 @@ def _fetch_unit_feeds(
 def _scoring_feeds(conn: sqlite3.Connection, site_id: int | None) -> list[FeedToggle]:
     """The Overlay's feed list for a site, ordered by source and model.
 
-    Every active feed of the site (9.2).
+    Every active feed of the site.
     """
     if site_id is None:
         return []

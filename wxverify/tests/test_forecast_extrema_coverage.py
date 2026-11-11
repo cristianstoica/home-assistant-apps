@@ -1,4 +1,4 @@
-"""Item F — daily extrema decided by coverage, before skill ranks (F.11).
+"""Daily extrema decided by coverage, before skill ranks.
 
 F-T1 through F-T5 live in ``tests/test_forecast_selection.py`` (pure
 ``select_cell_feeds``/``CellCandidate`` unit coverage, already present
@@ -19,7 +19,7 @@ there). This file covers F-T6 through F-T31:
 * F-T27 — retired with the old wind method: weighted wind's state ignores
   the ranking, and it has no extrema set. (Its precipitation half moved to
   ``tests/test_forecast_precip_coverage.py`` G-T23 through G-T26 once
-  precipitation adopted its own extrema-coverage rule under Item G.)
+  precipitation adopted its own extrema-coverage rule.)
 * F-T28 and F-T29 — tile-level state/confidence-state rollup across
   variables and badge/tooltip/persisted-metadata agreement. F-T30
   (rebuilding precedence on the extrema set) is retired with the daily
@@ -31,10 +31,8 @@ there). This file covers F-T6 through F-T31:
 
 All fixture identities are synthetic (``open-meteo``/``example-src``
 models already seeded by migrations, or hand-picked feed ids), and DST
-cases use ``Europe/Berlin`` (chosen only because Item F's own plan does;
-no real station or city is implied). Every expected value is derived from
-reading the named production function, never transcribed from the plan
-document.
+cases use ``Europe/Berlin`` (no real station or city is implied). Every
+expected value is derived from reading the named production function.
 """
 
 from __future__ import annotations
@@ -130,7 +128,7 @@ def _ensure_test_publication(
     so callers must read it back rather than assume it.
 
     ``forecast_ranking_with_status``'s ``rolling`` window now always reads
-    the active publication (9.2), never a live recompute. Mirrors
+    the active publication, never a live recompute. Mirrors
     ``tests/test_forecast_service.py``'s identically-named helper.
     """
     row = conn.execute(
@@ -150,7 +148,7 @@ def _ensure_test_publication(
     return pub_id, _TEST_PUBLICATION_WINDOW_DAYS
 
 
-def _seed_score_cache(
+def _seed_published_ranking(
     conn: sqlite3.Connection,
     *,
     variable: str,
@@ -471,7 +469,7 @@ def test_two_complementary_partial_feeds_never_qualify_on_the_union() -> None:
 
 # ===========================================================================
 # F-T13 -- morning-only candidate through build_forecast: suppressed, and
-# rendered with the exact F.6 label string.
+# rendered with the exact label string.
 # ===========================================================================
 
 
@@ -532,7 +530,7 @@ def test_morning_only_candidate_suppresses_and_renders_the_f6_label() -> None:
     assert today.temp.low_c is None
     assert today.temp.meta.extrema_unavailable is True
 
-    # Card 7: the old per-tile suppression text and "High / Low" row are
+    # The old per-tile suppression text and "High / Low" row are
     # gone. The replacement is the day header's value span, which renders
     # "—" (never a degree sign) whenever extrema_unavailable is True.
     page = _build_page(conn, now=now)
@@ -614,7 +612,7 @@ def test_fully_covered_feed_beats_higher_skill_partial_feed() -> None:
     )
     # Both confident; the partial feed has the HIGHER skill (closer forecast
     # to the fixed observed=10.0 baseline).
-    _seed_score_cache(
+    _seed_published_ranking(
         conn,
         variable="temperature",
         day_ahead=1,
@@ -684,8 +682,8 @@ def test_hourly_drilldown_survives_temperature_suppression() -> None:
 
 
 # ===========================================================================
-# F-T17 -- precipitation needs a whole local day too (Item G; rain release
-# C4: the winner's), so the SAME 12h partial fixture suppresses both.
+# F-T17 -- precipitation needs a whole local day too (the winner's), so the
+# SAME 12h partial fixture suppresses both.
 # ===========================================================================
 
 
@@ -711,7 +709,7 @@ def test_temperature_and_precip_suppress_on_the_same_partial_day() -> None:
         valid_ats=valid_ats,
         value=1.0,
     )
-    # Rain release, C4: the feed is the published rain ranking's only model.
+    # The feed is the published rain ranking's only model.
     seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_id]})
     conn.commit()
     view = build_forecast(
@@ -720,7 +718,7 @@ def test_temperature_and_precip_suppress_on_the_same_partial_day() -> None:
     today = view.tiles[0]
     assert today.temp.meta.extrema_unavailable is True  # temperature suppressed
 
-    # Precipitation (rain release, C4) needs a whole local day covered
+    # Precipitation needs a whole local day covered
     # exactly once from its winner: 12 of 24 hours is short of it, so the
     # ranked feed is no winner and the daily total/wet-hours are absent --
     # not aggregated from the 12h partial range.
@@ -735,8 +733,8 @@ def test_temperature_and_precip_suppress_on_the_same_partial_day() -> None:
 
 
 # ===========================================================================
-# F-T22 -- F-T30: the two-feed shared-contributor set (F.11's fixture), the
-# stale/confidence/rebuilding warning rules layered on top of the F.6
+# F-T22 -- F-T30: the two-feed shared-contributor set, the
+# stale/confidence/rebuilding warning rules layered on top of the
 # extrema-coverage split.
 # ===========================================================================
 
@@ -827,7 +825,9 @@ def _seed_ab_fixture(
     forecasts = {persistence_id: 8.0, feed_a: 10.02}
     if seed_b_scoring:
         forecasts[feed_b] = 10.2
-    _seed_score_cache(conn, variable="temperature", day_ahead=0, forecasts=forecasts)
+    _seed_published_ranking(
+        conn, variable="temperature", day_ahead=0, forecasts=forecasts
+    )
     return feed_a, feed_b
 
 
@@ -984,7 +984,7 @@ def test_confident_blend_set_with_unscored_extrema_set() -> None:
     assert today.temp.meta.extrema_state == "low_confidence"
     assert today.state == "normal"
     assert today.confidence_state == "low_confidence"
-    # Card 7 dropped the old per-state CSS class ("tile state-normal") for
+    # The old per-state CSS class ("tile state-normal") is gone, replaced by
     # a plain not_available boolean; the low-confidence/ranking-updating
     # distinction now lives only in the day header's warning texts.
     page = _build_page(conn, now=_AB_NOW)
@@ -1021,7 +1021,7 @@ def test_suppressed_extrema_contribute_to_neither_warning() -> None:
         values=[10.0 + i * 0.1 for i in range(20)],
     )
     _stamp_usable_fetch(conn, feed_id=feed_a, at=_AB_FRESH_ISSUED)
-    _seed_score_cache(
+    _seed_published_ranking(
         conn,
         variable="temperature",
         day_ahead=0,
@@ -1064,7 +1064,7 @@ def test_stale_blend_set_alone_still_sets_the_stale_badge_with_extrema_suppresse
         values=[10.0 + i * 0.1 for i in range(20)],
     )
     _stamp_usable_fetch(conn, feed_id=feed_a, at=_AB_STALE_ISSUED)
-    _seed_score_cache(
+    _seed_published_ranking(
         conn,
         variable="temperature",
         day_ahead=0,
@@ -1099,8 +1099,8 @@ def test_shared_contributor_set_confidence_states_are_independent_per_side() -> 
     # longer report "rebuilding" at all -- that case pinned removed
     # behaviour and was deleted outright rather than reworked. "low
     # confidence" and "ranking updating" are mutually exclusive badge
-    # states (F.6's ``_state_of`` precedence), so each remaining case pins
-    # exactly one outcome and its absence. The plan's shared-CONTRIBUTOR-SET half
+    # states (``_state_of`` precedence), so each remaining case pins
+    # exactly one outcome and its absence. The shared-CONTRIBUTOR-SET half
     # (extrema set == blend set, not just both confidence-linked) is
     # exercised separately below, in
     # ``test_shared_contributor_set_states_roll_up_identically_to_today``;
@@ -1157,7 +1157,7 @@ def _seed_shared_ab_fixture(
     feed_a_issued_at: str = _AB_FRESH_ISSUED,
     feed_b_issued_at: str = _AB_FRESH_ISSUED,
 ) -> tuple[int, int]:
-    """The plan's SHARED-contributor-set fixture for F-T26's second half.
+    """The SHARED-contributor-set fixture for F-T26's second half.
 
     Both feeds cover the full 24h local day, so ``extrema_feeds`` is not
     just non-empty but IS the blend set's clearing subset: both rankings
@@ -1187,7 +1187,7 @@ def _seed_shared_ab_fixture(
     )
     _stamp_usable_fetch(conn, feed_id=feed_a, at=feed_a_issued_at)
     _stamp_usable_fetch(conn, feed_id=feed_b, at=feed_b_issued_at)
-    _seed_score_cache(
+    _seed_published_ranking(
         conn,
         variable="temperature",
         day_ahead=0,
@@ -1300,7 +1300,7 @@ def test_tile_level_rollup_across_variables() -> None:
     # staleness per FEED on one last usable fetch shared by ALL that feed's
     # variables (``wxverify/forecast/data.py``), so a stale precipitation
     # cell on feed_a would be masked by that same feed's fresh stamp -- the
-    # trap this isolation avoids. Rain release, C4: the feed is the rain
+    # trap this isolation avoids. The feed is the rain
     # ranking's winner, so it needs a full day.
     # ``seed_rain_ranks`` runs BEFORE ``_seed_ab_fixture``: both create a
     # publication if none exists yet, and ``active_publication`` picks
@@ -1330,7 +1330,7 @@ def test_tile_level_rollup_across_variables() -> None:
     assert today.precip.meta.stale is True
     assert today.stale is True
 
-    # (3) Rain release, C4: the rain cell never reads the leaderboard, so
+    # (3) The rain cell never reads the leaderboard, so
     # precipitation with no scoring pairs at all (the old rung 3, which made
     # the cell low-confidence) is a normal cell under a settled rain
     # ranking. No temperature here: with the daily close on (the ranks are
@@ -1389,11 +1389,11 @@ def test_tile_level_rollup_across_variables() -> None:
     assert "state-not_available" not in frag
     assert LOW_CONFIDENCE_TEXT in frag
 
-    # (5) Rain release, C4: a low-confidence temperature cell BESIDE a
+    # (5) A low-confidence temperature cell BESIDE a
     # provisional rain ranking. The rollup's precedence (low confidence
     # outranks rebuilding) still resolves ACROSS cells for
     # ``confidence_state``, but the rain ranking's own "ranking updating"
-    # badge shows beside "low confidence" (owner, C6: the badge stays until
+    # badge shows beside "low confidence" (the badge stays until
     # a model really has 20 counted days). The old construction, a
     # rebuilding temperature extrema set beside a low-confidence rain cell,
     # cannot be built any more: the rain cell is never low-confidence.
@@ -1465,8 +1465,8 @@ def test_tile_level_rollup_across_variables() -> None:
 def test_badge_tooltip_and_persisted_metadata_agree_on_confidence() -> None:
     # F-T29: run the same fixture shape twice (extrema side confident, then
     # low-confidence) and check that, WITHIN EACH RUN, the rendered warning
-    # agrees with the single confidence knob that produced it. Card 7
-    # removed the old "Feeds: <names>" tooltip naming the extrema set with
+    # agrees with the single confidence knob that produced it. The page
+    # lost the old "Feeds: <names>" tooltip naming the extrema set with
     # no replacement (flagged in test_fully_covered_feed_beats_higher_
     # skill_partial_feed above) -- only the persisted-metadata half of this
     # test's original claim (the data assertions below) survives; the

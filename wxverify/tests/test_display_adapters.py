@@ -1,6 +1,6 @@
-"""Card 7: display-only fields (cloud_cover, wind_gust, wind_direction).
+"""Display-only fields (cloud_cover, wind_gust, wind_direction).
 
-Covers the three bullets of the plan:
+Covers:
   1. Each adapter stores the display fields in %, m/s and degrees (km/h
      gusts through kmh_to_ms); a null or absent field stores nothing.
   2. Each adapter's outgoing request is unchanged except for Open-Meteo's
@@ -165,7 +165,7 @@ def test_open_meteo_null_or_absent_gust_stores_nothing(
 
 
 def test_open_meteo_request_hourly_differs_only_by_three_display_names() -> None:
-    """Catches: an extra or missing hourly= name beyond the three card-7
+    """Catches: an extra or missing hourly= name beyond the three display
     fields, or a changed param elsewhere in the request."""
     captured: list[httpx.Request] = []
 
@@ -195,7 +195,7 @@ def test_open_meteo_request_hourly_differs_only_by_three_display_names() -> None
 
 def test_open_meteo_estimate_cost_and_metered_calls_unchanged() -> None:
     """Catches: a larger metered call count once the display names are
-    added to the hourly request (plan: Open-Meteo stays 1)."""
+    added to the hourly request (Open-Meteo stays 1)."""
     adapter = OpenMeteoAdapter(httpx.AsyncClient())
     plain = adapter.estimate_cost(_req(variables=FORECAST_VARIABLES))
     with_display = adapter.estimate_cost(_req(variables=ALL_VARIABLES))
@@ -207,9 +207,8 @@ def test_open_meteo_estimate_cost_and_metered_calls_unchanged() -> None:
 # ---------------------------------------------------------------------------
 
 _METEOBLUE_B_PARAMS: dict[str, Any] = {
-    # Copied by hand from wxverify-storage-release/wxverify/wxverify/feeds/
-    # meteoblue.py:85-94 (commit c08b19e), apikey replaced with a made-up
-    # value.
+    # Copied by hand from ``wxverify.feeds.meteoblue``'s request parameters,
+    # apikey replaced with a made-up value.
     "apikey": _API_KEY,
     "lat": _LAT,
     "lon": _LON,

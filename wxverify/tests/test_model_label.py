@@ -1,6 +1,5 @@
-"""Tests for ``wxverify.web.context.model_label`` (card 7, step 6
-adjustment 4): the Forecast page's model-row label, "model name only, never
-source / model". Pure -- no database.
+"""Tests for ``wxverify.web.context.model_label``: the Forecast page's
+model-row label, "model name only, never source / model". Pure -- no database.
 
 The 13 known pairs' expected names are hardcoded here as literals, not read
 from the private ``_MODEL_NAMES`` table: comparing the function's output to

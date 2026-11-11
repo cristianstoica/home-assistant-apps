@@ -1,5 +1,4 @@
-"""The rain check at the database level, through close stage 3 (plan
-2026-11-01-rain-release.md, Part A; test IDs A1, A7).
+"""The rain check at the database level, through close stage 3 (A1, A7).
 
 A2-A6 are covered purely, at the ``obs/rain_check`` level, in
 ``tests/test_rain_check_rules.py``; this file only needs what a real close
@@ -308,8 +307,8 @@ def _seed_site_temps_before(conn, site_id: int, day1: date) -> None:
 def _seed_prior_set_aside(conn, site_id: int, station_id: int, before: date) -> None:
     """A plain INSERT of one ``station_rain_checks`` row dated before the
     site's first day, already set aside -- what ``_write_station_list``
-    reads to seed a brand-new day's ``rain_counted`` (plan A1's "or 1 when
-    there is none").
+    reads to seed a brand-new day's ``rain_counted`` (or 1 when there is
+    none).
     """
     conn.execute(
         "INSERT INTO station_rain_checks"
@@ -468,7 +467,7 @@ def test_a7_stage3_retry_gives_the_same_rows() -> None:
 
 def test_a7_temperature_and_wind_identical_with_and_without_set_aside() -> None:
     """The same day's temperature and wind consensus are identical whether
-    A is counted or already set aside -- Part A only ever filters
+    A is counted or already set aside -- the rain check only ever filters
     ``precip``."""
     rain_mm = {"A": 0.0, "B": 3.0, "C": 3.0, "D": 3.0, "E": 3.0, "F": 3.0}
 

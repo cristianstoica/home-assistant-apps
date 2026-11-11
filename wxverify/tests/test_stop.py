@@ -1,10 +1,9 @@
-"""Tests for W1, stop handling (the storage-release plan, §6.2-6.4 and §6.6,
-work item W1).
+"""Tests for stop handling.
 
 Written before the module these tests import exists, and fails first for
 that reason: ``wxverify.core.stop`` does not exist at this commit, so every
 test below fails on ``ModuleNotFoundError`` until it is built. The build
-must match this API, read from plan §6.2-6.4:
+must match this API:
 
 - ``STOP: threading.Event()`` -- one process-wide stop flag.
 - ``register(conn: sqlite3.Connection) -> None`` / ``unregister(conn) ->
@@ -26,10 +25,10 @@ must match this API, read from plan §6.2-6.4:
   read as ``stop.STOP_BUDGET_S`` (or re-imported) at the point it is used,
   never bound to a local name at import time.
 
-Running code (6.3-6.4) is assumed to interrupt the *running* writer
+Running code is assumed to interrupt the *running* writer
 connection directly (``db._conn.interrupt()``, via the already-public
 ``get_db()``), not through ``register``/``unregister`` -- those two are
-named in §6.2 for *startup* only ("the one connection doing startup work").
+for *startup* only (the one connection doing startup work).
 
 Harness idioms are copied from ``tests/test_graceful_shutdown.py``
 (``_init_tmp_db``, ``_patch_worker_infra``, ``_insert_job``, the
@@ -67,7 +66,7 @@ from wxverify.worker.processor import run_worker
 
 # ---------------------------------------------------------------------------
 # Fixtures: STOP must never leak between tests -- it is a process-wide
-# ``threading.Event()`` per §6.2, so one test setting it would otherwise
+# ``threading.Event()``, so one test setting it would otherwise
 # leave every later test observing a stop already in progress.
 # ---------------------------------------------------------------------------
 
@@ -186,7 +185,7 @@ def _make_immediate_stub(_name: str):
 
 
 # ---------------------------------------------------------------------------
-# Case 1 (§6.2): register(conn) + request_stop() from another thread
+# Case 1: register(conn) + request_stop() from another thread
 # interrupts a long-running query within 1s.
 # ---------------------------------------------------------------------------
 
@@ -194,7 +193,7 @@ def _make_immediate_stub(_name: str):
 def test_request_stop_interrupts_a_long_running_query_on_the_registered_connection(
     tmp_path: Path,
 ) -> None:
-    """W1 case 1. A connection registered via ``register(conn)`` runs a long
+    """Case 1. A connection registered via ``register(conn)`` runs a long
     recursive CTE on its own thread; ``request_stop()``, called from the
     main thread, must end that statement with
     ``sqlite3.OperationalError: interrupted`` within 1 second.
@@ -252,7 +251,7 @@ def test_request_stop_interrupts_a_long_running_query_on_the_registered_connecti
 
 
 # ---------------------------------------------------------------------------
-# Case 2 (§6.2): check() inside a savepoint leaves user_version and rows as
+# Case 2: check() inside a savepoint leaves user_version and rows as
 # they were, after the caller rolls back.
 # ---------------------------------------------------------------------------
 
@@ -260,11 +259,11 @@ def test_request_stop_interrupts_a_long_running_query_on_the_registered_connecti
 def test_check_inside_a_savepoint_leaves_user_version_and_rows_unchanged_after_rollback(
     tmp_path: Path,
 ) -> None:
-    """W1 case 2. A step that opens a savepoint, changes ``user_version``
+    """Case 2. A step that opens a savepoint, changes ``user_version``
     and inserts a row, then calls ``check()`` with ``STOP`` already set,
     must see ``check()`` raise ``StopRequested`` -- and rolling back to the
     savepoint on that exception (as ``run_migrations``/``migrate_v18``
-    will, per §6.2) leaves both ``user_version`` and the row exactly as they
+    will) leaves both ``user_version`` and the row exactly as they
     were beforehand.
 
     Paired positive: the same step run with ``STOP`` clear completes,
@@ -318,7 +317,7 @@ def test_check_inside_a_savepoint_leaves_user_version_and_rows_unchanged_after_r
 
 
 # ---------------------------------------------------------------------------
-# Case 3 (§6.3): with STOP set, neither lane claims a pending job, and
+# Case 3: with STOP set, neither lane claims a pending job, and
 # neither lane returns before it is cancelled.
 # ---------------------------------------------------------------------------
 
@@ -326,14 +325,14 @@ def test_check_inside_a_savepoint_leaves_user_version_and_rows_unchanged_after_r
 def test_stop_set_blocks_both_lanes_from_claiming_and_neither_lane_returns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """W1 case 3. With ``STOP`` set before ``run_worker`` starts: a pending
+    """Case 3. With ``STOP`` set before ``run_worker`` starts: a pending
     main-lane job (claimed by ``_run_main_lane``, ``worker/processor.py:263``)
     and a pending current-obs job (claimed by ``run_current_obs_poller``,
     ``worker/current_obs_poller.py:82``) must both stay ``pending`` --
     neither lane may claim while a stop is pending. Also: the worker task
     must still be running (not returned) right up to the moment it is
     cancelled, since a lane that returns on its own is treated as a crash
-    by ``_stop_on_worker_done`` (§6.3's "must not return").
+    by ``_stop_on_worker_done``.
 
     Paired positive is case 6's crash-path test and the whole existing
     ``tests/test_graceful_shutdown.py`` suite, which claims and completes
@@ -372,17 +371,17 @@ def test_stop_set_blocks_both_lanes_from_claiming_and_neither_lane_returns(
 
 
 # ---------------------------------------------------------------------------
-# Case 4 (§6.3): the close chain starts no stage once STOP is set.
+# Case 4: the close chain starts no stage once STOP is set.
 # ---------------------------------------------------------------------------
 
 
 def test_stop_set_before_a_close_stage_starts_no_stage_body(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """W1 case 4. ``run_day_close`` dispatched to stage 6 (closure) with
+    """Case 4. ``run_day_close`` dispatched to stage 6 (closure) with
     ``STOP`` already set must never reach the stage body
-    (``close_chain._closure_stage``) -- "the close chain before each stage"
-    (§6.3) refuses to start work, the same contract as the lanes' claim
+    (``close_chain._closure_stage``) -- the close chain, checked before each
+    stage, refuses to start work, the same contract as the lanes' claim
     guard in case 3, at the stage-dispatch boundary instead of the claim.
 
     The job's payload is ``{"attempt": 1}``, a shape ``close_chain.
@@ -456,7 +455,7 @@ def test_stop_set_before_a_close_stage_starts_no_stage_body(
 
 
 # ---------------------------------------------------------------------------
-# Case 5 (§6.4): a job that outlasts the stop budget gives the ERROR line
+# Case 5: a job that outlasts the stop budget gives the ERROR line
 # and an interrupt() on the writer; reclaim_all_stale makes it pending.
 # ---------------------------------------------------------------------------
 
@@ -464,11 +463,11 @@ def test_stop_set_before_a_close_stage_starts_no_stage_body(
 def test_stop_budget_exceeded_logs_interrupts_writer_and_job_is_pending_after_reclaim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """W1 case 5. ``STOP_BUDGET_S`` monkeypatched to 1 second. The worker
+    """Case 5. ``STOP_BUDGET_S`` monkeypatched to 1 second. The worker
     lane's cancellation handler stands in for "a job write already running"
-    (§6.3) by performing a REAL long-running write on the process's writer
+    by performing a REAL long-running write on the process's writer
     connection (the same unbounded recursive CTE as case 1) instead of
-    returning promptly. Once the 1s budget elapses, §6.4 requires:
+    returning promptly. Once the 1s budget elapses:
 
     1. one ERROR "stop budget exceeded; still running: ..." naming the
        worker task;
@@ -477,8 +476,8 @@ def test_stop_budget_exceeded_logs_interrupts_writer_and_job_is_pending_after_re
        being cancelled (a bare task-cancel would not touch a statement
        already running inside ``db.write``'s executor thread);
     3. a job row left ``running`` by the interrupted write reverts to
-       ``pending`` once ``reclaim_all_stale`` runs (the next boot's call,
-       §6.4's last sentence) -- simulated here by seeding one such row and
+       ``pending`` once ``reclaim_all_stale`` runs (the next boot's call)
+       -- simulated here by seeding one such row and
        reclaiming it directly after shutdown completes.
 
     This test imports ``wxverify.core.stop`` and patches its
@@ -578,11 +577,11 @@ def test_stop_budget_exceeded_logs_interrupts_writer_and_job_is_pending_after_re
 def test_run_claimed_job_interrupted_by_stop_records_nothing_then_reclaim_repends(
     tmp_path: Path,
 ) -> None:
-    """W1 case 5, the "pending after reclaim" half, driven for real.
+    """Case 5, the "pending after reclaim" half, driven for real.
 
     A claimed ``day_close`` job run through ``processor.run_claimed_job``
     with ``STOP`` already set: ``run_day_close``'s ``stop.check()`` (close
-    chain, §6.3) raises ``StopRequested`` before any write starts, so
+    chain) raises ``StopRequested`` before any write starts, so
     ``run_claimed_job``'s ``except stop.StopRequested`` branch records
     nothing -- the job row is left exactly as claimed (``running``,
     ``retry_count`` unchanged), per its own comment ("the row stays running,
@@ -653,7 +652,7 @@ def test_run_claimed_job_interrupted_by_stop_records_nothing_then_reclaim_repend
 
 
 # ---------------------------------------------------------------------------
-# Case 6 (§6.6): a lane that raises still reaches stop_process at once,
+# Case 6: a lane that raises still reaches stop_process at once,
 # through _stop_on_worker_done, with no budget wait.
 # ---------------------------------------------------------------------------
 
@@ -661,11 +660,11 @@ def test_run_claimed_job_interrupted_by_stop_records_nothing_then_reclaim_repend
 def test_a_crashing_lane_reaches_stop_process_immediately_with_no_budget_wait(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """W1 case 6 (§6.6). ``STOP_BUDGET_S`` monkeypatched to 5 seconds -- a
+    """Case 6. ``STOP_BUDGET_S`` monkeypatched to 5 seconds -- a
     worker lane that CRASHES (raises, rather than being cancelled) must
     still reach ``_stop_on_worker_done`` -> ``stop_process()`` well under
-    that budget, since the crash path "keeps its exit path ... with no
-    budget" (§6.6). If a future change wrapped the crash-detection path in
+    that budget, since the crash path keeps its exit path with no
+    budget. If a future change wrapped the crash-detection path in
     the same budget wait the running-shutdown path uses, this test would
     see ``stop_process()`` fire only after ~5s (or time out waiting for it
     within 1s) instead of immediately.

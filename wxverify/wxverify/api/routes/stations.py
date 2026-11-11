@@ -372,7 +372,7 @@ async def create_station(
         clear_domain_backoff(conn, source_domain("weathercom"))
         clear_domain_backoff(conn, source_domain("open-meteo"))
         # No job is queued: a new station counts from its next full local day
-        # and is collected by the daily schedule (switch-over plan 7.2, R2).
+        # and is collected by the daily schedule.
         row = conn.execute(
             "SELECT * FROM stations WHERE id=?", (station_id,)
         ).fetchone()

@@ -1,6 +1,6 @@
 /* wxverify — app.css (Style B). Drop-in replacement for the shipped stylesheet: same class vocabulary, dark flat visual system.
    Sections: 1 tokens · 2 base · 3 chrome (topbar, heading, toolbar) · 4 panels & grids · 5 tables · 6 forms & buttons · 7 badges, verdicts, misc · 8 forecast page · 9 responsive · 10 vendored/uPlot
-   Card 7 edits on the design handoff: --danger-text, per-fill cell ink, the not-available day header, em-based forecast grids (#64), the day warning tip. */
+   Edits on the design handoff: --danger-text, per-fill cell ink, the not-available day header, em-based forecast grids, the day warning tip. */
 
 /* 1 — tokens (dark only; no light scheme) */
 :root{color-scheme:dark;--bg:#0f1418;--surface:#171d23;--surface-2:#212a32;--surface-3:#2a343d;--line:#2a333b;--text:#e6ebef;--text-on-color:#f4f7f9;--muted:#93a1ad;--accent:#03a9f4;--accent-soft:rgba(3,169,244,.16);--success:#4caf50;--success-soft:rgba(76,175,80,.16);--success-on-soft:#4caf50;--warn:#ffa726;--warn-soft:rgba(255,152,0,.16);--warn-on-soft:#ffa726;--danger:#ef5350;--danger-soft:rgba(239,83,80,.16);--danger-text:#f27573;--topbar-bg:#171d23;--shadow:none;--radius:8px;--radius-sm:6px;--chart-1:#4fc3f7;--chart-2:#f06292;--chart-3:#66bb6a;--chart-4:#ff8a65;--chart-5:#ba68c8;--chart-6:#4db6ac;--chart-axis:#93a1ad;--chart-grid:#2a333b;font-family:Roboto,"Noto Sans",system-ui,-apple-system,"Segoe UI",sans-serif}

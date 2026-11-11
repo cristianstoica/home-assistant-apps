@@ -3,7 +3,7 @@
 `collection/budget.py`'s ``effective_daily_call_limit`` clamps the stored
 ``sources.daily_call_limit`` at ``PROVIDER_DAILY_CALL_ALLOWANCE`` (weathercom:
 1500) on EVERY read, so the stored/configured value is never raised past it
-by any writer. §8.6 names five call sites that must apply the clamp:
+by any writer. Five call sites must apply the clamp:
 ``reserve_budget`` (T111), ``monitor._budget_conditions``,
 ``web/context.load_budgets``, ``provider_ops._provider_group`` and
 ``api/routes/health.health_budget`` (T113), plus an AST pin (T114) proving no

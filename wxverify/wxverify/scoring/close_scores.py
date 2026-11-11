@@ -1,23 +1,20 @@
-"""Scoring the closed day: P3's stage 5.
+"""Scoring the closed day: the close chain's stage 5.
 
-Daily-close P4 plan (``plans/2026-10-22-daily-close-pairs-and-publication.md``)
-section 6. ``score_day`` scores one ``closing`` day D in the transaction P3
-passes: for every real feed considered at D (6.2) and day ahead k it takes
+``score_day`` scores one ``closing`` day D in the transaction the close chain
+passes: for every real feed considered at D and day ahead k it takes
 the scored values the first stored download of D - k left in
-``forecast_scored`` (4.1, 4.3; rain release Part B, ``scoring/downloads.py``
-``scored_values``), pairs them with D's hourly values, makes the two yardsticks
-(4.6), and stores the scored hours (``forecast_history``: real feeds and the
-mean, never persistence; storage release 3.3), the day's sums
-(``day_scores``) and the per-close record (``close_records``,
-``close_record_downloads``), replacing an earlier attempt's rows. Since the
-rain release (Part C, C1) it also writes D's rain nearby (``rain_days``) and
-each real feed's daily rain total per day ahead (``rain_forecast_days``),
-which the publication's rain ranking reads. It never
-commits, enqueues nothing, changes no day state, fetches nothing and reads
-the clock only through ``now_utc``.
+``forecast_scored`` (``scoring/downloads.py`` ``scored_values``), pairs them
+with D's hourly values, makes the two yardsticks, and stores the scored hours
+(``forecast_history``: real feeds and the mean, never persistence), the day's
+sums (``day_scores``) and the per-close record (``close_records``,
+``close_record_downloads``), replacing an earlier attempt's rows. It also
+writes D's rain nearby (``rain_days``) and each real feed's daily rain total
+per day ahead (``rain_forecast_days``), which the publication's rain ranking
+reads. It never commits, enqueues nothing, changes no day state, fetches
+nothing and reads the clock only through ``now_utc``.
 
 ``metrics_from_sums`` lives in ``scoring/metrics.py`` beside
-``MetricResult``; it is re-exported here beside the sums it reads (6.4).
+``MetricResult``; it is re-exported here beside the sums it reads.
 """
 
 from __future__ import annotations
@@ -54,11 +51,11 @@ from wxverify.scoring.pair_flags import precip_flags
 from wxverify.verification.methodology import TEMP_TRUTH_MIN_HOURS
 from wxverify.worker.close_p4 import ScoreSummary
 
-#: The scoring rule each close record names (6.7); a later change to the
+#: The scoring rule each close record names; a later change to the
 #: rule writes a new text.
 SCORING_RULE: Final = "first-stored-download-of-local-day/1"
 
-#: ``ScoreSummary`` keys of the two yardsticks (6.8); real feeds are keyed
+#: ``ScoreSummary`` keys of the two yardsticks; real feeds are keyed
 #: ``feed:{feed_id}``.
 PERSISTENCE_KEY: Final = "persistence"
 MULTIMODEL_MEAN_KEY: Final = "multimodel_mean"
@@ -66,7 +63,7 @@ MULTIMODEL_MEAN_KEY: Final = "multimodel_mean"
 DayScoreStatus = Literal["scored", "absent", "no_hours", "not_counted"]
 
 _DAYS_AHEAD: Final = tuple(range(8))
-# The mean needs at least two real feeds at an hour and day ahead (4.6).
+# The mean needs at least two real feeds at an hour and day ahead.
 _MEAN_MIN_CONTRIBUTORS: Final = 2
 _TRUTH_QUANTITIES: Final = frozenset(
     {
@@ -95,7 +92,7 @@ _REAL_FEEDS_SQL: Final = (
 )
 _YARDSTICK_SQL: Final = "SELECT id FROM feeds WHERE source = 'virtual' AND model = ?"
 
-# Step 3 of 6.1: an earlier attempt's rows for D, so a retry replaces.
+# An earlier attempt's rows for D, so a retry replaces.
 # ``forecast_history`` has its own delete below.
 _DELETE_EARLIER_SQL: Final = (
     "DELETE FROM day_scores WHERE site_id = ? AND local_date = ?",
@@ -104,7 +101,7 @@ _DELETE_EARLIER_SQL: Final = (
     "DELETE FROM rain_days WHERE site_id = ? AND local_date = ?",
     "DELETE FROM rain_forecast_days WHERE site_id = ? AND local_date = ?",
 )
-# Storage release 3.6: an earlier attempt's ``forecast_history`` rows for D,
+# An earlier attempt's ``forecast_history`` rows for D,
 # one primary-key seek per feed, variable and day ahead. The ``valid_at``
 # bounds are D's widened by one day each side and only let the key seek;
 # ``local_date`` decides. Parameters: site, feed, variable, day ahead, the
@@ -115,7 +112,7 @@ _DELETE_FORECAST_HISTORY_SQL: Final = (
     " AND valid_at >= ? AND valid_at < ? AND local_date = ?"
 )
 _ALL_FEEDS_SQL: Final = "SELECT id FROM feeds ORDER BY id"
-# Rain nearby (rain release, C1): the day's ``ok`` station rain rows. The
+# Rain nearby: the day's ``ok`` station rain rows. The
 # station list is bound in Python, so the read seeks each station's key.
 _STATION_RAIN_SQL: Final = (
     "SELECT valid_at, value FROM station_observations"
@@ -171,7 +168,7 @@ _INSERT_RECORD_SQL: Final = """
 
 
 class ScoreDayRefused(Exception):
-    """P1's guard refused one of ``score_day``'s write kinds for the day (6.1).
+    """The closed-day guard refused one of ``score_day``'s write kinds for the day.
 
     ``score_day`` checks ``DAY_SCORES`` and ``CLOSE_RECORD`` before any other
     work; for a ``closing`` day both are accepted, so a refusal is a
@@ -184,12 +181,12 @@ class ScoreDayRefused(Exception):
 
 
 class ScoreDayInputMissing(Exception):
-    """The day has fewer than its five ``daily_truth`` rows (6.1)."""
+    """The day has fewer than its five ``daily_truth`` rows."""
 
 
 @dataclass(frozen=True, slots=True)
 class TruthRow:
-    """One of D's ``daily_truth`` rows, as ``score_day`` reads it (6.1)."""
+    """One of D's ``daily_truth`` rows, as ``score_day`` reads it."""
 
     quantity: str
     value: float | None
@@ -208,7 +205,7 @@ class _Hour:
 
 @dataclass(frozen=True, slots=True)
 class _Pair:
-    """One closed-day pair before it is stored (6.3)."""
+    """One closed-day pair before it is stored."""
 
     variable: str
     day_ahead: int
@@ -224,7 +221,7 @@ class _Pair:
 
 @dataclass(frozen=True, slots=True)
 class _Forecast:
-    """A real feed's scored forecast of D at one day ahead (6.2)."""
+    """A real feed's scored forecast of D at one day ahead."""
 
     download: ScoredDownload
     version: Mapping[tuple[str, str], StoredSample]
@@ -235,7 +232,7 @@ _Cells = dict[tuple[int, str, int], list[_Pair]]
 
 
 def scored_variables(truth_rows: Iterable[TruthRow]) -> frozenset[str]:
-    """The hourly variables scored on D, from its truth rows (6.5).
+    """The hourly variables scored on D, from its truth rows.
 
     Rain when ``precip_total`` is counted, wind when ``wind_max`` is
     counted, and temperature when D's temperature rows cover at least
@@ -262,7 +259,7 @@ def scored_variables(truth_rows: Iterable[TruthRow]) -> frozenset[str]:
 
 
 def rain_nearby(stations: Iterable[tuple[float, int]]) -> tuple[RainOutcome, int, int]:
-    """A day's rain nearby from its stations' (day total, hours) (C1).
+    """A day's rain nearby from its stations' (day total, hours).
 
     Totals are compared in hundredths (``round(total * 100)``). Rain: at
     least ``RAIN_NEARBY_PAIR_STATIONS`` stations at 0.2 mm or more, or one
@@ -297,7 +294,7 @@ def rain_nearby(stations: Iterable[tuple[float, int]]) -> tuple[RainOutcome, int
 def day_rain_total(
     samples: Iterable[StoredSample], *, local_date: date, timezone: str
 ) -> float | None:
-    """A model's daily rain total for ``local_date``, or ``None`` (C1).
+    """A model's daily rain total for ``local_date``, or ``None``.
 
     The sum of its ``precip`` values when they cover each hour of the local
     day exactly once (``covers_local_day_exactly``); ``None`` otherwise, so a
@@ -312,7 +309,7 @@ def day_rain_total(
 
 
 def _write_rain_day(conn: sqlite3.Connection, record: DayRecord) -> None:
-    """D's ``rain_days`` row from its rain-counted stations' ``ok`` rows (C1)."""
+    """D's ``rain_days`` row from its rain-counted stations' ``ok`` rows."""
     start = isoformat_utc(record.day_start_utc)
     end = isoformat_utc(record.day_end_utc)
     stations: list[tuple[float, int]] = []
@@ -340,18 +337,16 @@ def score_day(
 ) -> ScoreSummary:
     """Score the ``closing`` day ``record`` and store its scores and record.
 
-    P3's stage 5 call point (6.1). In the caller's transaction, never
-    committing: P1's guard for ``DAY_SCORES`` and ``CLOSE_RECORD`` (a
+    The close chain's stage 5 call point. In the caller's transaction, never
+    committing: the closed-day guard for ``DAY_SCORES`` and ``CLOSE_RECORD`` (a
     refusal raises ``ScoreDayRefused``), D's five truth rows of the site's
     published generation (fewer raise ``ScoreDayInputMissing``), the removal
-    of an earlier attempt's rows, then the scored forecasts (6.2), the pairs
-    (6.3), the day scores (6.4) and the per-close record (6.7). The day's
-    zone and bounds come from ``record`` only. D's ``rain_days`` row and its
-    ``rain_forecast_days`` rows (rain release, C1) are written in the same
-    call. ``scored_at`` is ``now_utc``
-    to the whole second (15.2). Returns, per feed considered at D (6.2) and
-    yardstick, how many of D's 8 forecasts were scored and how many absent
-    (6.8).
+    of an earlier attempt's rows, then the scored forecasts, the pairs, the
+    day scores and the per-close record. The day's zone and bounds come from
+    ``record`` only. D's ``rain_days`` row and its ``rain_forecast_days``
+    rows are written in the same call. ``scored_at`` is ``now_utc`` to the
+    whole second. Returns, per feed considered at D and yardstick, how many
+    of D's 8 forecasts were scored and how many absent.
     """
     site_id = record.site_id
     day_text = record.local_date.isoformat()
@@ -366,8 +361,8 @@ def score_day(
         conn.execute(sql, (site_id, day_text))
     _delete_earlier_history(conn, record)
 
-    # 6.2: every candidate's scored values of D at each day ahead k, from
-    # forecast_scored (rain release, Part B, B4), with the download they
+    # Every candidate's scored values of D at each day ahead k, from
+    # forecast_scored, with the download they
     # came from. The candidates are the real feeds less the meteoblue
     # package row; the active ones are those switched on at the site now,
     # the mean's members.
@@ -398,15 +393,15 @@ def score_day(
                 ),
             )
     # A candidate is considered at D when it is switched on now or has
-    # scored values for D at some day ahead; any other gets no row at D
-    # (6.2). A download that does not reach D counts as no download for D.
+    # scored values for D at some day ahead; any other gets no row at D.
+    # A download that does not reach D counts as no download for D.
     considered = [
         feed_id
         for feed_id in real_feeds
         if feed_id in active or any((feed_id, k) in forecasts for k in _DAYS_AHEAD)
     ]
 
-    # C1 (rain release): D's rain nearby, and each real feed's daily rain
+    # D's rain nearby, and each real feed's daily rain
     # total at each day ahead whose scored values cover D's every hour.
     _write_rain_day(conn, record)
     rain_totals: list[tuple[object, ...]] = []
@@ -421,7 +416,7 @@ def score_day(
     conn.executemany(_INSERT_RAIN_FORECAST_SQL, rain_totals)
 
     # D's hourly values, and the earlier hours persistence and each pair's
-    # skill reference read (value at valid_at - lead_hours, 6.3).
+    # skill reference read (value at valid_at - lead_hours).
     max_lead = max(
         [
             PERSISTENCE_MAX_LEAD_HOURS,
@@ -440,7 +435,7 @@ def score_day(
         end_utc=record.day_end_utc,
     )
 
-    # 6.3: the pairs of each (feed, variable, day ahead) cell.
+    # The pairs of each (feed, variable, day ahead) cell.
     cells: _Cells = {}
     for (feed_id, k), forecast in forecasts.items():
         for pair in _real_pairs(forecast, k, variables, hourly, record):
@@ -462,9 +457,9 @@ def score_day(
         if rain.rain_threshold_mm is not None
         else truth["precip_occurrence"].rain_threshold_mm
     )
-    # Storage release 3.3: the scored hours of the real feeds and the mean
+    # The scored hours of the real feeds and the mean
     # go to forecast_history. Persistence's pairs feed the day scores only;
-    # its history is rebuilt on read (3.5).
+    # its history is rebuilt on read.
     conn.executemany(
         _INSERT_HISTORY_SQL,
         [
@@ -475,7 +470,7 @@ def score_day(
         ],
     )
 
-    # 6.4: one day_scores row per (feed, variable, day ahead) considered.
+    # One day_scores row per (feed, variable, day ahead) considered.
     wind = truth["wind_max"]
     wind_obs_high = wind.value if wind.eligible else None
     entries = [(f"feed:{feed_id}", feed_id) for feed_id in considered]
@@ -489,7 +484,7 @@ def score_day(
         scored_counts[key] = 0
         absent_counts[key] = 0
         for k in _DAYS_AHEAD:
-            # A yardstick has no download (4.1), so it is never in forecasts.
+            # A yardstick has no download, so it is never in forecasts.
             forecast = forecasts.get((feed_id, k))
             download = None if forecast is None else forecast.download
             day_rows: list[tuple[object, ...]] = []
@@ -517,7 +512,7 @@ def score_day(
                     )
                 )
             conn.executemany(_INSERT_DAY_SCORE_SQL, day_rows)
-            # 6.8: a forecast counts once per day ahead, scored when any
+            # A forecast counts once per day ahead, scored when any
             # variable scored on D has a pair, absent with no download (no
             # pair, for a yardstick); a variable not scored on D counts
             # neither way, and a download with no hour paired neither.
@@ -528,7 +523,7 @@ def score_day(
             elif download is None:
                 absent_counts[key] += 1
 
-    # 6.7: the per-close record, one download row per considered feed and
+    # The per-close record, one download row per considered feed and
     # day ahead.
     for feed_id in considered:
         for k in _DAYS_AHEAD:
@@ -561,8 +556,9 @@ def _read_truth(
     conn: sqlite3.Connection, site_id: int, local_date: date
 ) -> dict[str, TruthRow]:
     """D's five truth rows of the site's one time zone generation, by
-    quantity, as P3's ``_truth_version`` reads them; ``ScoreDayInputMissing``
-    when any is missing (or the site has no time zone generation)."""
+    quantity, as the close chain's ``_truth_version`` reads them;
+    ``ScoreDayInputMissing`` when any is missing (or the site has no time
+    zone generation)."""
     generation_id = site_generation_id(conn, site_id)
     rows: dict[str, TruthRow] = {}
     if generation_id is not None:
@@ -590,8 +586,8 @@ def _read_truth(
 
 
 def _delete_earlier_history(conn: sqlite3.Connection, record: DayRecord) -> None:
-    """Remove an earlier attempt's ``forecast_history`` rows for D (storage
-    release 3.6): ``_DELETE_FORECAST_HISTORY_SQL`` for every feed, variable
+    """Remove an earlier attempt's ``forecast_history`` rows for D:
+    ``_DELETE_FORECAST_HISTORY_SQL`` for every feed, variable
     and day ahead, so each delete seeks the primary key and none scans."""
     low = isoformat_utc(record.day_start_utc - timedelta(days=1))
     high = isoformat_utc(record.day_end_utc + timedelta(days=1))
@@ -640,7 +636,7 @@ def _reference_sq_error(
     values: Mapping[datetime, _Hour], instant: datetime, lead: int, observed: float
 ) -> float | None:
     """Persistence's squared error at ``lead``: the value at ``instant`` -
-    ``lead`` hours against ``observed``; ``None`` with no such value (6.3)."""
+    ``lead`` hours against ``observed``; ``None`` with no such value."""
     source = values.get(instant - timedelta(hours=lead))
     if source is None:
         return None
@@ -659,8 +655,8 @@ def _real_pairs(
     record: DayRecord,
 ) -> list[_Pair]:
     """A real feed's pairs at day ahead ``k``: each scored hour of a scored
-    variable that D has a value for, one per hour (6.3); ``forecast_scored``
-    holds one row per hour (rain release, Part B, B4)."""
+    variable that D has a value for, one per hour; ``forecast_scored``
+    holds one row per hour."""
     chosen: dict[tuple[str, datetime], StoredSample] = {}
     for sample in forecast.version.values():
         if sample.variable not in variables:
@@ -698,7 +694,7 @@ def _real_pairs(
 def _persistence_pairs(
     variables: frozenset[str], hourly: _Hourly, record: DayRecord
 ) -> list[_Pair]:
-    """Persistence (4.6): for each hour h of D with a value and each lead L
+    """Persistence: for each hour h of D with a value and each lead L
     from 1 to 168, the value at h - L where there is one, at day ahead the
     local-date difference between h - L and h in the record's zone. The
     cells come from the shared definition (``scoring.history``
@@ -736,7 +732,7 @@ def _persistence_pairs(
 
 
 def _mean_pairs(cells: _Cells, active: set[int], hourly: _Hourly) -> list[_Pair]:
-    """The multi-model mean (4.6): at each hour and day ahead, the mean of
+    """The multi-model mean: at each hour and day ahead, the mean of
     the active real feeds' scored forecasts where at least two exist, at
     the smallest of their leads."""
     groups: dict[tuple[str, int, datetime], list[_Pair]] = {}
@@ -782,7 +778,7 @@ def active_real_feeds(conn: sqlite3.Connection, site_id: int) -> set[int]:
     """The real feeds active at the site now (``active_competitor_clause``),
     less the meteoblue package row: the feeds the close scores that are
     switched on. The close's multi-model mean and the publication's rain
-    ranking (C3) read them."""
+    ranking read them."""
     return {
         int(row["id"])
         for row in conn.execute(
@@ -803,8 +799,8 @@ def active_real_feeds(conn: sqlite3.Connection, site_id: int) -> set[int]:
 def _history_values(
     pair: _Pair, *, site_id: int, day_text: str, feed_id: int
 ) -> tuple[object, ...]:
-    """One ``forecast_history`` row in ``_INSERT_HISTORY_SQL`` order
-    (storage release 3.1, 3.3): ``valid_at`` is the observation hour's stored
+    """One ``forecast_history`` row in ``_INSERT_HISTORY_SQL`` order:
+    ``valid_at`` is the observation hour's stored
     text; the mean's ``issued_at`` is ``None`` and its ``contributors`` set."""
     return (
         site_id,
@@ -821,7 +817,7 @@ def _history_values(
 
 
 def _status(*, counted: bool, paired: bool, has_download: bool) -> DayScoreStatus:
-    """A day-score row's status (6.4). A yardstick has no download, so with
+    """A day-score row's status. A yardstick has no download, so with
     no pair it is ``absent``: there was no forecast to score."""
     if not counted:
         return "not_counted"
@@ -850,7 +846,7 @@ def _day_score_values(
     threshold: float | None,
     wind_obs_high: float | None,
 ) -> tuple[object, ...]:
-    """One ``day_scores`` row in ``_INSERT_DAY_SCORE_SQL`` order (6.4): the
+    """One ``day_scores`` row in ``_INSERT_DAY_SCORE_SQL`` order: the
     count and sums of the cell's pairs, as SQL would sum the stored rows."""
     errors = [pair.forecast - pair.observed for pair in pairs]
     rain_threshold = threshold if variable == "precip" else None
@@ -903,7 +899,7 @@ def _record_download_values(
     feed_id: int,
     day_ahead: int,
 ) -> tuple[object, ...]:
-    """One ``close_record_downloads`` row (6.7): NULL download fields for an
+    """One ``close_record_downloads`` row: NULL download fields for an
     absent forecast, so the record says what was missing."""
     if download is None:
         return (site_id, day_text, feed_id, day_ahead, None, None, None, None, None)

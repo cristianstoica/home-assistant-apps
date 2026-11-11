@@ -289,7 +289,7 @@ def test_boot_guard_clears_open_transaction_after_failed_rollback(
 
 
 # ---------------------------------------------------------------------------
-# S5 (0.16.2 plan): table_exists resolves case-insensitively.
+# S5: table_exists resolves case-insensitively.
 # ---------------------------------------------------------------------------
 
 
@@ -342,7 +342,7 @@ def test_sanitize_finds_mixed_case_jobs_and_station_poll_state() -> None:
 
 
 # ---------------------------------------------------------------------------
-# UP1-UP4 (plan §13.10, 0.16.13): release_key_refused_polls.
+# UP1-UP4 (0.16.13): release_key_refused_polls.
 #
 # The minimal `conn` fixture above (only station_id/next_poll_at) has none
 # of the three columns `release_key_refused_polls` requires, so its own

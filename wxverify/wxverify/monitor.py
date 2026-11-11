@@ -95,8 +95,8 @@ def _skipped(cond_id: str, group: str, severity: str) -> Condition:
 def _close_error_condition(exc: Exception) -> Condition:
     """The row a close-alert call's own ``try`` adds for a non-SQLite fault.
 
-    The ``unexpected_error`` shape ``error_verdict`` builds (daily-close plan
-    P5 §5.1); the group's other rows stay in place. Nothing is logged.
+    The ``unexpected_error`` shape ``error_verdict`` builds; the group's other
+    rows stay in place. Nothing is logged.
     """
     return Condition(
         id="unexpected_error",
@@ -132,7 +132,7 @@ _ELIGIBLE_FEED_WHERE = """
 # none of those rows resolves anything.
 # Start-up deletes the rows of every job type dispatch does not run, so no
 # other type is left to classify.
-# The daily close's two kinds are classified apart (daily-close P3 9.6). A
+# The daily close's two kinds are classified apart. A
 # failed day_close stage is left out of the arm: the day's state and attempt
 # record report it, and its scope (close:{site_id}:{local_date}:{stage}) is
 # the same for both attempts, so a later completion says nothing about the
@@ -140,7 +140,7 @@ _ELIGIBLE_FEED_WHERE = """
 # publish:{site_id}:7), is left out too: a failure fail_publication records
 # moves the publication record, whose state reports it, and a stale job's
 # failure has its WARNING line.
-# A feed's two download keys are one scope (daily-close P4 4.4). A round try
+# A feed's two download keys are one scope. A round try
 # (key round:{feed_id}) has max_retries 0, so a try that raises ends failed,
 # while the feed's daytime downloads complete under fetch:{feed_id}; resolved
 # only by a later ok row of its own key, a failed round try would count from
@@ -495,7 +495,7 @@ def _pipeline_conditions(
     )
     problem_jobs_n = failed_scopes_n + inflight_n
 
-    # obs_collection_delayed (D1.3): enabled stations of enabled sites whose
+    # obs_collection_delayed: enabled stations of enabled sites whose
     # current-obs poll is overdue. Reads schedule and job rows only, never the
     # poller heartbeat, so a dead or stalled poller cannot hold it green.
     (
@@ -517,11 +517,10 @@ def _pipeline_conditions(
         _main_liveness_evidence(conn), now
     )
 
-    # station_silent_today (daily-close plan P5 §6.3) and close_alerts
-    # (§5.1). Each call's own `try` keeps a fault in it from dropping the
-    # group's other rows: a sqlite3.Error still reaches the group's `try` in
-    # build_verdict (db_readable), and any other exception becomes one
-    # unexpected_error row in place of that call's rows.
+    # station_silent_today and close_alerts. Each call's own `try` keeps a
+    # fault in it from dropping the group's other rows: a sqlite3.Error still
+    # reaches the group's `try` in build_verdict (db_readable), and any other
+    # exception becomes one unexpected_error row in place of that call's rows.
     silent: CloseAlert | None = None
     close_rows: list[CloseAlert] = []
     close_errors: list[Condition] = []
@@ -559,7 +558,7 @@ def _pipeline_conditions(
         )
 
     def _provider_down_cond(alert: CloseAlert) -> Condition:
-        # Alert 7's own builder (§5.1, §6.6): `_cond` drops `detail` while
+        # Alert 7's own builder: `_cond` drops `detail` while
         # ok, and alert 7's "recovered at" line shows while ok. The start-up
         # grace still applies: during it the row is `_cond`'s grace row.
         if grace_active:
@@ -641,7 +640,7 @@ def _pipeline_conditions(
             )
         )
     # Each close alert as a pipeline row, severity warning, through `_cond`,
-    # so the start-up grace holds for it as for every pipeline row (§5.1);
+    # so the start-up grace holds for it as for every pipeline row;
     # alert 7 through its own builder, which keeps its recovered line.
     conditions.extend(
         _provider_down_cond(alert)
@@ -668,7 +667,7 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
     calls_tripped = 0
     credits_tripped = 0
     # Each tripped source by name; one whose effective cap sits below its
-    # configured limit names both (plan §8.6).
+    # configured limit names both.
     calls_tripped_names: dict[str, str] = {}
     for row in sources:
         source = str(row["source"])
@@ -746,9 +745,9 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
     refused = refused_kinds(conn, now)
     access_detail = _access_refused_detail(refused, now) if refused else ""
     # The daily close's part of the row is appended: the next try and the
-    # days affected (daily-close plan P5 §6.4), read only while a kind is
+    # days affected, read only while a kind is
     # listed, since only then does the row show a detail. The call's own
-    # `try` keeps a fault in it from dropping the group's other rows (§5.1):
+    # `try` keeps a fault in it from dropping the group's other rows:
     # a sqlite3.Error still reaches the group's `try` in build_verdict
     # (db_readable), and any other exception becomes one unexpected_error row
     # and leaves 0.16.13's line as it is.
@@ -921,9 +920,9 @@ def _grace_active(conn: sqlite3.Connection, now: datetime) -> bool:
     return now < started + timedelta(minutes=GRACE_MINUTES)
 
 
-# The pipeline group's skipped list while monitor_pipeline is off (daily-close
-# plan P5 §5.1): the five kept pipeline ids, station_silent_today and
-# close_alerts' seven ids, none of the four retired.
+# The pipeline group's skipped list while monitor_pipeline is off: the five
+# kept pipeline ids, station_silent_today and close_alerts' seven ids, none
+# of the four retired.
 _PIPELINE_SKIPPED: Final[tuple[str, ...]] = (
     "feed_stale",
     "fetch_feed_live",

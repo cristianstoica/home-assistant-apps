@@ -1,6 +1,5 @@
 """Station-add provider failures never leak the key, station id or coords.
 
-Regression suite for #108 (plan: 2026-10-03-station-add-error-leak.md §5).
 Drives the real ``stations.create_station`` route through a real
 ``uvicorn.Server`` (not Starlette's ``TestClient``, which never runs
 uvicorn's own exception-logging path) with ``httpx.AsyncClient`` replaced by
@@ -886,7 +885,7 @@ _URL_RE = re.compile(r'https?://[^\s"]+')
 
 
 def _provider_http_response_count(records: list[logging.LogRecord], host: str) -> int:
-    """Count records whose message holds a URL for ``host`` (plan §5.3)."""
+    """Count records whose message holds a URL for ``host``."""
     count = 0
     for r in records:
         message = r.getMessage()

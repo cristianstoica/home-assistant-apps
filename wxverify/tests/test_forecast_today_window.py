@@ -108,7 +108,7 @@ def _seed_varying(
 ) -> None:
     """Seed N hourly samples with DISTINCT per-hour values.
 
-    Item F requires complete coverage of the target local day for a
+    The extrema rule requires complete coverage of the target local day for a
     temperature cell's daily extrema to be shown at all, so any test that
     needs a real (non-suppressed) high/low needs 24 distinct values, not
     ``_seed_hourly``'s single constant.
@@ -136,7 +136,7 @@ def test_today_high_includes_elapsed_hour_max() -> None:
     only (20.0). Post-fix the window starts at local midnight, so the elapsed
     hour's 30.0 (the real daily max) is included.
 
-    Item F additionally requires COMPLETE coverage of the local day before a
+    The extrema rule additionally requires COMPLETE coverage of the local day before a
     temperature cell's high/low are shown at all (``covers_local_day``), so
     the fixture seeds all 24 hours of 2026-07-20 -- not just the 3 samples
     this test cares about -- to keep the daily extrema un-suppressed."""
@@ -170,7 +170,7 @@ def test_today_high_comes_from_future_hour_when_elapsed_sample_is_not_the_max() 
     full-day fixture's high_c comes from a future hour instead (20.0) --
     proving the prior test is discriminating on the elapsed sample's value,
     not vacuously green. Both fixtures keep all 24 hours of local-day
-    coverage so neither test's high_c is suppressed by Item F's extrema
+    coverage so neither test's high_c is suppressed by the extrema
     eligibility rule."""
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
@@ -260,8 +260,8 @@ def test_partial_badge_stays_set_under_eighteen_hour_coverage() -> None:
 
 def test_freshest_run_wins_for_elapsed_hour_via_build_hourly() -> None:
     conn = _make_db()
-    # Two labels in one hour exist only in a file below v16 (the rain
-    # release, Part B, keeps one row per hour): the pick is a no-op on a
+    # Two labels in one hour exist only in a file below v16 (v16
+    # keeps one row per hour): the pick is a no-op on a
     # v16 file, and the v16 carry-over keeps the row it picks.
     conn.execute("DROP INDEX idx_samples_slot")
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
@@ -313,10 +313,10 @@ def test_window_lower_bound_excludes_yesterday_includes_local_midnight() -> None
     BOTH samples (22:00Z < 12:00Z), so the boundary sample would be missing
     pre-fix too.
 
-    Item F requires complete local-day coverage before a temperature cell's
+    The extrema rule requires complete local-day coverage before a temperature cell's
     high/low are shown at all, so the "excluded sample cannot leak onto any
     tile" check needs the REST of the local day seeded too -- otherwise
-    Item F itself suppresses high_c to None on every tile and the
+    the rule itself suppresses high_c to None on every tile and the
     ``999.0 not in highs`` check passes vacuously over an empty list. The
     fixture seeds all 24 hours of the Berlin local day starting at the
     boundary instant, with the excluded prior-day sample kept genuinely
@@ -527,7 +527,7 @@ def test_only_elapsed_today_samples_render_tiles_not_empty() -> None:
     the view reads `empty=True`. Post-fix the local-midnight window includes
     it, so tiles render (with the elapsed data).
 
-    Item F is orthogonal to this: a single elapsed hour is far short of the
+    The extrema rule is orthogonal to this: a single elapsed hour is far short of the
     complete-local-day coverage ``covers_local_day`` requires, so
     temperature's daily high/low are suppressed to None on this tile --
     that suppression does not make the tile itself empty, which is what

@@ -1,18 +1,16 @@
-"""The scored round's schedule and the fixed daytime downloads (P4 plan 4.4,
-4.5, 5.1).
+"""The scored round's schedule and the fixed daytime downloads.
 
 Each night's round fetches every scheduled feed at the setting
 ``scoring_round_local_time`` with up to three quick retries; each feed's
 daytime downloads follow at fixed local times counted from the round, except
 the meteoblue package's, which use ``METEOBLUE_DAYTIME_LOCAL_TIMES``. Every
 round and slot instant is a local wall time on one day's ``schedule_day``,
-through P1's ``local_clock_utc``.
+through ``local_clock_utc``.
 
 Every function runs in the caller's transaction and never commits, and reads
 the clock only through ``now_utc``. ``worker/scheduler.py`` and
 ``worker/processor.py`` import this module, so it imports neither of them nor
-``worker/close_chain.py`` (plan 16.1); it takes P3's ``RoundState`` from
-``worker/close_p4.py``.
+``worker/close_chain.py``; it takes ``RoundState`` from ``worker/close_p4.py``.
 """
 
 from __future__ import annotations
@@ -40,8 +38,8 @@ from wxverify.worker.close_p4 import RoundState
 
 logger = logging.getLogger(__name__)
 
-#: The round's local start time, ``HH:MM`` (4.4). No stored default: readers
-#: use ``ROUND_DEFAULT_LOCAL_TIME`` when the key is absent (15.4).
+#: The round's local start time, ``HH:MM``. No stored default: readers
+#: use ``ROUND_DEFAULT_LOCAL_TIME`` when the key is absent.
 SCORING_ROUND_LOCAL_TIME_KEY: Final = "scoring_round_local_time"
 ROUND_DEFAULT_LOCAL_TIME: Final = "00:10"
 _ROUND_DEFAULT: Final = (0, 10)  # ROUND_DEFAULT_LOCAL_TIME as (hour, minute)
@@ -49,24 +47,24 @@ _ROUND_DEFAULT: Final = (0, 10)  # ROUND_DEFAULT_LOCAL_TIME as (hour, minute)
 # the evening collection, which ends at 23:59, and early enough that the
 # close's first attempt, which waits for the round's bound, can publish
 # before the 07:00 default snapshot time, the deadline of alert 4,
-# publication_late (4.4).
+# publication_late.
 _ROUND_EARLIEST_MINUTES: Final = 5
 _ROUND_LATEST_MINUTES: Final = 5 * 60
 
-#: Tries 2, 3 and 4, the quick retries, start this long after the round (4.4).
+#: Tries 2, 3 and 4, the quick retries, start this long after the round.
 ROUND_RETRY_OFFSETS: Final = (
     timedelta(minutes=5),
     timedelta(minutes=12),
     timedelta(minutes=20),
 )
-#: A try not claimed by the round's start plus this is not run (4.4, 4.5).
+#: A try not claimed by the round's start plus this is not run.
 ROUND_BOUND: Final = timedelta(minutes=30)
 ROUND_TRIES: Final = 1 + len(ROUND_RETRY_OFFSETS)
 _TRY_OFFSETS: Final = (timedelta(0), *ROUND_RETRY_OFFSETS)
 
 # The daytime download's job keeps the retry cap and failure cooldown of the
-# due-feed loop it replaces (5.1); the cooldown is worker/scheduler.py's
-# _DUE_JOB_FAILURE_COOLDOWN, which this module cannot import (16.1).
+# due-feed loop it replaces; the cooldown is worker/scheduler.py's
+# _DUE_JOB_FAILURE_COOLDOWN, which this module cannot import.
 DAYTIME_MAX_RETRIES: Final = 3
 DAYTIME_FAILURE_COOLDOWN: Final = timedelta(hours=1)
 
@@ -80,14 +78,14 @@ _LOCAL_TIME_RE: Final = re.compile(r"([01]\d|2[0-3]):([0-5]\d)")
 _MINUTES_PER_DAY: Final = 24 * 60
 _ONE_DAY: Final = timedelta(days=1)
 # A round try's row is dated by its end in the day record's zone or in
-# sites.timezone (4.2): within two days of the round date for any two zones,
+# sites.timezone: within two days of the round date for any two zones,
 # so its lookups stay on idx_forecast_downloads_day's (site, feed, date) range.
 _ROUND_ROW_DAYS: Final = timedelta(days=2)
 
 
 @dataclass(frozen=True, slots=True)
 class _ScheduleFeed:
-    """One feed the schedule fetches for a site (4.4, 5.1)."""
+    """One feed the schedule fetches for a site."""
 
     feed_id: int
     interval_minutes: int
@@ -102,7 +100,7 @@ def _as_utc(value: datetime) -> datetime:
 
 
 # ---------------------------------------------------------------------------
-# The setting (4.4)
+# The setting
 # ---------------------------------------------------------------------------
 
 
@@ -118,7 +116,7 @@ def _parse_round_time(value: str) -> tuple[int, int] | None:
 
 
 def set_scoring_round_local_time_sync(conn: sqlite3.Connection, value: str) -> None:
-    """Store the round's local start time (4.4).
+    """Store the round's local start time.
 
     ``value`` is ``HH:MM`` from ``00:05`` to ``05:00``. Raises ``ValueError``,
     storing nothing, for any other value. The change moves the next round;
@@ -132,7 +130,7 @@ def set_scoring_round_local_time_sync(conn: sqlite3.Connection, value: str) -> N
 
 
 def scoring_round_local_time(conn: sqlite3.Connection) -> tuple[int, int]:
-    """The round's local start time as ``(hour, minute)`` (4.4). Read-only.
+    """The round's local start time as ``(hour, minute)``. Read-only.
 
     ``ROUND_DEFAULT_LOCAL_TIME`` when the key is absent, and, with a warning,
     when its stored value does not read or lies outside the range.
@@ -153,7 +151,7 @@ def scoring_round_local_time(conn: sqlite3.Connection) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# The day every instant is taken from (4.4)
+# The day every instant is taken from
 # ---------------------------------------------------------------------------
 
 
@@ -176,7 +174,7 @@ def _latest_record(conn: sqlite3.Connection, site_id: int) -> DayRecord | None:
 def schedule_day(
     conn: sqlite3.Connection, *, site_id: int, local_date: date
 ) -> DayRecord:
-    """The day every round and daytime instant of ``local_date`` is taken from (4.4).
+    """The day every round and daytime instant of ``local_date`` is taken from.
 
     Read-only; makes no record. The date's record when it exists; else, when
     the site's latest record L is dated before it, L with the date and
@@ -223,7 +221,7 @@ def _tick_day(
     conn: sqlite3.Connection, site_id: int, now: datetime
 ) -> DayRecord | None:
     """The ``schedule_day`` that holds ``now``, among now's UTC date and the
-    dates either side (every zone lies within a day of UTC) (4.4, 5.1)."""
+    dates either side (every zone lies within a day of UTC)."""
     today = now.date()
     for offset in (-1, 0, 1):
         day = schedule_day(conn, site_id=site_id, local_date=today + offset * _ONE_DAY)
@@ -233,7 +231,7 @@ def _tick_day(
 
 
 def _round_start_utc(conn: sqlite3.Connection, day: DayRecord) -> datetime | None:
-    """The round's start on ``day``, or None on a day with no round (4.4).
+    """The round's start on ``day``, or None on a day with no round.
 
     The setting's local time by ``local_clock_utc`` on a copy of ``day``
     bounded by the zone's whole local day, which holds every time in the
@@ -254,7 +252,7 @@ def _round_start_utc(conn: sqlite3.Connection, day: DayRecord) -> datetime | Non
 
 
 # ---------------------------------------------------------------------------
-# Who is fetched, and what the record holds (4.4, 5.1)
+# Who is fetched, and what the record holds
 # ---------------------------------------------------------------------------
 
 
@@ -315,8 +313,7 @@ def _round_progress(
     conn: sqlite3.Connection, site_id: int, feed_id: int, round_date: date
 ) -> tuple[int, bool]:
     """The feed's last recorded try of the round, and whether a try ended it:
-    ``stored``, ``budget``, ``ineligible``, ``unavailable`` or ``refused``
-    (4.4)."""
+    ``stored``, ``budget``, ``ineligible``, ``unavailable`` or ``refused``."""
     low, high = _round_row_dates(round_date)
     row = conn.execute(
         """
@@ -339,7 +336,7 @@ def _round_progress(
 def _round_retries(
     conn: sqlite3.Connection, site_id: int, feed_id: int, round_date: date
 ) -> int:
-    """How many quick retries (tries 2 to 4) the feed's round made (4.4)."""
+    """How many quick retries (tries 2 to 4) the feed's round made."""
     low, high = _round_row_dates(round_date)
     row = conn.execute(
         """
@@ -355,14 +352,14 @@ def _round_retries(
 
 
 # ---------------------------------------------------------------------------
-# The round (4.4, 4.5)
+# The round
 # ---------------------------------------------------------------------------
 
 
 def round_state(
     conn: sqlite3.Connection, *, site_id: int, round_date: date
 ) -> RoundState:
-    """Whether the round of ``round_date`` has settled, and its bound (4.5).
+    """Whether the round of ``round_date`` has settled, and its bound.
 
     Read-only. ``bound_utc`` is the round's start, the setting's local time
     on ``schedule_day``, plus ``ROUND_BOUND``: it exists for any date, a
@@ -372,7 +369,7 @@ def round_state(
     try 4 recorded.
     A feed with no try, or with a further try still due, is not settled.
     On a day with no round (``schedule_day`` excludes the setting's local
-    time, 4.4) ``settled`` is True and ``bound_utc`` the day's
+    time) ``settled`` is True and ``bound_utc`` the day's
     ``day_start_utc``: there is nothing to wait for.
     """
     day = schedule_day(conn, site_id=site_id, local_date=round_date)
@@ -397,11 +394,11 @@ def round_try_stale(
     round_date: date,
     now_utc: datetime,
 ) -> bool:
-    """Whether a round try of ``round_date`` must end before any call (4.4).
+    """Whether a round try of ``round_date`` must end before any call.
 
     True when ``now_utc`` is at or after the round's bound (``round_state``'s
     ``bound_utc``), or the feed already has a ``stored`` round row for the
-    date, and always on a day with no round (4.4). Read-only. The caller
+    date, and always on a day with no round. Read-only. The caller
     cancels such a try with no call and no row, which also stops a try put
     back to pending after a restart.
     """
@@ -424,7 +421,7 @@ def round_try_stale(
 
 
 def enqueue_due_round_tries(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
-    """Enqueue each feed's due round try, from the record of its earlier tries (4.4).
+    """Enqueue each feed's due round try, from the record of its earlier tries.
 
     Per enabled site, the round of the date whose ``schedule_day`` holds
     ``now_utc``, from its start until its bound. Try 1 is due at the start;
@@ -432,7 +429,7 @@ def enqueue_due_round_tries(conn: sqlite3.Connection, *, now_utc: datetime) -> N
     round. Each try is one ``fetch_feed`` job keyed ``round:{feed_id}``
     with ``max_retries`` 0; an enqueue that meets a live try of the feed
     creates nothing. A site whose zone does not load is skipped this tick; a
-    day with no round (4.4) is skipped with no warning.
+    day with no round is skipped with no warning.
     """
     now = _as_utc(now_utc)
     for site_id in _enabled_site_ids(conn):
@@ -482,7 +479,7 @@ def enqueue_due_round_tries(conn: sqlite3.Connection, *, now_utc: datetime) -> N
 
 
 # ---------------------------------------------------------------------------
-# Daytime downloads (5.1)
+# Daytime downloads
 # ---------------------------------------------------------------------------
 
 
@@ -547,7 +544,7 @@ def _slot_covered(
 def enqueue_due_daytime_downloads(
     conn: sqlite3.Connection, *, now_utc: datetime
 ) -> None:
-    """Enqueue each feed's latest due daytime slot (5.1).
+    """Enqueue each feed's latest due daytime slot.
 
     Per enabled site, the slots of the date whose ``schedule_day`` holds
     ``now_utc``: the meteoblue package's set times, every other feed's times
@@ -556,7 +553,7 @@ def enqueue_due_daytime_downloads(
     ``unscheduled`` try of the feed on the date started at or after it. Only
     the latest due slot is fetched, so
     earlier missed slots are skipped. meteoblue's package loses one slot per
-    round retry of the date, latest first (4.4). The job is ``fetch_feed``
+    round retry of the date, latest first. The job is ``fetch_feed``
     keyed ``fetch:{feed_id}``, with the due-feed loop's retry cap and failure
     cooldown. A site whose zone does not load is skipped this tick.
     """

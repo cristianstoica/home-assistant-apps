@@ -1858,8 +1858,8 @@ def test_options_boot_apply_bad_options_and_packaging_files(
 
     # wxverify is wired into monorepo CI in the bundled de-nest PR.
     # builder.yaml MONITORED_FILES includes wxverify, pyproject.toml, and uv.lock;
-    # checks.yaml carries the wxverify-gates job (card 20 moved it out of
-    # lint.yaml, which now only calls checks.yaml on the nightly schedule).
+    # checks.yaml carries the wxverify-gates job (lint.yaml only calls
+    # checks.yaml on the nightly schedule).
     workflow_dir = repo.parent / ".github" / "workflows"
     builder = (workflow_dir / "builder.yaml").read_text(encoding="utf-8")
     checks = (workflow_dir / "checks.yaml").read_text(encoding="utf-8")
@@ -1966,7 +1966,7 @@ def test_health_backoffs_survives_unreadable_stored_count(
 def test_worker_status_pins_api_prefix_empty_queue_and_null_pair_score(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Worker-status regression pins (S03):
+    """Worker-status regression pins:
     - /worker/status (no /api prefix) → 404
     - empty jobs table → {"jobs": {}} (keys absent, not 0)
     - no active publication → last_completed_pair_and_score_at is null
@@ -1987,7 +1987,7 @@ def test_worker_status_pins_api_prefix_empty_queue_and_null_pair_score(
 def test_csrf_garbage_token_rejects(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """CSRF negative triple item (2): wrong/garbage token → 403 (T06).
+    """CSRF negative triple item (2): wrong/garbage token → 403.
 
     Items (1) no header and (3) correct token are already pinned in
     test_api_guard_and_routes. This test closes the gap for item (2).

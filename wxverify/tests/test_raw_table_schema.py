@@ -1,8 +1,7 @@
-"""The widened ``station_wind_records`` schema (plan 2026-10-21-daily-
-close-download-and-raw-store.md, section 11, test IDs SC3-SC4): its live
-CHECK/key constraints and the site-delete cascade. SC1 and SC2, which
-pinned the now-deleted migration that used to build this shape onto an
-older file, are retired (see the note below).
+"""The widened ``station_wind_records`` schema (test IDs SC3-SC4): its live
+CHECK/key constraints and the site-delete cascade. The tests that pinned
+the now-deleted migration that used to build this shape onto an older
+file are retired (see the note below).
 
 Real SQLite and real migrations throughout; nothing in the code under test
 is mocked. Synthetic data only: station id ``ISTATION01``, site name
@@ -64,13 +63,13 @@ def _make_station(conn: sqlite3.Connection, pws_station_id: str = "ISTATION01") 
 
 
 def test_sc3_checks_and_key_reject_every_bad_row() -> None:
-    """SC3 (14.11): each CHECK and the PRIMARY KEY refuses its bad row with
+    """SC3: each CHECK and the PRIMARY KEY refuses its bad row with
     ``sqlite3.IntegrityError``.
 
     This used to also run against a version-11 file rebuilt through
     ``run_migrations`` (the version-12 migration's own copy of the CREATE
     statement) -- that comparison is retired with ``migrate_v12_widen_raw_
-    readings`` (see the SC1/SC2 note above): there is now only the one
+    readings`` (see the note above): there is now only the one
     ``create_tables`` definition of this table left to check.
 
     M68 -> at the rain-``CHECK`` insert below: correct = raises
@@ -150,7 +149,7 @@ def _init_tmp_db(tmp_path: Path) -> sqlite3.Connection:
 def test_sc4_site_delete_route_cascades_to_station_wind_records(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """SC4 (14.11): deleting a site through the route removes its stations'
+    """SC4: deleting a site through the route removes its stations'
     raw readings via the ``stations(id)`` cascade.
 
     M69 -> at the ``remaining`` assertion: correct = [] (``ON DELETE

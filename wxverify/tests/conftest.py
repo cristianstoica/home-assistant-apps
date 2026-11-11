@@ -18,7 +18,7 @@ that ``tests/test_network_guard.py`` can import the same objects this fixture
 uses (this file is imported as a top-level ``conftest`` module and must not
 be imported by tests).
 
-``idle_current_obs_poller`` (plan §6.3.6) patches the real current-obs lane
+``idle_current_obs_poller`` patches the real current-obs lane
 out of ``run_worker`` for tests that drive it directly against a fake
 ``db`` (a ``_FakeDb`` with no real ``jobs``/``station_poll_state`` schema
 behind it). Without it, the second lane created inside ``run_worker`` would
@@ -42,8 +42,7 @@ and its known limits are in the fixture's own docstring.
 separate pytest subprocess, so the CLI's ``basicConfig(force=True)`` fires
 in a fresh session instead of against this session's own root handlers.
 
-``_check_day_close_records`` (autouse; plan 2026-10-20-daily-close-day-
-state-and-guard.md §13.1) calls ``tests.helpers.check_day_close_records``
+``_check_day_close_records`` (autouse) calls ``tests.helpers.check_day_close_records``
 after every test. With no connection registered by
 ``tests.helpers.day_close_site`` it does nothing, so the existing suite is
 untouched; a daily-close test that forgets ``note_day_clock`` for a later
@@ -190,7 +189,7 @@ def restore_logging_state() -> Iterator[None]:
 
 
 async def _idle_poller(db: object, *, run_job: Callable[..., Awaitable[None]]) -> None:
-    """A current-obs lane that never claims anything (plan §6.3.6)."""
+    """A current-obs lane that never claims anything."""
     await asyncio.Event().wait()
 
 

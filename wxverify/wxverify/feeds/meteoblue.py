@@ -26,7 +26,7 @@ VARIABLE_MAP: Final[dict[str, tuple[str, str]]] = {
     "temperature": ("temperature", "C"),
     "wind": ("windspeed", "km/h"),
     "precip": ("precipitation", "mm"),
-    # Display only (card 7), from the same multimodel-1h reply; it has no
+    # Display only, from the same multimodel-1h reply; it has no
     # gust key, so meteoblue gives no gust.
     "cloud_cover": ("cloudcover", "%"),
     "wind_direction": ("winddirection", "degree"),
@@ -51,7 +51,7 @@ def _empty_matrix() -> list[list[float | None]]:
 
 
 def _display_matrix(value: object) -> list[list[float | None]]:
-    """A display matrix (card 7), read so it never rejects the reply: a
+    """A display matrix, read so it never rejects the reply: a
     matrix that is not a list is empty, a row that is not a list is empty,
     and each entry ``float()`` cannot read is ``None``."""
     if not isinstance(value, list):

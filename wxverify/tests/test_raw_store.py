@@ -1,17 +1,11 @@
-"""Tests: storage, commit 4 of P2 of the daily close (plan 2026-10-21-daily-
-close-download-and-raw-store.md, section 14.5, RS1-RS7).
+"""Tests: raw-reading storage for the daily close, RS1-RS8.
 
 Covers ``wxverify.db.station_readings.store_readings`` writing the widened
-``station_wind_records`` table through P1's closed-day guard (section 6),
-the lane's today row (RS1, RS2, RS6) and the current-conditions poll's
+``station_wind_records`` table through the closed-day guard,
+the lane's today row (RS1, RS2) and the current-conditions poll's
 storage (RS5, RS7). Every station id below is synthetic (public repo):
 ``ISTATION01`` to ``ISTATION06``, standing for A to F; the weather.com key
 is the CI placeholder; zones are ``UTC`` only.
-
-No production code for P2 exists yet, so every test here fails at
-collection with an ``ImportError`` naming a P2 module
-(``wxverify.db.station_readings`` or ``wxverify.obs.hourly_values``), not
-for an unrelated reason.
 """
 
 from __future__ import annotations
@@ -59,8 +53,8 @@ _API_KEY = "0123456789abcdef0123456789abcdef"
 def _make_plain_site(
     conn: sqlite3.Connection, *, pws_id: str, today: date
 ) -> tuple[int, int]:
-    """One enabled site and one enabled station, with a P1 record covering
-    ``today`` -- the daily close is always on, so P1's guard needs a real
+    """One enabled site and one enabled station, with a day record covering
+    ``today`` -- the daily close is always on, so the closed-day guard needs a real
     record holding an instant before it accepts a ``READING``/``HOURLY``
     write of that instant."""
     cur = conn.execute(
@@ -148,7 +142,7 @@ def _five_minute_response(
 def test_rs1_full_five_minute_reply_stores_every_quantity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Plan 14.5 RS1: every reading of a full 5-minute reply is stored with
+    """RS1: every reading of a full 5-minute reply is stored with
     source ``five_minute``, its three values and local date, ``fetched_at``
     NOW -- not wind alone, as today's lane-only store does."""
     from tests.helpers import NOW, D, day_close_site
@@ -201,7 +195,7 @@ def test_rs1_full_five_minute_reply_stores_every_quantity(
 def test_rs2_later_download_replaces_only_what_it_carries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Plan 14.5 RS2: a later download of the same instant replaces the
+    """RS2: a later download of the same instant replaces the
     value it changed and keeps the one it is missing; ``fetched_at``
     moves; the row is never duplicated."""
     from tests.helpers import NOW, D, day_close_site
@@ -274,7 +268,7 @@ def test_rs2_later_download_replaces_only_what_it_carries(
 
 
 def test_rs3_one_instant_from_two_sources_gives_two_rows() -> None:
-    """Plan 14.5 RS3: a current-conditions reading of the same instant as a
+    """RS3: a current-conditions reading of the same instant as a
     5-minute reading lands as two rows, one per source, never one
     overwriting the other."""
     conn = sqlite3.connect(":memory:")
@@ -345,8 +339,8 @@ def test_rs3_one_instant_from_two_sources_gives_two_rows() -> None:
 def test_rs4_guard_refuses_a_closed_days_readings(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Plan 14.5 RS4: a reading of a closed day is dropped and counted, one
-    log line from P1's guard; a reading of an open day beside it is
+    """RS4: a reading of a closed day is dropped and counted, one
+    log line from the closed-day guard; a reading of an open day beside it is
     stored."""
     from tests.helpers import NOW, D, day_close_site
 
@@ -401,14 +395,14 @@ def test_rs4_guard_refuses_a_closed_days_readings(
     }
     assert stored == {isoformat_utc(open_instant)}, (
         "mutant -> at this assertion: correct = {the open instant only}"
-        " (P1's guard refuses the closed day's reading), mutant"
-        " (store_readings skips P1's guard) = both instants stored"
+        " (the closed-day guard refuses the closed day's reading), mutant"
+        " (store_readings skips the guard) = both instants stored"
     )
     assert result.refused == 1
     assert result.kept == 1
 
     declined = [r for r in caplog.records if "declined" in r.getMessage()]
-    assert len(declined) == 1, "one log line from P1's guard, not one per row"
+    assert len(declined) == 1, "one log line from the closed-day guard, not one per row"
     assert "kind=reading" in declined[0].getMessage()
     assert "count=1" in declined[0].getMessage()
 
@@ -421,7 +415,7 @@ def test_rs4_guard_refuses_a_closed_days_readings(
 def test_rs5_poll_dedup_and_offline_poll_stores_no_raw_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Plan 14.5 RS5: an online poll stores one ``current_obs`` row; an
+    """RS5: an online poll stores one ``current_obs`` row; an
     offline poll (204) stores none; a poll repeating the last reading is
     still one row."""
     conn = sqlite3.connect(":memory:")
@@ -480,7 +474,7 @@ def test_rs5_poll_dedup_and_offline_poll_stores_no_raw_row(
         "a poll repeating the last obsTimeUtc is the same reading, never a second row"
     )
 
-    # Plan 14.5 RS5's fourth case: a station disabled before the poll is
+    # RS5's fourth case: a station disabled before the poll is
     # saved. Paired with the same save after re-enabling the station, so the
     # suppression cannot pass vacuously (the positive would fail if the
     # disabled-station check misfired and always suppressed the row).
@@ -524,14 +518,14 @@ def test_rs5_poll_dedup_and_offline_poll_stores_no_raw_row(
 
 
 # =============================================================================
-# RS7 -- the poll's values pass 5.2's per-value check before the insert: M80.
+# RS7 -- the poll's values pass the per-value check before the insert: M80.
 # =============================================================================
 
 
 def test_rs7_poll_values_pass_the_per_value_check_before_the_raw_insert(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Plan 14.5 RS7: every poll's own write (poll state, the
+    """RS7: every poll's own write (poll state, the
     ``station_current_obs`` snapshot, ``next_poll_at``, the hold clear)
     lands regardless of the raw store; an all-null reply stores no raw row;
     an invalid-value reply stores one row with only the valid value."""
@@ -607,7 +601,7 @@ def test_rs7_poll_values_pass_the_per_value_check_before_the_raw_insert(
     except sqlite3.IntegrityError as exc:
         raised = str(exc)
     assert raised is None, (
-        "mutant -> at this assertion: correct = None (5.2's per-value check"
+        "mutant -> at this assertion: correct = None (the per-value check"
         " drops the invalid precip_total_mm (-1.0) and speed_kmh (nan)"
         " before the insert, so the row's CHECK never sees them), mutant"
         " (the poll's storage skips the per-value check, so the invalid"
@@ -668,7 +662,7 @@ def test_rs7_poll_values_pass_the_per_value_check_before_the_raw_insert(
     assert third_row is not None
     assert third_row["temp_c"] == 12.5
     assert third_row["speed_kmh"] is None, (
-        "mutant -> at this assertion: correct = None (5.2's per-value check"
+        "mutant -> at this assertion: correct = None (the per-value check"
         " rejects a bool as a wind value, the way it rejects one for"
         " temperature and rain, so a JSON true windSpeed is stored NULL),"
         " mutant (the raw values are taken from _number's output, which"
@@ -678,8 +672,8 @@ def test_rs7_poll_values_pass_the_per_value_check_before_the_raw_insert(
 
 # =============================================================================
 # RS8 -- today's row at a DST-shifted day boundary, where the old 24-hour
-# _STORE_MARGIN and the new yesterday-start/today-end bounds (plan 4.1 item
-# 1) disagree, and the future cap (plan 4.1) still applies to today's row.
+# _STORE_MARGIN and the new yesterday-start/today-end bounds disagree, and
+# the future cap still applies to today's row.
 # =============================================================================
 
 
@@ -722,8 +716,8 @@ def test_rs8_todays_row_keeps_only_yesterday_and_todays_bounds(
     earlier_before_today_start: timedelta,
     earlier_stored: bool,
 ) -> None:
-    """Plan 14.5 RS8: today's row in an ``America/New_York`` site on the
-    day after a clock change, so yesterday is not 24 hours long (plan 5.8).
+    """RS8: today's row in an ``America/New_York`` site on the
+    day after a clock change, so yesterday is not 24 hours long.
 
     Autumn (today 2024-11-04, yesterday 25 h): a reading 30 minutes after
     yesterday's start -- 24.5 h before today's start -- lies inside
@@ -756,7 +750,7 @@ def test_rs8_todays_row_keeps_only_yesterday_and_todays_bounds(
         0,
         tzinfo=ZoneInfo(timezone),
     ).astimezone(UTC)
-    # The lane needs P1 records (the daily close is always on): start one
+    # The lane needs day records (the daily close is always on): start one
     # two local days before `local_today` (so the earlier reading's own
     # bounds check has a real, open record to land in or outside of,
     # exactly as this test's subject needs) and fill forward to today's.
@@ -855,8 +849,7 @@ def test_rs8_todays_row_keeps_only_yesterday_and_todays_bounds(
 
 
 # =============================================================================
-# BT5 -- the 5-minute download ends a current-conditions poll pause (plan
-# 2026-11-07-health-release.md §2, Part B4).
+# BT5 -- the 5-minute download ends a current-conditions poll pause.
 # =============================================================================
 
 
@@ -895,7 +888,7 @@ def _clear_poll_pause_and_raw_rows(conn: sqlite3.Connection, station_id: int) ->
 def test_bt5_fresh_five_minute_reading_ends_the_pause(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Plan §2 BT5 (first case): station B seeded at (3, 'not_found'),
+    """BT5 (first case): station B seeded at (3, 'not_found'),
     ``next_poll_at`` 8 h ahead. A reply with a reading 10 min old ends the
     pause: count 0, reason NULL, ``next_poll_at`` equal to the frozen now.
     Catches: the call not wired into ``_persist_day`` -- a unit-only test
@@ -932,7 +925,7 @@ def test_bt5_fresh_five_minute_reading_ends_the_pause(
 def test_bt5_stale_five_minute_reading_does_not_end_the_pause(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Plan §2 BT5 (second case): a reply whose readings are all more than
+    """BT5 (second case): a reply whose readings are all more than
     60 minutes old leaves a paused station's poll-state row unchanged."""
     from tests.helpers import NOW, day_close_site
 
@@ -972,8 +965,8 @@ def test_bt5_end_poll_pause_on_fresh_reading_direct_calls(
     returns ``False`` and writes nothing; at count 2, a ``five_minute``
     row exactly 60 min old ends the pause, as does one exactly 60 min
     ahead (a separate case), while one 60 min 1 s old or ahead ends
-    nothing. Catches: the hourly source counted (the TODO keeps scoring
-    input out); a healthy station's poll pulled forward (the count guard
+    nothing. Catches: the hourly source counted (scoring input is kept
+    out); a healthy station's poll pulled forward (the count guard
     dropped, reached only with a fresh row present); the 1 s left off the
     excluded end (the row exactly 60 min ahead missed)."""
     from tests.helpers import NOW, day_close_site

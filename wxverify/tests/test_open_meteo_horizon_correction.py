@@ -166,12 +166,12 @@ def test_marker_present_blocks_recorrection_of_a_reset_row() -> None:
 def test_open_meteo_model_set_and_hours_match_cadence_map_and_feed_seeds() -> None:
     """The key set of ``OPEN_METEO_MAX_LEAD_HOURS`` equals the key set of
     ``feeds.open_meteo.RUN_CADENCE_HOURS`` AND the key set of
-    ``OPEN_METEO_FETCH_INTERVAL_MINUTES`` (Item E's fetch-interval table),
+    ``OPEN_METEO_FETCH_INTERVAL_MINUTES`` (the fetch-interval table),
     and all three equal the set of Open-Meteo models ``FEED_SEEDS`` builds --
-    the seven original models plus ``icon_eu`` (Item D1), eight in all.
-    Updated by Item E (E-T9) to cover the third, independently authored
-    mapping rather than duplicating this test -- adding a model to one of
-    the three without the other two now fails here. The expected hours are
+    the seven original models plus ``icon_eu``, eight in all. It covers the
+    third, independently authored mapping here rather than in a duplicate
+    test -- adding a model to one of the three without the other two fails
+    here. The expected hours are
     pinned as literals here, not read back from ``OPEN_METEO_MAX_LEAD_HOURS``
     -- ``FEED_SEEDS`` derives from that mapping, so comparing the two would
     be self-confirming.

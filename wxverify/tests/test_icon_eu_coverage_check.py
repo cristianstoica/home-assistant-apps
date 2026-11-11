@@ -1,4 +1,4 @@
-"""Item D1 -- ``scripts/icon_eu_coverage_check.py`` (plan §8.3/§4.7).
+"""``scripts/icon_eu_coverage_check.py``.
 
 The owner-run pre-release coverage check. Pure helpers are driven directly;
 ``main()`` is driven end to end through a ``MockTransport`` (never real
@@ -49,7 +49,7 @@ from wxverify.feeds.seam import ForecastRequest
 from wxverify.worker.feed_fetch import DownloadSlot, fetch_feed_once
 
 # ---------------------------------------------------------------------------
-# Synthetic fixture coordinates (plan §8.3: in-box, open North Atlantic,
+# Synthetic fixture coordinates (in-box, open North Atlantic,
 # distinctive six-decimal tails; a Southern Ocean FAIL pair with its own
 # distinctive tails).
 # ---------------------------------------------------------------------------
@@ -111,7 +111,7 @@ def test_in_side_window_table(hour: int, minute: int, expected: bool) -> None:
 
 
 def test_in_side_window_naive_matches_aware_under_a_non_utc_system_zone() -> None:
-    # Plan §8.3: a naive `now` must be read as UTC, not local time. Under a
+    # A naive `now` must be read as UTC, not local time. Under a
     # UTC CI system zone this would pass even with that bug, so the system
     # zone is forced away from UTC first (precedent test_daily_truth_discovery
     # .py:314-325).
@@ -200,8 +200,8 @@ def test_verdict_r1_bad_shape_wins_over_everything_else() -> None:
 def test_verdict_r4_wrong_times_checked_before_r2_too_few_steps() -> None:
     # Both defects present: the fixture as written gives steps far below the
     # 120-step floor AND a first_time that does not match fetch_hour. The
-    # function must report "wrong times" (R4), not "too few steps" (R2),
-    # proving R4 is checked first.
+    # function must report "wrong times", not "too few steps", proving the
+    # times are checked before the step count.
     bad = _summary(steps=5, first_time=datetime(2026, 6, 2, 9, tzinfo=UTC))
     assert verdict(None, bad, datetime(2026, 6, 2, 6, tzinfo=UTC)) == (
         Verdict.FAIL,
@@ -258,7 +258,7 @@ def test_verdict_r3b_gap_inside_data_checked_after_too_few_values() -> None:
 
 
 def test_verdict_r3_order_count_checked_before_gap_across_names() -> None:
-    # R3 must check EVERY name's count before checking any name's gap. With
+    # The verdict must check EVERY name's count before checking any name's gap. With
     # 120 steps: temperature_2m has one interior null and 119 non-null (count
     # passes, 119 >= 96); precipitation has 25 trailing nulls, 95 non-null, no
     # interior null (count fails, 95 < 96). A mutant that interleaves count
@@ -370,8 +370,8 @@ def test_verdict_r4_an_unparseable_entry_fails_wrong_times() -> None:
 
 
 def test_verdict_r4_three_hourly_axis_fails_wrong_times_not_too_few_steps() -> None:
-    # 40 steps at a 3-hourly cadence: far below the 120-step floor (R2), but
-    # R4 (not 1h steps) must be checked -- and fail -- first.
+    # 40 steps at a 3-hourly cadence: far below the 120-step floor, but the
+    # times check (not 1h steps) must run -- and fail -- first.
     fetch_hour = datetime(2026, 6, 2, 6, tzinfo=UTC)
     times = [(fetch_hour + timedelta(hours=3 * i)).isoformat() for i in range(40)]
     body: dict[str, object] = {
@@ -400,7 +400,7 @@ def test_exit_code_worst_of(verdicts: list[Verdict], expected: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Import allowlist (§4.7): stdlib + httpx + exactly five wxverify modules.
+# Import allowlist: stdlib + httpx + exactly five wxverify modules.
 # ---------------------------------------------------------------------------
 
 _ALLOWED_WXVERIFY_MODULES = {
@@ -435,11 +435,11 @@ def test_import_allowlist_static() -> None:
     assert other_top_level <= (set(sys.stdlib_module_names) | {"httpx"})
 
 
-#: §4.7's complete transitive closure: the five allowed modules plus
+#: The complete transitive closure: the five allowed modules plus
 #: everything they are documented to pull in. A baseline-subtraction oracle
 #: (pre-importing the five allowed modules, then diffing sys.modules before
 #: and after the script import) cannot see a module one of THOSE modules
-#: itself transitively loads -- exactly what this plan line pins. This is a
+#: itself transitively loads -- exactly what this check pins. This is a
 #: subset check instead: only the script is imported, and everything it
 #: brings into sys.modules must fall inside this literal list.
 _ALLOWED_TRANSITIVE_MODULES = {
@@ -495,7 +495,7 @@ def test_import_allowlist_runtime(tmp_path: Path) -> None:
     )
     loaded = set(ast_module.literal_eval(result.stdout.strip()))
     # Everything the script's import brings into sys.modules must be inside
-    # the §4.7 transitive closure -- this sees a module pulled in through
+    # the transitive closure above -- this sees a module pulled in through
     # one of the ALLOWED modules too, unlike a baseline-subtraction diff.
     assert loaded <= _ALLOWED_TRANSITIVE_MODULES
     for module in loaded:
@@ -633,7 +633,7 @@ def _assert_allowed_output(text: str) -> None:
         assert any(template.fullmatch(line) for template in _OUTPUT_TEMPLATES), line
 
 
-#: Two additional finite margin-band coordinates (R2): a latitude margin
+#: Two additional finite margin-band coordinates: a latitude margin
 #: with a normal longitude, and longitude margins on both the east and west
 #: edges of the PASS box, each paired with an in-box latitude.
 _MARGIN_LAT_1 = 30.071482
@@ -883,7 +883,7 @@ def test_main_applicability_cant_tell_margin_band_sends_no_request(
     lat: float,
     lon: float,
 ) -> None:
-    """A *finite* margin-band site (R2): unlike ``inf``/``"not-a-number"``,
+    """A *finite* margin-band site: unlike ``inf``/``"not-a-number"``,
     these values pass the script's second (``_finite_number``) guard, so
     only the applicability guard itself can be stopping the request.
     """
@@ -1109,7 +1109,7 @@ def test_main_forward_connect_error_is_cant_tell_network(
 
 
 # ---------------------------------------------------------------------------
-# KeyboardInterrupt (plan §8.3 "Mechanics (load-bearing)"): the interrupting
+# KeyboardInterrupt: the interrupting
 # MockTransport handler is ASYNC and does signal.raise_signal(SIGINT) then
 # await asyncio.sleep(0) -- a race turned into a deterministic rendezvous
 # with the real asyncio signal-delivery mechanism, never a bare

@@ -1,16 +1,15 @@
-"""P4's three call points in the daily close (plan 14.1).
+"""The daily close's three call points into the scored round and publication.
 
-The close calls the scored round and publication plan (P4) only through
-these names, always through this module, so P4 binds them here. Each is a
-one-line call into its P4 body, imported inside the function at call time
-(P4 plan 16.1): this module's own imports stay ``db.*``, so loading it loads
-no P4 module, and P4's modules import ``RoundState`` and ``ScoreSummary``
-from here without a cycle. The names stay module attributes, so a test can
-patch them.
+The close calls the scored round and the publication only through these
+names, always through this module, so their bodies are bound here. Each is
+a one-line call into its body, imported inside the function at call time:
+this module's own imports stay ``db.*``, so loading it loads none of those
+modules, and they import ``RoundState`` and ``ScoreSummary`` from here
+without a cycle. The names stay module attributes, so a test can patch them.
 
-Inside every call point P4 changes no day state, enqueues no job, reads a
-day's scores and record only once the day is ``closed``, and never fetches
-station readings (plan 14.1).
+Inside every call point the body changes no day state, enqueues no job,
+reads a day's scores and record only once the day is ``closed``, and never
+fetches station readings.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ from wxverify.db.site_days import DayRecord
 
 @dataclass(frozen=True, slots=True)
 class RoundState:
-    """Stage 1's answer for one round date (plan 2.3, 14.1).
+    """Stage 1's answer for one round date.
 
     ``settled`` is whether every feed of the round has succeeded or reached
     its limit; ``bound_utc`` is the round's scheduled start plus 30 minutes,
@@ -50,7 +49,7 @@ def round_state(
     """Whether the round of ``round_date`` has settled, and its bound (stage 1).
 
     Read-only. The bound exists for every round date, a round that never
-    ran included (plan 5.2). Body: ``worker/round.py`` ``round_state``.
+    ran included. Body: ``worker/round.py`` ``round_state``.
     """
     from wxverify.worker.round import round_state as body
 
@@ -67,10 +66,10 @@ def score_day(
 ) -> ScoreSummary:
     """Score one ``closing`` day and store its scores and close record (stage 5).
 
-    Writes through P1's guard in the caller's transaction, replacing any
-    rows of an earlier attempt. An exception, or a guard refusal of its
-    writes, fails the attempt (plan 5.3). Body: ``scoring/close_scores.py``
-    ``score_day``.
+    Writes through the closed-day guard in the caller's transaction,
+    replacing any rows of an earlier attempt. An exception, or a guard
+    refusal of its writes, fails the attempt. Body:
+    ``scoring/close_scores.py`` ``score_day``.
     """
     from wxverify.scoring.close_scores import score_day as body
 

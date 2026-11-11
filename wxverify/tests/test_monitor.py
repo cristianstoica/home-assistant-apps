@@ -216,7 +216,7 @@ def test_monitor_endpoint_non_sqlite3_error_is_critical_via_outer_guard(
         def _boom_value(conn: sqlite3.Connection, now: object, **_: object) -> object:
             raise ValueError("not a sqlite3 error")
 
-        # Inject into the budget group specifically (mirrors the real H2 path:
+        # Inject into the budget group specifically (mirrors the real path:
         # resolve_secret raising a non-sqlite3 error inside _budget_conditions).
         monkeypatch.setattr(monitor_mod, "_budget_conditions", _boom_value)
         resp = client.get("/api/health/monitor")
@@ -2223,7 +2223,7 @@ def test_key_missing_weathercom_arm_key_present_negative(
 
 
 # ---------------------------------------------------------------------------
-# obs_collection_delayed (D1.3, plan §14.4)
+# obs_collection_delayed
 #
 # Every case calls build_verdict directly (pipeline_enabled=True,
 # budget_enabled=False, db_enabled=False, now=_OCD_N, export_sweeper_dead=None)
@@ -2751,11 +2751,11 @@ def test_ocd_failure_cooldown_constant_matches_the_schedulers_enqueue_cooldown()
 
 
 # ---------------------------------------------------------------------------
-# WL1-WL16 -- main_worker_liveness monitor condition (§14.12, 0.16.3 commit 9).
+# WL1-WL16 -- main_worker_liveness monitor condition.
 # Every case runs on asof_conn() and calls build_verdict with the fixed
 # synthetic _WL_N below. Times are minutes relative to _WL_N, and every
-# seeded stamp is isoformat_utc(_WL_N + offset), matching the plan's W/S/I/C
-# notation.
+# seeded stamp is isoformat_utc(_WL_N + offset). W, S, C, F, S* and B below
+# are the names ``_LivenessEvidence`` and ``_main_liveness_check`` use.
 # ---------------------------------------------------------------------------
 
 _WL_N = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
@@ -2984,8 +2984,8 @@ def test_wl8_running_current_obs_poller_row_never_counts_as_current() -> None:
 def test_wl9_start_only_with_no_loop_stamp_trips_wording2() -> None:
     """W -20 only: tripped, wording 2 with <N-20>.
 
-    Kills: treating missing evidence as ok (this fixture has W but no S,
-    C, or I, and would read ok under such a mutant); B = S* only, ignoring
+    Kills: treating missing evidence as ok (this fixture has W but no S
+    or C, and would read ok under such a mutant); B = S* only, ignoring
     F (with no S at all, B would be None here, giving wording 3 instead of
     wording 2).
     """
@@ -3162,7 +3162,7 @@ def test_wl16_heartbeat_write_failure_reads_as_stale_evidence_not_hung(
 
 
 # ---------------------------------------------------------------------------
-# AL1-AL8 (plan §13.7, 0.16.13): weathercom_access_refused condition.
+# AL1-AL8: weathercom_access_refused condition.
 #
 # Every case calls build_verdict directly against a bare in-memory
 # schema-current connection (budget_enabled=True unless noted), so every

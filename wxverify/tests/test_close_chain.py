@@ -1,23 +1,15 @@
-"""Hand-offs (plan 2026-10-21-daily-close-close-job.md section 15.7): HO1
-to HO6.
+"""Hand-offs: HO1 to HO6.
 
-Written before ``close_chain.enqueue_due_close_work``, ``close_p4`` and
-``close_chain.fail_attempt`` exist, and fails first for that reason: every
-test in this file drives the real night chain end to end
+Every test in this file drives the real night chain end to end
 (``tests.helpers.install_round_state_standin``/``install_p4_standins``,
-the pattern of ``tests/test_close_timeline.py``), so each reaches
-``install_round_state_standin`` before doing anything else -- a
-``ModuleNotFoundError`` today, since ``wxverify.worker.close_p4`` does not
-exist. HO4 then changes one of D's real ``observations`` values through
-P1's real, already-built ``materialize_consensus``/``finish_close`` (6.1)
-between stage 4 and stage 6; HO6 patches
-``wxverify.worker.close_chain.enqueue_if_absent`` (a name that does not
-exist in ``close_chain.py`` at this commit, which holds only
-``record_collection_try``, so the patch uses ``raising=False``) to fail
-only the ``day_publish`` enqueue inside stage 6's own completing write.
+the pattern of ``tests/test_close_timeline.py``). HO4 then changes one of
+D's real ``observations`` values through ``materialize_consensus`` between
+stage 4 and stage 6; HO6 patches
+``wxverify.worker.close_chain.enqueue_if_absent`` to fail only the
+``day_publish`` enqueue inside stage 6's own completing write.
 
-Section 16.2 names the mutant each test ID kills; the mapping is given
-inline on the exact assertion it kills at.
+The mutant each test ID kills is named inline on the exact assertion it
+kills at.
 
 Real SQLite only (``tests.helpers.standard_night``, real ``run_migrations``
 via ``init_db`` on a ``tmp_path`` file). Station ids are synthetic
@@ -58,8 +50,8 @@ from wxverify.scoring.consensus import materialize_consensus, write_station_obse
 @pytest.fixture(autouse=True)
 def _clear_close_chain_log_map() -> None:
     """This file's own autouse wiring of ``clear_close_chain_log_map``
-    (15.1's "The log map.") -- autouse HERE, inside this one P3 test
-    file, never across the whole suite."""
+    -- autouse HERE, inside this one close-chain test file, never across
+    the whole suite."""
     clear_close_chain_log_map()
 
 
@@ -129,8 +121,8 @@ def test_ho1_the_standard_night_hands_off_every_stage_in_order(
 ) -> None:
     """HO1: the standard night, ``run_due_jobs`` from R 00:40Z. Claims in
     order: ``day_close`` stages 2 to 6, ``day_publish`` stage 7, each
-    keyed as 8.1; D ``closed``; the publication ``published``, ``pub-D``
-    (8.1).
+    keyed by its stage; D ``closed``; the publication ``published``,
+    ``pub-D``.
 
     M46 -> at the keys assertion below: correct = the five ``day_close``
     keys end ``:2`` through ``:6`` and the ``day_publish`` key ends ``:7``,
@@ -187,7 +179,7 @@ def test_ho1_the_standard_night_hands_off_every_stage_in_order(
         assert (publication["state"], publication["publication_id"]) == (
             "published",
             expected_pub_id,
-        ), "the publication must be published with P4's identifier"
+        ), "the publication must be published with the identifier publish returned"
 
     asyncio.run(_run())
 
@@ -319,13 +311,13 @@ def test_ho3_a_repeated_stage_job_is_skipped_not_rerun(
     stage-log row ``skipped`` with its job id, beside stage 3's
     ``completed`` row; the attempt record's ``last_stage`` and
     ``last_progress_at`` unchanged; the stage-4 job still the only
-    ``pending`` job; no second write of the stage (8.2).
+    ``pending`` job; no second write of the stage.
 
     M44 -> at the stage-log-count assertion below: correct = exactly ONE
     'skipped' row for stage 3 (the repeated job's own body did no work,
     only recorded that it was skipped), mutant M44 (a stage body without
     its "already complete" check) = a SECOND 'completed' row for stage 3
-    instead (the repeated job re-ran the whole stage, duplicating P2's
+    instead (the repeated job re-ran the whole stage, duplicating its
     writes).
     """
 
@@ -427,8 +419,8 @@ def test_ho3_a_repeated_stage_job_is_skipped_not_rerun(
             before_attempt["outcome"],
         ), (
             "M90 -> at this assertion: correct = last_progress_at UNCHANGED"
-            " (a repeated/skipped stage job writes only its stage-log row,"
-            " 8.2 -- _open_stage's completion branch must not touch"
+            " (a repeated/skipped stage job writes only its stage-log row"
+            " -- _open_stage's completion branch must not touch"
             " close_attempts at all), mutant M90 (the skipped path also"
             " runs the completing write's close_attempts UPDATE) = a NEW"
             " last_progress_at, stamped at the repeated job's own run time"
@@ -459,7 +451,7 @@ def test_ho4_stage_6_refuses_over_stale_truth_fails_the_attempt(
     """HO4: between stage 4 and stage 6, one observations value of D
     changed through ``materialize_consensus``. Stage 6's ``finish_close``
     refuses; attempt 1 fails at stage 6; the retry rebuilds truth and
-    closes (6.1, 8.3).
+    closes.
 
     Runs the standard night through ``run_due_jobs`` with ``stop_before``
     set to pause right before stage 6 claims, with stages 2-5 real (so D's
@@ -469,10 +461,8 @@ def test_ho4_stage_6_refuses_over_stale_truth_fails_the_attempt(
     hourly ``temperature`` reading for one hour of D is then changed for
     real, through ``write_station_observation``, and
     ``materialize_consensus`` recomputes the consensus and marks D's truth
-    stale (``scoring/consensus.py:370-377``) -- P1's own, already-built
-    mechanism (confirmed by the ``DayStateError`` check below, real
-    ``db/site_days.py`` behaviour, unchanged from the old version of this
-    test). ``run_due_jobs`` is then let continue: stage 6 claims, calls
+    stale (confirmed by the ``DayStateError`` check below).
+    ``run_due_jobs`` is then let continue: stage 6 claims, calls
     the real ``finish_close``, gets the ``DayStateError`` and -- once
     ``close_chain.fail_attempt`` exists -- fails the attempt instead of
     propagating or swallowing it. The clock is then moved past the
@@ -480,7 +470,7 @@ def test_ho4_stage_6_refuses_over_stale_truth_fails_the_attempt(
     rebuilds hours, truth and scores for real and closes D.
 
     M45 -> at the state assertion below: correct = 'retry_due' (the
-    DayStateError fails the attempt at stage 6, 9.1), mutant M45 (stage 6
+    DayStateError fails the attempt at stage 6), mutant M45 (stage 6
     catches DayStateError and closes anyway) = 'closed', over a truth row
     that no longer matches the day's hours.
     """
@@ -521,7 +511,7 @@ def test_ho4_stage_6_refuses_over_stale_truth_fails_the_attempt(
             )
         )
 
-        # P1's own refusal, confirmed real and unchanged (db/site_days.py):
+        # finish_close's own refusal (db/site_days.py):
         # a direct finish_close over the now-stale truth raises on its own,
         # before stage 6's body is ever asked to handle it.
         with pytest.raises(DayStateError):
@@ -542,7 +532,7 @@ def test_ho4_stage_6_refuses_over_stale_truth_fails_the_attempt(
         assert (attempt_row["outcome"], attempt_row["failed_stage"]) == (
             "failed",
             6,
-        ), "the attempt record must show failed_stage 6 (9.1)"
+        ), "the attempt record must show failed_stage 6"
         assert attempt_row["failure_reason"] == (
             f"site {site_id} day {D.isoformat()} (closing): the day's truth is stale"
         ), (
@@ -557,7 +547,7 @@ def test_ho4_stage_6_refuses_over_stale_truth_fails_the_attempt(
         retried = await _state(db, site_id)
         assert (retried.state, retried.attempts) == ("closed", 2), (
             "the retry must rebuild truth from the changed hour and close D,"
-            " at attempt 2 (6.1, 8.3)"
+            " at attempt 2"
         )
 
     asyncio.run(_run())
@@ -572,14 +562,14 @@ def test_ho5_a_pending_day_close_job_blocks_a_second_one(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """HO5: while a ``day_close`` job of S is pending, a tick. No second
-    ``day_close`` job for S (8.1).
+    ``day_close`` job for S.
 
     M46 -> at the assertion below: correct = exactly one pending
     ``day_close`` job keyed ``:2`` after the extra tick (``enqueue_if_absent``
     dedupes the attempt's own stage-2 job against itself), mutant M46
     (the stage number left out of the job key) does not change THIS
     assertion's outcome on its own -- see HO1 for M46's own discriminating
-    oracle; this test's own purpose is the predicate in 8.5 step 3 (no
+    oracle; this test's own purpose is the tick's predicate (no
     second ``begin_close`` while a day_close job is pending), named with a
     plain message.
     """
@@ -616,7 +606,7 @@ def test_ho5_a_pending_day_close_job_blocks_a_second_one(
         )
         assert [row[0] for row in after] == [row[0] for row in before], (
             "while a day_close job of S is pending, a further tick must"
-            " create no second one (8.1)"
+            " create no second one"
         )
 
     asyncio.run(_run())
@@ -633,20 +623,17 @@ def test_ho6_a_failed_handoff_after_stage_6_fails_the_attempt_atomically(
     """HO6: ``enqueue_if_absent`` raises for ``day_publish`` inside stage
     6's completing write. D ``retry_due``; the attempt record ``failed``
     with ``failed_stage`` 6 and ``last_stage`` 5; no publication record;
-    no ``day_publish`` job (8.2, 9.1).
+    no ``day_publish`` job.
 
     Runs the standard night through ``run_due_jobs`` with ``stop_before``
     set to pause right before stage 6 claims, stages 2-5 real. The real
     ``wxverify.db.queue.enqueue_if_absent`` is then patched onto
     ``wxverify.worker.close_chain.enqueue_if_absent`` -- the name under
-    which ``close_chain``'s own stage-6 body will look it up, once it
-    exists -- with a wrapper that raises only for ``day_publish`` and
-    calls the real function for every other job type (``close_chain.py``
-    does not define this name yet today, holding only
-    ``record_collection_try``; ``raising=False`` tolerates patching a name
-    piece 4 has not added). ``run_due_jobs`` then runs the real stage-6
+    which ``close_chain``'s own stage-6 body looks it up -- with a wrapper
+    that raises only for ``day_publish`` and calls the real function for
+    every other job type. ``run_due_jobs`` then runs the real stage-6
     body: it calls ``finish_close`` and the raising enqueue inside its own
-    ONE completing-write transaction (8.2), so the raise rolls back
+    ONE completing-write transaction, so the raise rolls back
     ``finish_close``'s effect together with the failed enqueue, and the
     exception reaches the real ``_fail_job`` terminal branch, which --
     once ``close_chain.fail_attempt`` exists -- fails the attempt.
@@ -655,12 +642,12 @@ def test_ho6_a_failed_handoff_after_stage_6_fails_the_attempt_atomically(
     'retry_due', no ``close_publications`` row, no ``day_publish`` job
     (``finish_close``'s effect and the failed enqueue share one
     transaction, so neither survives the raise, and ``_fail_job`` finds D
-    still 'closing' and fails the attempt, 9.1), mutant M42 (stage 6 saves
+    still 'closing' and fails the attempt), mutant M42 (stage 6 saves
     its completion and enqueues stage 7 in TWO transactions) = D 'closed'
     with an opened ``close_publications`` row already committed before the
     enqueue failed, no attempt failure at all (``_fail_job``'s day_close
     branch finds D already 'closed', not 'closing', and only fails the job
-    row, 9.1) -- a closure stranded without its successor's job.
+    row) -- a closure stranded without its successor's job.
     """
 
     def _raising_enqueue(
@@ -703,7 +690,7 @@ def test_ho6_a_failed_handoff_after_stage_6_fails_the_attempt_atomically(
             "M42 -> at this assertion: correct = 'retry_due' (finish_close's"
             " write is rolled back together with the failed enqueue, one"
             " transaction, so _fail_job finds D still 'closing' and fails"
-            " the attempt, 9.1), mutant M42 (two transactions) = 'closed'"
+            " the attempt), mutant M42 (two transactions) = 'closed'"
             " already, with the attempt never failed at all"
         )
         attempt_row = await _attempt_row(db, site_id, D, 1)
@@ -712,7 +699,7 @@ def test_ho6_a_failed_handoff_after_stage_6_fails_the_attempt_atomically(
             attempt_row["failed_stage"],
             attempt_row["last_stage"],
         ) == ("failed", 6, 5), (
-            "the attempt record must show failed_stage 6, last_stage 5 (9.1)"
+            "the attempt record must show failed_stage 6, last_stage 5"
         )
         publication_count = await db.read(
             lambda c: c.execute(

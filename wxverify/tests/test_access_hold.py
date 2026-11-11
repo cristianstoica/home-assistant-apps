@@ -1,5 +1,4 @@
-"""Unit tests for ``wxverify.worker.access_hold`` (plan 2026-10-27
-refused-access-hold §13.2, AH1-AH5).
+"""Unit tests for ``wxverify.worker.access_hold`` (AH1-AH5).
 
 Five oracles, each pinning one contract of the hold primitives directly
 (no job, no HTTP call):

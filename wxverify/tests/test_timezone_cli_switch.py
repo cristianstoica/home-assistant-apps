@@ -1,7 +1,6 @@
-"""The ``timezone change`` command, the daily close always on (plan
-``2026-10-22-daily-close-switch-over.md`` §10.4, §17.9, TC1).
+"""The ``timezone change`` command, the daily close always on (TC1).
 
-P1's ``enter_zone_change`` path applies a zone change unconditionally now
+The ``enter_zone_change`` path applies a zone change unconditionally now
 (the close-off branch and its refusal are gone): a regression pin (paired
 positive) that it keeps working exactly as before this cleanup.
 
@@ -58,8 +57,7 @@ def test_tc1_change_enters_a_zone_change(
     _init_tmp_db(tmp_path)
     monkeypatch.setattr("wxverify.__main__.utc_now", lambda: NOW)
 
-    # P1's own path, not part of this plan's fix -- a regression pin that
-    # it keeps working unchanged.
+    # A regression pin that this path keeps working unchanged.
     site_id_on = get_db().write_sync(
         lambda c: day_close_site(
             c,

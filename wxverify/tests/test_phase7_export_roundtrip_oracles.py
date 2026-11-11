@@ -1,4 +1,4 @@
-"""§18.10 oracle: export round-trip over the 0.11.0 state.
+"""Oracle: export round-trip over the 0.11.0 state.
 
 Drives the shipped export path -- POST /api/export/begin -> /export/status
 -> /export/download (VACUUM INTO + gzip) -- then opens the downloaded,
@@ -40,7 +40,7 @@ from wxverify.settings.keys import set_setting
 # ---------------------------------------------------------------------------
 # The shipped export path, driven end to end: POST /api/export/begin ->
 # GET /export/status -> GET /export/download (VACUUM INTO + gzip). Covers
-# the §18.10 artifact a bare schema-copy comparison would not reach: truth
+# the artifact a bare schema-copy comparison would not reach: truth
 # generations (timezone_generations + daily_truth), read directly off the
 # downloaded snapshot.
 # ---------------------------------------------------------------------------

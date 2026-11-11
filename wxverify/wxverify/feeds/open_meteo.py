@@ -39,7 +39,7 @@ VARIABLE_MAP: Final[dict[str, str]] = {
     "temperature": "temperature_2m",
     "wind": "wind_speed_10m",
     "precip": "precipitation",
-    # Display only (card 7): %, km/h ("maximum of the preceding hour",
+    # Display only: %, km/h ("maximum of the preceding hour",
     # kept under the provider's own hour label), degrees the wind comes from.
     "cloud_cover": "cloud_cover",
     "wind_gust": "wind_gusts_10m",
@@ -65,7 +65,7 @@ class OpenMeteoResponse(BaseModel):
     @field_validator("hourly", mode="before")
     @classmethod
     def _lenient_display_arrays(cls, value: object) -> object:
-        """Read the display arrays (card 7) leniently, before validation.
+        """Read the display arrays leniently, before validation.
 
         A display array that is not a list is dropped, and each entry
         ``float()`` cannot read becomes ``None``, so a bad display array
@@ -237,7 +237,7 @@ def _samples_from_hourly(
 def _display_sample(
     model: str, issued_at: str, variable: str, raw_time: object, raw_obj: object
 ) -> NormalizedSample | None:
-    """One display sample (card 7), or ``None``; never raises.
+    """One display sample, or ``None``; never raises.
 
     A value ``float()`` cannot read, or an hour label that does not parse,
     stores nothing. The value keeps the provider's hour label (a gust is

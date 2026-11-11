@@ -1,4 +1,4 @@
-"""Contrast oracles for the Forecast page's fills (plan step 7, "Contrast").
+"""Contrast oracles for the Forecast page's fills.
 
 Every oracle here reimplements WCAG 2.2 relative luminance, contrast ratio,
 HSL-to-RGB, hex/rgba parsing and alpha compositing from scratch -- nothing is
@@ -324,7 +324,7 @@ def test_icon_mark_reaches_minimum_contrast_against_surface(
 
 def test_timeline_rain_bar_text_and_bar_reach_their_minimum_contrasts() -> None:
     """The timeline rain bar's fill vs. --surface (>=3:1, a visible bar) and
-    its text vs. the fill (>=4.5:1). Catches: the handoff bar colour."""
+    its text vs. the fill (>=4.5:1). Catches: a bar colour below those."""
     gradient = _color_for_selector(_APP_CSS, ".tl .cell.rain", "background")
     # linear-gradient(to top, <bar-color> var(--h), var(--surface) var(--h))
     stops_text = gradient[gradient.index("(") + 1 : gradient.rindex(")")]

@@ -1,5 +1,4 @@
-"""The one-time compaction of the database file at startup (storage-release
-plan 4.2).
+"""The one-time compaction of the database file at startup.
 
 ``Database._open`` calls ``compact_storage`` on the writer after the
 migrations and the sanitize, before any reader opens. It runs only while

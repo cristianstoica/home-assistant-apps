@@ -87,7 +87,7 @@ def _make_site(conn: sqlite3.Connection, name: str, *, enabled: int = 1) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Part A -- Export (X1-X18: prepare-then-stream begin/status/download trio).
+# Export (X1-X18: prepare-then-stream begin/status/download trio).
 # ---------------------------------------------------------------------------
 #
 # There is no blocking `GET /api/export/db` route; these tests target
@@ -234,8 +234,8 @@ def test_export_download_matches_source_and_disposition(
 ) -> None:
     """X4: download streams an integrity-ok snapshot; rows + filename match.
 
-    Mirrors the old T1 (integrity + row parity) and T3 (Content-Disposition)
-    oracles against the new download route.
+    Integrity + row parity and Content-Disposition oracles against the
+    download route.
     """
     _init_tmp_db(tmp_path)
     app = _make_app(monkeypatch)
@@ -285,7 +285,7 @@ def test_export_download_includes_uncheckpointed_wal_rows(
 ) -> None:
     """X5: WAL-consistency -- an uncheckpointed committed row must export.
 
-    Mirrors old T2: the snapshot runs VACUUM INTO on the read connection,
+    The snapshot runs VACUUM INTO on the read connection,
     which sees WAL-committed data; a naive copy of the main file alone would
     miss the row while the -wal sidecar is still non-empty.
     """
@@ -864,7 +864,7 @@ def test_export_flow_under_ingress_and_standalone_parity(
     """X14: full begin->status->download works under ingress AND standalone.
 
     Confirms the trio resolves at the bare path both behind the Supervisor
-    ingress prefix (I7 cookie idiom) and for a standalone client.
+    ingress prefix and for a standalone client.
     """
     _init_tmp_db(tmp_path)
     app = _make_app(monkeypatch)
@@ -1182,8 +1182,8 @@ def test_export_begin_survives_bodyless_chunked_ingress_framing(
     The exact live signature must therefore now return 202 + an ``export_id``.
 
     Red/green: under the removed ``has_body``-includes-Transfer-Encoding
-    predicate this request is 415'd before the handler (see the scratchpad
-    red-proof driving HEAD's guard); under the fix it is 202. Same-origin +
+    predicate this request is 415'd before the handler; under the fix it
+    is 202. Same-origin +
     CSRF still run -- this test carries a valid Origin and CSRF pair, so the
     only thing the fix changes is the content-type gate.
     """

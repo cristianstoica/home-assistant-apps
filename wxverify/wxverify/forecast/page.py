@@ -1,4 +1,4 @@
-"""The Forecast page's data model (card 7), built from served values only.
+"""The Forecast page's data model, built from served values only.
 
 :func:`build_forecast_page` loads the page's inputs once
 (:func:`~wxverify.forecast.service.load_page_inputs`), builds the tile view
@@ -376,7 +376,7 @@ def day_warnings(tile: DayTile) -> tuple[str, ...]:
     Low confidence, ranking updating (a rebuilding confidence state or a
     provisional rain ranking), stale, substitute, fetch time unknown and
     partial, as the tile badges in ``forecast/_tiles.html`` decide them.
-    "Fetch time unknown" is not listed when "Stale" is (owner, 2026-11-04).
+    "Fetch time unknown" is not listed when "Stale" is.
     """
     rain_provisional = tile.precip.meta.extrema_state == "rebuilding"
     checks = (

@@ -1,4 +1,4 @@
-"""Methodology constants for the forecast-product backtest (plan §17).
+"""Methodology constants for the forecast-product backtest.
 
 Every constant is pre-declared and versioned here — one module, one
 ``METHODOLOGY_VERSION`` — and is never tuned after viewing scores. The
@@ -11,9 +11,6 @@ Every public constant here is either consumed by a non-test module or
 named in ``DECLARATIVE_ONLY`` — published for the audit trail but wired to
 no behavior. A module-scan test pins that disjunction, so a constant can
 never again sit here unconsumed and undeclared.
-
-Names and values follow the §17 table, which now holds only the rows
-still in use.
 """
 
 from __future__ import annotations

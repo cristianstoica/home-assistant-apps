@@ -9,7 +9,7 @@ failure, an exception class name. The re-parse is discarded once
 summarized, so nothing it produces is returned or stored.
 
 The re-parse and its counts cover the scored roster only: the display
-variables (card 7) are left out, so an hour holding only display values
+variables are left out, so an hour holding only display values
 never counts as a forecast hour and each record keeps its fields.
 """
 

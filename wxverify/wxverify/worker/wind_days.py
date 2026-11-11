@@ -89,7 +89,7 @@ WIND_DAYS_JOB_KEY: Final = "wind-days"
 #: The scheduler's success cooldown between two lane jobs of one site.
 WIND_DAYS_SPACING: Final = timedelta(minutes=5)
 
-#: The evening window's slots, local (hour, minute), in order (plan 4.2):
+#: The evening window's slots, local (hour, minute), in order:
 #: 23:00; ten retries 23:06 to 23:51; 23:56; three retries 23:57 to 23:59.
 EVENING_SLOTS: Final[tuple[tuple[int, int], ...]] = (
     (23, 0),
@@ -108,7 +108,7 @@ EVENING_SLOTS: Final[tuple[tuple[int, int], ...]] = (
     (23, 58),
     (23, 59),
 )
-#: The slot that always runs, even after a good download (plan 4.2).
+#: The slot that always runs, even after a good download.
 _LATE_SLOT: Final = (23, 56)
 
 _CHUNK_CALLS: Final = 6
@@ -122,7 +122,7 @@ _PAYLOAD_ROW_FAULTS: Final = frozenset(
 )
 
 #: The due selector, shared by the lane, the scheduler and ``wind_days_due``:
-#: the rows of the current day only (switch-over plan 7.2, R4). An unreadable
+#: the rows of the current day only. An unreadable
 #: ``next_attempt_at`` fails open.
 WIND_DUE_SQL: Final = """
 SELECT d.station_id, d.local_date, d.status, d.attempts, st.pws_station_id
@@ -146,7 +146,7 @@ class WindHeadroomExhausted(Exception):
 
 
 class ReservationDeferred(JobDeferred):
-    """A reservation met the domain back-off or the call limit (plan 4.4).
+    """A reservation met the domain back-off or the call limit.
 
     ``reason`` is ``backoff`` (``check_domain_backoff``) or ``call_limit``
     (``reserve_budget``); ``next_attempt_at`` is the deferral's end. A
@@ -160,7 +160,7 @@ class ReservationDeferred(JobDeferred):
 
 @dataclass(frozen=True, slots=True)
 class _DayClock:
-    """One site-day's evening slots and end, for today's row (plan 4.2).
+    """One site-day's evening slots and end, for today's row.
 
     ``slots`` are the UTC instants of ``EVENING_SLOTS`` that fall inside the
     day, in order, each once; ``labels`` their local ``HH:MM``. ``late`` is
@@ -233,7 +233,7 @@ def wind_days_due(
     """Run ``WIND_DUE_SQL``: the due rows dated ``today``, by station.
 
     The ``five_minute`` refused-access hold is checked per row inside the
-    reservation (``_reserve_wind_day_call``, plan 4.4), not here.
+    reservation (``_reserve_wind_day_call``), not here.
     """
     rows = conn.execute(
         WIND_DUE_SQL,
@@ -281,10 +281,10 @@ def ensure_wind_days(
 ) -> None:
     """Give every enabled station a row dated ``today``, and no other.
 
-    The lane creates only the row of the current day (switch-over plan 7.2,
-    R4); past rows are left as they stand. ``tz``, the site's zone, is not
-    read: ``today`` already names the day. Rows whose ``local_date`` is not
-    a canonical ``YYYY-MM-DD`` are deleted, with a WARNING and the count.
+    The lane creates only the row of the current day; past rows are left as
+    they stand. ``tz``, the site's zone, is not read: ``today`` already names
+    the day. Rows whose ``local_date`` is not a canonical ``YYYY-MM-DD`` are
+    deleted, with a WARNING and the count.
     """
     stations = [
         int(station["id"])
@@ -355,9 +355,9 @@ def _lane_today(
     *,
     ensure: bool,
 ) -> tuple[date, bool]:
-    """The lane's today, and whether today's row may be tried (plan 4.2).
+    """The lane's today, and whether today's row may be tried.
 
-    Today is the date of P1's record that holds ``now`` (with ``ensure``,
+    Today is the date of the day record that holds ``now`` (with ``ensure``,
     after creating the site's missing records). With no such record the
     site has no current day: today's row is closed (no row is created or
     tried), and the date returned is ``now``'s date in the site's zone
@@ -372,7 +372,7 @@ def _lane_today(
 
 
 def _clock_from_record(record: DayRecord) -> _DayClock:
-    """The evening slots of a day record, by P1's ``local_clock_utc`` rule.
+    """The evening slots of a day record, by ``local_clock_utc``'s rule.
 
     A slot that lies outside the day is left out; one that maps onto an
     instant already kept (a wall time the clocks skipped) is kept once.
@@ -399,9 +399,9 @@ def _clock_from_record(record: DayRecord) -> _DayClock:
 def _day_clock(
     conn: sqlite3.Connection, site_id: int, local_date: date
 ) -> _DayClock | None:
-    """The clock of today's row dated ``local_date`` (plan 4.2).
+    """The clock of today's row dated ``local_date``.
 
-    From P1's record of that date, in the zone saved on it; None when the
+    From the day record of that date, in the zone saved on it; None when the
     site has no such record (no slot is computed and nothing falls back to
     ``sites.timezone``).
     """
@@ -414,7 +414,7 @@ def wind_evening_due(
 ) -> bool:
     """True while one of the site's today rows is due in the evening window.
 
-    The scheduler passes no success spacing then (plan 4.2), so the 5-minute
+    The scheduler passes no success spacing then, so the 5-minute
     spacing after the 23:56 job cannot block 23:57 to 23:59. Read-only.
     """
     today, today_open = _lane_today(conn, site_id, tz, now, ensure=False)
@@ -429,11 +429,11 @@ def wind_evening_due(
 def wind_lane_due(
     conn: sqlite3.Connection, site_id: int, tz: ZoneInfo, *, now: datetime
 ) -> bool:
-    """True when the site's lane has work: the scheduler's due test (plan §8.13).
+    """True when the site's lane has work: the scheduler's due test.
 
     Today's rows are due on their own schedule only; the ``five_minute``
-    hold is not read here (plan 4.4). While no record holds ``now``, no
-    today row is due and none is missing (4.2).
+    hold is not read here. While no record holds ``now``, no
+    today row is due and none is missing.
     """
     today, today_open = _lane_today(conn, site_id, tz, now, ensure=False)
     if not today_open:
@@ -470,7 +470,7 @@ def _start_job(conn: sqlite3.Connection, site_id: int) -> _JobStart:
     if today_open:
         ensure_wind_days(conn, site_id, tz, today)
     else:
-        # No current day: no row is created (switch-over plan 7.2, R4).
+        # No current day: no row is created.
         _delete_unreadable_days(conn, site_id)
     return _JobStart(tz_name=tz_name, today=today, today_open=today_open)
 
@@ -482,7 +482,7 @@ async def run_wind_days(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> None:
-    """Run one bounded chunk of the site's wind-history lane (plan §8.3).
+    """Run one bounded chunk of the site's wind-history lane.
 
     ``client`` is for tests; the job opens its own ``httpx.AsyncClient``.
     """
@@ -526,7 +526,7 @@ async def _run_fetch_chunk(
     now = utc_now()
     today = start.today
     if not start.today_open:
-        # No record holds now: no today try (4.2).
+        # No record holds now: no today try.
         return
     chunk = _Chunk(
         db=db,
@@ -560,12 +560,11 @@ def _reserve_wind_day_call(
 
     Site disabled -> ``JobCancelled``; station disabled or moved -> None (skip
     the row); then domain backoff (``ReservationDeferred`` ``backoff``), for
-    today's row the ``five_minute`` refused-access hold (``AccessHeld``, plan
-    4.4), the backfill headroom (non-exempt only, ``WindHeadroomExhausted``
-    below one call), the budget (``ReservationDeferred`` ``call_limit``), and
-    the lane counter that the reservation belongs to. The lane tries only
-    today's row (switch-over plan 7.2, R4), so it passes ``exempt=True`` and
-    ``todays_row=True``.
+    today's row the ``five_minute`` refused-access hold (``AccessHeld``), the
+    backfill headroom (non-exempt only, ``WindHeadroomExhausted`` below one
+    call), the budget (``ReservationDeferred`` ``call_limit``), and the lane
+    counter that the reservation belongs to. The lane tries only today's row,
+    so it passes ``exempt=True`` and ``todays_row=True``.
     """
     site = conn.execute(
         "SELECT 1 FROM sites WHERE id = ? AND enabled = 1", (site_id,)
@@ -603,11 +602,12 @@ async def _run_row(
     position: int,
     total: int,
 ) -> _RowOutcome:
-    """Reserve, call and persist one station-day of today; §8.7's error table.
+    """Reserve, call and persist one station-day of today.
 
-    A try that meets the ``five_minute`` hold (``AccessHeld``) or a
-    reservation deferral (``ReservationDeferred``) sends nothing: one write
-    moves the row and logs the try (plan 4.4, 4.5), and the row is
+    A failed call goes to ``_fetch_failed``. A try that meets the
+    ``five_minute`` hold (``AccessHeld``) or a reservation deferral
+    (``ReservationDeferred``) sends nothing: one write moves the row and
+    logs the try, and the row is
     ``"skipped"``, not counted as a call.
     """
     key = chunk.key()
@@ -733,10 +733,10 @@ async def _fetch_failed(
     exc: Exception,
     message: str,
 ) -> _FailureOutcome:
-    """Record a failed call. Raises ``JobDeferred`` where §8.7 says.
+    """Record a failed call, raising ``JobDeferred`` in the cases below.
 
     The write that records the outcome also moves today's row to its next
-    try and logs the try (plan 4.2, 4.5). A 401/403 returns ``"fetched"``,
+    try and logs the try. A 401/403 returns ``"fetched"``,
     so the run's other today rows meet the new hold in their reservation. A
     429 or 5xx defers the job to the back-off's end, in the evening window
     as in the daytime; in the window a transport error returns
@@ -750,7 +750,7 @@ async def _fetch_failed(
 
     def begin(conn: sqlite3.Connection) -> _TodayTry | None:
         # Read before any write of the outcome: the slot is the one the row
-        # held when the try started (4.2).
+        # held when the try started.
         current = _read_day(conn, station_id, local_date)
         if current is None:
             return None
@@ -879,7 +879,7 @@ async def _fetch_failed(
                 failure(conn, daytime_until=end, not_before=end)
                 return wake, failed_try(conn, attempt, "provider", f"http {status}")
 
-            # In the window as in the daytime (4.2): the job waits for the
+            # In the window as in the daytime: the job waits for the
             # back-off's end, so the run's other today rows keep their slot.
             wake, entry = await write_after_reservation(
                 chunk.db, chunk.writer, server_error
@@ -918,7 +918,7 @@ async def _fetch_failed(
             if refund:
                 _refund(conn, reservation)
             # A daytime deferral moves today's row to min(try + 15 min,
-            # 23:00); in the window it goes to its next slot (4.2).
+            # 23:00); in the window it goes to its next slot.
             failure(conn, daytime_until=_parse_due(wake))
             return wake, failed_try(conn, attempt, "network", "network")
 
@@ -927,7 +927,7 @@ async def _fetch_failed(
         )
         _log_try(entry)
         if entry is not None and entry.in_window:
-            # 4.2: in the window the row is at its next slot and the run goes
+            # In the window the row is at its next slot and the run goes
             # on to its other today rows instead of deferring 15 minutes.
             return "fetched"
         raise JobDeferred(_capped_wake(wake, entry)) from exc
@@ -941,7 +941,7 @@ def _transport_wake() -> str:
 
 def _capped_wake(wake: str, entry: _TryLog | None) -> str:
     """``wake``, capped at the day's 23:00 slot for a daytime try of today's
-    row (4.2: a daytime deferral is still capped at 23:00)."""
+    row (a daytime deferral is still capped at 23:00)."""
     if entry is None or entry.in_window or entry.cap is None:
         return wake
     at = _parse_due(wake)
@@ -951,7 +951,7 @@ def _capped_wake(wake: str, entry: _TryLog | None) -> str:
 
 
 def _log_try(entry: _TryLog | None) -> None:
-    """The try's INFO line (plan 4.5), once its write has committed."""
+    """The try's INFO line, once its write has committed."""
     if entry is None:
         return
     logger.info(
@@ -991,7 +991,7 @@ def _today_next_attempt(
     *,
     cap: datetime,
 ) -> str:
-    """The next daytime try after one at ``now`` (plan 4.2).
+    """The next daytime try after one at ``now``.
 
     ``min(now + obs_interval_minutes, cap)``, whatever the try's outcome.
     ``cap`` is the day's 23:00 slot; every try at or after it belongs to the
@@ -1012,12 +1012,12 @@ def _parse_due(value: object) -> datetime | None:
 
 
 def _slot_label(clock: _DayClock | None, due: datetime | None, tried: datetime) -> str:
-    """The try log's slot for a try of today's row (plan 4.5).
+    """The try log's slot for a try of today's row.
 
     The slot the row held when the try started (``due``; the try time when
     the row held none): ``daytime`` before the 23:00 slot, else the latest
     evening slot at or before it as local ``HH:MM``. A late try is still
-    that slot's try (4.2).
+    that slot's try.
     """
     at = tried if due is None else due
     if clock is None or not clock.slots or at < clock.slots[0]:
@@ -1058,7 +1058,7 @@ def _window_next(
     success: bool,
     not_before: datetime | None,
 ) -> datetime:
-    """The next try after one at or after the 23:00 slot (plan 4.2).
+    """The next try after one at or after the 23:00 slot.
 
     A success before the 23:56 slot moves to it; a success at or after it is
     done for the day. Otherwise the first slot after ``tried`` (and, for a
@@ -1083,7 +1083,7 @@ def _next_try_at(
     daytime_until: datetime | None = None,
     not_before: datetime | None = None,
 ) -> str | None:
-    """The stamp today's row moves to after ``attempt`` (plan 4.2, 4.4).
+    """The stamp today's row moves to after ``attempt``.
 
     In the daytime ``min(tried + interval, 23:00)``, whatever the outcome,
     except a deferral: given its end ``daytime_until`` (a 429's or 5xx's
@@ -1154,7 +1154,7 @@ def _record_held_try(
     local_date: date,
     until: str,
 ) -> _TryLog | None:
-    """A try of today's row that met the ``five_minute`` hold (plan 4.4).
+    """A try of today's row that met the ``five_minute`` hold.
 
     Moves the row to its next try as a try that did not succeed, sets its
     ``refused_at`` and logs outcome ``held``. Writes nothing to the hold.
@@ -1196,7 +1196,7 @@ def _record_deferred_try(
     reason: DeferralReason,
     deferral_end: str,
 ) -> _TryLog | None:
-    """A try of today's row whose reservation was deferred (plan 4.4).
+    """A try of today's row whose reservation was deferred.
 
     Moves the row: in the daytime to ``min(deferral end, 23:00)``, in the
     window to the first slot at or after the deferral's end, else done for
@@ -1227,8 +1227,8 @@ def _record_deferred_try(
 
 
 def _stored_detail(result: StoreResult) -> str:
-    """The ``stored`` outcome's detail (plan 4.5): the readings kept per
-    quantity, those already stored, and those P1's guard refused."""
+    """The ``stored`` outcome's detail: the readings kept per quantity, those
+    already stored, and those the closed-day guard refused."""
     per = result.kept_by_quantity
     return (
         f"temperature={per['temperature']} precip={per['precip']}"
@@ -1254,14 +1254,14 @@ def _read_day(
 def _today_window(
     conn: sqlite3.Connection, site_id: int, *, now: datetime
 ) -> tuple[datetime, datetime] | None:
-    """The bounds of today's row's window: yesterday's start to today's end
-    (4.1). ``_persist_day`` caps the upper end at now plus ``_FUTURE_SLACK``.
+    """The bounds of today's row's window: yesterday's start to today's end.
+    ``_persist_day`` caps the upper end at now plus ``_FUTURE_SLACK``.
 
-    Today and yesterday are P1's record holding ``now`` and the site's
+    Today and yesterday are the day record holding ``now`` and the site's
     record dated the day before it, by their stored bounds, after creating
     the site's missing records as the guard would; with no record the day
     before, today's bounds alone. ``None`` while no record holds ``now``
-    (the site has no current day, 4.2): nothing is kept.
+    (the site has no current day): nothing is kept.
     """
     ensure_site_days(conn, site_id, now_utc=now)
     current = current_day(conn, site_id, now_utc=now)
@@ -1282,15 +1282,15 @@ def _persist_day(
     records: Sequence[StationReading],
     no_content: bool = False,
 ) -> _TryLog | None:
-    """Store today's fetched readings and advance today's row (plan 4.1, 4.2).
+    """Store today's fetched readings and advance today's row.
 
-    The lane selects only the row of the current day (switch-over plan 7.2,
-    R4), so ``local_date`` is today's date. The try is a successful one: the
-    row stays ``partial``, moves to its next try, and its try is logged in
-    this transaction (4.5) with outcome ``stored``, or ``no_readings``
+    The lane selects only the row of the current day, so ``local_date`` is
+    today's date. The try is a successful one: the row stays ``partial``,
+    moves to its next try, and its try is logged in this transaction with
+    outcome ``stored``, or ``no_readings``
     (``no_content`` for a 204, set by the caller, ``empty`` for an empty
     list); the log entry is returned for the INFO line. No hourly station
-    row is derived here: the close writes those (R5).
+    row is derived here: the close writes those.
 
     ``records`` are the download's readings. Those inside yesterday's and
     today's bounds (``_today_window``), capped at now plus ``_FUTURE_SLACK``
@@ -1404,14 +1404,13 @@ def _row_failure(
     daytime_until: datetime | None = None,
     not_before: datetime | None = None,
 ) -> None:
-    """The row-failure rule (plan §8.7) for today's row.
+    """The row-failure rule for today's row.
 
     Today's row stays ``partial`` and moves to its next try as a try that
-    did not succeed (plan 4.2): in the daytime a deferral's end
+    did not succeed: in the daytime a deferral's end
     ``daytime_until`` moves it to ``min(that end, 23:00)``; in the evening
     window ``not_before``, a back-off's end, moves it to the first slot at
-    or after that end. The lane tries no other row (switch-over plan 7.2,
-    R4).
+    or after that end. The lane tries no other row.
     """
     row = _read_day(conn, station_id, local_date)
     if row is None:

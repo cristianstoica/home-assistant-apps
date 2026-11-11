@@ -60,7 +60,7 @@ class CurrentObservation:
     ``local_date`` is the reading's own local date from ``obsTimeLocal``, or
     ``None`` when the reply carries none.
 
-    The ``reading_*`` fields are the raw store's values (plan 5.5), read from
+    The ``reading_*`` fields are the raw store's values, read from
     the reply's own ``metric.temp``, ``metric.precipTotal`` and
     ``metric.windSpeed`` through ``reading_value``: ``None`` when absent or
     rejected. ``reading_unusable`` names the quantities whose value was

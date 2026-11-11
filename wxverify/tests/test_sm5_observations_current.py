@@ -31,9 +31,8 @@ Nine oracles:
    at all (precedent: test_error_count_null_when_poll_state_absent): False,
    not None.
 
-9. A weather.com refused-access hold (401/403, plan 2026-10-27
-   refused-access-hold §13.9 API1) does not change this route's reply: the
-   hold lives in runtime_state, a table this route never reads/joins, so a
+9. A weather.com refused-access hold (401/403) does not change this route's
+   reply: the hold lives in runtime_state, a table this route never reads/joins, so a
    held current_obs kind must leave every value and the whole key set
    byte-identical to the pre-hold baseline.
 
@@ -91,8 +90,7 @@ _PRECIP_TOTAL_MM = 2.1
 # Synthetic neighborhood (opsec: public repo)
 _NEIGHBORHOOD = "Synthetic Test Valley"
 
-# Synthetic station id, distinct from the other oracles' constants (plan
-# §13.9 API1).
+# Synthetic station id, distinct from the other oracles' constants.
 _PWS_REFUSED = "ISTATION06"
 
 # Due before any "now" the route itself reads (the route never consults
@@ -795,7 +793,7 @@ def test_provider_reported_offline_false_when_poll_state_absent(
 
 
 # ---------------------------------------------------------------------------
-# Oracle 9 (plan §13.9, API1) — a refused-access hold does not change this
+# Oracle 9 — a refused-access hold does not change this
 #            route's reply
 # ---------------------------------------------------------------------------
 

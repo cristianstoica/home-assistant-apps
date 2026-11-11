@@ -1,4 +1,4 @@
-"""Keep the CSRF nonce across tabs (card 21, 0.16.19).
+"""Keep the CSRF nonce across tabs (0.16.19).
 
 ``render`` and ``/api/csrf`` reuse the cookie's nonce (``csrf_pair_for``)
 instead of minting a fresh one on every page load, so a second tab's token

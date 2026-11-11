@@ -1,5 +1,4 @@
-"""The cutover (daily-close switch-over plan §6; test IDs CV1-CV10 of
-§17.3).
+"""The cutover (test IDs CV1-CV10).
 
 CV1-CV7, CV9 and CV10 pinned ``wxverify.worker.cutover``, the one-time
 switch-over machinery that built each site's first publication and set the

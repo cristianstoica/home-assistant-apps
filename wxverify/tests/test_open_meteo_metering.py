@@ -1,9 +1,7 @@
-"""Item A -- Open-Meteo previous-runs metering (A-T1..A-T13).
+"""Open-Meteo previous-runs metering.
 
 Pins ``OpenMeteoAdapter.estimate_cost`` (A-T1), ``_metered_calls`` (A-T5) and
 the untouched-past-rows guarantee on a second ``run_migrations`` pass (A-T9).
-The historical-replay cases (A-T2-A-T4, A-T6-A-T8, A-T10-A-T13) leave with
-R10's removal of the previous-runs/historical-replay seam.
 """
 
 from __future__ import annotations
@@ -59,7 +57,7 @@ def _init_tmp_db(tmp_path: Path) -> sqlite3.Connection:
 @pytest.mark.parametrize("max_lead_hours", [168, 384])
 def test_forward_estimate_cost_is_always_one_call(max_lead_hours: int) -> None:
     """A-T1: three variables, one deterministic model -- weight 0.3, floored
-    to 1 -- regardless of how high Item C later raises the horizon.
+    to 1 -- regardless of how high the horizon is raised.
     """
     adapter = OpenMeteoAdapter(httpx.AsyncClient())
     req = _req(max_lead_hours=max_lead_hours)
@@ -86,7 +84,7 @@ def test_metered_calls_exact_integer_arithmetic_at_60_billed_days() -> None:
 def test_run_migrations_leaves_past_api_budget_rows_byte_identical(
     tmp_path: Path,
 ) -> None:
-    """A-T9: Item A changes no schema and performs no data migration. Prior
+    """A-T9: metering changes no schema and performs no data migration. Prior
     ``api_budget`` rows are historical fact and are untouched by a second
     ``run_migrations`` pass.
     """

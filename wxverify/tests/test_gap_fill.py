@@ -1,11 +1,10 @@
-"""The gap fill (plan 2026-10-21-daily-close-download-and-raw-store.md
-section 7.5, 12.1 and 14.8): ``gap_plan`` and ``fill_gaps``, tests GF1-GF9.
+"""The gap fill: ``gap_plan`` and ``fill_gaps``, tests GF1-GF9.
 
 The site is built with ``tests.helpers.day_close_site`` (A and B), extended
-with four more synthetic stations (C-F, ``ISTATION03``-``ISTATION06``), per
-plan 14.1: each added with its own ``station_changes`` 'added' row dated
+with four more synthetic stations (C-F, ``ISTATION03``-``ISTATION06``):
+each added with its own ``station_changes`` 'added' row dated
 D-10, before the site's day records are started, so every station sits on
-every day's station list (P1 DS13: a started day never gains a station).
+every day's station list (a started day never gains a station).
 D-3 is closed and D-2 is missed exactly as ``day_close_site``'s own
 ``with_records=True`` path does; this file additionally closes D-1 (named
 ``GAP_DAY`` below) through ``begin_close``, so ``GAP_DAY`` -- the day whose
@@ -14,33 +13,31 @@ noon UTC, ``tests.helpers.NOW``) is reached. Zone is ``UTC`` throughout;
 every station id is synthetic (``ISTATION01``-``ISTATION06``); the API key
 is the CI placeholder.
 
-Raw readings are seeded directly into ``station_wind_records`` (plan 11.1's
-shape, with ``source``), since the download that would otherwise produce
+Raw readings are seeded directly into ``station_wind_records`` (with
+``source``), since the download that would otherwise produce
 them is out of this file's scope. The six stations' days (inside the
 shared ``site`` fixture):
 
 - A (``ISTATION01``): nothing at all -- every hour a gap.
 - B (``ISTATION02``): hours 5 and 7 are pure gaps; hour 6 carries one
   isolated ``current_obs`` reading only (no ``five_minute`` reading), so it
-  is NOT a gap (a reading of either source is enough, 7.1) but has no wind
+  is NOT a gap (a reading of either source is enough) but has no wind
   pair (no_pair_hours); hour 23, the day's last hour, carries dense
-  ``five_minute`` readings every 5 minutes up to :49 (7.6: the 5-minute
+  ``five_minute`` readings every 5 minutes up to :49 (the 5-minute
   download never delivers a day's last few minutes), so it pairs within
   itself exactly like any other full hour and is neither a gap nor a
   no-pair hour -- no special carve-out is needed in ``gap_plan`` for it
   (GF8). Every other hour has two readings 5 minutes apart (an easy pair).
 - C, E, F: a full day of paired readings, no gaps, nothing to fill.
 - D (``ISTATION04``): a full day of paired readings except hour 10, whose
-  one reading at :55 pairs forward into hour 11 (the later reading's hour,
-  7.4) and so gets no pair of its own -- a no-pair hour, not a gap.
+  one reading at :55 pairs forward into hour 11 (the later reading's hour)
+  and so gets no pair of its own -- a no-pair hour, not a gap.
 
 Isolation: a fresh ``tmp_path`` SQLite file and a real ``Database``/
 ``FencedWriter`` per test (the ``site`` fixture is function-scoped); the
 provider is an ``httpx.MockTransport`` patched onto
-``wxverify.worker.day_values.httpx.AsyncClient`` (the module that, by this
-plan's placement of ``fill_gaps``, is where its own client would be built --
-the one choice beyond the written contract this file makes; see the
-hand-back message).
+``wxverify.worker.day_values.httpx.AsyncClient`` (the module where
+``fill_gaps`` builds its client).
 """
 
 from __future__ import annotations
@@ -200,7 +197,7 @@ def _seed_full_day(conn, station_id: int) -> None:  # type: ignore[no-untyped-de
 def _seed_station_b(conn, station_id: int) -> None:  # type: ignore[no-untyped-def]
     """Hours 5, 7 are pure gaps; hour 6 is current_obs-only (no pair); hour
     23 (the day's last hour) carries dense five_minute readings every 5
-    minutes up to :49 (7.6), which pair within the hour like any other
+    minutes up to :49, which pair within the hour like any other
     full hour -- pinning that no last-hour carve-out is needed in
     gap_plan (GF8, M53)."""
     for hour in range(24):
@@ -251,7 +248,7 @@ def _seed_station_b(conn, station_id: int) -> None:  # type: ignore[no-untyped-d
 
 def _seed_station_d(conn, station_id: int) -> None:  # type: ignore[no-untyped-def]
     """Every hour paired except hour 10: its one reading at :55 pairs
-    forward into hour 11 (the later reading's hour, 7.4), so hour 10 gets
+    forward into hour 11 (the later reading's hour), so hour 10 gets
     no pair of its own -- a no-pair hour, not a gap (it has a reading)."""
     for hour in range(24):
         if hour == 10:
@@ -405,7 +402,7 @@ def _patched_client(handler):  # type: ignore[no-untyped-def]
 def test_gf1_gap_plan_identifies_gaps_no_pair_and_to_fill(
     site: tuple[Database, FencedWriter, int, dict[str, int]],
 ) -> None:
-    """GF1 (plan 14.8): B's 3-hour window, D's no-pair hour, A with nothing.
+    """GF1: B's 3-hour window, D's no-pair hour, A with nothing.
 
     Kills M46 (gap_plan would count hour 6 -- which carries only a
     current_obs reading -- as a gap too): at the gap_hours(B) assertion,
@@ -720,15 +717,14 @@ def test_gf7_a_closed_or_missed_day_refuses_every_gap_fill_write(
     tmp_path: Path,
 ) -> None:
     """GF7: once GAP_DAY is closed, and separately once it is missed, every
-    station's gap-fill write is refused by P1's guard and nothing is
+    station's gap-fill write is refused by the closed-day guard and nothing is
     stored, even though every station still has hours to fill.
 
     This pins the guard refusal itself (a write-past-the-guard regression
-    would show up here as stored rows); P1's guard refuses a closed or
+    would show up here as stored rows); the guard refuses a closed or
     missed day's WriteKind.GAP_FILL and WriteKind.READING identically
     (``_record_allows``'s DONE_STATES branch answers only RAW_PRUNE), so
-    this fixture cannot itself tell GAP_FILL and READING apart -- see the
-    hand-back message for where that distinction is actually pinned.
+    this fixture cannot itself tell GAP_FILL and READING apart.
     """
     for close_kind in ("closed", "missed"):
         base = tmp_path / close_kind
@@ -781,7 +777,7 @@ def test_gf7_a_closed_or_missed_day_refuses_every_gap_fill_write(
 def test_gf8_the_days_last_hour_is_never_a_gap_fill_target(
     site: tuple[Database, FencedWriter, int, dict[str, int]],
 ) -> None:
-    """GF8: B's last hour has dense five_minute readings to 23:49 (7.6), so
+    """GF8: B's last hour has dense five_minute readings to 23:49, so
     it pairs within itself like any other full hour and sits in neither
     ``gap_hours`` nor ``to_fill`` -- no special last-hour exemption is
     needed or taken.

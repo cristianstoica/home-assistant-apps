@@ -1,14 +1,11 @@
-"""P5 plan §13.8: the provisional Overlay line (PL1-PL11).
+"""The provisional Overlay line (PL1-PL11).
 
-Fixtures and time per plan §13.1: ``day_close_site`` (tests/helpers.py)
-gives a UTC site, stations A (``ISTATION01``) and B (``ISTATION02``), D-3
-``closed``, D-2 ``missed``, D-1 ``open`` and ended, D current. Raw readings
-go through P2's own writer, ``store_readings``, with each row's real
-source. ``provisional_site_hours`` (plan §9.1) is the new name this module
-tests; it is imported inside each test body so the module collects before
-Step 4 piece 5 lands ``wxverify/provisional_line.py`` (plan §15 Step 3).
-Every row fails on today's code: the module does not exist yet, so every
-import raises ``ModuleNotFoundError``.
+Fixtures and time: ``day_close_site`` (tests/helpers.py) gives a UTC site,
+stations A (``ISTATION01``) and B (``ISTATION02``), D-3 ``closed``, D-2
+``missed``, D-1 ``open`` and ended, D current. Raw readings go through the
+collection's own writer, ``store_readings``, with each row's real source.
+``provisional_site_hours`` is the name this module tests; it is imported
+inside each test body.
 """
 
 from __future__ import annotations
@@ -94,7 +91,7 @@ def _hour(h: int, day: date = D) -> datetime:
 
 
 def test_pl1_running_hour_excluded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """PL1 (plan §13.8, §8.2): hours 00:00-11:00 have values, 12:00 none
+    """PL1: hours 00:00-11:00 have values, 12:00 none
     (M75: ``through_utc`` must floor to the whole hour, not take ``now``
     itself)."""
     from wxverify.provisional_line import provisional_site_hours
@@ -126,7 +123,7 @@ def test_pl1_running_hour_excluded(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_pl2_site_value_matches_consensus_over_qc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PL2 (plan §13.8, §8.3): the 03:00 temperature site value equals
+    """PL2: the 03:00 temperature site value equals
     ``qc_flag`` + ``compute_consensus`` run directly on the same per-station
     inputs (M76: a plain mean instead of ``compute_consensus``)."""
     from wxverify.provisional_line import provisional_site_hours
@@ -190,7 +187,7 @@ def test_pl2_site_value_matches_consensus_over_qc(
 
 
 def test_pl3_spike_left_out_by_qc(monkeypatch: pytest.MonkeyPatch) -> None:
-    """PL3 (plan §13.8, §8.3): A's 06:00 temperature spike (40C above its
+    """PL3: A's 06:00 temperature spike (40C above its
     05:00) is left out by ``qc_flag``; the site value comes from B alone
     (M77: ``qc_flag`` not applied)."""
     from wxverify.provisional_line import provisional_site_hours
@@ -264,7 +261,7 @@ def test_pl3_spike_left_out_by_qc(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_pl4_gap_hour_uses_current_obs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """PL4 (plan §13.8, §8.2): an hour with no 5-minute reading draws from
+    """PL4: an hour with no 5-minute reading draws from
     current-conditions readings instead (M78: only ``five_minute`` readings
     used)."""
     from wxverify.provisional_line import provisional_site_hours
@@ -316,7 +313,7 @@ def test_pl4_gap_hour_uses_current_obs(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_pl5_fully_empty_hour_has_no_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    """PL5 (plan §13.8, §8.2): an hour with no reading at all has no
+    """PL5: an hour with no reading at all has no
     temperature, rain or wind -- never drawn as 0 (M79)."""
     from wxverify.provisional_line import provisional_site_hours
 
@@ -370,14 +367,14 @@ def test_pl5_fully_empty_hour_has_no_values(monkeypatch: pytest.MonkeyPatch) -> 
     )
     assert rain_line.values.get(_hour(10)) is None, (
         "M79 -> at this assertion: correct = hour 10:00's rain is also"
-        " none (the rain hour right after a gap has none, §8.2), mutant ="
+        " none (the rain hour right after a gap has none), mutant ="
         " a gap hour drawn as 0, which this check also catches since the"
         " gap-aware absence would instead read as a zero."
     )
 
 
 def test_pl6_line_holds_prior_closing_day(monkeypatch: pytest.MonkeyPatch) -> None:
-    """PL6 (plan §13.8, §8.1): with D-1 ``closing`` and ``now`` D 00:40, the
+    """PL6: with D-1 ``closing`` and ``now`` D 00:40, the
     line holds D-1's hours and shows none of D's yet (M80: only today
     drawn)."""
     from wxverify.db.site_days import begin_close
@@ -425,7 +422,7 @@ def test_pl6_line_holds_prior_closing_day(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_pl7_closed_day_leaves_the_line(monkeypatch: pytest.MonkeyPatch) -> None:
-    """PL7 (plan §13.8, §8.1): PL6, then D-1 ``closed`` -- it leaves the
+    """PL7: PL6, then D-1 ``closed`` -- it leaves the
     line (M81: a closed day kept on the line)."""
     from wxverify.db.site_days import begin_close, finish_close
     from wxverify.provisional_line import provisional_site_hours
@@ -467,7 +464,7 @@ def test_pl7_closed_day_leaves_the_line(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_pl8_retry_due_kept_missed_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
-    """PL8 (plan §13.8, §8.1): PL6, then D-1 ``retry_due`` (still on the
+    """PL8: PL6, then D-1 ``retry_due`` (still on the
     line), then ``missed`` (off the line entirely) (M82)."""
     from wxverify.db.site_days import begin_close, fail_close
     from wxverify.provisional_line import provisional_site_hours
@@ -540,7 +537,7 @@ def test_pl8_retry_due_kept_missed_dropped(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_pl10_latest_reading_at_is_the_latest(monkeypatch: pytest.MonkeyPatch) -> None:
-    """PL10 (plan §13.8, §8.4): the line's latest reading time is the
+    """PL10: the line's latest reading time is the
     LATEST over the drawn stations, not the earliest (M84)."""
     from wxverify.provisional_line import provisional_site_hours
 
@@ -580,7 +577,7 @@ def test_pl10_latest_reading_at_is_the_latest(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_pl11_writes_no_scoring_or_truth_row(monkeypatch: pytest.MonkeyPatch) -> None:
-    """PL11 (plan §13.8, §8.3, §8.5): the line writes no
+    """PL11: the line writes no
     ``station_observations``, ``observations``, ``forecast_history`` or
     ``daily_truth`` row (M85: ``write_station_observation`` called for the
     jump check)."""
@@ -607,7 +604,7 @@ def test_pl11_writes_no_scoring_or_truth_row(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_pl12_set_aside_station_left_out_of_todays_rain() -> None:
-    """PL12 (rain release, Part A follow-up): a station the rain check set
+    """PL12: a station the rain check set
     aside for D (``rain_counted = 0`` on D's list row) does not count in
     D's provisional rain line, and counts again once taken back. A reads
     0.0 all morning; B's running total rises by 2.0 mm in hour 03:00, so

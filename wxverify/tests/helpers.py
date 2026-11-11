@@ -280,7 +280,7 @@ def asof_insert_sample(
 
 def evidence_digest(conn: sqlite3.Connection, run_id: int) -> str:
     """sha256 over every ``verification_evidence`` and
-    ``verification_day_context`` row for ``run_id`` (plan §5.2).
+    ``verification_day_context`` row for ``run_id``.
     """
     digest = hashlib.sha256()
 
@@ -361,8 +361,8 @@ def seed_pair_max_wind(
 
 
 # ---------------------------------------------------------------------------
-# Daily-close day-state fixture (plan 2026-10-20-daily-close-day-state-and-
-# guard.md §13.1). Station ids are synthetic (ISTATION01, ISTATION02, ...),
+# Daily-close day-state fixture.
+# Station ids are synthetic (ISTATION01, ISTATION02, ...),
 # zones are UTC/Etc/GMT only, and D is a fixed synthetic date well in the
 # past so the real clock never catches up with a test's faked one.
 # ---------------------------------------------------------------------------
@@ -384,7 +384,7 @@ def day_close_site(
     with_records: bool = True,
     station_ids: tuple[str, str] = (_DAY_CLOSE_STATION_A, _DAY_CLOSE_STATION_B),
 ) -> int:
-    """Build the daily-close plan's shared fixture site (plan §13.1).
+    """Build the daily-close tests' shared fixture site.
 
     Makes a site under ``timezone`` with two enabled stations, A and B,
     defaulting to ``ISTATION01`` and ``ISTATION02`` (override with
@@ -395,10 +395,6 @@ def day_close_site(
     ``missed`` (``never_attempted``), each 30 minutes after that day's own
     ``day_end_utc``.
     """
-    # wxverify.db.site_days arrives in Step 4 piece 2 of the daily-close
-    # plan; importing it inside this function body, rather than at module
-    # top, keeps every other test module that imports this file collecting
-    # until then.
     from wxverify.db.site_days import (
         DAILY_CLOSE_ON_KEY,
         begin_close,
@@ -474,7 +470,7 @@ def day_close_site(
 
 def evening_slots_utc(local_date: date, tz_name: str) -> tuple[datetime, ...]:
     """The 15 evening-window instants for ``local_date`` in ``tz_name``,
-    written out independently of the app (plan §1.5), never from
+    written out independently of the app, never from
     ``EVENING_SLOTS``.
 
     The suite's zones (``UTC`` and ``Etc/GMT-14``) have no clock change, so
@@ -490,7 +486,7 @@ def evening_slots_utc(local_date: date, tz_name: str) -> tuple[datetime, ...]:
 
 def note_day_clock(t: datetime) -> datetime:
     """Raise the helper's latest-known test clock to ``t`` when later, and
-    return ``t`` unchanged (plan §13.1).
+    return ``t`` unchanged.
 
     Any ``now_utc`` later than :data:`NOW` that reaches ``ensure_site_days``
     -- directly, or through the guard -- must be passed through this first
@@ -508,8 +504,7 @@ def note_day_clock(t: datetime) -> datetime:
 
 def check_day_close_records() -> None:
     """Assert every connection :func:`day_close_site` built holds no
-    ``site_days`` record dated past the bound the test's clocks allow
-    (plan §13.1).
+    ``site_days`` record dated past the bound the test's clocks allow.
 
     Imports nothing from ``wxverify.db.site_days``, so it shares no bug with
     the code under test: every read here is plain SQL against the
@@ -563,34 +558,33 @@ def check_day_close_records() -> None:
 
 
 # ---------------------------------------------------------------------------
-# P3 close-chain test helpers and fixtures (plan 2026-10-21-daily-close-
-# close-job.md §15.1). Shared by every file under tests/test_close_*.py that
-# exercises the night chain itself (test_close_timeline.py onward).
+# Close-chain test helpers and fixtures. Shared by every file under
+# tests/test_close_*.py that exercises the night chain itself
+# (test_close_timeline.py onward).
 #
-# None of P3's own names (close_chain.enqueue_due_close_work,
+# None of the close chain's names (close_chain.enqueue_due_close_work,
 # close_chain.settle_interrupted_closes, every close_p4 name) are imported
-# at this module's top level: they do not exist yet, and every test module
-# importing this file -- including the whole pre-close-chain suite -- must
-# keep collecting. Each helper below that needs one of them imports it
-# inside its own body instead.
+# at this module's top level, so a failing import in one of them cannot
+# stop every test module that imports this file from collecting. Each
+# helper below that needs one of them imports it inside its own body
+# instead.
 # ---------------------------------------------------------------------------
 
 
 def _job_stamp(when: datetime) -> str:
     """``jobs.created_at``/``updated_at``'s own DEFAULT form, from a clock
-    instant: ``%Y-%m-%dT%H:%M:%S.mmmZ`` (milliseconds, 3 digits; plan
-    §15.1's "job stamps follow the clock"), matching SQLite's
-    ``strftime('%Y-%m-%dT%H:%M:%fZ','now')`` (``db/migrations.py:1564-1567``).
+    instant: ``%Y-%m-%dT%H:%M:%S.mmmZ`` (milliseconds, 3 digits), matching
+    SQLite's ``strftime('%Y-%m-%dT%H:%M:%fZ','now')`` (``db/migrations.py:1564-1567``).
     """
     dt = when.astimezone(UTC)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
 # Every module whose own code a close-chain test runs and that imports
-# ``utc_now`` BY NAME (plan §15.1). ``wxverify.core.timeutil`` itself is
+# ``utc_now`` BY NAME. ``wxverify.core.timeutil`` itself is
 # included so every other reader of the real name sees the same clock.
-# P1's and P2's modules take ``now_utc`` as an explicit parameter instead
-# (confirmed: neither ``db/site_days.py`` nor ``worker/day_values.py``
+# The day-record and day-values modules take ``now_utc`` as a parameter
+# instead (confirmed: neither ``db/site_days.py`` nor ``worker/day_values.py``
 # imports ``utc_now``), so they are not listed; a test passes
 # ``clock.now()`` through their ``now_utc=`` parameter directly.
 _CLOSE_CLOCK_MODULES: Final[tuple[str, ...]] = (
@@ -618,8 +612,8 @@ _CLOSE_CLOCK_MODULES: Final[tuple[str, ...]] = (
 
 
 class MovingClock:
-    """One clock object for a close-chain test (plan §15.1's "a moving
-    clock"), plus the bookkeeping :func:`patch_close_clock` and
+    """One moving clock for a close-chain test, plus the bookkeeping
+    :func:`patch_close_clock` and
     :func:`tick`/:func:`run_due_jobs` need for the job-stamp rule: every
     ``jobs`` row a tick or a job run inserts (id above the highest id this
     clock has already stamped) gets ``created_at``/``updated_at`` set to
@@ -687,17 +681,15 @@ def patch_close_clock(monkeypatch: pytest.MonkeyPatch, clock: MovingClock) -> No
     """Replace ``utc_now`` with ``clock.now`` in ``core.timeutil`` and every
     module of :data:`_CLOSE_CLOCK_MODULES` that imports it by name, as
     ``tests/test_claim_promotion.py:108``'s ``frozen_now`` does for one
-    module (plan §15.1). ``close_chain`` does not import ``utc_now`` by
-    name yet (it holds only ``record_collection_try`` today), so that one
-    patch is inert until piece 3/4 add the import -- ``raising=False``
-    tolerates that rather than failing every test that patches the clock.
+    module. ``raising=False`` tolerates a listed module that does not import
+    ``utc_now`` by name, rather than failing every test that patches the clock.
     """
     for module in _CLOSE_CLOCK_MODULES:
         monkeypatch.setattr(f"{module}.utc_now", clock.now, raising=False)
 
 
 class Stop(BaseException):
-    """Raised by a stand-in to simulate a stop mid-stage (plan §15.1): a
+    """Raised by a stand-in to simulate a stop mid-stage: a
     ``BaseException`` subclass, deliberately NOT an ``Exception``, so it
     passes through every ``except Exception`` in the dispatch path the way
     a real process kill would, instead of being caught and turned into a
@@ -707,7 +699,7 @@ class Stop(BaseException):
 
 async def tick(db: Database, clock: MovingClock, at: datetime | None = None) -> None:
     """One ``scheduler_tick``, optionally moving ``clock`` to ``at`` first,
-    with the job-stamp rule applied to any row it inserted (plan §15.1).
+    with the job-stamp rule applied to any row it inserted.
 
     Primes ``clock`` right BEFORE ``scheduler_tick``'s own insert, not
     after: priming after would raise the high-water mark past the very
@@ -726,7 +718,7 @@ def _pending_stage_job_exists(
 ) -> bool:
     """Whether a ``pending`` job of ``job_type`` keyed to end in
     ``:{stage}`` exists (every ``day_close``/``day_publish`` key ends in
-    its stage, plan §8.1) -- :func:`run_due_jobs`'s ``stop_before`` check.
+    its stage) -- :func:`run_due_jobs`'s ``stop_before`` check.
     """
     row = conn.execute(
         "SELECT 1 FROM jobs WHERE type = ? AND status = 'pending'"
@@ -754,8 +746,8 @@ async def run_due_jobs(
     *,
     stop_before: tuple[str, int] | None = None,
 ) -> list[tuple[str, str | None, str]]:
-    """Tick and claim until nothing is due at the clock's current time
-    (plan §15.1), each job run with ``claim_next_job``/``run_claimed_job``
+    """Tick and claim until nothing is due at the clock's current time,
+    each job run with ``claim_next_job``/``run_claimed_job``
     as production does (the pattern of
     ``tests/test_verification_day_pipeline.py:1020``). Returns each
     claim's ``(type, job_key, outcome)`` in claim order, ``outcome`` being
@@ -806,12 +798,12 @@ async def run_due_jobs(
 
 
 class RoundStateStandIn:
-    """``close_p4.round_state`` stand-in (plan §14.1, stage 1 only; §15.1
-    "P4."; §18.13). Answers per ``(site_id, round_date)``, programmed with
+    """``close_p4.round_state`` stand-in (stage 1 only). Answers per
+    ``(site_id, round_date)``, programmed with
     :meth:`set_answer`; :meth:`raise_for_site` makes every call for one
     site raise instead (TL10's per-site fault), leaving other sites
     unaffected. A ``(site_id, round_date)`` with no programmed answer calls
-    through to P4's real ``round_state`` instead of raising ``KeyError``.
+    through to the real ``round_state`` instead of raising ``KeyError``.
     Every call is recorded in :attr:`calls`, in call order.
     """
 
@@ -842,17 +834,13 @@ class RoundStateStandIn:
             assert self._call_through is not None
             return self._call_through(conn, site_id=site_id, round_date=round_date)
         settled, bound_utc = answer
-        from wxverify.worker.close_p4 import RoundState  # P3 name, §14.1
+        from wxverify.worker.close_p4 import RoundState
 
         return RoundState(settled=settled, bound_utc=bound_utc)
 
 
 def install_round_state_standin(monkeypatch: pytest.MonkeyPatch) -> RoundStateStandIn:
-    """Patch ``close_p4.round_state`` with a fresh :class:`RoundStateStandIn`
-    (plan §15.1 "P4."; §18.13). ``close_p4.py`` does not exist until piece
-    3, so this raises ``ModuleNotFoundError`` until then -- the right
-    failure for any TL test that calls it before that piece lands.
-    """
+    """Patch ``close_p4.round_state`` with a fresh :class:`RoundStateStandIn`."""
     from wxverify.worker import close_p4
 
     standin = RoundStateStandIn(close_p4.round_state)
@@ -861,12 +849,12 @@ def install_round_state_standin(monkeypatch: pytest.MonkeyPatch) -> RoundStateSt
 
 
 class RecordingStandIn:
-    """Generic recorder for a sync P4 call point (plan §14.1's
-    ``score_day``; §15.1 "P4."; §18.13). Records every call's ``kwargs`` in
+    """Generic recorder for a sync ``close_p4`` call point (``score_day``).
+    Records every call's ``kwargs`` in
     :attr:`calls`; returns :attr:`result` (calling it first if it is a
     plain callable) or raises :attr:`raises` when the test sets one. When
-    neither is set, calls through to P4's real body. Deliberately ignorant
-    of P4's own return types -- the test that configures ``result`` builds
+    neither is set, calls through to the real body. Deliberately ignorant
+    of ``close_p4``'s own return types -- the test that configures ``result`` builds
     those itself, from ``close_p4`` directly.
     """
 
@@ -889,8 +877,8 @@ class RecordingStandIn:
 
 
 class AsyncRecordingStandIn(RecordingStandIn):
-    """:class:`RecordingStandIn` for an async P4 call point (``publish``,
-    plan §14.1; §18.13). Awaits what the call-through, or a callable
+    """:class:`RecordingStandIn` for an async ``close_p4`` call point
+    (``publish``). Awaits what the call-through, or a callable
     ``result``, returns when that value is awaitable.
     """
 
@@ -915,7 +903,7 @@ def install_p4_standins(
     monkeypatch: pytest.MonkeyPatch,
 ) -> dict[str, RecordingStandIn]:
     """Patch ``close_p4``'s other two call points -- ``score_day``,
-    ``publish`` -- with generic recorders that call through to P4's real
+    ``publish`` -- with generic recorders that call through to the real
     body when the test leaves neither ``result`` nor ``raises`` set. The
     round-state stage has its own :func:`install_round_state_standin`,
     since its answer is keyed by round date and may need to fault one
@@ -936,12 +924,11 @@ def install_p4_standins(
 
 def clear_close_chain_log_map() -> None:
     """Clear ``close_chain``'s per-``(site, step)`` last-ERROR-instant map
-    (plan §8.5's flood guard; §15.1 "The log map.") before the test, so no
+    (the flood guard) before the test, so no
     test inherits another's. A plain function, not a fixture (the whole
-    suite must stay untouched by a P3 fixture) -- each P3 test file wires
-    this into its own autouse fixture to request it explicitly.
-    Tolerates the map (or the module attribute) not existing yet: that is
-    the expected state before piece 4 lands.
+    suite must stay untouched by a close-chain fixture) -- each test file
+    using it wires this into its own autouse fixture to request it explicitly.
+    Tolerates the map (or the module attribute) not existing.
     """
     with contextlib.suppress(ModuleNotFoundError, AttributeError):
         from wxverify.worker import close_chain
@@ -953,7 +940,7 @@ def patch_weathercom_transport(
     monkeypatch: pytest.MonkeyPatch, handler: Callable[[httpx.Request], httpx.Response]
 ) -> None:
     """Patch the gap fill's HTTP client onto an ``httpx.MockTransport``
-    wrapping ``handler`` (plan §15.1 "The provider."; the pattern of
+    wrapping ``handler`` (the pattern of
     ``tests/test_gap_fill.py:394-397``, since ``_Fill.client()`` builds a
     bare ``httpx.AsyncClient()``, ``worker/day_values.py:487-491``).
     """
@@ -972,7 +959,7 @@ def write_weathercom_key(
 ) -> Path:
     """Write an ``options.json`` holding (``key`` given) or omitting
     (``key=None``, AT16) a ``weathercom_key``, and point
-    ``config.options_path`` at it (plan §15.1 "The weather.com key."; the
+    ``config.options_path`` at it (the
     pattern of ``tests/test_gap_fill.py:93-103``).
     """
     options_path = tmp_path / "options.json"
@@ -983,8 +970,8 @@ def write_weathercom_key(
 
 
 def disable_station_pacing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No-op the gap fill's between-call pacing sleep (plan §15.1 "No
-    pacing sleep."; the real ``pace_station_call`` sleeps between a fill's
+    """No-op the gap fill's between-call pacing sleep (the real
+    ``pace_station_call`` sleeps between a fill's
     calls, ``worker/station_pacing.py:71-74``, imported by name at
     ``worker/day_values.py:81``).
     """
@@ -1026,8 +1013,10 @@ def disable_other_enqueuers(
 def stub_fetch_feed(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
     """Replace ``dispatch``'s real ``fetch_feed`` handler
     (``worker/processor.py:720``) with a stub recording ``(site_id,
-    feed_id)`` and returning ``None`` (plan §15.1 "Other job kinds.",
-    TL8). Without this a seeded ``fetch_feed`` job would run through its
+    feed_id)`` and returning ``None`` (see
+    ``test_tl8_close_kinds_claim_ahead_of_an_older_tier1_job`` in
+    test_close_timeline.py). Without this a seeded
+    ``fetch_feed`` job would run through its
     real handler and trip the autouse network guard.
     """
     calls: list[tuple[int, int]] = []
@@ -1049,7 +1038,9 @@ def stub_fetch_feed(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
 def stub_wind_days(monkeypatch: pytest.MonkeyPatch) -> list[int]:
     """Replace ``dispatch``'s real wind-lane handler
     (``worker/processor.py:700``) with a stub recording ``site_id`` and
-    returning ``None`` (plan §15.1 "Other job kinds.", TL3).
+    returning ``None`` (see
+    ``test_tl3_close_waits_behind_a_due_wind_lane_job`` in
+    test_close_timeline.py).
     """
     calls: list[int] = []
 
@@ -1061,8 +1052,7 @@ def stub_wind_days(monkeypatch: pytest.MonkeyPatch) -> list[int]:
 
 
 def failed_scope_count(conn: sqlite3.Connection, *, now_utc: datetime) -> int:
-    """AT13/AT14/PB8/PB9's failed-scope count (plan §15.1 "The
-    failed-scope count."): the health check's failed arm alone
+    """AT13/AT14/PB8/PB9's failed-scope count: the health check's failed arm alone
     (``FAILED_SCOPES_SQL``, run with the same cutoff
     ``_pipeline_conditions`` uses, ``monitor.py:720,723``), never
     ``build_verdict``'s in-flight arm, which would also count a job a
@@ -1108,8 +1098,8 @@ def _seed_five_minute_day(
             )
 
 
-#: R, the round date of :data:`D` (plan §4.1: "R = D + 1"), and the
-#: standard night's round bound, R 00:40Z (plan §15.1 "Standard night").
+#: R, the round date of :data:`D` (``R = D + 1``), and the
+#: standard night's round bound, R 00:40Z.
 STANDARD_NIGHT_R: Final = D + timedelta(days=1)
 STANDARD_NIGHT_ROUND_BOUND: Final = datetime(
     STANDARD_NIGHT_R.year,
@@ -1124,7 +1114,7 @@ STANDARD_NIGHT_ROUND_BOUND: Final = datetime(
 def standard_night(
     tmp_path: Path,
 ) -> tuple[Database, FencedWriter, int, dict[str, int]]:
-    """Plan §15.1's standard night: site S in ``UTC``, day ``D`` ``open``,
+    """The standard night: site S in ``UTC``, day ``D`` ``open``,
     ``D - 1`` ``closed``, ``R = D + 1``, ``worker_started_at`` ``D``
     12:00Z (:data:`NOW`), stations A and B on ``D``'s list with full
     5-minute readings on ``D`` (so the gap fill, once reached, finds
@@ -1172,16 +1162,16 @@ def standard_night(
 
 
 # ---------------------------------------------------------------------------
-# P4 §18.1: fixtures for the scored round and daytime downloads
-# (`tests/test_round_schedule.py`). Built on P3's fixtures above --
+# Fixtures for the scored round and daytime downloads
+# (`tests/test_round_schedule.py`). Built on the close-chain fixtures above --
 # `standard_night`, `MovingClock`/`patch_close_clock`, `run_due_jobs`,
 # `tick`, `Stop` -- which this section reuses, never copies.
 # ---------------------------------------------------------------------------
 
-#: P4 §18.1's real feeds X, Y, Z (360-minute interval) and G (720-minute),
+#: Real feeds X, Y, Z (360-minute interval) and G (720-minute),
 #: each its own synthetic ``source``/``model`` pair (so `UNIQUE(source,
 #: model)` never collides with a seeded real feed). Not meteoblue: that
-#: source's package mechanics (4.2, 4.4) are hardcoded to the literal
+#: source's package mechanics are hardcoded to the literal
 #: `source='meteoblue'` in today's code (`worker/scheduler.py:285`,
 #: `db/migrations.py:1950-1951`), so the test's package stand-in ("P") has
 #: to be the real seeded `meteoblue`/`multimodel` row instead
@@ -1207,13 +1197,13 @@ def seed_round_schedule_feeds(
     *,
     subscribe: Sequence[str] = ("X", "Y", "Z", "G"),
 ) -> dict[str, int]:
-    """Insert P4 §18.1's feeds X, Y, Z and G: real feeds (``is_virtual=0``),
+    """Insert feeds X, Y, Z and G: real feeds (``is_virtual=0``),
     each its own synthetic ``source``/``model`` pair, each with its own
-    ``sources`` row (a 10000 call/day cap, matching open-meteo's, plan
-    §3.2) so :func:`wxverify.collection.budget.reserve_budget` accepts it
+    ``sources`` row (a 10000 call/day cap, matching open-meteo's) so
+    :func:`wxverify.collection.budget.reserve_budget` accepts it
     without a test having to seed one by hand. Subscribes every name in
     ``subscribe`` at ``site_id`` through ``site_feed_state`` (plain
-    INSERT, plan §18.1's "seed helpers by plain INSERT"). Returns
+    INSERT). Returns
     ``{"X": feed_id, "Y": feed_id, "Z": feed_id, "G": feed_id}``.
     """
     ids: dict[str, int] = {}
@@ -1244,9 +1234,9 @@ def seed_round_schedule_feeds(
 
 
 def meteoblue_package_feed_id(conn: sqlite3.Connection) -> int:
-    """P4 §18.1's package ``P``: the id of the real seeded
+    """The package ``P``: the id of the real seeded
     ``meteoblue``/``multimodel`` feed row (``config.FEED_SEEDS``). Its
-    members ``P1``/``P2`` are not pre-seeded rows -- each is created the
+    members are not pre-seeded rows -- each is created the
     first time a reply's samples carry its model name
     (``_feed_id_for_sample``, ``collection/forecast_fetcher.py:273-285``);
     build such a sample with :func:`meteoblue_member_sample`.
@@ -1259,8 +1249,8 @@ def meteoblue_package_feed_id(conn: sqlite3.Connection) -> int:
 
 
 def subscribe_meteoblue_package(conn: sqlite3.Connection, site_id: int) -> int:
-    """Subscribe ``site_id`` to the real meteoblue package feed (P4
-    §18.1's "P"), by plain INSERT. Returns its feed id."""
+    """Subscribe ``site_id`` to the real meteoblue package feed ("P"),
+    by plain INSERT. Returns its feed id."""
     feed_id = meteoblue_package_feed_id(conn)
     conn.execute(
         "INSERT INTO site_feed_state (site_id, feed_id, enabled, error_count)"
@@ -1278,7 +1268,7 @@ def meteoblue_member_sample(
     lead_hours: int,
     value: float,
 ) -> NormalizedSample:
-    """One meteoblue package member's sample (P4 §18.1's "P1"/"P2"): its
+    """One meteoblue package member's sample: its
     ``model`` differs from the package row's ``multimodel``, so
     ``_feed_id_for_sample`` registers it under a new feed row the first
     time it is persisted (``collection/forecast_fetcher.py:273-285``).
@@ -1319,26 +1309,24 @@ def round_schedule_sample(
     )
 
 
-# -- The provider stand-in (P4 §18.1's "the provider") ----------------------
+# -- The provider stand-in ---------------------------------------------------
 
 
 @dataclass(frozen=True)
 class ProviderReply:
-    """A stand-in adapter call's successful outcome: usable samples (P4
-    §18.1's "a reply with given run labels and values")."""
+    """A stand-in adapter call's successful outcome: usable samples."""
 
     samples: tuple[NormalizedSample, ...]
 
 
 @dataclass(frozen=True)
 class ProviderEmpty:
-    """An HTTP 200 with no usable sample (P4 §18.1's "an empty reply")."""
+    """An HTTP 200 with no usable sample."""
 
 
 @dataclass(frozen=True)
 class ProviderHttpError:
-    """An HTTP failure status (P4 §18.1's "an HTTP 404", "500" or "a 429
-    with Retry-After")."""
+    """An HTTP failure status (a 404, a 500 or a 429 with Retry-After)."""
 
     status: int
     retry_after: str | None = None
@@ -1346,7 +1334,7 @@ class ProviderHttpError:
 
 @dataclass(frozen=True)
 class ProviderConnectError:
-    """A transport failure (P4 §18.1's "a ConnectError")."""
+    """A transport failure (a ``ConnectError``)."""
 
 
 ProviderOutcome = (
@@ -1356,7 +1344,7 @@ ProviderOutcome = (
 
 class _StandInAdapter:
     """One ``ForecastAdapter`` for one ``source``, answering from
-    :class:`ProviderStandIn`'s queue for that source (P4 §18.1)."""
+    :class:`ProviderStandIn`'s queue for that source."""
 
     def __init__(self, standin: ProviderStandIn, source: str) -> None:
         self._standin = standin
@@ -1390,7 +1378,7 @@ class _StandInAdapter:
 
 
 class ProviderStandIn:
-    """P4 §18.1's "the provider": one adapter stand-in, shared across every
+    """One adapter stand-in, shared across every
     source, answering per ``(source, call)`` from a per-source programmed
     queue, and counting calls per source in :attr:`calls`. Install with
     :func:`install_provider_standin`.
@@ -1428,14 +1416,14 @@ def install_provider_standin(monkeypatch: pytest.MonkeyPatch) -> ProviderStandIn
     """Patch the real dispatch path's adapter builder
     (``worker/processor.py``'s module-level ``build_adapter``, imported by
     name at ``worker/processor.py:48`` and called from ``_fetch_feed`` at
-    ``:1270``) with a fresh :class:`ProviderStandIn` (P4 §18.1's "the
-    provider, registered through `adapter_builder`"). Every ``fetch_feed``
+    ``:1270``) with a fresh :class:`ProviderStandIn`, registered through
+    ``adapter_builder``. Every ``fetch_feed``
     job -- round, daytime or unscheduled -- then calls the stand-in
     instead of a real provider; nothing opens a socket.
 
     Also installs :func:`install_test_source_domains`, since every caller
     of this stand-in drives a real download through the job pipeline for
-    one of P4 §18.1's synthetic feed sources, and without that mapping
+    one of the synthetic feed sources, and without that mapping
     ``source_domain`` raises a bare ``KeyError`` before any call is made.
     """
     standin = ProviderStandIn()
@@ -1445,7 +1433,7 @@ def install_provider_standin(monkeypatch: pytest.MonkeyPatch) -> ProviderStandIn
 
 
 def install_test_source_domains(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Map P4 §18.1's synthetic feed sources (X/Y/Z/G,
+    """Map the synthetic feed sources (X/Y/Z/G,
     :data:`ROUND_SCHEDULE_SOURCES`) in ``worker.domain_backoff.SOURCE_DOMAINS``
     (today keyed by real provider names only -- ``open-meteo``, ``meteoblue``,
     etc.) onto ``"{source}.example.invalid"``, not onto the bare source name.
@@ -1468,8 +1456,8 @@ def install_test_source_domains(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# P5's seven role seeds (daily-close plan 2026-10-22-daily-close-alerts-and-
-# pages.md §13.1). Each writes through P3's or P4's own writer where one
+# The seven role seeds for close-monitor and page tests. Each writes through
+# the close chain's or the publication's own writer where one
 # exists outside a running close, else a plain INSERT with that table's own
 # columns and stamp forms, so a renamed column changes one place. Station
 # ids and dates are synthetic; see ``day_close_site`` above for D/NOW.
@@ -1491,13 +1479,13 @@ def seed_attempt(
     ended_at: datetime | None = None,
     truth_version: str | None = None,
 ) -> None:
-    """R3.1's attempt record (one ``close_attempts`` row, P3 11.3).
+    """A close attempt record (one ``close_attempts`` row).
 
-    The row behind P3's ``AttemptRecord``: a close attempt (1 or 2) of a
-    site-day, from which P3 derives R3.4's blocking stage and which holds a
-    running stage's ``last_progress_at``. Plain INSERT: no P3 writer builds
-    one outside a running close. ``last_progress_at`` defaults to
-    ``started_at``.
+    The row behind ``AttemptRecord``: a close attempt (1 or 2) of a
+    site-day, from which the close chain derives the day's blocking stage
+    and which holds a running stage's ``last_progress_at``. Plain INSERT:
+    no close-chain writer builds one outside a running close.
+    ``last_progress_at`` defaults to ``started_at``.
     """
     conn.execute(
         "INSERT INTO close_attempts"
@@ -1538,11 +1526,11 @@ def seed_stage_log(
     reason: str | None = None,
     detail: str = "{}",
 ) -> None:
-    """R3.5's stage-log row (one ``close_stage_log`` row, P3 11.1).
+    """A close stage-log row (one ``close_stage_log`` row).
 
     One finished stage run: its start, end, queue wait and outcome
     (``completed``, ``failed``, ``superseded`` or ``skipped``). Plain
-    INSERT: P3 writes this only from inside a running close. ``job_id`` is
+    INSERT: the close chain writes this only from inside a running close. ``job_id`` is
     None for stage 1 only (the table's own CHECK).
     """
     conn.execute(
@@ -1585,9 +1573,9 @@ def seed_try(
     readings_kept: int = 0,
     readings_refused: int = 0,
 ) -> None:
-    """R3.6's collection-try row (one ``close_try_log`` row, P3 11.2).
+    """A collection-try row (one ``close_try_log`` row).
 
-    Thin wrapper over P3's own writer, ``record_collection_try``
+    Thin wrapper over the close chain's own writer, ``record_collection_try``
     (``worker/close_chain.py``), which exists outside a running close: one
     weather.com collection try, its station, download kind, slot (evening
     ``HH:MM``, ``daytime``, or ``gap_fill`` with ``close_attempt``), outcome
@@ -1626,12 +1614,12 @@ def seed_publication_state(
     publication_id: str | None = None,
     last_failure: str | None = None,
 ) -> None:
-    """R3.7's publication record (one ``close_publications`` row, P3 11.5).
+    """A publication record (one ``close_publications`` row).
 
     The site-day's publication state (``pending``, ``building``,
     ``published``, ``retry_due``, ``failed`` or ``superseded``), its
     ``opened_at``, ``started_at``, ``retry_at``, ``finished_at`` and
-    ``last_failure``. Plain INSERT: P3's own reader, ``publication_record``,
+    ``last_failure``. Plain INSERT: the close chain's reader, ``publication_record``,
     is read-only, and the only writer runs inside a running close.
     """
     conn.execute(
@@ -1671,15 +1659,15 @@ def seed_active_publication(
     wind_constants: str = "{}",
     build_started_at: datetime | None = None,
 ) -> int:
-    """R4.1's active publication (one ``publications`` row, P4 §16.2).
+    """The site's active publication (one ``publications`` row).
 
     What ``active_publication(conn, site_id=…, at_utc=…)`` resolves: the
     site's publication through ``cutoff``, published at ``published_at``.
-    Plain INSERT: P4 writes this row only from inside ``publish``/
+    Plain INSERT: ``close_p4`` writes this row only from inside ``publish``/
     ``publish_first``, which run a real build. Returns the new row's id.
     ``first_record_date``/``window_start_date``/``wind_start_date`` default
     to ``cutoff`` minus ``window_days`` - 1 when not given. ``min_n`` is
-    baked into the publication's own settings (9.1), read back by
+    baked into the publication's own settings, read back by
     ``Publication.min_n`` -- never the runtime ``min_n`` setting.
     """
     first_record_date = first_record_date or (cutoff - timedelta(days=window_days - 1))
@@ -1722,13 +1710,13 @@ def seed_publication_ranking(
     window_key: str,
     result: MetricResult,
 ) -> None:
-    """One ``publication_rankings`` row (R4.1, 9.2) carrying a computed
+    """One ``publication_rankings`` row carrying a computed
     ``MetricResult``.
 
     What ``published_ranking`` reads, keyed by ``(publication_id, variable,
     day_ahead, window_key, feed_id)``; ``confident`` is derived at read time
     from the publication's own ``min_n``, never stored here. ``INSERT OR
-    REPLACE`` on that primary key: P4 writes this table only during a
+    REPLACE`` on that primary key: ``close_p4`` writes this table only during a
     build, but callers here may re-seed a cell.
     """
     conn.execute(
@@ -1768,11 +1756,11 @@ def seed_coverage(
     expected: int,
     starting_days: int = 0,
 ) -> None:
-    """R4.2's coverage cell (one ``publication_coverage`` row, P4 §7.4).
+    """A coverage cell (one ``publication_coverage`` row).
 
     What ``published_coverage(conn, pub=…, variable=…, window_key=…)``
     returns, keyed by ``(feed_id, day_ahead)``: the forecasts scored and
-    expected, with the starting days apart. Plain INSERT: P4 writes this
+    expected, with the starting days apart. Plain INSERT: ``close_p4`` writes this
     table only during a build.
     """
     conn.execute(
@@ -1802,7 +1790,7 @@ def seed_rain_ranks(
     provisional: Collection[int] = (),
     selected: Mapping[int, int] | None = None,
 ) -> int:
-    """The rain release's published rain ranking (C3), for tile tests.
+    """A published rain ranking, for tile tests.
 
     Switches the daily close on at ``published_at`` (the published ranks
     are read only then), adds the site's active publication through the
@@ -1895,12 +1883,7 @@ def seed_forecast_history(
 
 
 # ---------------------------------------------------------------------------
-# Moved from ``tests/test_verification_run.py`` (0.16.14 Part 6, Step 4
-# piece 2/3: that file's subject, the replay chain, is removed whole in
-# piece 5, but ``tests/test_run_input_manifest.py`` imports this name from
-# it for kept behaviour). ``ensure_published_generation`` is swapped for
-# ``ensure_site_generation`` per the switch-over plan's rule 2; every other
-# name and value is unchanged.
+# Fixture data and helpers for a verification run's site, feeds and samples.
 # ---------------------------------------------------------------------------
 
 _VR_PERIOD_DAYS = ["2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04", "2026-06-05"]

@@ -12,9 +12,9 @@ Covers:
 - T12    Backfill/catchup at DEBUG: window/chunk / sites/changed lines
 - T13    DB migration firehose at DEBUG: migrations begin…done + txn begin/commit
 - T14    Wire-level (httpx at DEBUG): HTTP Request record passes through filter scrubbed
-- T15    BC1: cycle INFO line present with correct outcome; DEBUG per-op lines absent
-- T16    D5: terminal ERROR comes from processor, NOT from feed_fetch.py
-- T17/T7b BC2: job deferred moved INFO → DEBUG (paired positive + negative)
+- T15    Cycle INFO line present with correct outcome; DEBUG per-op lines absent
+- T16    Terminal ERROR comes from processor, NOT from feed_fetch.py
+- T17/T7b Job deferred moved INFO → DEBUG (paired positive + negative)
 - L1     _configure_logging's handler streams to sys.stdout by identity
 - L2     _uvicorn_log_config overrides only handlers.default.stream
 - L3     cycle: INFO line is actually emitted (not just whitelisted)
@@ -128,14 +128,14 @@ def _claim_once(job: Job):  # type: ignore[no-untyped-def]
 
 
 async def _idle_poller(db: object, *, run_job: object) -> None:
-    """A current-obs lane that never claims anything (plan §6.3.6)."""
+    """A current-obs lane that never claims anything."""
     await asyncio.Event().wait()
 
 
 def _patch_worker_infra(monkeypatch: pytest.MonkeyPatch) -> None:
     """Silence heartbeats, scheduler, and purge in worker loop tests.
 
-    Also idles the current-obs lane (plan §6.3.6): every caller of this
+    Also idles the current-obs lane: every caller of this
     helper drives ``run_worker`` directly against a fake ``db`` with no
     real ``jobs``/``station_poll_state`` schema behind it, and the real
     poller would issue its own ``db.write`` calls against that fake.
@@ -449,7 +449,7 @@ def test_info_level_policy_only_sanctioned_milestones(
     Drives a completed job through run_worker. Asserts:
       (i)  zero DEBUG records reach caplog
       (ii) every INFO record's message matches a sanctioned milestone shape
-      (iii) 'job deferred' does NOT appear as an INFO record (BC2 guard)
+      (iii) 'job deferred' does NOT appear as an INFO record
       (iv) WARNING/ERROR lines for the existing transient-failure path remain intact
     """
     job = _make_job(job_type="fetch_feed", site_id=42)
@@ -496,10 +496,10 @@ def test_info_level_policy_only_sanctioned_milestones(
             f"unsanctioned INFO line at INFO level: {msg!r}"
         )
 
-    # (iii) 'job deferred' must NOT appear as INFO (BC2: it moved to DEBUG)
+    # (iii) 'job deferred' must NOT appear as INFO (it moved to DEBUG)
     info_deferred = [r for r in info_records if "job deferred" in r.getMessage()]
     assert len(info_deferred) == 0, (
-        "BC2 violated: 'job deferred' still appears as INFO; must be DEBUG only"
+        "'job deferred' still appears as INFO; must be DEBUG only"
     )
 
     # (iv) a cycle line with outcome=completed appeared
@@ -514,23 +514,23 @@ def test_info_level_policy_only_sanctioned_milestones(
 
 
 # ---------------------------------------------------------------------------
-# T7b / T17 — BC2: 'job deferred' moved INFO → DEBUG
+# T7b / T17 — 'job deferred' moved INFO → DEBUG
 # ---------------------------------------------------------------------------
 
 
 def test_deferred_job_cycle_line_is_info_deferred_line_is_debug(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """T7b/T17: BC2 — 'job deferred' is at DEBUG; cycle outcome=deferred is at INFO.
+    """T7b/T17: 'job deferred' is at DEBUG; cycle outcome=deferred is at INFO.
 
     Replaces the old test_worker_deferred_job_logs_info which was an accidental-green:
     it matched 'deferred' in the new cycle: INFO line, not the moved 'job deferred'
-    DEBUG line. This test pins the real post-BC2 contract:
+    DEBUG line. This test pins the real contract:
       - cycle: job=... outcome=deferred appears at INFO
       - 'job deferred ...' appears at DEBUG (present when caplog captures DEBUG)
       - 'job deferred ...' is ABSENT from INFO-only captures
 
-    Goes red if BC2 is reverted: if 'job deferred' is ever re-promoted to INFO,
+    Goes red if 'job deferred' is ever re-promoted to INFO,
     the negative branch fails.
     """
     job = _make_job(job_type="fetch_feed", site_id=42)
@@ -595,7 +595,7 @@ def test_deferred_job_cycle_line_is_info_deferred_line_is_debug(
         if r.levelno == logging.INFO and "job deferred" in r.getMessage()
     ]
     assert len(info_deferred) == 0, (
-        "BC2: 'job deferred' must NOT appear at INFO level — it is a DEBUG line now"
+        "'job deferred' must NOT appear at INFO level — it is a DEBUG line now"
     )
 
     # But the cycle: INFO line with outcome=deferred IS present at INFO
@@ -923,14 +923,14 @@ def test_httpx_wire_record_scrubbed_by_filter(
 
 
 # ---------------------------------------------------------------------------
-# T15 — BC1: cycle INFO line present; per-op DEBUG lines absent at INFO
+# T15 — cycle INFO line present; per-op DEBUG lines absent at INFO
 # ---------------------------------------------------------------------------
 
 
 def test_bc1_cycle_info_line_present_for_completed_job(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """T15-BC1 (completed): cycle: INFO line fires with outcome=completed at INFO."""
+    """T15 (completed): cycle: INFO line fires with outcome=completed at INFO."""
     job = _make_job(job_type="fetch_feed", site_id=7)
 
     async def _succeed(db: Any, writer: Any, j: Job) -> None:
@@ -970,7 +970,7 @@ def test_bc1_cycle_info_line_present_for_completed_job(
 def test_bc1_cycle_info_line_deferred_outcome(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """T15-BC1 (deferred): cycle: INFO line fires with outcome=deferred at INFO."""
+    """T15 (deferred): cycle: INFO line fires with outcome=deferred at INFO."""
     job = _make_job(job_type="fetch_feed", site_id=7)
 
     async def _defer(db: Any, writer: Any, j: Job) -> None:
@@ -999,7 +999,7 @@ def test_bc1_cycle_info_line_deferred_outcome(
 def test_bc1_cycle_info_line_retry_outcome(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """T15-BC1 (retry): cycle: INFO line fires with outcome=retry at INFO."""
+    """T15 (retry): cycle: INFO line fires with outcome=retry at INFO."""
     job = _make_job(job_type="fetch_feed", site_id=7, retry_count=1, max_retries=5)
 
     async def _raise(db: Any, writer: Any, j: Job) -> None:
@@ -1041,7 +1041,7 @@ def test_bc1_cycle_info_line_retry_outcome(
 def test_bc1_cycle_info_line_failed_outcome(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """T15-BC1 (failed): cycle: INFO line fires with outcome=failed for terminal."""
+    """T15 (failed): cycle: INFO line fires with outcome=failed for terminal."""
     job = _make_job(job_type="fetch_feed", site_id=7, retry_count=5, max_retries=5)
 
     async def _raise(db: Any, writer: Any, j: Job) -> None:
@@ -1078,14 +1078,14 @@ def test_bc1_cycle_info_line_failed_outcome(
 
 
 # ---------------------------------------------------------------------------
-# T16 — D5: terminal ERROR comes from processor, NOT from feed_fetch.py
+# T16 — terminal ERROR comes from processor, NOT from feed_fetch.py
 # ---------------------------------------------------------------------------
 
 
 def test_d5_terminal_error_from_processor_not_feed_fetch(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """T16-D5 (a): terminal ERROR is emitted by wxverify.worker.processor exactly once.
+    """T16 (a): terminal ERROR is emitted by wxverify.worker.processor exactly once.
 
     Mirrors test_worker_terminal_failure_logs_error, which already exists and must
     remain green. This test adds: (i) confirm the ERROR record's logger name is the
@@ -1132,7 +1132,7 @@ def test_d5_terminal_error_from_processor_not_feed_fetch(
 def test_d5_feed_fetch_http_error_emits_no_error_record(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """T16-D5 (b): HTTPStatusError from fetch_feed_once emits no ERROR from feed_fetch.
+    """T16 (b): HTTPStatusError from fetch_feed_once emits no ERROR from feed_fetch.
 
     The except-arm traces at DEBUG, not ERROR. Confirm the DEBUG trace is present
     (with the secret redacted), and zero ERROR records from feed_fetch.
@@ -1185,7 +1185,7 @@ def test_d5_feed_fetch_http_error_emits_no_error_record(
         if r.name == "wxverify.worker.feed_fetch" and r.levelno == logging.ERROR
     ]
     assert len(feed_fetch_errors) == 0, (
-        f"D5 violated: feed_fetch must emit no ERROR for httpx.HTTPStatusError; "
+        f"feed_fetch must emit no ERROR for httpx.HTTPStatusError; "
         f"got: {[(r.levelno, r.getMessage()) for r in feed_fetch_errors]}"
     )
 
@@ -1208,7 +1208,7 @@ def test_d5_feed_fetch_http_error_emits_no_error_record(
 def test_d5_feed_fetch_transport_error_emits_no_error_record(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """T16-D5 (b2): fetch_feed_once with a generic transport error emits no ERROR."""
+    """T16 (b2): fetch_feed_once with a generic transport error emits no ERROR."""
     conn = _init_tmp_db(tmp_path)
     site_id = _insert_site(conn)
     feed_id = _open_meteo_feed_id(conn)
@@ -1249,7 +1249,7 @@ def test_d5_feed_fetch_transport_error_emits_no_error_record(
         if r.name == "wxverify.worker.feed_fetch" and r.levelno == logging.ERROR
     ]
     assert len(feed_fetch_errors) == 0, (
-        f"D5 violated: feed_fetch must emit no ERROR for transport errors; "
+        f"feed_fetch must emit no ERROR for transport errors; "
         f"got: {[(r.levelno, r.getMessage()) for r in feed_fetch_errors]}"
     )
 

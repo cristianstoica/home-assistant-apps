@@ -1,8 +1,8 @@
-"""Smoke coverage for the `wxverify timezone change` operator command
-(§13/§20, plan 7.3). `status` and `correct` are retired to a retirement
-message in `wxverify.__main__.main` and have no tests here.
+"""Smoke coverage for the `wxverify timezone change` operator command.
+`status` and `correct` are retired to a retirement message in
+`wxverify.__main__.main` and have no tests here.
 
-These prove the §20 step-2 invocation path exists and behaves: `change`
+These prove the invocation path exists and behaves: `change`
 reaches the generation machinery, and a rejected operation exits non-zero
 with a message rather than a traceback.
 """
@@ -61,14 +61,14 @@ def _generations() -> list[dict[str, object]]:
 def test_do2_change_enters_a_zone_change(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Plan §13.7 DO2: ``timezone change`` enters the zone change through
+    """DO2: ``timezone change`` enters the zone change through
     ``enter_zone_change`` instead of ``apply_prospective_change``,
     ``--effective-from`` is forbidden, and an unknown zone is refused the
     same way. A fourth sub-case, on a second database whose helper site has
     ``with_records=False`` and was started at D+1 (as DS15c starts it),
     prints a first full day with no changeover date.
 
-    ``wxverify.__main__`` imports ``utc_now`` (P1), so this monkeypatch
+    ``wxverify.__main__`` imports ``utc_now``, so this monkeypatch
     fixes the clock the CLI reads. The ``site_days`` rows the change
     makes are checked by DS15 and DS15c in ``tests/test_site_days.py``.
     """
@@ -181,7 +181,7 @@ def test_do2_change_enters_a_zone_change(
 def test_do2b_change_on_an_unknown_site(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Plan §13.7 DO2: an unknown site is refused. The existence check
+    """DO2: an unknown site is refused. The existence check
     inside ``enter_zone_change``, via ``_require_site_timezone``, runs
     before any date logic, so ``_timezone_change``'s ``DayStateError``
     catch reports it with a message instead of a traceback."""
@@ -213,6 +213,6 @@ def test_do2b_change_on_an_unknown_site(
 
 
 def test_site_update_still_cannot_carry_a_timezone() -> None:
-    """§13's other half: the CLI is the ONLY way in, because a normal site
+    """The other half: the CLI is the ONLY way in, because a normal site
     edit has no timezone field to rewrite history with."""
     assert "timezone" not in SiteUpdate.model_fields

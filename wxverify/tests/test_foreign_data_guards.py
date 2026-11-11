@@ -165,7 +165,7 @@ def _setup_site_feed_state_last_run_at_boundary_offset(
     conn: sqlite3.Connection,
 ) -> _ExpectedJobs:
     """A well-formed near-``datetime.max`` stamp with a non-UTC offset in
-    last_run_at: the slot rule (plan 5.1) reads no last_run_at, so this value
+    last_run_at: the slot rule reads no last_run_at, so this value
     is inert carrier data, not a trigger for the scheduler to parse. The
     default-subscribed control feed (open-meteo/ecmwf_ifs, no site_feed_state
     row) must still be scheduled."""
@@ -229,8 +229,8 @@ def _setup_fetch_interval_minutes_hostile_null_last_run_at(
 ) -> _ExpectedJobs:
     """A never-run feed (site_feed_state row with last_run_at NULL) must not
     be treated as due unconditionally when its cadence is hostile -- the
-    cadence guard has to run BEFORE the due decision. The slot rule (plan
-    5.1) reads no last_run_at at all, so there is no elapsed-time branch
+    cadence guard has to run BEFORE the due decision. The slot rule
+    reads no last_run_at at all, so there is no elapsed-time branch
     left for this column to reach."""
     site_id = _insert_site(conn)
     control_feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
@@ -451,7 +451,7 @@ def test_scheduler_tick_survives_hostile_reader_values(
     with caplog.at_level(logging.WARNING, logger=case.logger_name):
         scheduler_tick(conn)  # must not raise
         # The current-obs due-scan moved out of scheduler_tick and into the
-        # poller's own write transaction (plan §6.3.5); drive it explicitly so
+        # poller's own write transaction; drive it explicitly so
         # the stations_site_id_* cases still see their expected job land.
         enqueue_due_current_obs(conn)  # must not raise
 
@@ -528,7 +528,7 @@ def test_scheduler_tick_ignores_hostile_last_run_at(
     monkeypatch: pytest.MonkeyPatch,
     setup: Callable[[sqlite3.Connection], _ExpectedJobs],
 ) -> None:
-    """The slot rule (plan 5.1) reads no last_run_at, so a hostile value in
+    """The slot rule reads no last_run_at, so a hostile value in
     that column is inert carrier data: the feed is scheduled on the same
     slot basis as a clean row, with no WARNING."""
     conn = _init_tmp_db(tmp_path)

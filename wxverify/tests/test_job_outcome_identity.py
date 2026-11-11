@@ -1,4 +1,4 @@
-"""F9/W1 regression: a job's outcome lands only on the claimed row (§5.5).
+"""A job's outcome lands only on the claimed row.
 
 These tests run the REAL ``_still_claimed`` guard. None of them imports
 ``_patch_worker_infra`` (test_011_patch.py, test_debug_logging.py), the
@@ -7,7 +7,7 @@ offlock ``_claimed`` fixture, or any other fixture that patches
 unguarded code. Every outcome check reads raw SQL after the real write path
 has run, never a mock's call record.
 
-The D-tests (#103) also read log records, always next to a raw-SQL check
+The D-tests also read log records, always next to a raw-SQL check
 of the same run: the label and the persisted state must agree.
 
 Synthetic fixtures only -- fake site names and station ids.
@@ -74,7 +74,7 @@ def _make_dispatch_stub(outcome: str, site_x: int, swap):  # noqa: ANN001
 
 
 # ---------------------------------------------------------------------------
-# D: a dropped outcome is reported as dropped (#103)
+# D: a dropped outcome is reported as dropped
 # ---------------------------------------------------------------------------
 
 _MARKER = "SYNTHETIC-PAYLOAD-MARKER"
@@ -139,7 +139,7 @@ def _reused_unchanged(
 
 
 def _assert_landed(conn: sqlite3.Connection, job: Job, outcome: str) -> None:
-    """E3's per-outcome state assertions (§5, ``landed(o)``)."""
+    """E3's per-outcome state assertions (``landed(o)``)."""
     row = conn.execute(_SNAP, (job.id,)).fetchone()
     assert row is not None
     if outcome == "ok":

@@ -132,7 +132,7 @@ def _ensure_test_publication(conn: sqlite3.Connection, *, site_id: int) -> int:
     """This site's one test publication, created on first use.
 
     ``leaderboard_in_snapshot``'s ``window=all`` read now always reads the
-    active publication (9.2), never ``score_cache``; its ``min_n`` is baked
+    active publication, never ``score_cache``; its ``min_n`` is baked
     in at creation from the runtime ``min_n`` setting active at that point
     (every caller here sets it before the first ``_seed_cell``), so the
     read-time confidence check agrees with the real strategy math asserted

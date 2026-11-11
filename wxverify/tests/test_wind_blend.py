@@ -1,11 +1,9 @@
-"""Wind training and weights (plan §11.1-11.3, §15.1 T49-T58).
+"""Wind training and weights (T50, T51, T56-T58).
 
-T49, T52-T55 and the excluded-feeds filter check drove
-``load_wind_training``/``training_window``/``training_pairs_query`` end to
-end. Served wind weights are now always the published ones or ``{}``
-(storage-release plan 2026-11-02, table 1.B): those three names are gone
-from ``wxverify.forecast.wind_blend``, so all of those tests pinned removed
-behaviour and are deleted with it.
+The tests that drove ``load_wind_training``/``training_window``/
+``training_pairs_query`` end to end, and the excluded-feeds filter check,
+are deleted: served wind weights are now always the published ones or
+``{}``, and those three names are gone from ``wxverify.forecast.wind_blend``.
 
 T50, T51, T56, T57 and T58 are pure once a ``WindTraining``/candidate set is
 in hand (``compute_wind_weights``, ``choose_wind_feeds``,
@@ -94,7 +92,7 @@ def test_t51_19_days_absent_20_present() -> None:
     """mutant_off_by_one -> at the second assertion: correct = True (key
     present at 20 matched days), mutant (``<=`` in place of ``<`` on the
     day-count guard) = False (20 treated as still-too-few). The fixture's
-    second case sits exactly at the plan's stated threshold.
+    second case sits exactly at the stated threshold.
     """
     days_19 = [_day(n) for n in range(1, 20)]
     training_19 = WindTraining(

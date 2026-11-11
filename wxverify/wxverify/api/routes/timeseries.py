@@ -1,13 +1,12 @@
 """Forecast-vs-observed timeseries route.
 
-The reply (daily-close plan P5, §9.2) is the feed's forecast history
-(storage release 3.6: ``forecast_history`` + ``observations``, the closed
-days and the days before the site's first day record together, persistence
-rebuilt at the longest lead), the provisional observed line on the days not
-yet done, and the missed and zone-flagged days of the range. Every part
-comes from one read snapshot, so the history and the provisional part meet
-at the same instants. Each hour gives one forecast of one day ahead,
-``lead`` (default "D+1"), the Overlay's pick.
+The reply is the feed's forecast history (``forecast_history`` +
+``observations``, the closed days and the days before the site's first day
+record together, persistence rebuilt at the longest lead), the provisional
+observed line on the days not yet done, and the missed and zone-flagged days
+of the range. Every part comes from one read snapshot, so the history and
+the provisional part meet at the same instants. Each hour gives one forecast
+of one day ahead, ``lead`` (default "D+1"), the Overlay's pick.
 """
 
 from __future__ import annotations
@@ -71,7 +70,7 @@ def _reply(
     to: str | None,
     lead: str,
 ) -> dict[str, object]:
-    """The route's reply (plan §9)."""
+    """The route's reply."""
     head: dict[str, object] = {"site": site, "variable": variable, "feed_id": feed_id}
     return {
         **head,
@@ -97,9 +96,9 @@ def _reply_lists(
     to: str | None,
     lead: str,
 ) -> dict[str, object]:
-    """The reply's lists (plan §9.2).
+    """The reply's lists.
 
-    The pairs are ``chart_pairs`` (storage release 3.6): one range read of
+    The pairs are ``chart_pairs``: one range read of
     the feed's ``forecast_history`` at ``lead``'s day ahead, the ``closed``
     days and the days before the site's first record together, within
     ``from`` and ``to``; for persistence, rebuilt at the longest lead. Days
@@ -178,7 +177,7 @@ def _instant(value: str | None, name: str) -> datetime | None:
 
 def _day_ahead(lead: str) -> int:
     """``lead`` as a day ahead from 0 to 7, through the dashboard's parser;
-    422 when it does not parse or lies outside that range (plan §9.2)."""
+    422 when it does not parse or lies outside that range."""
     try:
         day_ahead = parse_day_ahead(lead)
     except ValueError as exc:
@@ -199,9 +198,9 @@ def _first_record_start(
     """Where the site's starting history ends: its first record's start.
 
     Found by walking down by date from the latest done day or, with none
-    done, from the day that holds ``now``: P1's records follow one another
+    done, from the day that holds ``now``: the day records follow one another
     one date apart. ``None`` when neither exists; then no record has started
-    and every stored pair is starting history (plan §9.1, §12.2).
+    and every stored pair is starting history.
     """
     record = top if top is not None else current_day(conn, site_id, now_utc=now)
     if record is None:

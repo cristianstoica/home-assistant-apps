@@ -3,7 +3,7 @@
 ``/leaderboard``, ``/composite`` and ``/winrate`` send the active
 publication's cutoff as an ``X-Evidence-Through`` header (ISO date) and keep
 their bodies' shape; ``/curve`` carries it in its body as
-``evidence_through`` (9.6). With no publication no header is sent and
+``evidence_through``. With no publication no header is sent and
 ``evidence_through`` is None.
 """
 
@@ -102,7 +102,7 @@ async def curve(
 
     def _read(conn: sqlite3.Connection) -> dict[str, object]:
         # The eight leads in one snapshot, so every one reads the same
-        # publication (9.3).
+        # publication.
         with read_snapshot(conn, label="curve"):
             results = [
                 leaderboard_in_snapshot(
@@ -243,7 +243,7 @@ async def composite(
 def _set_evidence_header(
     response: Response | None, evidence_through: date | None
 ) -> None:
-    """Send the cutoff as ``X-Evidence-Through`` when there is one (9.6).
+    """Send the cutoff as ``X-Evidence-Through`` when there is one.
 
     ``response`` is None on a direct call, which sends nothing.
     """

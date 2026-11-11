@@ -2,8 +2,7 @@
 
 O14 — sanitized_exception never returns an empty string, even for an
 exception whose str() is empty (httpx maps a bare TimeoutError() this way
-under httpx 0.28.1; see the plan's ground truth at
-error_sanitize.py:16-19). O15 — exception notes (PEP 678, add_note) are
+under httpx 0.28.1). O15 — exception notes (PEP 678, add_note) are
 appended and redacted the same way the base message is. O16 — a rendered
 UpstreamPayloadError line survives sanitization byte-for-byte. O22(b) pins
 the same empty-text guarantee at the real ``jobs.last_error`` column via
@@ -40,7 +39,7 @@ _STATION_ID = "ISTATION01"
 _API_KEY = "SYNTHETIC-SECRET-KEY"
 
 # ---------------------------------------------------------------------------
-# Part F (plan §6): provider_reason -- shared fixtures (its own request-
+# provider_reason -- shared fixtures (its own request-
 # building style, host/key/station all made up).
 # ---------------------------------------------------------------------------
 
@@ -239,7 +238,7 @@ class TestSafeDetail:
 
 
 # ---------------------------------------------------------------------------
-# Part F, FT1 (plan §6) -- provider_reason at the unit level: the two
+# FT1 -- provider_reason at the unit level: the two
 # weather.com-shaped messages (path cases on the hold/display side live in
 # tests/test_access_hold_current_obs.py, test_access_hold_five_minute.py and
 # tests/test_access_days.py).
@@ -248,8 +247,8 @@ class TestSafeDetail:
 
 class TestProviderReasonWeatherComShape:
     def test_throttled_key_message_is_found_and_unmasked(self) -> None:
-        """Catches: only `_http_status_error` changed so the owner's own
-        case is never shown (TODO item 4)."""
+        """Catches: only `_http_status_error` changed so the provider's own
+        reason is never shown."""
         response = _pf_json_response(
             401,
             {
@@ -283,7 +282,7 @@ class TestProviderReasonWeatherComShape:
 
 
 # ---------------------------------------------------------------------------
-# Part F, FT3 (plan §6) -- the fixed _REASON_PATHS, tried in order; a
+# FT3 -- the fixed _REASON_PATHS, tried in order; a
 # non-string value skipped; a deeply nested body raises nothing.
 # ---------------------------------------------------------------------------
 
@@ -343,13 +342,13 @@ class TestProviderReasonNestedPaths:
 
 
 # ---------------------------------------------------------------------------
-# Part F, FT4 (plan §6) -- an HTML page: no reason, and _http_status_error's
+# FT4 -- an HTML page: no reason, and _http_status_error's
 # text is byte-for-byte today's (no new code runs on this path).
 # ---------------------------------------------------------------------------
 
 
 def test_ft4_html_page_gives_no_reason_and_unchanged_status_error_text() -> None:
-    """Catches: raw text stored from an unparsable body (TODO item 1) --
+    """Catches: raw text stored from an unparsable body --
     at the final assertion: correct = byte-for-byte today's text (no
     `; provider says ...` suffix), mutant = the suffix present."""
     html_body = b"<html><head><title>Forbidden words here</title></head></html>"
@@ -368,7 +367,7 @@ def test_ft4_html_page_gives_no_reason_and_unchanged_status_error_text() -> None
 
 
 # ---------------------------------------------------------------------------
-# Part F, FT5 (plan §6) -- the byte-size bound and the 200-character cut.
+# FT5 -- the byte-size bound and the 200-character cut.
 # ---------------------------------------------------------------------------
 
 
@@ -398,7 +397,7 @@ class TestProviderReasonSizeBounds:
 
 
 # ---------------------------------------------------------------------------
-# Part F, FT6 (plan §6) -- echoes of the request are masked, in place.
+# FT6 -- echoes of the request are masked, in place.
 # ---------------------------------------------------------------------------
 
 
@@ -424,9 +423,8 @@ def test_ft6_the_bare_key_url_station_and_host_are_each_masked_in_place() -> Non
 
 def test_ft6_a_key_with_reserved_characters_is_masked_both_raw_and_encoded() -> None:
     """Catches: masking the percent-encoded form only, or the raw form
-    only -- the plan's own key has no reserved characters, so its encoded
-    form is identical to it and cannot discriminate the two; this key
-    does."""
+    only -- a key with no reserved characters has an encoded form identical
+    to it and cannot discriminate the two; this key does."""
     from urllib.parse import quote
 
     key = "SYNTH+KEY/0123=abcdef"
@@ -504,7 +502,7 @@ def test_ft6_a_digit_bearing_path_segment_is_masked_in_the_message() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Part F, FT7 (plan §6) -- a reply provider_reason cannot read.
+# FT7 -- a reply provider_reason cannot read.
 # ---------------------------------------------------------------------------
 
 
@@ -515,7 +513,7 @@ class TestProviderReasonUnreadableReply:
         assert provider_reason(response) is None
 
     def test_unread_streamed_reply_gives_none_and_stays_unread(self) -> None:
-        """Catches: a `read()` that consumes the stream (TODO item 3) --
+        """Catches: a `read()` that consumes the stream --
         the second assertion proves the stream is still unread afterward,
         so the real caller's own later read is untouched."""
         stream_body = b'{"message":"x"}'
@@ -532,7 +530,7 @@ class TestProviderReasonUnreadableReply:
         self,
     ) -> None:
         """Catches: an exception from `.content` hiding the original
-        failure (TODO item 3) -- at the two equality assertions below:
+        failure -- at the two equality assertions below:
         correct = equal to the no-reason render, mutant = raises or
         differs."""
 
@@ -558,7 +556,7 @@ class TestProviderReasonUnreadableReply:
 
 
 # ---------------------------------------------------------------------------
-# Part F, FT8 (plan §6) -- flattened to one printable line.
+# FT8 -- flattened to one printable line.
 # ---------------------------------------------------------------------------
 
 

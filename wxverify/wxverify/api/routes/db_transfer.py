@@ -30,7 +30,7 @@ router = APIRouter(prefix="/api", tags=["export"])
 _TMP_GLOBS = (
     ".wxverify-export-*.db.tmp",
     # An upload temp that an earlier version's interrupted database import
-    # left behind (storage-release plan 5.5).
+    # left behind.
     ".wxverify-import-*.db.tmp",
     # The `*.db.tmp` globs do NOT match the `.gz` sibling, so an export that
     # dies after compress but before download would otherwise leak its gz.
@@ -264,8 +264,7 @@ def on_export_sweeper_done(task: asyncio.Task[None]) -> None:
 
     Never raises: the only rendering it does is ``safe_detail``, which cannot.
     Loud but not fatal -- the process keeps serving and the sweeper is never
-    restarted; see the plan's D3 for why a disk-hygiene timer does not earn
-    the worker's ``os._exit(1)``.
+    restarted; a disk-hygiene timer does not earn the worker's ``os._exit(1)``.
     """
     global _sweeper_death
     if task.cancelled():

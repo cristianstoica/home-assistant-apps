@@ -1,5 +1,5 @@
 """Query-plan tests for the two forecast_samples reads the Forecast page
-(step 6) depends on: ``DISPLAY_SAMPLES_SQL`` (``forecast/data.py``) and
+depends on: ``DISPLAY_SAMPLES_SQL`` (``forecast/data.py``) and
 ``future_samples_sql()``. Relationship checks, never one
 planner's exact wording (the pattern of
 ``tests/test_query_plan_regressions.py``): both statements must plan a

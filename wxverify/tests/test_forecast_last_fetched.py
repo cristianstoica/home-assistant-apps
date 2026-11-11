@@ -1,4 +1,4 @@
-"""Item L -- the "Last fetched" label (plan §11, oracles listed in §14.7).
+"""The "Last fetched" label.
 
 The label is the newest ``site_feed_state.last_usable_fetch_at`` among the
 feeds contributing to the page's tiles (:func:`_last_fetched_at` in
@@ -147,7 +147,7 @@ def _stamp_usable_fetch(
 
 def _render_tiles(*, site_id: int, conn: sqlite3.Connection, now: datetime) -> str:
     """Renders the Forecast region from a real :func:`build_forecast_page`
-    page (card 7's template reads ``page``, not the raw ``view`` the old
+    page (the template reads ``page``, not the raw ``view`` the old
     template took) -- ``now`` is passed straight through to
     ``build_forecast_page``, so no ``utc_now`` monkeypatch is needed even
     though ``forecast/page.py`` reads its own ``utc_now`` binding when
@@ -443,7 +443,7 @@ def test_duplicates_only_fetch_moves_label_advances_forecast_fingerprint_only() 
     assert view1.updated_ago == "1 h ago"
 
     # Duplicates-only re-fetch: identical samples, later fetched_at ->
-    # INSERT OR IGNORE inserts 0 rows, but the stamp still advances (§10.3).
+    # INSERT OR IGNORE inserts 0 rows, but the stamp still advances.
     outcome2 = persist_fetch_result(
         conn,
         site_id=1,
@@ -561,7 +561,7 @@ def test_error_fetch_leaves_label_and_forecast_fingerprint_unchanged() -> None:
 
 # ===========================================================================
 # Newest across feeds: two contributor feeds on the SAME cell, the label
-# follows the newer stamp. Mutant (plan §14.7): `min` for `max`.
+# follows the newer stamp. Mutant: `min` for `max`.
 # ===========================================================================
 
 
@@ -605,7 +605,7 @@ def test_newest_across_feeds_picks_the_later_stamp_not_earlier() -> None:
 
 # ===========================================================================
 # String vs parsed ordering: a pair whose raw-string order and instant
-# order DIVERGE at the whole-second level (the plan's own fractional pair
+# order DIVERGE at the whole-second level (a same-second fractional pair
 # collapses to the same whole-second output either way and cannot
 # discriminate this).
 # ===========================================================================
@@ -635,8 +635,8 @@ def test_last_fetched_uses_parsed_instant_not_raw_string_order() -> None:
     )
     # feed_a's RAW STRING sorts later ("...T12..." > "...T11...") but its
     # INSTANT (10:00:00Z, from the +02:00 offset) is earlier than feed_b's
-    # (11:00:00.7Z) -- these two orderings genuinely disagree, unlike the
-    # plan's same-whole-second fractional pair.
+    # (11:00:00.7Z) -- these two orderings genuinely disagree, unlike a
+    # same-whole-second fractional pair.
     _stamp_usable_fetch(conn, feed_id=feed_a, at="2026-01-01T12:00:00+02:00")
     _stamp_usable_fetch(conn, feed_id=feed_b, at="2026-01-01T11:00:00.700000Z")
     conn.commit()
@@ -755,7 +755,7 @@ def test_route_duplicates_only_serves_moved_label_and_drops_unknown_badge(
 
         tiles_before = client.get(f"/forecast/tiles?site={site_id}&fingerprint=")
         assert tiles_before.status_code == 200
-        # sanity: starts unknown -- card 7 moved this badge into the day
+        # sanity: starts unknown -- the badge moved into the day
         # header's warning tooltip text (day_warnings in forecast/page.py),
         # rather than a per-tile "fetch time unknown" label.
         assert (

@@ -1,20 +1,24 @@
 """The daily close's night chain: the close of each site-day and its logs.
 
 Holds the chain's constants; the bodies of stages 2 to 7 (``day_close``
-stages 2 to 6, ``day_publish`` stage 7) under the hand-off rule
-(plan 8.1-8.3), entered through ``run_day_close`` and ``run_day_publish``;
-the failure writes ``fail_attempt`` and ``fail_publication`` (9.1, 9.4) and
-the hooks ``_fail_job`` calls for them; ``run_close_retention`` (8.4);
-``publication_record``; ``close_status``, ``stage_log``,
-``collection_tries`` and ``publication_state``, the read-only interface for
-P5 and P6 (14.2); ``record_collection_try``, the writer of the
-collection try log (11.2); and ``enqueue_due_close_work``, the tick's part
-(8.5): stage 1, the missed days, the repair and the publication retry; and
-``settle_interrupted_closes``, which settles the closes and publications a
-stop cut short, at each start (5.5, 9.4).
+stages 2 to 6, ``day_publish`` stage 7), entered through ``run_day_close``
+and ``run_day_publish``; the failure writes ``fail_attempt`` and
+``fail_publication`` and the hooks ``_fail_job`` calls for them;
+``run_close_retention``; ``publication_record``; ``close_status``,
+``stage_log``, ``collection_tries`` and ``publication_state``, the read-only
+interface for ``close_monitor`` and the web pages; ``record_collection_try``,
+the writer of the collection try log; and ``enqueue_due_close_work``, the
+tick's part: stage 1, the missed days, the repair and the publication retry;
+and ``settle_interrupted_closes``, which settles the closes and publications
+a stop cut short, at each start.
 
-P4's three call points are always called through ``close_p4``, never
-imported by name, so P4 binds them in that one module.
+The hand-off rule: a stage saves its completion and enqueues the next stage
+in one transaction, and the tick's repair enqueues again a job lost after
+that.
+
+The three call points into the scored round and publication are always
+called through ``close_p4``, never imported by name, so their bodies are
+bound in that one module.
 
 ``worker/wind_days.py`` imports ``record_collection_try`` at load time, so
 this module must never import ``wind_days`` at load time, directly or
@@ -77,26 +81,26 @@ from wxverify.worker.rain_check import check_station_rain
 logger = logging.getLogger(__name__)
 
 #: The longest a stage may wait in the queue, and how late after a due
-#: instant the add-on still counts as running (plan 5.2, 8.3). Equal to
+#: instant the add-on still counts as running. Equal to
 #: ``RETRY_DELAY``, so a late start never runs past the retry's instant.
 CLOSE_LATE_LIMIT: Final = timedelta(hours=1)
-#: How long the stage log and the try log keep a row (plan 11.6).
+#: How long the stage log and the try log keep a row.
 CLOSE_LOG_KEEP_DAYS: Final = 90
 #: How many counted days with nothing from any source pause a station's
-#: nightly gap fill (plan 5.6, :137; the owner's value).
+#: nightly gap fill.
 CLOSE_PAUSE_DAYS: Final = 1
 
 #: The tick's per-site ERROR line is written at most once per site and step
-#: in this span of ``now_utc`` (plan 8.5).
+#: in this span of ``now_utc``.
 _SITE_ERROR_EVERY: Final = timedelta(hours=1)
-#: (site id, step) -> the ``now_utc`` of its last per-site ERROR line (8.5).
+#: (site id, step) -> the ``now_utc`` of its last per-site ERROR line.
 _LAST_SITE_STEP_ERROR: dict[tuple[int, int], datetime] = {}
-#: The order key of a site with no due instant: after every due one (8.5).
+#: The order key of a site with no due instant: after every due one.
 _NEVER_DUE: Final = datetime.max.replace(tzinfo=UTC)
 
-#: The gap-fill outcome and reason pairs with which the attempt goes on
-#: (plan 5.3, 10.1). An allowlist: any other pair, a named outcome with
-#: another reason included, fails the attempt.
+#: The gap-fill outcome and reason pairs with which the attempt goes on.
+#: An allowlist: any other pair, a named outcome with another reason
+#: included, fails the attempt.
 _GAP_FILL_GOES_ON: Final[frozenset[tuple[str, str | None]]] = frozenset(
     {
         ("filled", None),
@@ -109,7 +113,7 @@ _GAP_FILL_GOES_ON: Final[frozenset[tuple[str, str | None]]] = frozenset(
     }
 )
 
-#: The 13 ``daily_truth`` columns of the truth version, per row (plan 11.4),
+#: The 13 ``daily_truth`` columns of the truth version, per row,
 #: of the one generation stage 4 writes under: the site's published one.
 _TRUTH_VERSION_SQL: Final = (
     "SELECT quantity, value, eligible, exclusion_reason, covered_hours,"
@@ -154,7 +158,7 @@ class PublicationRecord:
 
     The states move ``pending`` -> ``building`` -> ``published``, or on a
     failure to ``retry_due`` and then ``failed``; an older cutoff passed by
-    a newer open or published one ends ``superseded`` (plan 8.6, 9.4, 11.5).
+    a newer open or published one ends ``superseded``.
     """
 
     site_id: int
@@ -171,7 +175,7 @@ class PublicationRecord:
 
 @dataclass(frozen=True, slots=True)
 class _StageJob:
-    """A stage job's identity, from its key and payload (plan 8.1).
+    """A stage job's identity, from its key and payload.
 
     ``local_date`` is the site-day for stages 2 to 6 and the publication's
     cutoff for stage 7; ``attempt`` the close attempt or the
@@ -203,7 +207,7 @@ def record_collection_try(
 ) -> None:
     """Insert one ``close_try_log`` row for a weather.com collection try.
 
-    One row per try of a station's site-day: P2's daytime and evening
+    One row per try of a station's site-day: the daytime and evening
     5-minute tries (``kind`` ``five_minute``, ``slot`` ``daytime`` or the
     evening slot as local ``HH:MM``, ``close_attempt`` None) and the close's
     gap fill (``kind`` ``hourly``, ``slot`` ``gap_fill``, ``close_attempt``
@@ -257,7 +261,7 @@ def _instant_or_none(value: object) -> datetime | None:
 def publication_record(
     conn: sqlite3.Connection, *, site_id: int, cutoff: date
 ) -> PublicationRecord | None:
-    """The publication record of ``site_id`` and ``cutoff``, or None (11.5).
+    """The publication record of ``site_id`` and ``cutoff``, or None.
 
     Read-only; runs in the caller's transaction.
     """
@@ -283,12 +287,12 @@ def publication_record(
     )
 
 
-# --- the read-only interface for P5 and P6 (14.2) ---------------------------
+# --- the read-only interface for close_monitor and the web pages -------------
 
 
 @dataclass(frozen=True, slots=True)
 class AttemptRecord:
-    """One ``close_attempts`` row: one close attempt of a site-day (11.3).
+    """One ``close_attempts`` row: one close attempt of a site-day.
 
     ``outcome`` is ``running``, ``closed`` or ``failed``. ``last_stage`` is
     the last stage saved as complete (1 when the attempt starts), and
@@ -310,12 +314,12 @@ class AttemptRecord:
 
 @dataclass(frozen=True, slots=True)
 class StationDayRecord:
-    """One ``close_station_days`` row: a station's presence on a day (11.3).
+    """One ``close_station_days`` row: a station's presence on a day.
 
     The readings in the day's bounds per source after the gap fill; whether
     a 5-minute try of the station-day was answered; whether the day was
     lost to refused access; whether the station was paused for the day. A
-    paused station is never one whose values were thrown away (5.6, 14.2).
+    paused station is never one whose values were thrown away.
     """
 
     station_id: int
@@ -329,7 +333,7 @@ class StationDayRecord:
 
 @dataclass(frozen=True, slots=True)
 class StageRun:
-    """One ``close_stage_log`` row: one run of a stage (11.1).
+    """One ``close_stage_log`` row: one run of a stage.
 
     ``attempt`` is the close attempt for stages 1 to 6 and the publication
     attempt for stages 7 and 8, whose rows are dated by the publication's
@@ -353,11 +357,11 @@ class StageRun:
 
 @dataclass(frozen=True, slots=True)
 class CollectionTry:
-    """One ``close_try_log`` row: one weather.com collection try (11.2).
+    """One ``close_try_log`` row: one weather.com collection try.
 
     ``slot`` is an evening slot as local ``HH:MM``, ``daytime`` or
     ``gap_fill``; ``close_attempt`` is set for a gap fill only. A held or
-    refused try is an outage of access, never a station offline (14.2).
+    refused try is an outage of access, never a station offline.
     """
 
     station_id: int
@@ -374,9 +378,9 @@ class CollectionTry:
 
 @dataclass(frozen=True, slots=True)
 class CloseStatus:
-    """Everything about the close of one site-day, from stored rows (14.2).
+    """Everything about the close of one site-day, from stored rows.
 
-    ``state`` to ``done_at`` are P1's ``site_days`` columns as stored.
+    ``state`` to ``done_at`` are the ``site_days`` columns as stored.
     ``blocking_stage`` is derived (``_blocking_stage``). ``attempt_records``
     are the day's attempts in attempt order; ``stations`` its presence
     records in station order (after stage 2 of an attempt); ``publication``
@@ -447,13 +451,13 @@ def _station_records(
 def _blocking_stage(
     record: DayRecord, attempts: tuple[AttemptRecord, ...], now_utc: datetime
 ) -> int | None:
-    """The stage the day waits on, or None (14.2).
+    """The stage the day waits on, or None.
 
     ``open`` from its ``day_end_utc`` on: 1, the wait for the round; only
     here is ``now_utc``, the caller's clock, used. ``closing``: the
     current attempt's ``last_stage`` + 1. ``retry_due`` and ``missed``
     (``retry_failed``): the failed attempt's ``failed_stage``. The current
-    or failed attempt is the one numbered ``attempts``, P1's count. None in
+    or failed attempt is the one numbered ``attempts``, the day's count. None in
     every other case, and when that attempt has no record.
     """
     if record.state == "open":
@@ -473,9 +477,9 @@ def _blocking_stage(
 def close_status(
     conn: sqlite3.Connection, *, site_id: int, local_date: date, now_utc: datetime
 ) -> CloseStatus | None:
-    """Everything about the close of ``site_id``'s day ``local_date`` (14.2).
+    """Everything about the close of ``site_id``'s day ``local_date``.
 
-    None when the site has no P1 record dated ``local_date`` (before its
+    None when the site has no day record dated ``local_date`` (before its
     first record). Each field is present or None as the stored rows hold it;
     nothing is cached. Read-only: runs in the caller's transaction and never
     commits, so a caller that needs its four SELECTs in one snapshot holds
@@ -503,7 +507,7 @@ def close_status(
 def stage_log(
     conn: sqlite3.Connection, *, site_id: int, local_date: date
 ) -> list[StageRun]:
-    """The stage-log rows of ``site_id`` dated ``local_date`` (11.1, 14.2).
+    """The stage-log rows of ``site_id`` dated ``local_date``.
 
     Stages 1 to 6 of the day's close attempts and, for a ``closed`` day,
     stages 7 and 8 of the publication whose cutoff it is, in the order the
@@ -537,7 +541,7 @@ def stage_log(
 def collection_tries(
     conn: sqlite3.Connection, *, site_id: int, local_date: date
 ) -> list[CollectionTry]:
-    """The collection try-log rows of ``site_id`` dated ``local_date`` (11.2, 14.2).
+    """The collection try-log rows of ``site_id`` dated ``local_date``.
 
     Every station's 5-minute tries and gap-fill calls of the day, whatever
     its state, in the order the rows were written. Rows older than
@@ -570,7 +574,7 @@ def collection_tries(
 def publication_state(
     conn: sqlite3.Connection, *, site_id: int
 ) -> PublicationRecord | None:
-    """The site's publication record with the latest cutoff, or None (11.5, 14.2).
+    """The site's publication record with the latest cutoff, or None.
 
     Whatever its state. Read-only; runs in the caller's transaction.
     """
@@ -594,7 +598,7 @@ def _close_key(site_id: int, local_date: date, stage: int) -> str:
 def _enqueue_close_stage(
     conn: sqlite3.Connection, site_id: int, local_date: date, stage: int, attempt: int
 ) -> None:
-    """Enqueue one ``day_close`` stage; the queue never retries it (8.1)."""
+    """Enqueue one ``day_close`` stage; the queue never retries it."""
     enqueue_if_absent(
         conn,
         "day_close",
@@ -608,7 +612,7 @@ def _enqueue_close_stage(
 def _enqueue_publish_stage(
     conn: sqlite3.Connection, site_id: int, cutoff: date, stage: int, attempt: int
 ) -> None:
-    """Enqueue one ``day_publish`` stage; the queue never retries it (8.1)."""
+    """Enqueue one ``day_publish`` stage; the queue never retries it."""
     enqueue_if_absent(
         conn,
         "day_publish",
@@ -620,7 +624,7 @@ def _enqueue_publish_stage(
 
 
 def _stage_job(job: Job) -> _StageJob | None:
-    """The job's site, date, stage and attempt; None when malformed (8.1)."""
+    """The job's site, date, stage and attempt; None when malformed."""
     attempt = job.payload.get("attempt")
     if job.site_id is None or job.job_key is None:
         return None
@@ -650,7 +654,7 @@ def _stage_job(job: Job) -> _StageJob | None:
 def _job_stamps(
     conn: sqlite3.Connection, job_id: int, now_utc: datetime
 ) -> tuple[str, str]:
-    """The job row's ``created_at`` and claim-time ``updated_at`` (11.1).
+    """The job row's ``created_at`` and claim-time ``updated_at``.
 
     Read before the queue writes the job's outcome, which overwrites
     ``updated_at``. A row no longer there gives ``now_utc`` for both.
@@ -665,7 +669,7 @@ def _job_stamps(
 
 
 def _stalled(enqueued_at: str, started_at: str) -> bool:
-    """Whether the job was claimed more than ``CLOSE_LATE_LIMIT`` late (8.3)."""
+    """Whether the job was claimed more than ``CLOSE_LATE_LIMIT`` late."""
     return parse_utc(started_at) - parse_utc(enqueued_at) > CLOSE_LATE_LIMIT
 
 
@@ -684,7 +688,7 @@ def _insert_stage_row(
     reason: str | None = None,
     detail: dict[str, object] | None = None,
 ) -> None:
-    """Insert one ``close_stage_log`` row (11.1).
+    """Insert one ``close_stage_log`` row.
 
     ``enqueued_at`` and ``started_at`` are stored as given and parsed for
     the queue wait and the duration; ``ended_at`` is ``now_utc``, when the
@@ -723,7 +727,7 @@ def _write_stage_row(
     reason: str | None = None,
     detail: dict[str, object] | None = None,
 ) -> None:
-    """Insert one ``close_stage_log`` row for a stage 2 to 7 job (11.1).
+    """Insert one ``close_stage_log`` row for a stage 2 to 7 job.
 
     ``enqueued_at`` and ``started_at`` are the job row's stamps as stored;
     ``ended_at`` is ``now_utc``, when the completing or failing write runs.
@@ -750,7 +754,7 @@ def _write_stage_row(
 
 @dataclass(frozen=True, slots=True)
 class _Running:
-    """A stage 2 to 6 job cleared to run: its day and attempt state (8.2)."""
+    """A stage 2 to 6 job cleared to run: its day and attempt state."""
 
     record: DayRecord
     truth_version: str | None
@@ -760,7 +764,7 @@ class _Running:
 def _attempt_progress(
     conn: sqlite3.Connection, job: _StageJob
 ) -> tuple[int, str | None] | None:
-    """The attempt record's ``last_stage`` and ``truth_version`` (11.3)."""
+    """The attempt record's ``last_stage`` and ``truth_version``."""
     row = conn.execute(
         "SELECT last_stage, truth_version FROM close_attempts"
         " WHERE site_id = ? AND local_date = ? AND attempt = ?",
@@ -777,7 +781,7 @@ def _current(
     """The day and its attempt progress when the job is current, else None.
 
     Current: the day is ``closing`` with ``attempts`` equal to the job's
-    attempt (8.2). The day's state is read before the attempt record, so a
+    attempt. The day's state is read before the attempt record, so a
     stale job is never taken for a repeated one.
     """
     record = day_record(conn, job.site_id, job.local_date)
@@ -792,7 +796,7 @@ def _current(
 def _open_stage(
     conn: sqlite3.Connection, job: _StageJob, now_utc: datetime
 ) -> _Running | None:
-    """Steps 1 and 2 of the hand-off rule for a stage 2 to 6 job (8.2, 8.3).
+    """The checks a stage 2 to 6 job passes before its work.
 
     None when the stage must not run: a stale job (nothing written), a
     repeated one (only its ``skipped`` stage-log row written, the attempt
@@ -836,7 +840,7 @@ def _complete_stage(
     now_utc: datetime,
     detail: dict[str, object] | None = None,
 ) -> None:
-    """Step 4 for stages 2 to 5: save the completion, enqueue the next (8.2).
+    """The last step of stages 2 to 5: save the completion, enqueue the next.
 
     ``now_utc`` is the stage's end: the caller reads the clock after the
     stage's work, inside the completing write, so the stage-log row's
@@ -867,14 +871,14 @@ def _complete_stage(
 def _paused_station_ids(
     conn: sqlite3.Connection, *, site_id: int, local_date: date
 ) -> frozenset[int]:
-    """The stations paused for the day's gap fill (plan 5.6).
+    """The stations paused for the day's gap fill.
 
-    A station on the day's list is paused when P2's ``day_presence`` counts
+    A station on the day's list is paused when ``day_presence`` counts
     no ``five_minute`` and no ``current_obs`` reading for it inside the
     day's bounds, and its latest ``CLOSE_PAUSE_DAYS`` counted days before
-    the day each had nothing from any source on their presence record
-    (11.3). A counted day is a ``closed`` day whose saved station list holds
-    the station (P1 §6.2) and that was not lost to refused access
+    the day each had nothing from any source on their presence record. A
+    counted day is a ``closed`` day whose saved station list holds the
+    station and that was not lost to refused access
     (``refused_lost``); missed days and days lost to refused access are
     passed over. A ``closed`` day that lists the station but has no presence
     record for it (one closed before the records were kept) ends the walk
@@ -917,7 +921,7 @@ def _fill_label(fill: StationFill) -> str:
 
 
 def _gap_fill_failure(ended: bool, stations: dict[int, StationFill]) -> str | None:
-    """Why the gap fill fails the attempt, or None when it goes on (5.3, 8.3).
+    """Why the gap fill fails the attempt, or None when it goes on.
 
     Sorted by outcome AND reason against an allowlist. The reason names the
     failing outcomes, never a station.
@@ -937,7 +941,7 @@ def _gap_fill_failure(ended: bool, stations: dict[int, StationFill]) -> str | No
 def _write_presence(
     conn: sqlite3.Connection, job: _StageJob, paused: frozenset[int]
 ) -> None:
-    """Replace the day's station presence records (plan 5.6, 11.3)."""
+    """Replace the day's station presence records."""
     local_date = job.local_date.isoformat()
     conn.execute(
         "DELETE FROM close_station_days WHERE site_id = ? AND local_date = ?",
@@ -970,10 +974,10 @@ def _write_presence(
 
 
 async def _gap_fill_stage(db: Database, writer: FencedWriter, job: _StageJob) -> None:
-    """Stage 2: the gap fill, then its try rows and presence records (8.1).
+    """Stage 2: the gap fill, then its try rows and presence records.
 
     Not one transaction: ``fill_gaps`` makes its calls between its own
-    writes (8.1). An exception from it propagates and fails the attempt.
+    writes. An exception from it propagates and fails the attempt.
     """
 
     def begin(conn: sqlite3.Connection) -> frozenset[int] | None:
@@ -1036,8 +1040,8 @@ async def _gap_fill_stage(db: Database, writer: FencedWriter, job: _StageJob) ->
 
 
 def _hourly_values_stage(conn: sqlite3.Connection, job: _StageJob) -> None:
-    """Stage 3: the day's hourly values and site hours (8.1, 8.3), then the
-    rain check over them (rain release, A2), in the one transaction."""
+    """Stage 3: the day's hourly values and site hours, then the rain check
+    over them, in the one transaction."""
     now = utc_now()
     running = _open_stage(conn, job, now)
     if running is None:
@@ -1055,7 +1059,7 @@ def _hourly_values_stage(conn: sqlite3.Connection, job: _StageJob) -> None:
 
 
 def _truth_version(conn: sqlite3.Connection, site_id: int, local_date: date) -> str:
-    """SHA-256 of the day's ``daily_truth`` rows as JSON (plan 11.4).
+    """SHA-256 of the day's ``daily_truth`` rows as JSON.
 
     The rows as stage 4 wrote them: those of the site's one time zone
     generation, read through ``site_generation_id`` as
@@ -1076,7 +1080,7 @@ def _truth_version(conn: sqlite3.Connection, site_id: int, local_date: date) -> 
 
 
 def _truth_stage(conn: sqlite3.Connection, job: _StageJob) -> None:
-    """Stage 4: the verdict, the bounds check and the truth (6.1, 11.4)."""
+    """Stage 4: the verdict, the bounds check and the truth."""
     now = utc_now()
     running = _open_stage(conn, job, now)
     if running is None:
@@ -1124,7 +1128,7 @@ def _truth_stage(conn: sqlite3.Connection, job: _StageJob) -> None:
 
 
 def _score_stage(conn: sqlite3.Connection, job: _StageJob) -> None:
-    """Stage 5: P4 scores the day in this transaction (plan 2.3, 8.3)."""
+    """Stage 5: ``close_p4.score_day`` scores the day in this transaction."""
     now = utc_now()
     running = _open_stage(conn, job, now)
     if running is None:
@@ -1149,7 +1153,7 @@ def _score_stage(conn: sqlite3.Connection, job: _StageJob) -> None:
 
 
 def _closure(conn: sqlite3.Connection, job: _StageJob) -> bool:
-    """Stage 6's one write: the closure, its publication, stage 7 (8.1, 8.6).
+    """Stage 6's one write: the closure, its publication, stage 7.
 
     ``finish_close``, the attempt closed, the stage-log row, the publication
     record of cutoff ``closed_through`` opened and stage 7 enqueued all
@@ -1186,7 +1190,7 @@ def _closure(conn: sqlite3.Connection, job: _StageJob) -> bool:
 
 
 async def _closure_stage(writer: FencedWriter, job: _StageJob) -> None:
-    """Stage 6: the closure, then raw retention in a write of its own (8.4)."""
+    """Stage 6: the closure, then raw retention in a write of its own."""
     if await writer.write(lambda conn: _closure(conn, job)):
         await writer.write(lambda conn: run_close_retention(conn, now_utc=utc_now()))
 
@@ -1195,7 +1199,7 @@ async def _closure_stage(writer: FencedWriter, job: _StageJob) -> None:
 
 
 def _newer_publication(conn: sqlite3.Connection, job: _StageJob) -> bool:
-    """Whether a later cutoff of the site is open or published (plan 8.6).
+    """Whether a later cutoff of the site is open or published.
 
     Open is ``pending`` or ``building``. A ``published`` later cutoff
     counts too, so an older cutoff's retry, or its repaired stage 7, never
@@ -1210,12 +1214,13 @@ def _newer_publication(conn: sqlite3.Connection, job: _StageJob) -> bool:
 
 
 def _begin_publication(conn: sqlite3.Connection, job: _StageJob) -> bool:
-    """Stage 7's short first write: the checks, then ``building`` (8.2, 9.4).
+    """Stage 7's short first write: the checks, then ``building``.
 
     False, with nothing written, when the job's record is not open (its
     cutoff, its attempt, ``pending`` or ``building``). An older cutoff with
     a newer open or published record ends ``superseded``, with no call to
-    P4. A job claimed too late fails the publication as ``stalled`` (8.3).
+    ``close_p4.publish``. A job claimed too late fails the publication as
+    ``stalled``.
     """
     now = utc_now()
     record = publication_record(conn, site_id=job.site_id, cutoff=job.local_date)
@@ -1255,9 +1260,10 @@ def _begin_publication(conn: sqlite3.Connection, job: _StageJob) -> bool:
 
 
 async def _publish_stage(db: Database, writer: FencedWriter, job: _StageJob) -> None:
-    """Stage 7, the chain's last: publish up to the cutoff (8.1, 9.4).
+    """Stage 7, the chain's last: publish up to the cutoff.
 
-    An exception from P4 propagates; ``fail_day_publish_job`` records it.
+    An exception from ``close_p4.publish`` propagates;
+    ``fail_day_publish_job`` records it.
     """
     if not await writer.write(lambda conn: _begin_publication(conn, job)):
         return
@@ -1313,14 +1319,14 @@ def _parse_or_cancel(job: Job, kind: str) -> _StageJob:
 
 
 async def run_day_close(db: Database, writer: FencedWriter, job: Job) -> None:
-    """Run one ``day_close`` job: stage 2, 3, 4, 5 or 6 (plan 8.1, 8.2).
+    """Run one ``day_close`` job: stage 2, 3, 4, 5 or 6.
 
     ``dispatch`` calls it as ``await run_day_close(db, writer, job)``. A
     malformed job ends with ``JobCancelled``. A stale job returns at once; a
     stage that decides it failed records the failure itself and returns. An
     exception propagates, for ``_fail_job`` to record through
     ``fail_day_close_job``. Once a stop has begun no stage starts:
-    ``StopRequested`` (storage-release plan 6.3), for which
+    ``StopRequested``, for which
     ``run_claimed_job`` records nothing.
     """
     stop.check()
@@ -1338,7 +1344,7 @@ async def run_day_close(db: Database, writer: FencedWriter, job: Job) -> None:
 
 
 async def run_day_publish(db: Database, writer: FencedWriter, job: Job) -> None:
-    """Run one ``day_publish`` job: stage 7 (plan 8.1, 8.2, 9.4).
+    """Run one ``day_publish`` job: stage 7.
 
     ``dispatch`` calls it as ``await run_day_publish(db, writer, job)``. A
     malformed job ends with ``JobCancelled``. An exception propagates, for
@@ -1364,9 +1370,9 @@ def fail_attempt(
     now_utc: datetime,
     job_id: int,
 ) -> DayState:
-    """Record a failed close attempt, in the caller's transaction (plan 9.1).
+    """Record a failed close attempt, in the caller's transaction.
 
-    P1's ``fail_close`` moves the day to ``retry_due`` (``retry_at`` =
+    ``fail_close`` moves the day to ``retry_due`` (``retry_at`` =
     ``now_utc`` + ``RETRY_DELAY``) after attempt 1, or to ``missed``
     (``retry_failed``) after attempt 2; then the attempt record is closed
     with ``stage`` and ``reason``, the stage-log row of job ``job_id``
@@ -1421,7 +1427,7 @@ def fail_publication(
     now_utc: datetime,
     job_id: int,
 ) -> None:
-    """Record a failed stage 7, in the caller's transaction (plan 9.4).
+    """Record a failed stage 7, in the caller's transaction.
 
     Acts only on a ``building`` record of ``cutoff`` whose ``attempt`` is
     the job's: after attempt 1 it goes to ``retry_due`` with ``retry_at`` =
@@ -1470,7 +1476,7 @@ def fail_publication(
 def fail_day_close_job(
     conn: sqlite3.Connection, job: Job, reason: str, *, now_utc: datetime
 ) -> None:
-    """``_fail_job``'s ``day_close`` branch, in its transaction (plan 9.1).
+    """``_fail_job``'s ``day_close`` branch, in its transaction.
 
     Calls ``fail_attempt`` with the job's stage and ``reason`` (the
     sanitized message) only when the day is ``closing`` with ``attempts``
@@ -1517,7 +1523,7 @@ def fail_day_close_job(
 def fail_day_publish_job(
     conn: sqlite3.Connection, job: Job, reason: str, *, now_utc: datetime
 ) -> None:
-    """``_fail_job``'s ``day_publish`` branch, in its transaction (plan 9.4).
+    """``_fail_job``'s ``day_publish`` branch, in its transaction.
 
     Stage 7: ``fail_publication`` with ``reason``. Call it before
     ``fail()``, as ``fail_day_close_job``.
@@ -1541,7 +1547,7 @@ def fail_day_publish_job(
 
 
 def _database_failing(exc: Exception) -> bool:
-    """Whether ``exc`` must fail the caller's write (plan 8.4, 8.5).
+    """Whether ``exc`` must fail the caller's write.
 
     Every ``sqlite3.DatabaseError`` but ``sqlite3.IntegrityError``: the
     database is locked or failing (``OperationalError``), or the file is
@@ -1554,9 +1560,9 @@ def _database_failing(exc: Exception) -> bool:
     )
 
 
-#: Rain release Part B (B6): each site's oldest day not yet done, by its
-#: start. A site's scored values for hours before it have been read by
-#: their closes; a site with no such day keeps all of its rows.
+#: Each site's oldest day not yet done, by its start. A site's scored values
+#: for hours before it have been read by their closes; a site with no such
+#: day keeps all of its rows.
 _OLDEST_UNDONE_STARTS_SQL: Final = """
     SELECT d.site_id, d.day_start_utc
     FROM site_days AS d
@@ -1572,7 +1578,7 @@ _DELETE_OLD_SCORED_SQL: Final = (
     "DELETE FROM forecast_scored"
     " WHERE site_id = ? AND julianday(valid_at) < julianday(?)"
 )
-#: Card 7 (plan 4.4): one display variable's rows of one site for hours
+#: One display variable's rows of one site for hours
 #: before the bound, the site's local midnight of today (the Forecast page's
 #: first hour). String comparison on ``valid_at``, as the display loader
 #: reads it, so ``idx_samples_site_var_valid`` serves the whole key. The
@@ -1584,8 +1590,8 @@ DELETE_PAST_DISPLAY_SAMPLES_SQL: Final = (
 
 
 def _delete_past_display_samples(conn: sqlite3.Connection, now_utc: datetime) -> None:
-    """Delete the display rows (card 7) no longer shown, for every site
-    (enabled or not) whose zone loads (plan 4.4).
+    """Delete the display rows no longer shown, for every site (enabled or
+    not) whose zone loads.
 
     The bound is ``isoformat_utc(local_day_start(now_utc, sites.timezone))``,
     so today's earlier hours keep theirs. A site whose zone does not load
@@ -1612,9 +1618,9 @@ def _delete_past_display_samples(conn: sqlite3.Connection, now_utc: datetime) ->
 
 def run_close_retention(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
     """Prune raw readings, the old scored values, the past display rows and
-    the close's two logs (plan 8.4, 11.6; rain release Part B, B6; card 7).
+    the close's two logs.
 
-    Runs P2's ``prune_raw_readings``, deletes the ``forecast_scored`` rows
+    Runs ``prune_raw_readings``, deletes the ``forecast_scored`` rows
     of hours before each site's oldest day not yet done, deletes the display
     rows of ``forecast_samples`` before each site's local midnight of today
     (``_delete_past_display_samples``), and deletes the stage-log and
@@ -1652,14 +1658,14 @@ def run_close_retention(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
 
 @dataclass(slots=True)
 class _SiteStep:
-    """The step of plan 8.5 a site's part of the tick is in (1 to 5), or of
-    5.5 a day or publication record being settled is in (1 to 4)."""
+    """The step a site's part of the tick is in (1 to 5), or a day or
+    publication record being settled is in (1 to 4)."""
 
     number: int = 1
 
 
 def _log_site_error(site_id: int, step: int, exc: Exception, now_utc: datetime) -> None:
-    """One ERROR line per site and step per ``_SITE_ERROR_EVERY`` (8.5)."""
+    """One ERROR line per site and step per ``_SITE_ERROR_EVERY``."""
     last = _LAST_SITE_STEP_ERROR.get((site_id, step))
     if last is not None and now_utc - last < _SITE_ERROR_EVERY:
         return
@@ -1678,7 +1684,7 @@ def _in_site_savepoint[T](
     now_utc: datetime,
     steps: Callable[[_SiteStep], T],
 ) -> T | None:
-    """Run one site's ``steps`` under ``SAVEPOINT close_site`` (plan 8.5).
+    """Run one site's ``steps`` under ``SAVEPOINT close_site``.
 
     ``steps`` sets the step number as it goes. An exception is re-raised
     when the transaction is gone or it is a database error
@@ -1703,7 +1709,7 @@ def _in_site_savepoint[T](
 def _running_at(
     due_utc: datetime, worker_started_at: str | None, now_utc: datetime
 ) -> bool:
-    """Whether the add-on was running at ``due_utc`` (plan 5.2).
+    """Whether the add-on was running at ``due_utc``.
 
     True when this process started at or before ``due_utc`` (the stored
     ``worker_started_at``; none stored counts as not running) and this tick
@@ -1716,7 +1722,7 @@ def _running_at(
 
 
 def _undone_days(conn: sqlite3.Connection, site_id: int) -> list[DayRecord]:
-    """The site's days not yet done, oldest first (P1 §4.5; plan 5.2)."""
+    """The site's days not yet done, oldest first."""
     rows = conn.execute(
         "SELECT local_date FROM site_days WHERE site_id = ?"
         " AND state NOT IN ('closed', 'missed') ORDER BY local_date",
@@ -1731,7 +1737,7 @@ def _round(
     rounds: dict[tuple[int, date], close_p4.RoundState],
     record: DayRecord,
 ) -> close_p4.RoundState:
-    """P4's answer for the round of R = D + 1, asked once per tick (5.1, 14.1)."""
+    """``close_p4.round_state`` for the round of R = D + 1, asked once per tick."""
     key = (record.site_id, record.local_date + timedelta(days=1))
     if key not in rounds:
         rounds[key] = close_p4.round_state(conn, site_id=key[0], round_date=key[1])
@@ -1739,7 +1745,7 @@ def _round(
 
 
 def _wind_lane_due(conn: sqlite3.Connection, site_id: int, now_utc: datetime) -> bool:
-    """Whether the site's wind-lane job is ``pending`` and due (plan 5.1).
+    """Whether the site's wind-lane job is ``pending`` and due.
 
     Due as the queue's claim reads it. The key is a literal: this module
     cannot import ``wind_days``.
@@ -1776,7 +1782,7 @@ def _site_due_instant(
     rounds: dict[tuple[int, date], close_p4.RoundState],
     step: _SiteStep,
 ) -> datetime:
-    """The earliest due instant among the site's candidates (plan 4.5, 8.5).
+    """The earliest due instant among the site's candidates.
 
     The candidates: the oldest day not done (once it has ended, its round's
     bound; or its ``retry_at``) and each ``retry_due`` publication record's
@@ -1803,12 +1809,12 @@ def _site_due_instant(
 def _start_attempt(
     conn: sqlite3.Connection, record: DayRecord, now_utc: datetime
 ) -> None:
-    """Start a due attempt, in the tick's write (plan 5.1, 8.1, 11.3).
+    """Start a due attempt, in the tick's write.
 
     ``begin_close``, then the attempt record (``last_stage`` 1); for attempt
     1 only, stage 1's stage-log row: no job, ``enqueued_at`` and
-    ``started_at`` the day's ``day_end_utc`` as P1 stores it, so its wait is
-    0 and its duration runs from the day's end (11.1). Then stage 2 is
+    ``started_at`` the day's ``day_end_utc`` as stored, so its wait is
+    0 and its duration runs from the day's end. Then stage 2 is
     enqueued with the attempt.
     """
     site_id, local_date = record.site_id, record.local_date
@@ -1844,7 +1850,7 @@ def _close_due_days(
     rounds: dict[tuple[int, date], close_p4.RoundState],
     step: _SiteStep,
 ) -> bool:
-    """Steps 2 and 3: the missed days, then a due attempt (plan 5.1, 5.2).
+    """Steps 2 and 3: the missed days, then a due attempt.
 
     Walks the site's days not done, oldest first. A changeover day at its
     first due instant (the round's bound), or a day whose attempt fell due
@@ -1864,7 +1870,7 @@ def _close_due_days(
             answer = _round(conn, rounds, record)
             due = answer.bound_utc
             if record.zone_changeover:
-                # Never attempted: missed at its first due instant (4.4).
+                # Never attempted: missed at its first due instant.
                 if now_utc < due:
                     break
                 reason = "zone_changeover"
@@ -1899,7 +1905,7 @@ def _close_due_days(
 def _has_live_job(conn: sqlite3.Connection, job_type: str, site_id: int) -> bool:
     """Whether the site has a ``pending`` or ``running`` keyed job of the type.
 
-    Every stage job has a key (8.1). The status and key terms repeat
+    Every stage job has a key. The status and key terms repeat
     ``idx_jobs_active_dedupe``'s partial-index predicate word for word, and
     the site term uses that index's ``COALESCE(site_id, -1)`` expression,
     so the read can probe the live jobs on that index rather than walk every
@@ -1917,7 +1923,7 @@ def _has_live_job(conn: sqlite3.Connection, job_type: str, site_id: int) -> bool
 
 
 def _repair(conn: sqlite3.Connection, site_id: int) -> None:
-    """Step 4: enqueue again a stage job that was lost (plan 8.2, 8.5).
+    """Step 4: enqueue again a stage job that was lost.
 
     A ``closing`` day with no ``day_close`` job of the site gets the stage
     after its attempt record's ``last_stage``, with its attempt. An open
@@ -1960,10 +1966,10 @@ def _retry_publications(
     now_utc: datetime,
     worker_started_at: str | None,
 ) -> None:
-    """Step 5: each publication retry whose time has come (plan 9.4).
+    """Step 5: each publication retry whose time has come.
 
     A ``retry_due`` record whose ``retry_at`` has passed, when the add-on
-    was running at ``retry_at`` (5.2), becomes ``pending`` with ``attempt``
+    was running at ``retry_at``, becomes ``pending`` with ``attempt``
     2 and no ``retry_at``, and stage 7 is enqueued with that attempt;
     otherwise it goes to ``failed`` with reason ``retry_not_run``.
     """
@@ -1994,7 +2000,7 @@ def _site_steps(
     rounds: dict[tuple[int, date], close_p4.RoundState],
     step: _SiteStep,
 ) -> bool:
-    """Steps 1 to 5 of plan 8.5 for one site; True when a day moved to missed."""
+    """The tick's steps 1 to 5 for one site; True when a day moved to missed."""
     ensure_site_days(conn, site_id, now_utc=now_utc)
     moved = _close_due_days(conn, site_id, now_utc, worker_started_at, rounds, step)
     step.number = 4
@@ -2005,16 +2011,16 @@ def _site_steps(
 
 
 def enqueue_due_close_work(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
-    """The tick's close work, in ``scheduler_tick``'s transaction (plan 8.5).
+    """The tick's close work, in ``scheduler_tick``'s transaction.
 
     Each enabled site, in order of the earliest due instant among its
-    candidates, then site id (4.5), runs under ``SAVEPOINT close_site``:
+    candidates, then site id, runs under ``SAVEPOINT close_site``:
     step 1 ``ensure_site_days``; steps 2 and 3 the missed days and a due
-    attempt, oldest day first (5.1, 5.2); step 4 the repair (8.2); step 5 a
-    due publication retry (9.4). A site whose due instant or steps raise
+    attempt, oldest day first; step 4 the repair; step 5 a
+    due publication retry. A site whose due instant or steps raise
     begins nothing this tick and the other sites go on
     (``_in_site_savepoint``). When the tick moved a day to ``missed``, raw
-    retention runs once after the last site (8.4).
+    retention runs once after the last site.
     """
     worker_started_at = get_runtime_state(conn, "worker_started_at")
     rounds: dict[tuple[int, date], close_p4.RoundState] = {}
@@ -2051,7 +2057,7 @@ def _in_settle_savepoint(
 ) -> None:
     """Run one day's or one record's settling under ``SAVEPOINT close_settle``.
 
-    The catch of plan 8.5, as 5.5 copies it: an exception is re-raised when
+    The catch of ``_in_site_savepoint``: an exception is re-raised when
     the transaction is gone or it is a database error
     (``_database_failing``); any other is rolled back to the savepoint with
     one ERROR line naming the site, the date and the step, and the day or
@@ -2087,18 +2093,18 @@ def _settle_day(
     now_utc: datetime,
     step: _SiteStep,
 ) -> None:
-    """Steps 1 to 4 of plan 5.5 for one ``closing`` day.
+    """The four steps that settle one ``closing`` day.
 
     1. L, the stop's time: the later of ``worker_last_loop_at`` and the
        attempt record's ``last_progress_at``. A day with no attempt record
-       (a P1 record only) has the day's ``state_changed_at``, when
+       (a day record only) has the day's ``state_changed_at``, when
        ``begin_close`` ran, in place of ``last_progress_at``.
     2. ``fail_close`` at L with reason "stopped during stage N", N the stage
        after the attempt's ``last_stage``; the attempt record is closed with
-       N, the reason and L (11.3). No stage-log row: a stage cut short by a
-       stop writes none (11.1).
+       N, the reason and L. No stage-log row: a stage cut short by a
+       stop writes none.
     3. After attempt 1, a ``retry_at`` this start is later than was not
-       covered by a running add-on (5.2): ``mark_missed`` ``retry_not_run``.
+       covered by a running add-on: ``mark_missed`` ``retry_not_run``.
     4. Every ``pending`` or ``running`` ``day_close`` job of the day is
        completed without running (``complete``, no success marker).
     """
@@ -2158,16 +2164,16 @@ def _settle_publication(
     now_utc: datetime,
     step: _SiteStep,
 ) -> None:
-    """Plan 9.4's stop during stage 7: a ``building`` record failed at L.
+    """A stop during stage 7: a ``building`` record failed at L.
 
     1. L: the later of ``worker_last_loop_at`` and the record's
        ``started_at``, stage 7's saved start (its ``opened_at`` if none).
     2. After attempt 1, ``retry_due`` with ``retry_at`` = L + ``RETRY_DELAY``;
        after attempt 2, ``failed``. Reason "stopped during stage 7"; no
-       stage-log row (11.1).
+       stage-log row.
     3. A ``retry_at`` this start is later than was not covered by a running
-       add-on (5.2): ``failed`` with reason ``retry_not_run``, as the tick's
-       publication retry writes it (8.5 step 5).
+       add-on: ``failed`` with reason ``retry_not_run``, as the tick's
+       publication retry writes it.
     """
     cutoff = date.fromisoformat(cutoff_text)
     record = publication_record(conn, site_id=site_id, cutoff=cutoff)
@@ -2205,13 +2211,13 @@ def _settle_publication(
 def settle_interrupted_closes(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
     """Settle the close work a stop cut short, in the caller's transaction.
 
-    Plan 5.5 and 9.4. ``lifespan`` calls it at each start, after
+    ``lifespan`` calls it at each start, after
     ``reclaim_all_stale`` and before the ``worker_started_at`` write, so
     ``now_utc`` is the start's time. Each ``closing`` day, oldest first,
     then each ``building`` publication record, oldest cutoff first, is
     settled under its own ``SAVEPOINT close_settle`` (``_settle_day``,
     ``_settle_publication``); one that raises is left as it was, with one
-    ERROR line, and the next goes on. Then raw retention runs once (8.4).
+    ERROR line, and the next goes on. Then raw retention runs once.
     Never commits.
     """
     last_loop_at = get_runtime_state(conn, "worker_last_loop_at")

@@ -1,15 +1,13 @@
-"""Rain release Part A outside the close: the Sites page.
+"""The rain check outside the close: the Sites page.
 
-Plan 2026-11-01-rain-release.md, Part A, "Schema (v16)" / "Upgrade
-carry-over" and A5. ``tests/test_rain_check_rules.py`` and
-``tests/test_rain_check_close.py`` cover the rules and the close; this file
-pins what those leave out:
+``tests/test_rain_check_rules.py`` and ``tests/test_rain_check_close.py``
+cover the rules and the close; this file pins what those leave out:
 
 - U2: the Sites page Status cell adds `` · rain not counted since <date>``
   only while a station is set aside, the date being the first day left out.
 
-U1 (a made-up v15 file upgrading to v16 with every existing list row
-counted) has no test here: the dedicated v15->v16 migration function it
+A made-up v15 file upgrading to v16 with every existing list row counted
+has no test here: the dedicated v15->v16 migration function it
 pinned is deleted along with every other ``migrate_v2`` ... ``migrate_v16``
 function -- ``station_rain_checks`` is now just
 part of the permanent schema (``create_tables``), with no conversion step

@@ -1,4 +1,4 @@
-"""As-of sample reconstruction (plan §6) — implementer tests.
+"""As-of sample reconstruction — implementer tests.
 
 The daily close's day_scores rows are the only scoring path, so there is
 no as-of pair-knowability query to cover here.

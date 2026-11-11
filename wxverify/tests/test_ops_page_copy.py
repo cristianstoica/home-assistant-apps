@@ -1,4 +1,4 @@
-"""Item 8 (§1.2/§6.14): the Ops page carries controls, not documentation.
+"""The Ops page carries controls, not documentation.
 
 A scripted deletion removed explanatory prose from the publish-hold panel
 (`ops/_publish_hold.html`); the publish-hold heading was renamed from
@@ -56,7 +56,7 @@ def _norm(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# MS1 (plan §13.8, 0.16.13): the Key Status panel's `access_holds` lines
+# MS1: the Key Status panel's `access_holds` lines
 # have NO 24h "still listed" cutoff (unlike the monitor alert's AL1-AL8
 # above) -- a hold whose `until` has long passed still renders, its tail
 # switching from "held until ..." to "waiting for the next try" purely on

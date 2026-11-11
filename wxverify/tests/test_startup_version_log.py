@@ -1,4 +1,4 @@
-"""The startup version log (card 20, plan 2026-11-08-cleanup-release.md §3.3).
+"""The startup version log.
 
 ``lifespan``'s first log line reports this run's ``__version__``, SQLite
 and Python versions, so an after-install check can compare the deployed
@@ -30,10 +30,10 @@ async def _idle_worker(db: object) -> None:
 def test_lifespan_logs_wxverify_sqlite_python_versions_at_startup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """``lifespan`` logs, at INFO, exactly the line §3.3 specifies.
+    """``lifespan`` logs, at INFO, exactly the startup version line.
 
     There is no "absent" counterpart for a startup line (it always runs),
-    so this pins the one literal the spec requires rather than pairing a
+    so this pins the one literal rather than pairing a
     negative/positive: ``__version__`` ties the line to this release, and
     the SQLite/Python values are read live, not hardcoded, from the same
     ``sqlite3``/``platform`` calls the app line uses.

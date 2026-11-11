@@ -15,7 +15,7 @@ from wxverify.settings.keys import get_setting
 from wxverify.verification.methodology import SNAPSHOT_LOCAL_TIME
 
 #: Global settings key for the snapshot wall-clock time; a per-site override
-#: lives at ``record_snapshot_local_time:<site_id>`` (§15).
+#: lives at ``record_snapshot_local_time:<site_id>``.
 SNAPSHOT_TIME_KEY = "record_snapshot_local_time"
 
 
@@ -33,7 +33,7 @@ def parse_wall_clock(raw: str) -> tuple[int, int] | None:
 
 
 def snapshot_wall_clock(conn: sqlite3.Connection, site_id: int) -> str:
-    """The site's snapshot wall-clock time ``HH:MM`` (§15 resolution order).
+    """The site's snapshot wall-clock time ``HH:MM``.
 
     Per-site setting, then the global setting, then the methodology default.
     Unparseable values fall through to the next layer rather than erroring —
@@ -50,11 +50,11 @@ def resolve_snapshot_utc(timezone: str, local_date: date, wall_clock: str) -> da
     """UTC instant of T: first instant at/after ``wall_clock`` on the local day.
 
     PEP 495 semantics with ``fold=0``: an ambiguous fall-back time maps to
-    its first occurrence, exactly the §3 rule. A wall-clock time inside a
-    spring-forward gap maps to the gap-SHIFTED instant (02:30 -> 03:30), an
-    architect-accepted approximation of §3's first-instant-after-the-gap
-    (03:00) — within the hour, deterministic, and identical for the default
-    07:00 snapshot time, which no real-world DST gap touches.
+    its first occurrence. A wall-clock time inside a spring-forward gap maps
+    to the gap-SHIFTED instant (02:30 -> 03:30), an approximation of the
+    first instant after the gap (03:00) — within the hour, deterministic, and
+    identical for the default 07:00 snapshot time, which no real-world DST
+    gap touches.
     """
     parsed = parse_wall_clock(wall_clock)
     if parsed is None:

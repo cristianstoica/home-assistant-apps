@@ -28,7 +28,7 @@ def test_every_uplot_instantiation_captures_return_value() -> None:
     # A discarded `new uPlot(...)` return (bare `new uPlot({` with no
     # assignment) can never be labeled -- this pins that both remaining chart
     # renderers keep the instance (the hourly chart was deleted with the
-    # Forecast page rebuild, card 7).
+    # Forecast page rebuild).
     bare_calls = re.findall(r"^\s*new uPlot\(", APP_JS, re.MULTILINE)
     assert bare_calls == [], (
         f"found uPlot(...) call(s) with a discarded return value: {bare_calls!r}"

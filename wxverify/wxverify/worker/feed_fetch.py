@@ -68,10 +68,10 @@ T = TypeVar("T")
 logger = logging.getLogger(__name__)
 
 # The value-change log counts an hour as changed when its value differs by
-# more than this (daily-close P4 plan 5.2).
+# more than this.
 VALUE_CHANGE_TOLERANCE: Final = 1e-9
 
-# A forward download try's outcome in forecast_downloads (plan 4.2).
+# A forward download try's outcome in forecast_downloads.
 DownloadOutcome = Literal[
     "stored",
     "no_usable",
@@ -86,7 +86,7 @@ DownloadOutcome = Literal[
 
 @dataclass(frozen=True)
 class DownloadSlot:
-    """Which try of a feed's schedule one forward download is (plan 4.2).
+    """Which try of a feed's schedule one forward download is.
 
     ``slot`` is ``"round"``, a daytime slot as local ``"HH:MM"``, or
     ``"unscheduled"`` (an enable-time or command-line fetch, or a job
@@ -183,7 +183,7 @@ async def fetch_feed_once(
 
     ``slot`` is the try's place in the feed's schedule. A reply that is
     persisted writes its ``stored`` or ``no_usable`` download row with it,
-    in the samples' transaction (daily-close P4 plan 4.2). A refused answer
+    in the samples' transaction. A refused answer
     (``ProviderAnswerRefused``) writes the feed's state and its ``refused``
     row here, saves nothing of the reply and returns ``Refused``. Every
     other outcome is the caller's to record.
@@ -567,17 +567,16 @@ def _persist_fetch_success(
 
     The ``stored`` or ``no_usable`` row of ``forecast_downloads`` is written
     with the samples, so a stored download always has its row, and a
-    ``stored`` download logs its value changes (daily-close P4 plan 4.2,
-    5.2). For each feed the reply carried that has no earlier stored
-    download on the try's local date S (``first_recorded_download``, asked
-    before this try's row exists), the download is S's first, and its
-    valid samples become that feed's scored values (rain release, Part B,
-    B2). A failure anywhere rolls all of it back with the transaction.
+    ``stored`` download logs its value changes. For each feed the reply
+    carried that has no earlier stored download on the try's local date S
+    (``first_recorded_download``, asked before this try's row exists), the
+    download is S's first, and its valid samples become that feed's scored
+    values. A failure anywhere rolls all of it back with the transaction.
     ``slot=None`` records the try as ``unscheduled``, started at its end.
     """
     clear_domain_backoff(conn, source_domain(target.source))
     # One clock reading ends the try: the samples' fetched_at keeps its
-    # microseconds, the row's ended_at is whole-second (plan 15.2). Read
+    # microseconds, the row's ended_at is whole-second. Read
     # through the module attribute, the clock isoformat_utc() reads, as
     # db/queue.py's claim does.
     ended_at = timeutil.utc_now()
@@ -590,7 +589,7 @@ def _persist_fetch_success(
         conn, target.site_id, aware_end.astimezone(UTC).replace(microsecond=0)
     )
     # Read before the samples are written, so each hour is compared with
-    # the value this reply replaces (B3).
+    # the value this reply replaces.
     comparisons = _value_change_comparisons(conn, target, result)
     outcome = persist_fetch_result(
         conn,
@@ -601,7 +600,7 @@ def _persist_fetch_success(
         fetched_at=fetched_at,
     )
     stored = outcome.usable_sample_count > 0
-    # B2: decided before this try's download row is written, which would
+    # Decided before this try's download row is written, which would
     # otherwise be S's first stored download itself.
     first_feeds = (
         []
@@ -677,11 +676,11 @@ def record_download_try(
     inserted: int = 0,
     labels: Mapping[int, Sequence[str]] | None = None,
 ) -> int | None:
-    """Write one ``forecast_downloads`` row for a forward download try (plan 4.2).
+    """Write one ``forecast_downloads`` row for a forward download try.
 
     ``started_at`` (``slot.started_at``) and ``ended_at`` are stored
     whole-second, ``isoformat_utc(t.replace(microsecond=0))``, the only form
-    import accepts for them (plan 15.2, 15.6); ``fetched_at`` is stored as
+    import accepts for them; ``fetched_at`` is stored as
     given. ``local_date`` is the local date of the end: the daily-close
     record holding it, else in ``sites.timezone``.
     Returns the row id, or ``None`` with nothing written when the site or
@@ -734,7 +733,7 @@ def record_download_try(
 def _download_local_date(
     conn: sqlite3.Connection, site_id: int, ended: datetime
 ) -> date | None:
-    """The local date of a try's end (plan 4.2); ``None`` for a site that
+    """The local date of a try's end; ``None`` for a site that
     does not exist."""
     record = day_for_instant(conn, site_id, isoformat_utc(ended))
     if record is not None:
@@ -756,10 +755,9 @@ def _download_local_date(
 
 @dataclass(frozen=True)
 class _ValueComparison:
-    """One carried feed's side of the value-change log (plan 5.2): the
-    reply's usable values, the previous stored download, and the stored
-    newest values over the reply's hours, which the reply replaces (rain
-    release, Part B, B3)."""
+    """One carried feed's side of the value-change log: the reply's usable
+    values, the previous stored download, and the stored newest values
+    over the reply's hours, which the reply replaces."""
 
     cells: dict[str, dict[str, float]]
     previous: ScoredDownload
@@ -772,7 +770,7 @@ def _value_change_comparisons(
 ) -> dict[int, _ValueComparison]:
     """For each feed the reply carried that has a previous recorded stored
     download, the reply's values and the feed's stored newest values over
-    the reply's valid hours (plan 5.2; rain release, Part B, B3).
+    the reply's valid hours.
 
     Called before the reply's samples are written, so the latest stored
     download is the previous one and each stored value is the one this
@@ -819,7 +817,7 @@ def _record_value_changes(
     download_id: int,
     labels: Mapping[int, Sequence[str]],
 ) -> None:
-    """Write the value-change rows of a ``stored`` download (plan 5.2).
+    """Write the value-change rows of a ``stored`` download.
 
     One row per compared feed and variable: the hours present in both the
     reply and the stored values it replaces, those whose value differs by more than
@@ -898,7 +896,7 @@ def _reply_cells(
     """The reply's usable values as ``{feed_id: {variable: {valid_at: value}}}``.
 
     A usable sample is of the scored roster and has a lead of at least 1
-    hour, as ``persist_fetch_result`` counts it; a display sample (card 7)
+    hour, as ``persist_fetch_result`` counts it; a display sample
     and a value that is not finite are left out. Where two labels give the
     same hour, the newer label's value, as ``persist_fetch_result`` writes
     it.

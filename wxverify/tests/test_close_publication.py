@@ -1,5 +1,4 @@
-"""The publication (plan 2026-10-21-daily-close-close-job.md section
-15.11): PB1 to PB9.
+"""The publication: PB1 to PB9.
 
 Written before ``close_chain.enqueue_due_close_work``, ``close_p4`` and
 ``close_chain.fail_publication``/``publication_record`` exist, and fails
@@ -15,14 +14,13 @@ PB1-PB3 and PB7, PB9 drive the real night chain end to end (the pattern of
 publication's own state only exists once stage 6 has genuinely opened it.
 PB4-PB6 instead build their precondition directly against
 ``close_publications``/``site_days``/``jobs`` and then insert, claim and run
-one stray stage-7 job (plan 15.1's own pattern, and PB6's own plan-text
-description, "a stage-7 job for D, attempt 1, inserted and run"),
-since the precondition each needs (two open records, an already-published
-one, an already-failed one) is state stage 6/7's own earlier run would
-produce, not something this test's own code under test builds.
+one stray stage-7 job, since the precondition each needs (two open records,
+an already-published one, an already-failed one) is state stage 6/7's own
+earlier run would produce, not something this test's own code under test
+builds.
 
-Section 16.2 names the mutant each test ID kills; the mapping is given
-inline on the exact assertion it kills at.
+The mutant each test ID kills is named inline on the exact assertion it
+kills at.
 
 Real SQLite only (``tests.helpers.standard_night``, real ``run_migrations``
 via ``init_db`` on a ``tmp_path`` file). Station ids are synthetic
@@ -65,8 +63,8 @@ from wxverify.worker.processor import run_claimed_job
 @pytest.fixture(autouse=True)
 def _clear_close_chain_log_map() -> None:
     """This file's own autouse wiring of ``clear_close_chain_log_map``
-    (15.1's "The log map.") -- autouse HERE, inside this one P3 test
-    file, never across the whole suite."""
+    -- autouse HERE, inside this one close-chain test file, never across
+    the whole suite."""
     clear_close_chain_log_map()
 
 
@@ -101,8 +99,7 @@ async def _publication_row(db, site_id, cutoff):  # type: ignore[no-untyped-def]
 
 async def _real_publication_id(db, site_id, cutoff):  # type: ignore[no-untyped-def]
     """The real ``publications`` row's id for ``cutoff``, as text -- the
-    id ``close_p4.publish``'s call-through actually returns, now that
-    P3's stand-in no longer invents one."""
+    id ``close_p4.publish``'s call-through actually returns."""
     row = await db.read(
         lambda c: c.execute(
             "SELECT id FROM publications WHERE site_id = ? AND cutoff = ?",
@@ -138,14 +135,14 @@ def _seed_closed_site_day(
 ) -> None:
     """Make ``site_days``'s row of ``local_date`` (PB4's second cutoff)
     ``closed`` directly, satisfying its own CHECKs (``attempts=1``,
-    ``done_at`` set, ``retry_at`` NULL). A precondition from P1's own table,
+    ``done_at`` set, ``retry_at`` NULL). A precondition from the day table,
     not from the close chain under test: PB4 exercises stage 7's own "a
     newer open record exists" check, which never reads ``site_days`` at
     all, so this only needs to satisfy ``close_publications``'s own foreign
     key to ``site_days(site_id, local_date)``.
 
-    ``standard_night``'s own ``ensure_site_days`` call (P1 4.6, "through
-    its next local date") already creates D + 1's row, ``open`` -- an
+    ``standard_night``'s own ``ensure_site_days`` call (through its next
+    local date) already creates D + 1's row, ``open`` -- an
     INSERT here collides with it (UNIQUE site_id, local_date), so this
     UPDATEs the existing row to ``closed`` instead of inserting a new one.
     """
@@ -235,17 +232,17 @@ def test_pb1_a_missed_day_opens_no_publication(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """PB1: D closed; D + 1 missed. One publication for cutoff D; none for
-    D + 1 (8.6).
+    D + 1.
 
     Closes D for real through ``run_due_jobs`` (so D's own publication
     record opens and publishes normally), then pushes
     ``worker_started_at`` past D + 1's own first-attempt due instant (D +
-    2's round bound) -- the real "never_attempted" path of 5.2/8.5, the
+    2's round bound) -- the real "never_attempted" path, the
     same mechanism ``tests/test_close_attempts.py``'s AT4/AT7 use -- so D +
     1 is moved to ``missed`` by ``enqueue_due_close_work``'s own
-    missed-day step, never by this test calling P1's ``mark_missed``
+    missed-day step, never by this test calling ``mark_missed``
     directly. Only that real path can be checked against M64: a
-    hand-seeded missed day would never reach the code 8.6 names.
+    hand-seeded missed day would never reach the missed-day step.
 
     M64 -> at the publication-count assertion below: correct = (1, 0) (one
     ``close_publications`` row, for cutoff D only), mutant M64 (a missed
@@ -267,10 +264,10 @@ def test_pb1_a_missed_day_opens_no_publication(
         clock.set(BOUND)
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
-        assert record.state == "closed", "D must close first (8.1)"
+        assert record.state == "closed", "D must close first"
 
         # Push the add-on's own start time past D+1's due instant (D+2's
-        # round bound) without ever letting its attempt run -- 5.2's
+        # round bound) without ever letting its attempt run -- the
         # "never_attempted" rule, exercised for real.
         late_start = _bound_for(D_PLUS_2) + timedelta(minutes=5)
         await db.write(
@@ -306,13 +303,12 @@ def test_pb2_a_failed_publish_retries_once_an_hour_later(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """PB2: ``publish`` raises once. Record ``retry_due``, ``retry_at`` +1
-    h; the previous publication untouched; at the retry ``published``
-    (9.4).
+    h; the previous publication untouched; at the retry ``published``.
 
     Closes D for real, stage 7's own body claims and runs through
     ``run_due_jobs``, so the real ``_fail_job`` terminal branch for
     ``day_publish`` calls the real ``fail_publication`` on a genuine
-    ``RuntimeError`` from P4's stand-in.
+    ``RuntimeError`` from the ``publish`` stand-in.
 
     M65 -> at the retry_at assertion below: correct = the failure instant
     plus exactly one hour, mutant M65 (the publication's retry 30 minutes
@@ -366,7 +362,7 @@ def test_pb2_a_failed_publish_retries_once_an_hour_later(
             2,
             "published",
             expected_pub_id,
-        ), "the retry must close out as published, attempt 2, with P4's identifier"
+        ), "the retry must close out as published, attempt 2, with publish's identifier"
 
     asyncio.run(_run())
 
@@ -380,7 +376,7 @@ def test_pb3_a_failed_publication_does_not_block_the_next_cutoff(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """PB3: ``publish`` raises twice. Record ``failed``; the next closed
-    day's publication has cutoff D + 1 and is built (9.4).
+    day's publication has cutoff D + 1 and is built.
 
     Closes D for real (``publish`` raising on both the first attempt and
     its one retry), then closes D + 1 for real too, with ``publish``
@@ -465,7 +461,7 @@ def test_pb4_an_older_open_record_is_superseded_by_a_newer_one(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """PB4: two closed days' records open before stage 7 runs. The older
-    ends ``superseded`` with no call to P4; one call, for the newer (8.6).
+    ends ``superseded`` with no call to ``publish``; one call, for the newer.
 
     Builds the precondition directly: two ``pending`` ``close_publications``
     rows (D, then D + 1), and D's stage-7 job -- not D + 1's own yet. Both
@@ -480,7 +476,7 @@ def test_pb4_an_older_open_record_is_superseded_by_a_newer_one(
     D + 1's job is seeded only afterward, once D's row is no longer
     pending/running. Only the state of ``close_publications`` (not
     ``site_days``) decides stage 7's own body, so D + 1's ``site_days`` row
-    is seeded directly as already ``closed`` (P1's own table, not the code
+    is seeded directly as already ``closed`` (the day table, not the code
     under test), rather than driving two full nights through a FIFO race
     this test has no seam to control deterministically.
 
@@ -572,7 +568,7 @@ def test_pb4_an_older_open_record_is_superseded_by_a_newer_one(
 def test_pb4b_a_retrying_older_record_is_superseded_by_a_published_newer_one(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PB4b (F2): ``_newer_publication`` (close_chain.py:1212) must
+    """PB4b: ``_newer_publication`` must
     also count a later cutoff's record that is already ``published``, not
     only ``pending``/``building`` -- the old code (``e70b81f``) checks only
     ``state IN ('pending', 'building')``, so an older cutoff's own retry
@@ -580,13 +576,13 @@ def test_pb4b_a_retrying_older_record_is_superseded_by_a_published_newer_one(
 
     Cutoff C1 (D) starts ``retry_due``; C2 (D + 1) is already
     ``published``. PB7 already proves the ``retry_due`` -> ``pending``
-    attempt-2 transition (plan 8.5 step 5), so this test builds that
+    attempt-2 transition, so this test builds that
     transition directly (PB4's own build-the-precondition-directly rule,
     since the code under test here is stage 7's own
     ``_newer_publication`` check, not the retry repair step), then
     seeds and runs C1's own retry job (attempt 2).
 
-    F2 -> at the two assertions below: correct = 'superseded' and publish
+    PB4b -> at the two assertions below: correct = 'superseded' and publish
     not called (C1's retry sees C2's already-published record as newer),
     the old code (``e70b81f``) (only pending/building count as newer) = C1
     published after C2.
@@ -632,8 +628,8 @@ def test_pb4b_a_retrying_older_record_is_superseded_by_a_published_newer_one(
             )
         )
 
-        # PB7 already proves the retry_due -> pending, attempt-2 transition
-        # (8.5 step 5); build it directly here (the file's own
+        # PB7 already proves the retry_due -> pending, attempt-2 transition;
+        # build it directly here (the file's own
         # build-the-precondition-directly rule).
         await db.write(
             lambda c: c.execute(
@@ -677,9 +673,9 @@ def test_pb6_a_stale_job_exception_never_touches_a_non_building_record(
 ) -> None:
     """PB6: a stage-7 job for D, attempt 1, inserted and run, whose first
     read of the record (``publication_record`` as ``close_chain`` calls
-    it, 8.2) raises once. The job row ``failed``; the record is
+    it) raises once. The job row ``failed``; the record is
     ``fail_publication``'s own "any other record" case, so it is never
-    touched: one WARNING line and no stage-log row (9.4).
+    touched: one WARNING line and no stage-log row.
 
     ``seeded_state`` ``published`` is the original PB6 case: every write
     ``fail_publication``'s own ``retry_due`` branch could make to a
@@ -705,13 +701,12 @@ def test_pb6_a_stale_job_exception_never_touches_a_non_building_record(
     record existed, where correct code's early return (``record is
     None``) writes no row at all.
 
-    Imports ``publication_record`` from ``close_chain`` inline (an
-    ``ImportError`` today, the name does not exist until piece 3/4), wraps
+    Imports ``publication_record`` from ``close_chain`` inline, wraps
     it to raise only on its first call -- stage 7's own predicate read
-    (8.2 step 1) -- and call through to the real function afterward, so
+    -- and call through to the real function afterward, so
     the SECOND read, inside the real ``fail_publication``, finds the
     record genuinely as seeded (never ``building``) and declines to touch
-    it, logging the WARNING 9.4 names for "any other record".
+    it, logging the WARNING for "any other record".
 
     M77 -> at the ``pending`` state assertion below: correct = still
     'pending' (``fail_publication`` acts only on a 'building' record of
@@ -821,7 +816,7 @@ def test_pb6_a_stale_job_exception_never_touches_a_non_building_record(
             )
 
         warnings = [rec for rec in caplog.records if rec.levelname == "WARNING"]
-        assert len(warnings) == 1, "exactly one WARNING line must be written (9.4)"
+        assert len(warnings) == 1, "exactly one WARNING line must be written"
 
         stage_log_after = (
             await db.read(
@@ -855,16 +850,15 @@ def test_pb7_a_retry_due_record_is_not_repaired_early(
     before ``retry_at``, then at ``retry_at``. Before: nothing enqueued,
     the record ``retry_due``; at ``retry_at``: the record ``pending`` with
     ``attempt`` 2 and no ``retry_at``, and exactly one stage-7 job with
-    payload ``{"cutoff": D, "attempt": 2}``; it publishes ``pub-D`` (8.5,
-    9.4).
+    payload ``{"cutoff": D, "attempt": 2}``; it publishes ``pub-D``.
 
     Closes D for real (``publish`` raising once), deletes the now-``failed``
     stage-7 job row so the "before" tick's own absence of any job is
     unambiguous, then ticks once before ``retry_at`` and once at it.
 
     M79 -> at the before-retry_at assertion below: correct = no
-    ``day_publish`` job exists yet (the repair of 8.2 never touches a
-    ``retry_due`` record -- only the publication retry of 8.5 step 5 does,
+    ``day_publish`` job exists yet (the repair never touches a
+    ``retry_due`` record -- only the publication retry does,
     and only once ``retry_at`` has passed), mutant M79 (the repair treats a
     ``retry_due`` record as open) = a stage-7 job reappears a tick early.
     """
@@ -921,10 +915,7 @@ def test_pb7_a_retry_due_record_is_not_repaired_early(
             2,
             "pending",
             None,
-        ), (
-            "at retry_at, in one write: attempt 2, pending, retry_at"
-            " cleared (8.5 step 5)"
-        )
+        ), "at retry_at, in one write: attempt 2, pending, retry_at cleared"
 
         jobs_at_retry = await db.read(
             lambda c: c.execute(
@@ -949,7 +940,7 @@ def test_pb7_a_retry_due_record_is_not_repaired_early(
             2,
             "published",
             expected_pub_id,
-        ), "the retry must publish, with P4's identifier"
+        ), "the retry must publish, with publish's identifier"
 
     asyncio.run(_run())
 
@@ -963,9 +954,9 @@ def test_pb9_both_failed_stage7_jobs_report_no_failed_scope(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """PB9: PB3 up to the record ``failed``, then the failed-scope count
-    (15.1) read at the second stage-7 failure + 49 h, with no tick and no
+    read at the second stage-7 failure + 49 h, with no tick and no
     job run in between. 0 failed scopes, though both stage-7 job rows are
-    ``failed`` and older than 48 hours; the record still ``failed`` (9.6).
+    ``failed`` and older than 48 hours; the record still ``failed``.
 
     ``FAILED_SCOPES_SQL`` excludes the whole ``day_publish`` job type (the
     publication record itself reports a failed stage 7, `monitor.py`'s

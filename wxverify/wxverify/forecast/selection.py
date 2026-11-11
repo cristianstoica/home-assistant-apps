@@ -254,7 +254,7 @@ def confident_order_key(
 ) -> tuple[float, str, str]:
     """The ladder's order among confident feeds: skill descending, then
     source and model. Defined once, for ``_rank``, :func:`ladder_order` and
-    the substitute flag's choice (11.3)."""
+    the substitute flag's choice."""
     return (-_skill_or_zero(skill_score), source, model)
 
 

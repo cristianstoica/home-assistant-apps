@@ -1,4 +1,4 @@
-"""Per-variable blend-depth resolution with provenance (§15).
+"""Per-variable blend-depth resolution with provenance.
 
 Only :func:`~wxverify.forecast.service.load_page_inputs` resolves depth
 through this ONE helper, and the Forecast page and the hourly forecast
@@ -17,9 +17,9 @@ from typing import Literal
 
 from wxverify.settings.keys import get_number_setting, get_setting
 
-#: The variables that accept a per-variable depth override (§15), and the
+#: The variables that accept a per-variable depth override, and the
 #: CANONICAL forecast-variable roster: the forecast page and sample
-#: validation both derive their own tuples from this one (NB-4) so the set
+#: validation both derive their own tuples from this one so the set
 #: can never drift between them.
 DEPTH_VARIABLES: tuple[str, ...] = ("temperature", "wind", "precip")
 
@@ -36,7 +36,7 @@ def depth_override_key(variable: str) -> str:
 
 @dataclass(frozen=True)
 class EffectiveDepth:
-    """A resolved depth plus where it came from (§15 provenance)."""
+    """A resolved depth plus where it came from."""
 
     depth: int
     source: DepthSource

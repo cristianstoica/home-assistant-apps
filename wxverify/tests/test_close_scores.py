@@ -1,9 +1,4 @@
-"""Scoring the day (daily-close plan 2026-10-22-daily-close-pairs-and-
-publication.md, section 6; test IDs SD1-SD18, plan 18.6).
-
-Written before ``wxverify.scoring.close_scores`` exists: every test below
-collects, then fails at its own ``from wxverify.scoring.close_scores import
-...`` with ``ModuleNotFoundError`` -- the failure Step 3 accepts.
+"""Scoring the day: test IDs SD1-SD18.
 
 Real SQLite throughout (``tests.helpers.asof_conn``, real migrations);
 nothing in the code under test is mocked. Synthetic data only: stations
@@ -11,24 +6,21 @@ nothing in the code under test is mocked. Synthetic data only: stations
 ``synthetic-sd-x``/``synthetic-sd-y``/``synthetic-sd-z``, zone ``UTC``.
 
 Each test calls ``score_day`` directly on a hand-built ``DayRecord`` in the
-``closing`` state (the shape ``tests/test_p4_dormant.py``'s PD2 also uses,
-plan 4.3), rather than running the full night chain through
-``run_due_jobs`` -- 18.6's "stage 5 ran" is read here as
-"score_day's stage-5 call point ran with D's inputs in place", the same
-entry point P3's stage 5 calls (plan 6.1), not a literal scheduler replay.
-This is a deliberate simplification; see the test-authoring report for the
-chain-based alternative.
+``closing`` state (the shape ``tests/test_p4_dormant.py``'s PD2 also uses),
+rather than running the full night chain through ``run_due_jobs``: the
+same entry point the close chain's stage 5 calls, not a literal scheduler
+replay.
 
-The shared seed (18.6's intro paragraph): feeds X and Y, each with one
+The shared seed: feeds X and Y, each with one
 recorded ``round`` download on every S from D-7 to D, each download's label
 dated the day before S, carrying hourly temperature/wind/precip forecasts
 for D at that download's day ahead, seeded as its ``forecast_scored`` rows
-(rain release, Part B: the close's only forecast input); D has hourly
+(the close's only forecast input); D has hourly
 observations for all three
 variables and five truth rows, all eligible, ``rain_threshold_mm`` 0.25.
 X's forecasts carry a constant, deterministic bias over the observed value
 (+1.0 C, +2.0 km/h wind, 0 mm rain); Y's a different one (-0.5 C, -1.0 km/h,
-0 mm rain) -- chosen so every metric in 6.4's sums is non-trivial but exact
+0 mm rain) -- chosen so every metric in the sums is non-trivial but exact
 and reproducible by hand.
 """
 
@@ -240,8 +232,8 @@ def _seed_forecast_hour(
     fetched_at,
 ) -> None:
     """One scored value: the ``forecast_scored`` row the first download of
-    ``download_date`` wrote for ``valid_at`` at ``day_ahead`` (rain release,
-    Part B). The close reads only this table for its forecasts."""
+    ``download_date`` wrote for ``valid_at`` at ``day_ahead``. The close
+    reads only this table for its forecasts."""
     conn.execute(
         "INSERT INTO forecast_scored"
         " (site_id, feed_id, variable, valid_at, day_ahead, value, lead_hours,"
@@ -357,7 +349,7 @@ def _build_base(
 
 
 def _forecast_history_rows(conn, site_id: int, feed_id: int) -> list[dict[str, object]]:
-    """Storage release 3.1/3.3: ``close_pairs``'s replacement for stage 5's
+    """``close_pairs``'s replacement for stage 5's
     scored hours. Raw rows (no join), so an absence check here still catches
     a row wrongly written with no backing observation (``close_pairs``'s
     old gap-hour bug, M44) -- joining ``observations`` would hide exactly
@@ -437,7 +429,7 @@ def test_sd1_scored_day_writes_pairs_scores_record(tmp_path) -> None:  # noqa: A
     `close_pairs` for every (variable, day ahead 0-7, hour), `day_scores`
     sums equal to the sums over those rows, a `close_records` row with the
     truth version and `SCORING_RULE`, and one `close_record_downloads` row
-    per feed and day ahead (6.2-6.7).
+    per feed and day ahead.
     """
     from wxverify.scoring.close_scores import SCORING_RULE, score_day
 
@@ -518,7 +510,7 @@ def test_sd1_scored_day_writes_pairs_scores_record(tmp_path) -> None:  # noqa: A
 def test_sd2_missing_download_is_absent_not_scored(tmp_path) -> None:  # noqa: ARG001
     """SD2: X's download of D-2 (k=2) deleted from the record and its
     scored values: X's k=2 rows are `absent`, no pairs, a record row with NULL
-    download; `ScoreSummary.absent["feed:X"]` counts 1 (6.2, 6.8).
+    download; `ScoreSummary.absent["feed:X"]` counts 1.
 
     Paired positive: Y, seeded identically but not deleted, gets `scored`
     k=2 rows and real pairs -- the same call, so the absence above traces
@@ -594,7 +586,7 @@ def test_sd2_missing_download_is_absent_not_scored(tmp_path) -> None:  # noqa: A
 
 def test_sd3_day_ahead_from_receipt_date_not_run_label(tmp_path) -> None:  # noqa: ARG001
     """SD3: D's day ahead 0 download is a round received at D 00:10Z whose
-    label is dated D-1; those pairs have `day_ahead` 0, not 1 (6.2, :148).
+    label is dated D-1; those pairs have `day_ahead` 0, not 1.
     """
     from wxverify.scoring.close_scores import score_day
 
@@ -612,7 +604,7 @@ def test_sd3_day_ahead_from_receipt_date_not_run_label(tmp_path) -> None:  # noq
     for p in x_pairs_by_label:
         assert int(p["day_ahead"]) == 0, (
             "M41 -> at this assertion: correct = 0 (day ahead counted from"
-            " the download's receipt date D, plan :148), mutant (day ahead"
+            " the download's receipt date D), mutant (day ahead"
             " counted from the run label, dated D-1) = 1"
         )
 
@@ -626,7 +618,7 @@ def test_sd4_metrics_from_sums_matches_hand_computed_values() -> None:
     """SD4: `metrics_from_sums` on a hand-built sums row with at least one
     pair whose `ref_sq_error` is NULL (no value at h - L): n, bias, MAE,
     RMSE, POD, FAR, CSI, ETS, HSS and skill equal frozen, hand-computed
-    values -- never by calling `ContinuousStrategy`/`PrecipStrategy` (6.4).
+    values -- never by calling `ContinuousStrategy`/`PrecipStrategy`.
 
     Sums (chosen by hand, not read from any DB row):
     err_n=4, err_sum=2.0 (errors 1,1,-1,1), abs_sum=4.0, sq_sum=4.0 (each
@@ -710,7 +702,7 @@ def test_sd5_gap_hours_unpaired_and_threshold_from_truth_row(tmp_path) -> None: 
     """SD5: three hours of D with no observation get no pairs at all; a
     rain sample of 0.3 mm against an observed 0.3 mm pairs `cat_hit` 1 with
     threshold 0.25 FROM THE TRUTH ROW, even after `sites.rain_threshold_mm`
-    was set to 0.5 by plain UPDATE (6.3).
+    was set to 0.5 by plain UPDATE.
     """
     from wxverify.scoring.close_scores import score_day
 
@@ -792,7 +784,7 @@ def test_sd5_gap_hours_unpaired_and_threshold_from_truth_row(tmp_path) -> None: 
 def test_sd6_thin_variables_not_counted_and_unpaired(tmp_path) -> None:  # noqa: ARG001
     """SD6: `precip_total` not eligible and `wind_max` not eligible: no
     rain and no wind pairs; their `day_scores` rows `not_counted`; the
-    summary leaves them out (6.5).
+    summary leaves them out.
 
     Paired positive: temperature, left eligible, is still scored and
     counted the same call.
@@ -839,7 +831,7 @@ def test_sd7_temperature_scored_by_covered_hours_not_peak_windows(tmp_path) -> N
     """SD7 (i): D with a temperature reading at every hour but 12-17 (18
     covered hours; `temperature_high` not eligible for its window,
     `temperature_low` eligible): temperature is still scored -- pairs at
-    the 18 hours, `day_scores` `scored` (6.5). (ii) 17 covered hours (both
+    the 18 hours, `day_scores` `scored`. (ii) 17 covered hours (both
     not eligible): temperature `not_counted`, no pairs.
     """
     from wxverify.scoring.close_scores import score_day
@@ -905,10 +897,10 @@ def test_sd7_temperature_scored_by_covered_hours_not_peak_windows(tmp_path) -> N
 
 def test_sd8_persistence_pairs_at_hours_with_a_source_value(tmp_path) -> None:  # noqa: ARG001
     """SD8: persistence pairs exist at hours with a value at h - L; one
-    pair per hour and lead with a source value; day ahead from h - L (4.6).
+    pair per hour and lead with a source value; day ahead from h - L.
 
     Persistence is never written to ``forecast_history``; it is rebuilt on
-    read from the shared ``persistence_cells`` function (3.5), so this
+    read from the shared ``persistence_cells`` function, so this
     test calls that function directly on D's own observations -- the same
     inputs ``score_day`` fed it -- rather than reading stored pairs. The
     closing ``day_scores`` assertion then proves ``score_day`` itself
@@ -933,7 +925,7 @@ def test_sd8_persistence_pairs_at_hours_with_a_source_value(tmp_path) -> None:  
 
     assert _forecast_history_rows(conn, site_id, persistence_id) == [], (
         "M-fh-persist -> at this assertion: correct = [] (persistence is"
-        " never written to forecast_history, storage release 3.3), mutant"
+        " never written to forecast_history), mutant"
         " (persistence pairs stored like a real feed) = a row present"
     )
 
@@ -983,7 +975,7 @@ def test_sd8_persistence_pairs_at_hours_with_a_source_value(tmp_path) -> None:  
     assert day0_rows[0]["n"] == len(day0_cells), (
         "M48-day-scores -> at this assertion: correct ="
         f" {len(day0_cells)} (score_day's own count of persistence cells at"
-        " day ahead 0 must match the shared function's, 3.5's point),"
+        " day ahead 0 must match the shared function's),"
         f" mutant = {day0_rows[0]['n']}"
     )
 
@@ -996,7 +988,7 @@ def test_sd8_persistence_pairs_at_hours_with_a_source_value(tmp_path) -> None:  
 def test_sd9_multimodel_mean_over_active_feeds_only(tmp_path) -> None:  # noqa: ARG001
     """SD9: the mean of X, Y and Z scored at (h, k) with Z switched off is
     the mean of X and Y, `contributors` 2, `lead_hours` the smaller lead;
-    with only X subscribed, no mean pair at all (4.6, the two-feed rule).
+    with only X subscribed, no mean pair at all (the two-feed rule).
     """
     from wxverify.scoring.close_scores import score_day
 
@@ -1069,7 +1061,7 @@ def test_sd9_multimodel_mean_over_active_feeds_only(tmp_path) -> None:  # noqa: 
 def test_sd10_ref_sq_error_null_when_no_earlier_value(tmp_path) -> None:  # noqa: ARG001
     """SD10: `ref_sq_error` is the squared persistence error where h - L
     has a value, and NULL where it does not; `skill_n` counts only the
-    first (6.3, 6.4). Asserted from `score_day`'s own output (`day_scores`),
+    first. Asserted from `score_day`'s own output (`day_scores`),
     never recomputed from the fixture -- a recomputed check cannot catch a
     bug in `score_day`'s own `skill_n`/`skill_ref_sq_sum` arithmetic.
     """
@@ -1140,7 +1132,7 @@ def test_sd10_ref_sq_error_null_when_no_earlier_value(tmp_path) -> None:  # noqa
 def test_sd11_wind_sums_from_paired_hours_only(tmp_path) -> None:  # noqa: ARG001
     """SD11: X with 21 paired wind hours at k=1, Y with 19:
     `wind_fc_high` the highest paired forecast, `wind_fc_hours` 21 and 19;
-    `wind_obs_high` D's `wind_max` (6.4).
+    `wind_obs_high` D's `wind_max`.
     """
     from wxverify.scoring.close_scores import score_day
 
@@ -1233,9 +1225,9 @@ def test_sd11_wind_sums_from_paired_hours_only(tmp_path) -> None:  # noqa: ARG00
 def test_sd12_rerun_replaces_not_adds_third_call_adds_nothing(tmp_path) -> None:  # noqa: ARG001
     """SD12: `score_day` called a second time leaves every row equal but
     `scored_at`; a later download's value of X for D, then a third call,
-    adds nothing (6.9): the later value is the newest stored value in
+    adds nothing: the later value is the newest stored value in
     `forecast_samples`, and the close reads only `forecast_scored`, which
-    holds the first download's values (rain release, Part B).
+    holds the first download's values.
     """
     from wxverify.scoring.close_scores import score_day
 
@@ -1318,7 +1310,7 @@ def test_sd12_rerun_replaces_not_adds_third_call_adds_nothing(tmp_path) -> None:
     third = _p4_table_snapshot(conn, site_id)
     for table in first:
         assert _without_scored_at(second[table]) == _without_scored_at(third[table]), (
-            "Part B -> at this assertion: correct = the later download's"
+            "SD12 -> at this assertion: correct = the later download's"
             " value (the newest in forecast_samples) is left out, so the"
             " third call adds nothing, mutant (the close reads the newest"
             " stored value) = a k=1 temperature pair at D 10:00 with the"
@@ -1396,8 +1388,8 @@ def test_sd12_rerun_with_a_different_clock_replaces_close_records_row(
 
 def test_sd13_stop_rolls_back_rerun_reaches_sd1(tmp_path) -> None:  # noqa: ARG001
     """SD13: a wrapper calls `score_day` through, then raises a `Stop`-like
-    exception before the caller commits: after the stop, D's P4 rows are
-    as before stage 5; after a rerun, SD1's rows (6.9).
+    exception before the caller commits: after the stop, D's score rows are
+    as before stage 5; after a rerun, SD1's rows.
     """
     from wxverify.scoring.close_scores import score_day
 
@@ -1420,7 +1412,7 @@ def test_sd13_stop_rolls_back_rerun_reaches_sd1(tmp_path) -> None:  # noqa: ARG0
 
     after_stop = _p4_table_snapshot(conn, site_id)
     assert after_stop == before, (
-        "M55 -> at this assertion: correct = every P4 table unchanged (the"
+        "M55 -> at this assertion: correct = every score table unchanged (the"
         " stop rolled back score_day's own writes, which never committed),"
         " mutant (score_day commits after the pairs, instead of leaving"
         " everything in the caller's transaction) = rows survive the"
@@ -1445,8 +1437,8 @@ def test_sd13_stop_rolls_back_rerun_reaches_sd1(tmp_path) -> None:  # noqa: ARG0
 
 
 def test_sd14_closed_day_refused_nothing_written(tmp_path) -> None:  # noqa: ARG001
-    """SD14: `score_day` for D-1, `closed`: `ScoreDayRefused`; every P4
-    table "unchanged" (6.1).
+    """SD14: `score_day` for D-1, `closed`: `ScoreDayRefused`; every score
+    table "unchanged".
     """
     from wxverify.scoring.close_scores import ScoreDayRefused, score_day
 
@@ -1501,7 +1493,7 @@ def test_sd14_closed_day_refused_nothing_written(tmp_path) -> None:  # noqa: ARG
 
 def test_sd15_missing_truth_row_raises_nothing_written(tmp_path) -> None:  # noqa: ARG001
     """SD15: one truth row of D deleted before stage 5:
-    `ScoreDayInputMissing`; nothing written (6.1).
+    `ScoreDayInputMissing`; nothing written.
     """
     from wxverify.scoring.close_scores import ScoreDayInputMissing, score_day
 
@@ -1536,7 +1528,7 @@ def test_sd15_missing_truth_row_raises_nothing_written(tmp_path) -> None:  # noq
 def test_sd16_no_stored_download_gives_absent_everywhere_no_failure(tmp_path) -> None:  # noqa: ARG001
     """SD16: no stored download of any feed on D-7 to D: `absent` rows for
     every switched-on feed and day ahead, persistence pairs still made, the
-    record still written; no failure (6.9).
+    record still written; no failure.
     """
     from wxverify.scoring.close_scores import score_day
 
@@ -1553,7 +1545,7 @@ def test_sd16_no_stored_download_gives_absent_everywhere_no_failure(tmp_path) ->
         assert rows, f"expected absent rows for {name}"
         assert all(r["status"] == "absent" for r in rows), (
             "M58 -> at this assertion: correct = every row 'absent' (no"
-            f" stored download for {name} on D-7..D, plan 6.9), mutant (a"
+            f" stored download for {name} on D-7..D), mutant (a"
             " day with no forecasts raises instead of writing absent"
             " rows) = this line is never reached"
         )
@@ -1576,7 +1568,7 @@ def test_sd16_no_stored_download_gives_absent_everywhere_no_failure(tmp_path) ->
     persistence_rows = _day_score_rows(conn, site_id, persistence_id)
     assert any(r["status"] == "scored" for r in persistence_rows), (
         "the yardsticks have no download and are unaffected by every real"
-        " feed being absent (4.6)"
+        " feed being absent"
     )
     record_row = conn.execute(
         "SELECT 1 FROM close_records WHERE site_id = ? AND local_date = ?",
@@ -1584,7 +1576,7 @@ def test_sd16_no_stored_download_gives_absent_everywhere_no_failure(tmp_path) ->
     ).fetchone()
     assert record_row is not None, (
         "M58 -> at this assertion: correct = a close_records row exists"
-        " even with every forecast absent (6.9 'never empty'), mutant (a"
+        " even with every forecast absent (never empty), mutant (a"
         " day with no forecasts raises) = no record row at all"
     )
 
@@ -1597,7 +1589,7 @@ def test_sd16_no_stored_download_gives_absent_everywhere_no_failure(tmp_path) ->
 def test_sd17_scored_at_whole_second_microseconds_dropped(tmp_path) -> None:  # noqa: ARG001
     """SD17: as SD1, with `now_utc` at an instant whose microsecond is
     250000: `close_records.scored_at` passes `is_canonical_utc_stamp`, the
-    check import applies to it (15.2, 15.6).
+    check import applies to it.
     """
     from wxverify.scoring.close_scores import score_day
 
@@ -1628,8 +1620,8 @@ def test_sd17_scored_at_whole_second_microseconds_dropped(tmp_path) -> None:  # 
         fractional_now_utc.replace(microsecond=0)
     ), (
         "M143 -> at this assertion: correct ="
-        f" {isoformat_utc(fractional_now_utc.replace(microsecond=0))!r} (15.2's"
-        " isoformat_utc(t.replace(microsecond=0))), mutant ="
+        f" {isoformat_utc(fractional_now_utc.replace(microsecond=0))!r} ("
+        "isoformat_utc(t.replace(microsecond=0))), mutant ="
         f" {record_row['scored_at']!r}"
     )
 
@@ -1642,11 +1634,11 @@ def test_sd17_scored_at_whole_second_microseconds_dropped(tmp_path) -> None:  # 
 def test_sd18_considered_feeds_switched_on_or_downloaded_not_never_fetched(
     tmp_path,
 ) -> None:  # noqa: ARG001
-    """SD18: the feeds considered at D (6.2) are X (switched on, no download
+    """SD18: the feeds considered at D are X (switched on, no download
     on D-7..D), Y (switched off, only its D-3 download) and V (a third real
     feed with no `site_feed_state` row at all, never fetched): X and Y are
     considered and get rows; V, never subscribed and never downloaded, gets
-    none (6.2, 6.7, 6.8).
+    none.
     """
     from wxverify.scoring.close_scores import score_day
 

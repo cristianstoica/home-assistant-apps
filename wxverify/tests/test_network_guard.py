@@ -1,4 +1,4 @@
-"""Oracles for ``tests/network_guard.py`` (plan: network-denial-guard, §9).
+"""Oracles for ``tests/network_guard.py``.
 
 Every target here is RFC 2606 / RFC 5737: ``HOST`` is a reserved ``.invalid``
 name, ``LITERAL`` is a TEST-NET-1 address.
@@ -190,7 +190,7 @@ def test_swallowed_trip_fails_at_teardown() -> None:
         assert HOST in message
         assert "getaddrinfo" in message
         assert "test_network_guard.py" in message
-        # A5: the reported call site is the test frame, not a guard-module frame.
+        # The reported call site is the test frame, not a guard-module frame.
         assert "in test_swallowed_trip_fails_at_teardown" in message
         for guard_frame_name in (
             "_guarded_getaddrinfo",

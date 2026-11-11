@@ -1,6 +1,6 @@
-"""P5 plan §13.6: alert 6's close part (AC1-AC5, AC7).
+"""Alert 6's close part (AC1-AC5, AC7).
 
-Fixtures and time per plan §13.1: ``day_close_site`` (tests/helpers.py) gives
+Fixtures and time: ``day_close_site`` (tests/helpers.py) gives
 a UTC site with stations A (``ISTATION01``) and B (``ISTATION02``), D-3
 ``closed``, D-2 ``missed`` (``never_attempted``), D-1 ``open`` and ended, D
 current, ``NOW`` = D 12:00 UTC. 0.16.13's access-refused rows are written
@@ -8,10 +8,7 @@ with ``record_access_refused``/``clear_access_refused`` with
 ``wxverify.worker.access_hold.utc_now`` monkeypatched (the module's own bare
 import; see tests/test_access_hold.py's ``_freeze``). The close's part of
 alert 6 is read through ``build_verdict`` (budget group), reusing
-``access_days_affected`` only through that route -- the new function name is
-imported inside each test body so this module collects before Step 4 piece 2
-lands it (plan §13.1, §15 Step 3).
-
+``access_days_affected`` only through that route.
 """
 
 from __future__ import annotations
@@ -209,7 +206,7 @@ def test_ft1_hourly_download_path_stores_providers_masked_reason(
     reply_headers: dict[str, str],
     expected_reason: str | None,
 ) -> None:
-    """Part F, FT1 (health-release plan §6): a weather.com 403 reaching
+    """FT1: a weather.com 403 reaching
     the REAL hourly download inside ``fill_gaps`` -- never
     ``provider_reason``/``record_access_refused`` called directly by this
     test -- stores the provider's own masked reason on the hourly hold;
@@ -234,8 +231,8 @@ def test_ft1_hourly_download_path_stores_providers_masked_reason(
     that calls ``provider_reason`` on the real response and then
     ``record_access_refused`` with its result.
 
-    Catches: only `_http_status_error` changed so the owner's real case
-    is never shown on the hold (TODO item 4), or the hourly caller
+    Catches: only `_http_status_error` changed so the provider's reason
+    is never shown on the hold, or the hourly caller
     passing `reason=None` instead of the real `provider_reason` result --
     at the "the hold row's reason" assertion below: correct =
     ``expected_reason``, mutant = the other run's reason.
@@ -279,7 +276,7 @@ def test_ft1_hourly_download_path_stores_providers_masked_reason(
 
 
 def test_ac1_next_try_before_and_after_until(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC1 (plan §13.6, §6.4): the five_minute next-try clause (M53).
+    """AC1: the five_minute next-try clause (M53).
 
     The refusal is recorded at D 09:00; ``until`` = D 10:00. The site's next
     scheduled 5-minute try at D 09:30 lies before ``until``, so the clause
@@ -330,7 +327,7 @@ def test_ac1_next_try_before_and_after_until(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_ac2_days_affected_spans_two_days(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC2 (plan §13.6, §6.4): days affected is not limited to the current
+    """AC2: days affected is not limited to the current
     day (M54): a refusal run spanning midnight lists D-1 (closing) and D
     (collecting).
     """
@@ -371,7 +368,7 @@ def test_ac2_days_affected_spans_two_days(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_ac3_current_obs_clause_after_until(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC3 (plan §13.6, §6.4): the current_obs clause reads "current
+    """AC3: the current_obs clause reads "current
     conditions at <until>" only while the hold is in force; after it, with
     no new try, it reverts to 0.16.13's "waiting for the next try" (M55).
     """
@@ -407,7 +404,7 @@ def test_ac3_current_obs_clause_after_until(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_ac4_hourly_clause_reads_retry_at(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC4 (plan §13.6, §6.4): the hourly clause reads the gap fill's next
+    """AC4: the hourly clause reads the gap fill's next
     try from the day's own ``retry_at``, not a fixed or unrelated time
     (M56).
     """
@@ -455,7 +452,7 @@ def test_ac4_hourly_clause_reads_retry_at(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_ac5_days_affected_caps_at_three(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC5 (plan §13.6, §6.4): the days-affected list caps at 3 days, then
+    """AC5: the days-affected list caps at 3 days, then
     "and N more" (M57).
 
     ``day_close_site``'s fixture already gives 5 qualifying days (D-3
@@ -526,7 +523,7 @@ def _close_plain(conn: sqlite3.Connection, site_id: int, local_date) -> None:
 def test_ac7_no_station_named_with_alert3_and_gap_fill_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC7 (plan §13.6, §5.4, §6.4): alert 6's detail never names a station,
+    """AC7: alert 6's detail never names a station,
     even when alert 3 has a real nothing-usable finding at the same time
     (M59: ``access_days_affected`` also appends ``station <id>`` for each
     alert-3 station to alert 6's days).
@@ -618,7 +615,7 @@ def test_ac7_no_station_named_with_alert3_and_gap_fill_pause(
         " it can never be a day alert 3 counts or skips either way; a repeat"
         " of this same assertion after the refusal would prove only that the"
         " refusal adds nothing to alert 3's D-6..D-4 reading, not that a day"
-        " lost to it is skipped (plan §5.4, §6.4, TODO.md:1138)."
+        " lost to it is skipped."
     )
 
     refusal_at = datetime(D.year, D.month, D.day, 9, 0, tzinfo=UTC)

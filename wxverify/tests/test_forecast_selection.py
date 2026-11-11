@@ -490,8 +490,8 @@ def test_extrema_coverage_not_required_leaves_blend_set_and_metadata_unchanged()
     None
 ):
     # F-T5: extrema_coverage_required=False must be byte-for-byte the
-    # pre-Item-F behaviour: `feeds` and `low_confidence` unchanged, and the
-    # new fields sit at their explicit "not asked" values.
+    # behaviour without the coverage rule: `feeds` and `low_confidence`
+    # unchanged, and the new fields sit at their explicit "not asked" values.
     candidates = [
         _candidate(1, model="a", confident=True, skill_score=0.9),
         _candidate(2, model="b", confident=True, skill_score=0.7),

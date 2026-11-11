@@ -28,9 +28,8 @@ router = APIRouter(prefix="/api", tags=["health"])
 # re-typed copy: a bare COUNT(*) with no WHERE lets the planner pick whichever
 # index is smallest, so this stays a table-free scan without an INDEXED BY hint.
 FORECAST_SAMPLES_COUNT_SQL = "SELECT COUNT(*) AS n FROM forecast_samples"
-# forecast_history has no index but its primary key (storage-release plan
-# 3.1), so its count walks the table's own key b-tree; it runs only when
-# opted in.
+# forecast_history has no index but its primary key, so its count walks the
+# table's own key b-tree; it runs only when opted in.
 FORECAST_HISTORY_COUNT_SQL = "SELECT COUNT(*) AS n FROM forecast_history"
 
 # Two probes over one body: `/api/health/feeds` answers with an exact COUNT by
@@ -379,13 +378,12 @@ async def worker_status(counts: str = Query("")) -> dict[str, object]:
             )
         # The key Home Assistant's last-score sensor reads: the newest
         # published_at over the sites' active publications, or null before
-        # the first (daily-close plan P5, 9.6).
+        # the first.
         status["last_completed_pair_and_score_at"] = latest_published_at(conn)
         # Exact counts, opt-in: forecast_history is a WITHOUT ROWID table, so
         # it has no rowid watermark to estimate from, and this route is a
         # five-minutely coordinator-polled core slice that must not carry the
-        # cost of an exact count on every poll (storage-release plan, table
-        # 1.A row A5).
+        # cost of an exact count on every poll.
         if counts == "exact":
             status["forecast_samples_rows"] = int(
                 conn.execute(FORECAST_SAMPLES_COUNT_SQL).fetchone()["n"]

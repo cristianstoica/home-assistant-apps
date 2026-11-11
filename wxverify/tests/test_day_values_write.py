@@ -1,19 +1,18 @@
-"""Writing the hourly values for the close (plan
-2026-10-21-daily-close-download-and-raw-store.md section 7.7, 12.1 and
-14.9): ``write_hourly_values`` and ``day_presence``, tests DV1-DV6.
+"""Writing the hourly values for the close: ``write_hourly_values`` and
+``day_presence``, tests DV1-DV6.
 
-The site is built with the same shape as ``tests.helpers.day_close_site``
-(P1 §13.1), but with ``with_records=False``: each test picks its own close
+The site is built with the same shape as ``tests.helpers.day_close_site``,
+but with ``with_records=False``: each test picks its own close
 state for ``WRITE_DAY`` (D-1) instead of the fixture's own D-3
 closed/D-2 missed pair, since DV4 needs a CLOSED day and the rest need a
 CLOSING one. D-3 and D-2 are always closed/missed first, as the guard
 requires every earlier day to be done before D-1 can move at all. Every
 station id is synthetic (``ISTATION01``-``ISTATION05``, standing for A, B,
-D and E of the plan's naming); the API key is the CI placeholder; zone is
+D and E); the API key is the CI placeholder; zone is
 ``UTC`` throughout.
 
-Raw readings are seeded directly into ``station_wind_records`` (plan
-11.1's shape, with ``source``), since the download that would otherwise
+Raw readings are seeded directly into ``station_wind_records`` (with
+``source``), since the download that would otherwise
 produce them is out of this file's scope.
 """
 
@@ -220,8 +219,8 @@ def _seed_full_day(
 # ---------------------------------------------------------------------------
 
 
-def test_dv1_writes_hourly_values_with_7_7_source_raw_forms(tmp_path: Path) -> None:
-    """DV1 (plan 14.9): a full day for B and D, WRITE_DAY closing.
+def test_dv1_writes_hourly_values_with_source_raw_forms(tmp_path: Path) -> None:
+    """DV1: a full day for B and D, WRITE_DAY closing.
 
     Kills M54 (write_hourly_values enqueues pair_and_score): at the
     ``jobs`` count assertion, correct = unchanged (0), mutant = at least
@@ -233,7 +232,7 @@ def test_dv1_writes_hourly_values_with_7_7_source_raw_forms(tmp_path: Path) -> N
     The wind assertion (``b_wind is not None``) also catches a mutant that
     routes writes through ``insert_station_observation`` instead of
     ``write_station_observation`` directly: that function silently drops
-    every wind row (named in the ``Catches`` column, no numbered mutant).
+    every wind row.
     """
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
@@ -322,7 +321,7 @@ def test_dv1_writes_hourly_values_with_7_7_source_raw_forms(tmp_path: Path) -> N
 
 
 def test_dv2_removes_a_stale_row_at_an_hour_with_no_value(tmp_path: Path) -> None:
-    """DV2 (plan 14.9): an older row at a gap hour is removed, and that
+    """DV2: an older row at a gap hour is removed, and that
     hour's ``observations`` row is rebuilt away.
 
     Kills M56 (write_hourly_values keeps rows at hours without a value):
@@ -585,7 +584,7 @@ def test_dv8_stale_row_read_seeks_the_unique_index_with_a_valid_at_range(
 def test_dv3_writing_in_time_order_lets_the_jump_check_see_the_hour_before(
     tmp_path: Path,
 ) -> None:
-    """DV3 (plan 14.9): temperature 10.0 every hour except 30.0 at hour 11.
+    """DV3: temperature 10.0 every hour except 30.0 at hour 11.
 
     Kills M57 (write_hourly_values writes in reverse time order): at the
     hour-11-and-12 qc_flag assertion, correct = both ``spike`` (hour 11's
@@ -641,9 +640,9 @@ def test_dv3_writing_in_time_order_lets_the_jump_check_see_the_hour_before(
 def test_dv4_a_closed_day_refuses_the_write_and_changes_nothing(
     tmp_path: Path,
 ) -> None:
-    """DV4 (plan 14.9): WRITE_DAY closed (not closing).
+    """DV4: WRITE_DAY closed (not closing).
 
-    Kills M58 (write_hourly_values skips P1's guard): at the
+    Kills M58 (write_hourly_values skips the closed-day guard): at the
     station_observations-row-unchanged assertion, correct = the
     pre-existing row's value untouched (81.0), mutant = overwritten by the
     method's own computed value (10.0) for an hour the guard should have
@@ -717,13 +716,12 @@ def test_dv4_a_closed_day_refuses_the_write_and_changes_nothing(
 
 
 def test_dv5_a_rerun_on_unchanged_readings_changes_no_row(tmp_path: Path) -> None:
-    """DV5 (plan 14.9): write_hourly_values twice on the same readings.
+    """DV5: write_hourly_values twice on the same readings.
 
-    No mutant of 15.2 is named for DV5 (14.11's footnote: its fault is
-    already made by the mutants above); this pins the idempotency
-    contract directly (7.7: "a rerun on unchanged readings changes no
-    row"), as a regression guard for whatever makes the writes above
-    non-idempotent.
+    No mutant is named for DV5 (its fault is already made by the mutants
+    above); this pins the idempotency contract directly (a rerun on
+    unchanged readings changes no row), as a regression guard for whatever
+    makes the writes above non-idempotent.
     """
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
@@ -789,7 +787,7 @@ def test_dv5_a_rerun_on_unchanged_readings_changes_no_row(tmp_path: Path) -> Non
 def test_dv6_day_presence_tells_a_refusal_from_a_silent_station(
     tmp_path: Path,
 ) -> None:
-    """DV6 (plan 14.9): B has readings; A answered with only 204s all day;
+    """DV6: B has readings; A answered with only 204s all day;
     E's every try was held.
 
     Kills M59 (day_presence reports ``answered`` from any try, held ones

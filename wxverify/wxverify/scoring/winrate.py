@@ -31,7 +31,7 @@ class FeedStats:
 
 @dataclass(frozen=True)
 class WinrateResult:
-    """The win-rate rows, and the cutoff they end at (9.6)."""
+    """The win-rate rows, and the cutoff they end at."""
 
     rows: list[dict[str, object]]
     evidence_through: date | None = None
@@ -58,14 +58,13 @@ def winrate_with_evidence(
     day_ahead: int,
     window: str = "rolling",
 ) -> WinrateResult:
-    """The win rate of each feed, plus the cutoff it ends at (9.2).
+    """The win rate of each feed, plus the cutoff it ends at.
 
     The winner rule over the window's dates ending at the active
     publication's cutoff, read from ``forecast_history`` + ``observations``
     for the closed record dates and the pre-close dates before the first
     record together, persistence rebuilt at the shortest lead
-    (storage-release plan 3.6, ``scoring.history.winrate_errors``); no
-    publication gives no rows.
+    (``scoring.history.winrate_errors``); no publication gives no rows.
 
     Inside the caller's transaction when one is open; otherwise in one read
     snapshot of its own, since the read is several statements.
@@ -88,9 +87,9 @@ def _published_winrate(
     day_ahead: int,
     window: str,
 ) -> WinrateResult:
-    """The win rate (9.2), inside the caller's read: the errors of the
-    window's dates ending at the cutoff (storage-release plan 3.6), closed
-    and pre-close together, persistence's among them."""
+    """The win rate, inside the caller's read: the errors of the window's
+    dates ending at the cutoff, closed and pre-close together, persistence's
+    among them."""
     pub = active_publication(conn, site_id=site_id, at_utc=None)
     if pub is None:
         return WinrateResult(rows=[])
@@ -135,7 +134,7 @@ def _window_start(pub: Publication, window: str) -> date | None:
 
 
 def _tally(cells: list[CanonicalCell]) -> list[dict[str, object]]:
-    """The winner rule (3.3) over canonical cells in (valid_at, feed) order."""
+    """The winner rule over canonical cells in (valid_at, feed) order."""
     stats: dict[int, FeedStats] = {}
     cells_by_valid_at: dict[str, list[CanonicalCell]] = {}
     for cell in cells:

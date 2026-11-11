@@ -1,6 +1,6 @@
-"""HTTP/screen-level tests for the rebuilt Forecast page (plan step 7):
+"""HTTP/screen-level tests for the rebuilt Forecast page:
 ``?day=`` selection and clamping, the auto-poll region, the day headers'
-warning badges and the rain-only-feed route regression (plan step 6's
+warning badges and the rain-only-feed route regression (the page test's
 fixture, driven through the routes this time).
 
 Isolation: a real tmp-file SQLite DB via ``init_db``/``close_db`` + an idle
@@ -171,7 +171,7 @@ def _dh_buttons(html: str) -> list[dict[str, str]]:
 class _ButtonNestingParser(HTMLParser):
     """Records, for every ``<button>``, whether it opened while another
     button carrying the ``dh`` class was still open -- the warnings test's
-    nesting check (plan: "no ``.day-warn`` sits inside a ``.dh``")."""
+    nesting check (no ``.day-warn`` sits inside a ``.dh``)."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -195,7 +195,7 @@ class _ButtonNestingParser(HTMLParser):
 
 
 # ---------------------------------------------------------------------------
-# ?day= selection and clamping (plan step 7, "?day=").
+# ?day= selection and clamping.
 # ---------------------------------------------------------------------------
 
 
@@ -297,7 +297,7 @@ def test_under_ingress_every_day_button_hx_get_and_replace_url_carry_the_prefix(
 
 
 # ---------------------------------------------------------------------------
-# Poll (plan step 7, "Poll").
+# Poll.
 # ---------------------------------------------------------------------------
 
 
@@ -404,7 +404,7 @@ def test_hx_replace_url_appears_exactly_8_times_all_on_dh_buttons(
 
 
 # ---------------------------------------------------------------------------
-# Warnings -- pure day_warnings() order (plan step 7, "Warnings").
+# Warnings -- pure day_warnings() order.
 # ---------------------------------------------------------------------------
 
 
@@ -499,7 +499,7 @@ def test_no_conditions_renders_no_warnings() -> None:
 
 # ---------------------------------------------------------------------------
 # Warnings -- the day-warn button is never nested inside the .dh button
-# (plan step 7, "Warnings"; HTTP-level, needs a real warning on the page).
+# (HTTP-level, needs a real warning on the page).
 # ---------------------------------------------------------------------------
 
 
@@ -547,7 +547,7 @@ def test_day_warn_button_is_never_nested_inside_a_dh_button(
 
 
 # ---------------------------------------------------------------------------
-# Rain-only feed, at the route level (plan step 6's fixture -- the exact
+# Rain-only feed, at the route level (the page test's fixture -- the exact
 # scenario of tests/test_forecast_page.py's
 # test_rain_only_feed_stray_temperature_hour_adds_no_blend_value, driven
 # through /forecast and /forecast/day instead of build_forecast_page
@@ -570,7 +570,7 @@ def _insert_feed(conn: sqlite3.Connection, name: str) -> int:
 def test_rain_only_feed_stray_temperature_hour_is_200_on_both_routes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Plan step 6's rain-only-feed fixture (a precip-only feed R that also
+    """The rain-only-feed fixture (a precip-only feed R that also
     carries one stray temperature sample for an hour two temperature feeds
     already cover), driven through the HTTP routes rather than
     ``build_forecast_page`` directly: both ``GET /forecast`` and

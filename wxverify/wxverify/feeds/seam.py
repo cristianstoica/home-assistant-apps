@@ -11,7 +11,7 @@ from wxverify.core.timeutil import isoformat_utc, parse_utc
 
 
 def display_float(value: object) -> float | None:
-    """A display field's value (card 7) as a float, or ``None``.
+    """A display field's value as a float, or ``None``.
 
     Anything ``float()`` cannot read (text such as ``"N/A"``, a list, an
     object, an integer too large for a float) is ``None``, so it stores
@@ -27,7 +27,7 @@ def display_float(value: object) -> float | None:
 
 
 def display_mapping(value: object) -> object:
-    """A display container (card 7) as given when it is an object, else
+    """A display container as given when it is an object, else
     ``None``, so a malformed container never fails a reply's validation."""
     if isinstance(value, dict | BaseModel):
         return cast(object, value)
@@ -61,7 +61,7 @@ class NormalizedSample(BaseModel):
 
 
 class ModelRun(BaseModel):
-    """One model run a reply carried, for the run log (card 27).
+    """One model run a reply carried, for the run log.
 
     ``run_at`` is the canonical UTC stamp the model's samples carry as
     ``issued_at``. ``updated`` is a log token: a canonical UTC stamp (the

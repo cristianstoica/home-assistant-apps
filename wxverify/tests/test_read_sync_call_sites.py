@@ -19,8 +19,8 @@ _DEFINITION_SITE = "wxverify/db/connection.py"
 _ALLOWED_CALLERS = frozenset({"wxverify/__main__.py"})
 #: One call site each for `settings list`, `settings get`, `jobs purge
 #: --dry-run`, `providers doctor`, and `providers fetch`/`smoke`'s feed
-#: selection; `timezone status`'s was retired with the daily close (plan
-#: 7.3), for a total of 5.
+#: selection; `timezone status`'s was retired with the daily close, for a
+#: total of 5.
 _EXPECTED_TOTAL_CALLS = 5
 
 

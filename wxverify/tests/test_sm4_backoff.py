@@ -557,7 +557,7 @@ class TestMalformedJsonBodyEscapesToTransientFloor:
             " JSON-parse failure must NOT refund the reserved call"
         )
 
-        # O18: the persisted last_error carries the rendered diagnostic line
+        # The persisted last_error carries the rendered diagnostic line
         # and never the request's secret query string.
         assert ps["last_error"] is not None
         assert ps["last_error"].startswith("upstream payload error kind=json_decode")

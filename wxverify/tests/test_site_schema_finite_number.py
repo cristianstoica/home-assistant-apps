@@ -1,4 +1,4 @@
-"""Site schema finite-number validation (0.16.7, #81).
+"""Site schema finite-number validation (0.16.7).
 
 Before this fix, ``SiteCreate.forecast_lat``/``forecast_lon``/``elevation_m``
 accepted any float pydantic could coerce, including a non-finite one sent as

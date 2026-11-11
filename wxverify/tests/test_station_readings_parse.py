@@ -1,12 +1,11 @@
-"""The P2 collection-contract parsers (plan 2026-10-21-daily-close-download-
-and-raw-store.md, section 5.2/5.5/5.6, test IDs PR1-PR7).
+"""The collection-contract parsers (test IDs PR1-PR7).
 
 ``readings_from_payload`` and ``current_obs_from_payload`` are pure: no
 database, no clock, no network. ``fetch_hourly_history_payload`` is the new
-split of ``fetch_hourly_history`` (5.6); its test (PR7) uses an
+split of ``fetch_hourly_history``; its test (PR7) uses an
 ``httpx.MockTransport`` handler, mirroring ``tests/test_pws_adapter_params.py``.
 
-Synthetic data only: station ids stand for K24's A-F (``ISTATION01`` to
+Synthetic data only: station ids stand for A-F (``ISTATION01`` to
 ``ISTATION06``), the API key is the CI placeholder.
 """
 
@@ -45,7 +44,7 @@ def _payload(*observations: dict[str, object]) -> dict[str, object]:
 
 
 def test_pr1_tempavg_preferred_over_high_low_and_temp_not_required() -> None:
-    """PR1 (14.3): ``tempAvg`` is read over ``tempHigh``/``tempLow``; a
+    """PR1: ``tempAvg`` is read over ``tempHigh``/``tempLow``; a
     reading with no ``temp`` field still gets a temperature from it. A
     second item has both ``tempAvg`` and ``temp`` present, to pin that
     ``tempAvg`` is read before ``temp``.
@@ -95,7 +94,7 @@ def test_pr1_tempavg_preferred_over_high_low_and_temp_not_required() -> None:
 
 
 def test_pr2_no_tempavg_leaves_temperature_absent_unless_temp_present() -> None:
-    """PR2 (14.3): without ``tempAvg`` or ``temp``, temperature is absent
+    """PR2: without ``tempAvg`` or ``temp``, temperature is absent
     (never ``tempHigh``/``tempLow``); rain is kept regardless.
 
     mutant_reads_high_or_low -> at the first reading's ``temp_c``
@@ -123,7 +122,7 @@ def test_pr2_no_tempavg_leaves_temperature_absent_unless_temp_present() -> None:
 
 
 def test_pr3_one_bad_value_per_item_keeps_the_rest_of_that_reading() -> None:
-    """PR3 (14.3): each bad temperature/rain/wind value is counted invalid
+    """PR3: each bad temperature/rain/wind value is counted invalid
     and leaves the reading's other, good values; a reading with no good
     value at all is dropped.
 
@@ -189,7 +188,7 @@ def test_pr3_one_bad_value_per_item_keeps_the_rest_of_that_reading() -> None:
 
 
 def test_pr4_local_date_from_obstimelocal_then_validtimelocal_then_none() -> None:
-    """PR4 (14.3): the reading's own local date prefers ``obsTimeLocal``,
+    """PR4: the reading's own local date prefers ``obsTimeLocal``,
     falls back to ``validTimeLocal``, and is NULL when neither is present
     -- never derived from the UTC instant.
 
@@ -228,7 +227,7 @@ def test_pr4_local_date_from_obstimelocal_then_validtimelocal_then_none() -> Non
 
 
 def test_pr5_sorted_first_of_duplicate_kept_bad_instant_dropped_no_raise() -> None:
-    """PR5 (14.3): readings are sorted by instant; of two readings sharing
+    """PR5: readings are sorted by instant; of two readings sharing
     one instant the FIRST in the payload is kept; an item with no usable
     instant is dropped and counted, and nothing raises.
 
@@ -259,7 +258,7 @@ def test_pr5_sorted_first_of_duplicate_kept_bad_instant_dropped_no_raise() -> No
 
 
 def test_pr6_current_obs_carries_local_date_and_instant_wind() -> None:
-    """PR6 (14.3): ``current_obs_from_payload`` reads ``obsTimeLocal`` into
+    """PR6: ``current_obs_from_payload`` reads ``obsTimeLocal`` into
     the new ``local_date`` field, and ``metric.windSpeed`` as the reading's
     instant wind.
 
@@ -286,7 +285,7 @@ def test_pr6_current_obs_carries_local_date_and_instant_wind() -> None:
 
 
 def test_pr7_hourly_history_and_payload_split_share_the_same_request() -> None:
-    """PR7 (14.3): ``fetch_hourly_history_payload`` makes exactly the same
+    """PR7: ``fetch_hourly_history_payload`` makes exactly the same
     request as ``fetch_hourly_history`` and drops nothing by age;
     ``fetch_hourly_history`` keeps its own age cutoff unchanged.
 

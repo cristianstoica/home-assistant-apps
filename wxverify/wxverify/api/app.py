@@ -138,12 +138,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     # once the database is closed: one process can run many lifespans.
     stop.reset_stop()
     ZoneInfo("America/Denver")
-    # Off the main thread (storage-release plan 6.2): a Python signal handler
-    # runs only between bytecodes on the main thread, so with `init_db` there
-    # a stop would wait for the whole upgrade. While it runs, SIGTERM and
-    # SIGINT also begin the stop, which interrupts the startup statement.
-    # `run_to_completion` is `asyncio.to_thread` that never lets this
-    # coroutine move on, and so put the handlers back, while the thread runs.
+    # Off the main thread: a Python signal handler runs only between bytecodes
+    # on the main thread, so with `init_db` there a stop would wait for the
+    # whole upgrade. While it runs, SIGTERM and SIGINT also begin the stop,
+    # which interrupts the startup statement. `run_to_completion` is
+    # `asyncio.to_thread` that never lets this coroutine move on, and so put
+    # the handlers back, while the thread runs.
     restore_signals = _wrap_stop_signals()
     try:
         db = await run_to_completion(init_db, config.db_path)
@@ -152,7 +152,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     options = load_runtime_options()
     await db.write(reclaim_all_stale)
     # Close work a stop cut short is settled before the workers start and
-    # before this start's `worker_started_at` (plan 5.5).
+    # before this start's `worker_started_at`.
     await db.write(lambda conn: settle_interrupted_closes(conn, now_utc=utc_now()))
     await db.write(lambda conn: set_runtime_state_now(conn, "worker_started_at"))
     if options.rolling_window_days is not None:
@@ -166,7 +166,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         )
     )
     # The stored value stays the configured one; every reader clamps it to the
-    # provisional provider allowance (plan §8.6). Say so once when it bites.
+    # provisional provider allowance. Say so once when it bites.
     weathercom_cap = effective_daily_call_limit(
         "weathercom", options.weathercom_daily_call_limit
     )
@@ -199,8 +199,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await publish_discovery(app.state.bind_port)
         yield
     finally:
-        # First (plan 6.3): from here no lane claims and no close stage
-        # starts, and the stop budget the reap waits within starts (6.4).
+        # First: from here no lane claims and no close stage starts, and the
+        # stop budget the reap waits within starts.
         stop.request_stop()
         logger.info("worker stopping")
         try:
@@ -256,7 +256,7 @@ async def _cancel_and_reap(tasks: list[tuple[str, asyncio.Task[None]]]) -> None:
     abandoned unawaited, which is the failure this helper exists to
     prevent.
 
-    The wait is bounded by the stop budget (storage-release plan 6.4):
+    The wait is bounded by the stop budget:
     `lifespan` requests the stop before calling this, and when the budget
     runs out one ERROR names the tasks still running, the writer's running
     statement is interrupted so its transaction rolls back instead of being
@@ -357,7 +357,7 @@ async def _cancel_and_reap(tasks: list[tuple[str, asyncio.Task[None]]]) -> None:
 
 def _interrupt_writer() -> None:
     """Interrupt the process writer's running statement, if a database is
-    open (plan 6.4). ``current_db``, never ``get_db``, which would open one."""
+    open. ``current_db``, never ``get_db``, which would open one."""
     db = current_db()
     if db is not None:
         db.interrupt_writer()
@@ -366,7 +366,7 @@ def _interrupt_writer() -> None:
 def _wrap_stop_signals() -> Callable[[], None]:
     """Make SIGTERM and SIGINT also begin the stop while ``init_db`` runs.
 
-    Storage-release plan 6.2. Each current handler that is a Python callable
+    Each current handler that is a Python callable
     (uvicorn's ``handle_exit`` in the add-on) is replaced by one that calls
     ``core.stop.request_stop`` -- which interrupts the startup statement --
     and then the original, so uvicorn still records the signal and exits

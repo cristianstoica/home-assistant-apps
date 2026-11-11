@@ -38,7 +38,7 @@ class OwmHour(BaseModel):
     temp: float | None = None
     wind_speed: float | None = None
     rain: OwmRain | None = None
-    # Display only (card 7): %, m/s ("where available"), degrees.
+    # Display only: %, m/s ("where available"), degrees.
     clouds: DisplayFloat = None
     wind_gust: DisplayFloat = None
     wind_deg: DisplayFloat = None

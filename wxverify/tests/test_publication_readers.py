@@ -1,19 +1,4 @@
-"""Readers (daily-close plan 2026-10-22-daily-close-pairs-and-publication.md,
-section 9; test IDs RD1-RD17, plan 18.8).
-
-Written before P4's reader surface exists. Most tests below fail at a
-``from wxverify.scoring.publication import ...`` with ``ModuleNotFoundError``
-(``Publication``, ``active_publication``, ``published_ranking``,
-``published_coverage``, ``pending_ranking_settings`` and ``closed_day_pairs``
-are guessed to live in ``wxverify.scoring.publication`` -- the plan names their
-signatures (16.1/16.2/9.1) but not their module for every one of them; this is
-the plainest reading, named in the test-authoring report). The ones that
-import only existing names (``leaderboard_with_status_in_transaction``,
-``composite_with_status``, ``winrate``, ``load_wind_serving``,
-``load_future_samples``, ``forecast_fingerprint``) instead fail at a
-``sqlite3.OperationalError: no such table`` when they seed P4's own tables
-by hand (not yet migrated), or at an assertion once the table exists but the
-close-on reader branch does not -- both failures Step 3 accepts.
+"""Readers (test IDs RD1-RD17).
 
 Real SQLite throughout (``tests.helpers.day_close_site``/``asof_conn``, real
 migrations); nothing in the code under test is mocked. Synthetic data only:
@@ -228,8 +213,8 @@ def _seed_forecast_history(
     observed: float,
     issued_at: str | None = None,
 ) -> None:
-    """A ``forecast_history`` row plus the ``observations`` row it joins to
-    (storage-release plan 3.1, 3.6). ``observations`` is keyed on
+    """A ``forecast_history`` row plus the ``observations`` row it joins to.
+    ``observations`` is keyed on
     ``(site_id, variable, valid_at)`` alone -- one shared truth value, never
     per feed -- so a second call at the same ``valid_at`` (a second feed's
     row) must pass the same ``observed`` and is a silent no-op on that
@@ -317,10 +302,10 @@ def _close_through_with_missed(
     missed_date=None,
 ) -> None:
     """Closes every date from ``first_date`` to ``last_closed_date``
-    inclusive, except ``missed_date``, which becomes ``missed`` via P1's
+    inclusive, except ``missed_date``, which becomes ``missed`` via the day record's
     own retry-exhaustion path (``begin_close`` then ``fail_close``, twice)
-    in place of ``closed``. Dates are processed in order, as P1 requires
-    (``_has_earlier_undone``, ``db/site_days.py:757``): a ``missed`` date
+    in place of ``closed``. Dates are processed in order, as
+    ``_has_earlier_undone`` requires: a ``missed`` date
     counts as done, so the date after it still closes. ``missed_date``
     defaults to None: every date closes.
 
@@ -329,7 +314,7 @@ def _close_through_with_missed(
     module import of a private, underscore-named helper between two
     independent reader/build test files is awkward and this file's own
     seed helpers are already declared local (module docstring); kept
-    behaviorally identical to the original (RD4 (ii)/RD5 (ii), plan 18.8).
+    behaviorally identical to the original (RD4 (ii)/RD5 (ii)).
     """
     from wxverify.db.site_days import (
         begin_close,
@@ -372,8 +357,8 @@ def _close_through_with_missed(
 
 
 def _rolling_fixture(conn):
-    """The 18.8 shared default (plan row, :897): close on; D-3 to D-1
-    closed through P1's ``begin_close``/``finish_close`` (``day_close_site``
+    """The shared default: close on; D-3 to D-1
+    closed through ``begin_close``/``finish_close`` (``day_close_site``
     ``with_records=False``, then this file's own
     ``_close_through_with_missed`` with no missed date) and D open --
     ``day_close_site``'s own ``with_records=True`` records would leave D-1
@@ -431,7 +416,7 @@ def test_rd1_leaderboard_rolling_reads_publication_min_n_not_saved() -> None:
     """RD1: with the close on, ``rolling`` reads the active publication's
     rows and takes ``confident`` from the PUBLICATION's ``min_n`` (3), not
     the saved setting (10); status ``hit``; ``evidence_through`` the
-    publication's cutoff (9.2)."""
+    publication's cutoff."""
     from wxverify.scoring.leaderboard import leaderboard_with_status_in_transaction
 
     conn = asof_conn()
@@ -458,7 +443,7 @@ def test_rd1_leaderboard_rolling_reads_publication_min_n_not_saved() -> None:
 
 def test_rd1_composite_rolling_reads_publication_not_score_cache() -> None:
     """RD1 (second reader): ``composite_with_status``'s ``rolling`` window
-    takes the same branch (9.2)."""
+    takes the same branch."""
     from wxverify.scoring.composite import composite_with_status
 
     conn = asof_conn()
@@ -482,7 +467,7 @@ def test_rd1_composite_rolling_reads_publication_not_score_cache() -> None:
 def test_rd2_feed_toggle_changes_the_read_with_no_new_publication() -> None:
     """RD2: switching Y off removes its row from the next read; switching
     it back on restores it -- both acting at once, through the SAME
-    publication (no new row written, 9.1)."""
+    publication (no new row written)."""
     from wxverify.scoring.leaderboard import leaderboard_with_status_in_transaction
 
     conn = asof_conn()
@@ -498,7 +483,7 @@ def test_rd2_feed_toggle_changes_the_read_with_no_new_publication() -> None:
     feed_ids_off = {row.feed_id for row in result_off.rows}
     assert y not in feed_ids_off, (
         "M80 -> at this assertion: correct = Y absent once switched off"
-        " (the subscription is applied at READ time, 9.1), mutant M80 (the"
+        " (the subscription is applied at READ time), mutant M80 (the"
         " subscription applied at build time) = Y still present -- got"
         f" {feed_ids_off!r}"
     )
@@ -529,13 +514,13 @@ def test_rd2_feed_toggle_changes_the_read_with_no_new_publication() -> None:
 @pytest.mark.parametrize("window", ["rolling", "all", "3d"])
 def test_rd3_no_publication_is_empty(window: str) -> None:
     """RD3 (i): with the close on and no publication row at all, every
-    window answers ``empty`` (9.2).
+    window answers ``empty``.
 
     Live data a wrong fallback could surface is seeded first --
     ``day_scores`` rows across D-2 to D (so an ``Nd`` view that forgot the
     no-publication gate would still find rows to sum for ``3d``). Without
     this seed the row would pass "empty" merely because there was nothing
-    at all to read -- a vacuous pass that could not distinguish P4's
+    at all to read -- a vacuous pass that could not distinguish the
     no-publication rule from an ordinary empty database."""
     from wxverify.scoring.leaderboard import leaderboard_with_status_in_transaction
 
@@ -553,7 +538,7 @@ def test_rd3_no_publication_is_empty(window: str) -> None:
     assert result.status == "empty", (
         "M81 -> at this assertion: correct = 'empty' (no active publication:"
         " the no-input gate runs before any window-specific read, so the"
-        " seeded day_scores rows must never surface, 9.2), mutant M81 (the"
+        " seeded day_scores rows must never surface), mutant M81 (the"
         " leaderboard with no publication falls back to a live read) = the"
         f" seeded live row would be read instead -- got {result.status!r}"
     )
@@ -563,7 +548,7 @@ def test_rd3_no_publication_is_empty(window: str) -> None:
 @pytest.mark.parametrize("window", ["rolling", "all", "3d"])
 def test_rd3_site_disabled_is_empty_even_with_a_publication(window: str) -> None:
     """RD3 (ii): a publication exists, but the site is disabled -- still
-    ``empty`` for every window (9.2's no-input gate runs first)."""
+    ``empty`` for every window (the no-input gate runs first)."""
     from wxverify.scoring.leaderboard import leaderboard_with_status_in_transaction
 
     conn = asof_conn()
@@ -587,8 +572,7 @@ def test_rd4_nd_window_sums_only_the_closed_dates_ending_at_cutoff_not_today() -
     """RD4 (i): ``window="3d"`` sums only the 3 dates ending at the
     publication's cutoff D-1 -- D-3, D-2, D-1 -- never D, even once D
     itself closes AFTER the publication is built (its stage 7 not run
-    yet, plan row RD4, :904). ``day_scores`` seeded at n=1 on D-3/D-2/D-1
-    and n=100 on D (9.2)."""
+    yet). ``day_scores`` seeded at n=1 on D-3/D-2/D-1 and n=100 on D."""
     from wxverify.db.site_days import begin_close, finish_close
     from wxverify.scoring.leaderboard import leaderboard_with_status_in_transaction
 
@@ -628,15 +612,15 @@ def test_rd4_nd_window_sums_only_the_closed_dates_ending_at_cutoff_not_today() -
 
 
 def test_rd4_ii_nd_window_excludes_a_missed_dates_leftover_day_scores() -> None:
-    """RD4 (ii): D-2's record is ``missed`` (P1's ``begin_close`` then
+    """RD4 (ii): D-2's record is ``missed`` (``begin_close`` then
     ``fail_close``, twice -- retry exhaustion, the same mechanism PB17 uses
     in ``test_publication_build.py``), its ``day_scores`` row left in
     place; the "3d" window (D-3 to D-1) must sum only D-3 and D-1, never
-    D-2's leftover row (7.2, 9.2).
+    D-2's leftover row.
 
     A dedicated site/close-chain, not ``_rolling_fixture`` -- a cross-test
     ``missed`` state from a shared fixture would leave which mechanism
-    produced it ambiguous, so this row builds its own site via P1's
+    produced it ambiguous, so this row builds its own site via the day record's
     retry-exhaustion path directly.
     """
     from wxverify.scoring.leaderboard import leaderboard_with_status_in_transaction
@@ -680,7 +664,7 @@ def test_rd4_ii_nd_window_excludes_a_missed_dates_leftover_day_scores() -> None:
     row = next(row for row in result.rows if row.feed_id == x)
     assert row.n == 2, (
         "M152 -> at this assertion: correct = 2 (D-3's and D-1's n=1 rows"
-        " only -- D-2 is missed, and 7.2/9.2 say every read of day_scores"
+        " only -- D-2 is missed, and every read of day_scores"
         " keeps only dates whose record is closed), mutant M152 (an Nd"
         " view sums day_scores without the record's closed state) = 3"
         " (D-2's leftover n=1 row wrongly included)"
@@ -696,8 +680,8 @@ def test_rd5_winrate_reads_forecast_history_closed_and_starting() -> None:
     """RD5: the win rate credits a win from a closed date's
     ``forecast_history`` row AND a win from a starting-history date's
     ``forecast_history`` row, inside the same (rolling, 5-date) window
-    (9.2; storage-release plan A2/3.6 -- both rows now live in the one
-    table, told apart only by the date's ``site_days`` state)."""
+    (both rows now live in the one table, told apart only by the date's
+    ``site_days`` state)."""
     from wxverify.scoring.winrate import winrate
 
     conn = asof_conn()
@@ -768,7 +752,7 @@ def test_rd5_winrate_reads_forecast_history_closed_and_starting() -> None:
 
     assert wins_by_feed.get(x, 0.0) >= 1.0, (
         "the win rate must credit X's win from the CLOSED date's"
-        f" forecast_history row (9.2) -- got {wins_by_feed!r}"
+        f" forecast_history row -- got {wins_by_feed!r}"
     )
     assert wins_by_feed.get(y, 0.0) >= 1.0, (
         "M83 -> at this assertion: correct = Y credited a win from the"
@@ -781,16 +765,16 @@ def test_rd5_winrate_reads_forecast_history_closed_and_starting() -> None:
 def test_rd5_ii_winrate_excludes_a_missed_dates_leftover_forecast_history() -> None:
     """RD5 (ii): as (i) -- X wins a closed date's hour, Y wins a
     starting-history date's hour, inside the same (rolling, 5-date)
-    window -- plus a ``missed`` date inside the window (D-2, via P1's
+    window -- plus a ``missed`` date inside the window (D-2, via
     ``begin_close`` then ``fail_close``, twice) whose leftover
     ``forecast_history`` row gives Y a perfect, winning hour. Read, it
-    would raise Y's win count to 2; excluded (7.2, 9.2), Y's count must
+    would raise Y's win count to 2; excluded, Y's count must
     stay 1, the same as (i).
 
     A dedicated site/close-chain, not ``_rolling_fixture``, for the same
     reason as RD4 (ii): a cross-test ``missed`` state from a shared
     fixture would leave which mechanism produced it ambiguous, so this
-    row builds its own site via P1's retry-exhaustion path directly.
+    row builds its own site via the day record's retry-exhaustion path directly.
     """
     from wxverify.scoring.winrate import winrate
 
@@ -871,9 +855,8 @@ def test_rd5_ii_winrate_excludes_a_missed_dates_leftover_forecast_history() -> N
     )
 
     # The missed D-2's leftover forecast_history: Y perfect (would win the
-    # hour if read), X well off. Left in place, as 7.2 describes a missed
-    # date's rows ("left in place") -- the record's own `closed` state is
-    # the only thing that must exclude them.
+    # hour if read), X well off. Left in place -- the record's own `closed`
+    # state is the only thing that must exclude them.
     valid_missed = f"{_D2.isoformat()}T00:00:00Z"
     _seed_forecast_history(
         conn,
@@ -913,7 +896,7 @@ def test_rd5_ii_winrate_excludes_a_missed_dates_leftover_forecast_history() -> N
     assert wins_by_feed.get(y, 0.0) == 1.0, (
         "M153 -> at this assertion: correct = 1.0 (Y's win from the"
         " STARTING-HISTORY D-5 hour only; D-2's leftover forecast_history"
-        " row is excluded because its record is missed, 7.2/9.2), mutant"
+        " row is excluded because its record is missed), mutant"
         " M153 (the win rate reads forecast_history without the record's"
         " closed state) = 2.0 (D-2's leftover perfect Y row wrongly also"
         f" counted) -- got {wins_by_feed!r}"
@@ -928,7 +911,7 @@ def test_rd5_ii_winrate_excludes_a_missed_dates_leftover_forecast_history() -> N
 def test_rd6_wind_serving_filters_by_subscription_then_empty() -> None:
     """RD6: ``load_wind_serving`` reads the active publication's weights,
     dropping a switched-off feed's row; with no publication it returns
-    ``{}`` (9.4)."""
+    ``{}``."""
     from wxverify.forecast.wind_blend import load_wind_serving
 
     conn = asof_conn()
@@ -979,7 +962,7 @@ def test_rd6_wind_serving_filters_by_subscription_then_empty() -> None:
     )
     assert serving_empty.weights == {}, (
         "with no active publication, load_wind_serving must answer with no"
-        f" weights (9.4) -- got {serving_empty.weights!r}"
+        f" weights -- got {serving_empty.weights!r}"
     )
 
 
@@ -1012,9 +995,9 @@ def test_rd7_curve_response_reads_one_publication_version_throughout(
     tmp_path: Path,
 ) -> None:
     """RD7: one response built inside ONE ``read_snapshot`` -- the
-    mechanism 9.3 names for ``/curve`` -- sees the SAME publication (D-1)
+    mechanism ``/curve`` uses -- sees the SAME publication (D-1)
     at every leaderboard read inside it, even when a SECOND connection
-    commits a newer (D) publication while that snapshot is held open (9.3).
+    commits a newer (D) publication while that snapshot is held open.
 
     Deterministic rendezvous in place of a timing race: the spied function
     is ``leaderboard_with_status_in_transaction`` (``wxverify.scoring.
@@ -1067,7 +1050,7 @@ def test_rd7_curve_response_reads_one_publication_version_throughout(
     assert len(set(seen_cutoffs)) == 1 and seen_cutoffs[0] == _D1, (
         "M85 -> at this assertion: correct = every call inside the one"
         " snapshot reports evidence_through D-1, the publication"
-        " active when the snapshot opened (9.3: one read_snapshot"
+        " active when the snapshot opened (one read_snapshot"
         " per response), mutant M85 (/curve reads each leaderboard in its"
         " own snapshot) = the second call, no longer sharing the first"
         f" call's snapshot, would see the newly-committed D publication"
@@ -1166,7 +1149,7 @@ def test_rd7_curve_route_itself_reads_one_publication_version_throughout(
         " manual simulation of the mechanism): correct = every one of"
         " /curve's 8 leaderboard reads reports evidence_through D-1, the"
         " publication active when /curve's one read_snapshot"
-        " opened (9.3), mutant M85 (/curve drops read_snapshot and"
+        " opened, mutant M85 (/curve drops read_snapshot and"
         " reads each lead through leaderboard_with_status, its own"
         " snapshot per call) = the leads read after the first would see"
         f" the newly-committed D publication instead -- got {seen_cutoffs!r}"
@@ -1239,7 +1222,7 @@ def test_rd9_download_date_counts_from_the_round_not_the_label() -> None:
     """RD9: a sample fetched by the round at D 00:10Z, whose run label is
     dated D-1, valid on D+1: ``load_future_samples`` reports
     ``download_date`` D (the round's receipt day), so day ahead counts as
-    1, never 2 as the label's own date would give (9.5, :148)."""
+    1, never 2 as the label's own date would give."""
     from wxverify.forecast.data import load_future_samples
 
     conn = asof_conn()
@@ -1283,8 +1266,8 @@ def test_rd9_download_date_counts_from_the_round_not_the_label() -> None:
     row = next(r for r in rows if r.feed_id == x)
     got = getattr(row, "download_date", None)
     assert got == D, (
-        "M87 -> at this assertion: correct = D (the round's own local_date,"
-        " 9.5), mutant M87 (_candidates/load_future_samples keeps the"
+        "M87 -> at this assertion: correct = D (the round's own local_date),"
+        " mutant M87 (_candidates/load_future_samples keeps the"
         f" issue-time day ahead, from the label's D-1) -- got {got!r}"
     )
 
@@ -1296,7 +1279,7 @@ def test_rd9_download_date_counts_from_the_round_not_the_label() -> None:
 
 def test_rd10_fingerprint_changes_when_a_new_publication_lands() -> None:
     """RD10: ``forecast_fingerprint`` differs before and after a new
-    publication is committed (9.5)."""
+    publication is committed."""
     from wxverify.forecast.data import forecast_fingerprint
 
     conn = asof_conn()
@@ -1309,7 +1292,7 @@ def test_rd10_fingerprint_changes_when_a_new_publication_lands() -> None:
 
     assert before != after, (
         "M88 -> at this assertion: correct = different tokens (the"
-        " fingerprint includes the active publication id, 9.5), mutant M88"
+        " fingerprint includes the active publication id), mutant M88"
         " (the fingerprint built without the publication id) = identical"
         f" tokens {before!r}"
     )
@@ -1323,7 +1306,7 @@ def test_rd10_fingerprint_changes_when_a_new_publication_lands() -> None:
 def test_rd11_pending_ranking_settings_compares_publication_to_saved_values() -> None:
     """RD11: ``pending_ranking_settings`` reports the (published, saved)
     pair for each of the two settings that differ, and ``{}`` for no
-    publication (13.1). Paired positive/negative in one test."""
+    publication. Paired positive/negative in one test."""
     from wxverify.scoring.publication import pending_ranking_settings
 
     conn = asof_conn()
@@ -1357,7 +1340,7 @@ def test_rd12_active_publication_resolves_by_published_at_not_by_id() -> None:
     """RD12: ``active_publication`` at a series of instants around two
     publications' ``published_at`` times resolves by TIME, not by the
     newest ``id`` -- a later-dated row with a HIGHER id but published
-    AFTER both probe windows must never leak into them (7.5)."""
+    AFTER both probe windows must never leak into them."""
     from wxverify.scoring.publication import active_publication
 
     conn = asof_conn()
@@ -1409,7 +1392,7 @@ def test_rd12_active_publication_resolves_by_published_at_not_by_id() -> None:
         got_cutoff = None if pub is None else pub.cutoff
         assert got_cutoff == expected_cutoff, (
             "M90 -> at this assertion: correct = resolve by published_at"
-            f" (7.5); at {at_utc!r} expected cutoff {expected_cutoff!r},"
+            f"; at {at_utc!r} expected cutoff {expected_cutoff!r},"
             " mutant M90 (the active publication picked by id instead of"
             f" cutoff/published_at) would pick the highest-id row -- got {got_cutoff!r}"
         )
@@ -1484,7 +1467,7 @@ def test_rd14_chart_pairs_returns_only_a_closed_dates_rows() -> None:
     )
     assert open_rows == [], (
         "M93 -> at this assertion: correct = [] for the open date D (its"
-        " record is not closed, 16.2), mutant M93 (chart_pairs returns an"
+        " record is not closed), mutant M93 (chart_pairs returns an"
         " open day's rows too) = a 1-row list holding the leftover"
         f" forecast_history row just seeded for D -- got {open_rows!r}"
     )
@@ -1507,7 +1490,7 @@ def test_rd15_substitute_flag_set_only_when_a_stale_chosen_feed_is_left_out() ->
     the only D+3 sample; Y, ranked first at day ahead 3 (skill 0.3, n 5,
     no row for Z there) but FRESH, is chosen-but-absent there too, yet
     ``substitute`` must stay False -- only a STALE chosen-but-absent feed
-    sets it (plan row RD15, :914; 11.3)."""
+    sets it."""
     from wxverify.forecast.service import build_forecast
 
     conn = asof_conn()
@@ -1642,7 +1625,7 @@ def test_rd16_download_date_from_the_later_round_not_the_earlier_sample_fetch() 
     round at D 00:10Z downloads L again (``inserted=0``, no new sample
     row); a sample of L valid on D+1 is looked up at day ahead 1, from the
     ROUND's ``forecast_downloads`` row (``local_date`` D) -- not 2, which
-    the sample's own ``fetched_at`` on D-1 would give (9.5)."""
+    the sample's own ``fetched_at`` on D-1 would give."""
     from wxverify.forecast.data import load_future_samples
 
     conn = asof_conn()
@@ -1716,8 +1699,8 @@ def test_rd17_latest_published_at_is_the_newest_over_active_publications() -> No
     two sites -- site A with a D-1 publication published at t1 and an
     OLDER-cutoff D-3 publication published LATER, at t3, and site B with a
     D-1 publication published at t2 (t1 < t2 < t3) -- the newest
-    ``published_at`` over the sites' ACTIVE publications (plan row RD17,
-    :916). Site A's active publication is its D-1 one (the newer cutoff),
+    ``published_at`` over the sites' ACTIVE publications. Site A's active
+    publication is its D-1 one (the newer cutoff),
     published at t1, not its D-3 row published at t3, so t3 must never
     surface."""
     from wxverify.scoring.publication import latest_published_at
@@ -1752,7 +1735,7 @@ def test_rd17_latest_published_at_is_the_newest_over_active_publications() -> No
         " publication is its D-1 row -- the newer cutoff -- published at"
         " t1; site B's active publication is its only row, published at"
         " t2; the newest published_at over just those two active rows is"
-        " t2, 16.2), mutant M154 (latest_published_at takes the newest"
+        " t2), mutant M154 (latest_published_at takes the newest"
         " published_at over EVERY publication, not over the sites'"
         " active ones) = t3 (site A's older-cutoff D-3 row, never active,"
         f" published latest of all three rows) -- got {got!r}"

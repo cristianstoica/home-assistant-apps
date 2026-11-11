@@ -1,4 +1,4 @@
-"""Google horizon correction oracles — 0.12.0 §15 family 7 (§4, W1).
+"""Google horizon correction oracles (0.12.0).
 
 Covers ``wxverify.db.migrations.correct_google_horizon``: the one-shot,
 marker-gated data correction that raises the ``(source='google',
@@ -7,7 +7,7 @@ fresh-install seed path that lands on 168 directly. The ``run_migrations``
 oracles assert ``PRAGMA user_version`` ends at ``TARGET_USER_VERSION``; the
 direct-invocation oracle asserts ``correct_google_horizon`` leaves the
 version exactly where it found it — the correction is a data fix, not a
-schema migration (§4 "Why this does not bump TARGET_USER_VERSION").
+schema migration, so it does not bump TARGET_USER_VERSION.
 
 Every fixture is built with ``create_schema`` + a hand-set ``PRAGMA
 user_version`` (mirrors ``tests/test_publish_hold_bootstrap.py``'s
@@ -74,8 +74,8 @@ def _user_version(conn: sqlite3.Connection) -> int:
 def _build_v4_matrix_db(
     *, google_blend_lead: int, marker: str | None
 ) -> sqlite3.Connection:
-    """A fresh-build-path (user_version 0) database holding the three rows
-    §4's fixture spec calls for: the target row, a differently-valued
+    """A fresh-build-path (user_version 0) database holding three rows:
+    the target row, a differently-valued
     other-source row, and a google-non-blend row at a value that is
     neither 24 nor 168. The correction has no version gate of its own (it
     runs unconditionally in ``run_migrations``'s fixed corrections step),
@@ -92,7 +92,7 @@ def _build_v4_matrix_db(
 
 
 # ---------------------------------------------------------------------------
-# §4 matrix — fresh install; existing db at 24; re-run; other-rows-untouched.
+# Matrix — fresh install; existing db at 24; re-run; other-rows-untouched.
 # ---------------------------------------------------------------------------
 
 
@@ -100,7 +100,7 @@ def test_fresh_database_seeds_google_blend_at_168() -> None:
     """Fresh install (no rows, no marker): the SEED lands the row at 168 --
     correct_google_horizon's UPDATE matches nothing on an empty table. This
     is the paired positive for the existing-db-at-24 correction below: it
-    fails if only the correction half ships (§4's final "Separately" test).
+    fails if only the correction half ships.
     """
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -112,7 +112,7 @@ def test_fresh_database_seeds_google_blend_at_168() -> None:
 
 
 def test_existing_row_at_24_corrected_and_rerun_is_noop() -> None:
-    """The core §4 matrix oracle: existing db at 24, no marker -> corrected,
+    """The core matrix oracle: existing db at 24, no marker -> corrected,
     marker set, other rows untouched, user_version unmoved; then a SECOND
     run_migrations on the same connection changes nothing and does not
     raise (idempotent re-run)."""
@@ -135,7 +135,7 @@ def test_existing_row_at_24_corrected_and_rerun_is_noop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §4's three design oracles.
+# The three design oracles.
 # ---------------------------------------------------------------------------
 
 
@@ -155,13 +155,13 @@ def test_one_shot_marker_present_blocks_recorrection_of_a_reset_row() -> None:
 
 
 def test_crash_window_recovers_via_idempotent_rerun() -> None:
-    """Crash window (§4 change item 4): a crash between the UPDATE and the
+    """Crash window: a crash between the UPDATE and the
     marker write leaves the row at 168 with no marker. The guarantee the
     implementation actually makes -- UPDATE-then-marker ordering makes
     every interruption point already correct, not that the two writes are
     transactional together (``executescript`` inside ``create_schema`` has
-    already committed by this point, and no SAVEPOINT wraps this function;
-    see §4's "no SAVEPOINT is needed") -- is that RESUMING from exactly that
+    already committed by this point, and no SAVEPOINT wraps this function)
+    -- is that RESUMING from exactly that
     state is idempotent: calling ``correct_google_horizon`` directly (not
     the full ``run_migrations``, to isolate the ordering property from
     seeding/bootstrap) re-runs an UPDATE that matches nothing and writes

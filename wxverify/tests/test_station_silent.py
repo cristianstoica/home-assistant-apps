@@ -1,10 +1,4 @@
-"""Alert 5, a station silent today (daily-close plan 2026-10-22-daily-close-
-alerts-and-pages.md §6.3, §7.3; test IDs SL1-SL7 in this file's §13.5).
-
-Written before ``wxverify.close_monitor.station_silent`` exists: every test
-below imports it (or a name it will add) inside its own body, so the rest of
-this file keeps collecting -- each then fails at its own
-``ModuleNotFoundError`` or ``ImportError``, the failure Step 3 accepts.
+"""Alert 5, a station silent today (test IDs SL1-SL7).
 
 Real SQLite throughout (``tests.helpers.asof_conn``, real migrations);
 nothing in the code under test is mocked. The only fakes are the clock
@@ -14,7 +8,7 @@ instant so ``persist_poll_result``/``record_access_refused`` write a known
 ``last_poll_at``/``since``/``until``) and the httpx responses built locally,
 never over the network. Synthetic data only: stations ``ISTATION01``/
 ``ISTATION02`` (via ``day_close_site``), zone UTC, dates built from the
-fixture's ``D``/``NOW``. P1's own functions move every day state; no test
+fixture's ``D``/``NOW``. The ``db.site_days`` functions move every day state; no test
 writes ``site_days`` directly.
 """
 
@@ -161,7 +155,7 @@ def _set_usable(conn, station_id: int, local_date, variables: tuple[str, ...]) -
 def test_sl1_online_age_ignores_now_threshold_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SL1 (plan §13.5, §6.3): an ONLINE station's age is last_poll_at minus
+    """SL1: an ONLINE station's age is last_poll_at minus
     last_obstime, never `now`, and the threshold trips at >= 2 h (M44, M45).
 
     This also gives the paired positive for SL6's absence check: here
@@ -224,7 +218,7 @@ def test_sl1_online_age_ignores_now_threshold_boundary(
 def test_sl2_online_back_off_uses_last_poll_at_not_now(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SL2 (plan §13.5, §6.3): ONLINE with a 30-minute-old reading, then
+    """SL2: ONLINE with a 30-minute-old reading, then
     `now` 5 h later with no further poll (a back-off), stays ok (M44, M46)."""
     from wxverify.close_monitor import station_silent
 
@@ -256,7 +250,7 @@ def test_sl2_online_back_off_uses_last_poll_at_not_now(
 def test_sl3_offline_age_from_now_and_never_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SL3 (plan §13.5, §6.3): OFFLINE's age is `now` minus `last_obstime`,
+    """SL3: OFFLINE's age is `now` minus `last_obstime`,
     not `last_poll_at` minus `last_obstime` (M47); a station with no
     reading yet trips "no observation yet"."""
     from wxverify.close_monitor import station_silent
@@ -304,7 +298,7 @@ def test_sl3_offline_age_from_now_and_never_read(
 def test_sl4_transient_and_terminal_never_judged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SL4 (plan §13.5, §6.3): a TRANSIENT (503, and a transport error) and
+    """SL4: a TRANSIENT (503, and a transport error) and
     a TERMINAL (404) answer after an old reading are never judged (M48)."""
     from wxverify.close_monitor import station_silent
 
@@ -344,7 +338,7 @@ def test_sl4_transient_and_terminal_never_judged(
 def test_sl5_current_obs_hold_suppresses_then_clears(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SL5 (plan §13.5, §6.3): SL3's OFFLINE station is ok while the
+    """SL5: SL3's OFFLINE station is ok while the
     current_obs hold is in force, and trips again once it clears (M49)."""
     from wxverify.close_monitor import station_silent
 
@@ -398,7 +392,7 @@ def test_sl5_current_obs_hold_suppresses_then_clears(
 def test_sl6_provisional_mark_false_drops_the_word(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SL6 (plan §13.5, §7.3): with STATION_SILENT_PROVISIONAL set False by
+    """SL6: with STATION_SILENT_PROVISIONAL set False by
     the test, "provisional" is absent (M50). Paired positive: SL1 (same
     scenario, mark left at its default True) has "provisional" present."""
     import wxverify.close_monitor as close_monitor_module
@@ -433,7 +427,7 @@ def test_sl6_provisional_mark_false_drops_the_word(
 def test_sl7_alert3_every_variable_suppresses_once_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SL7 (plan §13.5, §6.3): with the close on, B's silence line shows
+    """SL7: with the close on, B's silence line shows
     while alert 3 does not yet name it for every variable, and disappears
     once alert 3 does (M51)."""
     from wxverify.close_monitor import station_silent

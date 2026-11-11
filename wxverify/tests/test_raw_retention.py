@@ -1,18 +1,17 @@
-"""Raw retention (plan 2026-10-21-daily-close-download-and-raw-store.md
-section 10, 12.1 and 14.10): ``prune_raw_readings``, tests RR1-RR4; and the
-reads of 12.2/12.3 (``reading_times``, ``last_five_minute_store``,
-``raw_readings``), tests RD1-RD3.
+"""Raw retention: ``prune_raw_readings``, tests RR1-RR4; and the reads
+``reading_times``, ``last_five_minute_store`` and ``raw_readings``, tests
+RD1-RD3.
 
 Readings of every source on D-3 to D: D-3 closed at a chosen instant, D-2
 closed an hour later, D-1 and D left open unless a test moves them. The
-site is built with ``with_records=False`` and P1's own functions
+site is built with ``with_records=False`` and the ``db.site_days`` functions
 (``start_site_days``, ``ensure_site_days``, ``begin_close``, ``finish_close``,
 ``mark_missed``), since ``tests.helpers.day_close_site``'s own
 ``with_records=True`` path sets different close times and states than this
 section needs. Every station id is synthetic (``ISTATION01``-``ISTATION06``);
 the API key is the CI placeholder; zone is ``UTC`` throughout.
 
-RD1-RD3 are pure reads with no day-state to set up, so they skip P1's
+RD1-RD3 are pure reads with no day-state to set up, so they skip the day-state
 machinery and build their own minimal site (``asof_make_site``) and
 stations (``_make_station``), using ``ISTATION04``-``ISTATION06`` to stay
 clear of RR1-RR4's ``ISTATION01``-``ISTATION03``. Their readings are
@@ -178,7 +177,7 @@ def _count_between(  # type: ignore[no-untyped-def]
 
 
 def test_rr1_prunes_only_once_7_days_past_the_later_close(tmp_path: Path) -> None:
-    """RR1 (plan 14.10): D-3 closed at T, D-2 closed at T+1h, D-1 and D open.
+    """RR1: D-3 closed at T, D-2 closed at T+1h, D-1 and D open.
 
     Kills M60 (prune_raw_readings deletes without asking check_date_write,
     by D's own state only): at the ``before`` assertion, correct = 0 (D-3's
@@ -229,7 +228,7 @@ def test_rr1_prunes_only_once_7_days_past_the_later_close(tmp_path: Path) -> Non
 
 
 def test_rr2_the_next_day_must_also_be_done(tmp_path: Path) -> None:
-    """RR2 (plan 14.10): D-2 with D-1 open, at T+30d; then D-1 missed at
+    """RR2: D-2 with D-1 open, at T+30d; then D-1 missed at
     T2, at T2+7d.
 
     Kills M62 (prune_raw_readings deletes the first day the guard refused,
@@ -278,7 +277,7 @@ def test_rr2_the_next_day_must_also_be_done(tmp_path: Path) -> None:
 
 
 def test_rr3_the_delete_is_bounded_below_and_by_site(tmp_path: Path) -> None:
-    """RR3 (plan 14.10): a reading before D-3 (the site's first tracked
+    """RR3: a reading before D-3 (the site's first tracked
     day), and another site's rows at the same instants, are both untouched
     by pruning D-3.
 
@@ -288,12 +287,12 @@ def test_rr3_the_delete_is_bounded_below_and_by_site(tmp_path: Path) -> None:
     is excluded), mutant = absent (a delete bounded only above sweeps it
     up too, along with every older row for that station).
 
-    The other-site reading is asserted untouched too, as the plan's case
-    names it, but this half is not claimed against any numbered mutant:
-    the real implementation already deletes per ``station_id`` within the
-    site being processed (10.3 step 3), so no single-field mutation in
-    15.2 crosses a site boundary on its own. This stands as defensive
-    coverage of the per-station scoping, not a claimed kill.
+    The other-site reading is asserted untouched too, but this half is
+    not claimed against any numbered mutant: the real implementation
+    already deletes per ``station_id`` within the site being processed,
+    so no single-field mutation crosses a site boundary on its own. This
+    stands as defensive coverage of the per-station scoping, not a
+    claimed kill.
     """
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
@@ -387,7 +386,7 @@ class _FaultAfterN(sqlite3.Connection):
 def test_rr4_a_mid_walk_failure_leaves_the_marker_on_the_day_it_finished(
     tmp_path: Path,
 ) -> None:
-    """RR4 (plan 14.10): the marker after RR1; a stop between two days (the
+    """RR4: the marker after RR1; a stop between two days (the
     second day's delete raising).
 
     Kills M65 (the marker is written before the day's deletes, in a
@@ -450,7 +449,7 @@ def test_rr4_a_mid_walk_failure_leaves_the_marker_on_the_day_it_finished(
 
 
 # ---------------------------------------------------------------------------
-# RD1, RD2, RD3 (plan 14.10's second table; ``reading_times``,
+# RD1, RD2, RD3 (``reading_times``,
 # ``last_five_minute_store`` and ``raw_readings`` are new in
 # ``db/station_readings.py``). Pure reads with no site_days/guard state to
 # set up: each test builds its own minimal site and stations rather than
@@ -484,7 +483,7 @@ def _insert_raw_reading(
     """Like ``_insert_reading``, but with ``fetched_at`` and ``local_date``
     under the caller's control -- RD2 and RD3 need ``fetched_at`` stamps
     independent of ``obs_at``, and RD3 needs a row with no ``fetched_at`` at
-    all (NULL, as a pre-0.16.14 row would carry, plan 6.2).
+    all (NULL, as a pre-0.16.14 row would carry).
     """
     conn.execute(
         "INSERT INTO station_wind_records"
@@ -510,7 +509,7 @@ def _insert_raw_reading(
 
 
 def test_rd1_reading_times_time_order_and_source_filter(tmp_path: Path) -> None:
-    """RD1 (plan 14.10): ``reading_times`` for B over 10:00-10:07: B has
+    """RD1: ``reading_times`` for B over 10:00-10:07: B has
     ``five_minute`` readings at 10:00 and 10:05, ``current_obs`` at 10:02
     and 10:07, ``hourly`` at 10:00; C has a reading at 10:03. Then the same
     range filtered to ``source="current_obs"``.
@@ -581,7 +580,7 @@ def test_rd1_reading_times_time_order_and_source_filter(tmp_path: Path) -> None:
 
 
 def test_rd2_last_five_minute_store_by_source_and_site(tmp_path: Path) -> None:
-    """RD2 (plan 14.10): ``last_five_minute_store`` for a site with B's
+    """RD2: ``last_five_minute_store`` for a site with B's
     ``five_minute`` row (fetched 08:00) and C's ``five_minute`` (09:00),
     ``current_obs`` (10:00) and ``hourly`` (11:00) rows, and another
     site's ``five_minute`` row (fetched 12:00); then ``store_readings``
@@ -607,7 +606,7 @@ def test_rd2_last_five_minute_store_by_source_and_site(tmp_path: Path) -> None:
     conn = db._conn  # noqa: SLF001
     site_id = asof_make_site(conn, "rd2-site")
     # The repeat store below goes through store_readings's closed-day
-    # guard (the daily close is always on): it needs a real P1 record
+    # guard (the daily close is always on): it needs a real day record
     # holding D.
     start_site_days(conn, site_id, D, now_utc=_day_start(D))
     station_b = _make_station(conn, site_id, "ISTATION04")
@@ -784,11 +783,11 @@ def test_rd4_last_five_minute_store_skips_an_unreadable_fetched_at(
 
 
 def test_rd3_raw_readings_fields_bounds_and_nulls(tmp_path: Path) -> None:
-    """RD3 (plan 14.10): ``raw_readings`` for B over 10:00-11:00: a row
+    """RD3: ``raw_readings`` for B over 10:00-11:00: a row
     with every column set, a row with every value the table's CHECK
     allows NULL (local date, temperature, rain total, ``fetched_at`` --
     ``speed_kmh`` keeps a value, since the CHECK requires at least one of
-    the three, plan 6.2), a row at 11:00, and C's row at 10:30.
+    the three), a row at 11:00, and C's row at 10:30.
 
     Kills M94 (``raw_readings`` swaps ``temp_c`` and ``precip_total_mm``):
     at the ``result`` assertion, correct = the first row with

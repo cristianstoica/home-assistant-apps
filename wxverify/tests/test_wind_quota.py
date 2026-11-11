@@ -1,5 +1,4 @@
-"""Tests: the wind-history lane's weather.com quota, group 3 of plan
-section 15.1 (2026-09-30).
+"""Tests: the wind-history lane's weather.com quota.
 
 Covers T90-T96, T112 and T116 against ``wxverify.collection.wind_quota``,
 ``wxverify.collection.budget`` and ``wxverify.obs.pws_adapter``'s rate
@@ -9,7 +8,7 @@ Isolation: T90-T92, T112 and T116 drive the pure quota functions directly
 over a ``:memory:`` connection + ``run_migrations`` (``_make_db``), mirroring
 ``tests/test_wind_auth_hold.py``'s sync harness. T93 and T95 are plain
 sync/async unit tests of ``WeathercomRateLimiter``/``_get_with_deadline`` with
-no database at all. T94 and T96 drive ``run_wind_days`` end to end against a
+no database at all. T96 drives ``run_wind_days`` end to end against a
 real tmp-path ``Database``/``FencedWriter`` + ``httpx.MockTransport``,
 reusing ``tests/test_wind_auth_hold.py``'s async harness
 (``_init_tmp_db``, ``_freeze``, ``_run_wind_days``).
@@ -489,7 +488,7 @@ def test_t96_a_simulated_day_makes_54_all_1day_calls(
     site_id = _make_site(conn)
     station_ids = [_make_station(conn, site_id, f"KTEST{i:03d}") for i in range(1, 7)]
     start = datetime(2026, 3, 10, 0, 0, 0, tzinfo=UTC)
-    # The lane needs a P1 record holding `start` (the daily close is
+    # The lane needs a day record holding `start` (the daily close is
     # always on): without one, _lane_today's `ensure` creates only a
     # first record dated tomorrow, and the simulated day below would make
     # no calls at all.

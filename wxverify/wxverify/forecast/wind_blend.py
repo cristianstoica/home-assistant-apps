@@ -1,4 +1,4 @@
-"""Weighted wind forecast: every eligible feed, weighted by past accuracy (§11).
+"""Weighted wind forecast: every eligible feed, weighted by past accuracy.
 
 The served wind is not the blend-depth selection. Each feed's weight at a lead
 ``k`` is ``1 / max(MAE, FLOOR_MS)``, where the MAE compares the feed's
@@ -200,7 +200,7 @@ def load_wind_serving(
     timezone: str,
     today: date,
 ) -> WindServing:
-    """The wind weights of the active publication (9.4, 12).
+    """The wind weights of the active publication.
 
     The latest publication's, for the feeds switched on now; ``{}`` with no
     publication, which wind serving reads as "not enough feeds". ``timezone``

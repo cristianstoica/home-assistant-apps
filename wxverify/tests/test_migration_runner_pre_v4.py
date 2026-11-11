@@ -64,12 +64,10 @@ def test_o10_run_migrations_on_empty_matches_create_schema_plus_triggers() -> No
     }
 
     assert fresh_names == composite_names | _TRIGGERS
-    # 78 since the rain release (Part B): forecast_scored and idx_samples_slot;
-    # 79 with Part A's station_rain_checks; 83 with Part C's rain_days,
-    # rain_forecast_days, rain_picks and publication_rain_ranks; 69 with the
-    # storage release: +1 forecast_history, -15 for forecast_pairs,
-    # close_pairs and the seven verification_* tables and their own
-    # indexes, all dropped (3.1, 4.1); 68 with card 29; 67 with the health
-    # release (`score_cache` dropped), 68 with the health release's
-    # `station_wind_constant` (Part A).
+    # 78 with forecast_scored and idx_samples_slot; 79 with
+    # station_rain_checks; 83 with rain_days, rain_forecast_days, rain_picks
+    # and publication_rain_ranks; 69 after +1 forecast_history, -15 for
+    # forecast_pairs, close_pairs and the seven verification_* tables and
+    # their own indexes, all dropped; 68 with the daily forecast record
+    # dropped; 67 with `score_cache` dropped; 68 with `station_wind_constant`.
     assert len(fresh_names) == 68

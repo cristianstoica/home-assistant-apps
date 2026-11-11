@@ -37,7 +37,7 @@ class CompositeParts:
 class CompositeResult:
     rows: list[dict[str, object]]
     status: CompositeStatus
-    #: The cutoff of the publication read (9.6); None with no publication.
+    #: The cutoff of the publication read; None with no publication.
     evidence_through: date | None = None
 
 
@@ -53,7 +53,7 @@ def composite_with_status(
 ) -> CompositeResult:
     """Return composite rows plus a status for the resolved window.
 
-    The verdict comes from the active publication (9.2), read inside one
+    The verdict comes from the active publication, read inside one
     WAL read snapshot (``read_snapshot``): no publication, or the site
     disabled, is ``empty``; ``rolling`` and ``all`` group the publication's
     ``w:{N}`` and ``w:all`` rows on the canonical (variable, day ahead)
@@ -68,7 +68,7 @@ def composite_in_snapshot(
     conn: sqlite3.Connection, *, site_id: int, window: str = "rolling"
 ) -> CompositeResult:
     """``composite_with_status`` for a response that holds its own snapshot
-    (9.3: the dashboard), where the facade's snapshot would refuse to nest.
+    (the dashboard), where the facade's snapshot would refuse to nest.
 
     Raises ``RuntimeError`` when no transaction is open on ``conn``.
     """
@@ -87,7 +87,7 @@ def _composite_in_transaction(
 def _published_composite(
     conn: sqlite3.Connection, *, site_id: int, window: str
 ) -> CompositeResult:
-    """The verdict of ``composite_with_status`` (9.2)."""
+    """The verdict of ``composite_with_status``."""
     pub = (
         active_publication(conn, site_id=site_id, at_utc=None)
         if _site_enabled(conn, site_id)

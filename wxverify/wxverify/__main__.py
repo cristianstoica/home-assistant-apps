@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in ("backfill", "catchup") or (
         args.command == "timezone" and args.timezone_command in ("correct", "status")
     ):
-        # Retired with the daily close (plan 7.3): the message and exit 1,
+        # Retired with the daily close: the message and exit 1,
         # before logging is set up and before init_db opens the file.
         _die(RETIRED_CONTROL_MESSAGE)
     if args.command == "serve":
@@ -111,7 +111,7 @@ def _build_parser() -> argparse.ArgumentParser:
     fetch.add_argument("feed_id", type=int)
 
     # Retired with the daily close; the parsers stay, so a script that calls
-    # them gets the retirement message, not a usage error (plan 7.3).
+    # them gets the retirement message, not a usage error.
     backfill = sub.add_parser("backfill")
     backfill.add_argument("site_id", type=int)
 
@@ -175,9 +175,9 @@ def _build_parser() -> argparse.ArgumentParser:
     purge.add_argument("--json", action="store_true")
 
     # A normal site edit (PUT /api/sites/{id}) cannot change a timezone by
-    # design; ``change`` enters a zone change (daily-close P1 6.4). The
-    # retired ``status`` and ``correct`` keep their parsers, so a script that
-    # calls them gets the retirement message, not a usage error (plan 7.3).
+    # design; ``change`` enters a zone change. The retired ``status`` and
+    # ``correct`` keep their parsers, so a script that calls them gets the
+    # retirement message, not a usage error.
     timezone = sub.add_parser("timezone")
     timezone_sub = timezone.add_subparsers(dest="timezone_command", required=True)
     tz_status = timezone_sub.add_parser("status")
@@ -606,7 +606,7 @@ async def _providers_run_now(args: argparse.Namespace, *, smoke: bool) -> int:
         {"status": "error", "message": message} for message in selection.errors
     ]
     for feed in selection.feeds:
-        # A command-line fetch is an unscheduled try (daily-close P4 4.2).
+        # A command-line fetch is an unscheduled try.
         slot = DownloadSlot(
             slot="unscheduled", round_date=None, round_try=None, started_at=utc_now()
         )

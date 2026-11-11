@@ -1,5 +1,5 @@
 """The station wind writer and readers, and the pair-max row predicate
-(plan §8-9, §15.1 T23-T28, T110).
+(T23-T28, T110).
 
 No package code reads a site's old ``wind_basis`` key any more. Tests that
 store one write it by its literal name and expect the same outcome whatever
@@ -65,10 +65,10 @@ _VALID_AT_DAY = date(2026, 7, 1)
 
 
 def _give_day_record(conn: sqlite3.Connection, site_id: int, station_id: int) -> None:
-    """Give the site a P1 record covering the tests' ``valid_at`` day (the
+    """Give the site a day record covering the tests' ``valid_at`` day (the
     close is always on; the write guard refuses an instant with no record
     holding it), with the day's saved station list holding ``station_id``
-    too, through the real ``record_station_change`` path (6.2), the way a
+    too, through the real ``record_station_change`` path, the way a
     joining station reaches the list."""
     start_site_days(
         conn, site_id, _VALID_AT_DAY, now_utc=datetime(2026, 7, 1, tzinfo=UTC)
@@ -112,7 +112,7 @@ def test_insert_guard_refuses_wind_whatever_the_stored_key(state: str | None) ->
     """Correct = False in every state: the wind lane writes every wind row
     through ``write_station_observation``. A guard that still admits wind in
     some state (the old ``staging`` allowlist) returns True for that id; no
-    guard at all (plan M1) returns True for every id."""
+    guard at all (M1) returns True for every id."""
     conn = _make_db()
     site = _make_site(conn)
     station = _make_station(conn, site, "KTEST001")
@@ -346,10 +346,10 @@ def _seed_station_trust_wind_rows(conn: sqlite3.Connection, site: int) -> None:
 
 @pytest.mark.parametrize("state", _STORED_WIND_KEY_VALUES)
 def test_station_trust_reader_ignores_wind_basis_state(state: str | None) -> None:
-    """Station trust tests neither the stored key nor ``source_raw`` for wind
-    (plan §5.3 item 10), so both stations' wind rows show in every state. A
+    """Station trust tests neither the stored key nor ``source_raw`` for wind,
+    so both stations' wind rows show in every state. A
     reader that still gates wind on the state, or on the row's shape, drops
-    one or both stations for some id; one that excludes wind (plan M18)
+    one or both stations for some id; one that excludes wind (M18)
     drops both for every id."""
     from wxverify.web.context import load_station_trust
 

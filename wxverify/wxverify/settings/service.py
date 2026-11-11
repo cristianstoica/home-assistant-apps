@@ -29,7 +29,7 @@ async def apply_plain_settings(options: RuntimeOptions) -> None:
             set_setting(conn, "min_n", str(options.min_n))
         if options.forecast_blend_depth is not None:
             set_setting(conn, "forecast_blend_depth", str(options.forecast_blend_depth))
-        # §15 clearing rule — scoped to the three per-variable depth keys
+        # Clearing rule, scoped to the three per-variable depth keys
         # only: a key absent from this apply DELETES its settings row, so
         # the global fallback takes effect and provenance reads "global".
         # The plain keys above keep their apply-when-present semantics.

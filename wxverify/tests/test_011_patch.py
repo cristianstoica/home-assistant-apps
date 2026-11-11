@@ -169,14 +169,14 @@ class _FakeClock:
 
 
 async def _idle_poller(db: object, *, run_job: object) -> None:
-    """A current-obs lane that never claims anything (plan §6.3.6)."""
+    """A current-obs lane that never claims anything."""
     await asyncio.Event().wait()
 
 
 def _patch_worker_infra(monkeypatch: pytest.MonkeyPatch) -> None:
     """Silence heartbeats, scheduler, and purge in worker loop tests.
 
-    Also idles the current-obs lane (plan §6.3.6): every caller of this
+    Also idles the current-obs lane: every caller of this
     helper drives ``run_worker`` directly against a fake ``db`` with no
     real ``jobs``/``station_poll_state`` schema behind it, and the real
     poller would issue its own ``db.write`` calls against that fake.
@@ -496,13 +496,13 @@ def test_fetch_feed_429_consumes_budget_and_writes_backoff(tmp_path: Path) -> No
 def test_ft2_feed_401_with_reason_matches_the_empty_body_outcome(
     tmp_path: Path,
 ) -> None:
-    """Part F, FT2 (health-release plan §6): a feed's 401 whose body
+    """FT2: a feed's 401 whose body
     carries the provider's own reason gets it appended to
     ``site_feed_state.last_error``; ``error_count`` and the backoff
     outcome are unaffected by the reason's presence, compared against the
     identical 401 with an empty body.
 
-    Catches: the feeds left out of Part F (TODO item 4) -- at the
+    Catches: a feed's 401 not carrying the provider's reason -- at the
     "ends with" assertion below: correct = the suffix present, mutant =
     absent. The equality assertions after it catch the reason changing
     ``error_count`` or the backoff outcome (it must not).
@@ -1119,7 +1119,7 @@ def test_scheduler_tick_does_not_reenqueue_fetch_feed_within_failure_cooldown(
     """A fetch_feed job that failed minutes ago must not be re-enqueued by
     the next scheduler tick -- the same cooldown that already protects
     fetch_obs/fetch_current_obs must also protect fetch_feed. Under the
-    slot rule (plan §5.1) no daytime slot is due between local midnight
+    slot rule no daytime slot is due between local midnight
     and 06:10 for a 360-minute feed, so the clock is fixed at 06:15Z,
     when the 06:10 slot is due, and the failed job is stamped 5 minutes
     before it (06:10Z) so the cooldown applies.
@@ -1165,7 +1165,7 @@ def test_scheduler_tick_enqueues_fetch_feed_with_reduced_retry_cap(
     """The scheduler's daytime-download path must cap fetch_feed retries at
     3, not the schema default of 5 -- a metered provider job that keeps
     failing must not fall back to the longer generic retry cap. Under the
-    slot rule (plan §5.1) the clock is fixed at 06:15Z, when the 06:10
+    slot rule the clock is fixed at 06:15Z, when the 06:10
     slot of the 360-minute feed is due.
     """
     conn = _init_tmp_db(tmp_path)
@@ -1433,15 +1433,15 @@ def test_worker_terminal_failure_logs_error(
 def test_worker_deferred_job_cycle_line_info_deferred_line_debug(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BC2: 'job deferred' moved INFO→DEBUG; cycle: outcome=deferred stays INFO.
+    """'job deferred' moved INFO→DEBUG; cycle: outcome=deferred stays INFO.
 
-    The old test matched 'deferred' against the new cycle: INFO line — a false
-    oracle that would pass even if BC2 were reverted or the wrong line fired.
-    This retargeted version pins the real post-BC2 contract:
+    Matching 'deferred' against the cycle: INFO line would be a false oracle
+    that passes even if the move were reverted or the wrong line fired.
+    This version pins the real contract:
       - 'job deferred …' is a DEBUG record (present at DEBUG, absent at INFO)
       - 'cycle: job=… outcome=deferred' is an INFO record
 
-    Will go red if BC2 is reverted (job deferred re-promoted to INFO), or if the
+    Will go red if 'job deferred' is re-promoted to INFO, or if the
     cycle: line stops carrying outcome=deferred.
     """
     job = _make_job(job_type="fetch_feed", site_id=42)
@@ -1467,9 +1467,7 @@ def test_worker_deferred_job_cycle_line_info_deferred_line_debug(
         for r in caplog.records
         if r.levelno == logging.INFO and "job deferred" in r.getMessage()
     ]
-    assert len(job_deferred_info) == 0, (
-        "BC2: 'job deferred' must NOT appear at INFO level"
-    )
+    assert len(job_deferred_info) == 0, "'job deferred' must NOT appear at INFO level"
 
     job_deferred_debug = [
         r

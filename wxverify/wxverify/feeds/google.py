@@ -41,7 +41,7 @@ from wxverify.feeds.synthetic_run import snap_run
 _ENDPOINT: Final = "https://weather.googleapis.com/v1/forecast/hours:lookup"
 
 # Google self-describes each value's unit; a non-metric unit on a scored
-# value is a hard error. A display gust (card 7) in another unit is skipped.
+# value is a hard error. A display gust in another unit is skipped.
 _EXPECTED_TEMPERATURE_UNIT: Final = "CELSIUS"
 _EXPECTED_SPEED_UNIT: Final = "KILOMETERS_PER_HOUR"
 _EXPECTED_PRECIP_UNIT: Final = "MILLIMETERS"
@@ -96,12 +96,12 @@ class GoogleSpeed(BaseModel):
 
 
 def _display_text(value: object) -> str | None:
-    """A display unit (card 7) as given when it is text, else ``None``."""
+    """A display unit as given when it is text, else ``None``."""
     return value if isinstance(value, str) else None
 
 
 class GoogleGust(BaseModel):
-    """A wind gust, display only (card 7).
+    """A wind gust, display only.
 
     Its own model, never ``GoogleSpeed``, whose required ``value`` would
     reject the reply: a gust with no value or unit, or a value ``float()``
@@ -115,7 +115,7 @@ class GoogleGust(BaseModel):
 
 
 class GoogleWindDirection(BaseModel):
-    """Display only (card 7): degrees, "the angle it is coming from"."""
+    """Display only: degrees, "the angle it is coming from"."""
 
     model_config = ConfigDict(extra="allow", frozen=True)
 
@@ -152,7 +152,7 @@ class GoogleForecastHour(BaseModel):
     temperature: GoogleTemperature | None = None
     wind: GoogleWind | None = None
     precipitation: GooglePrecipitation | None = None
-    # Display only (card 7): an int 0-100 in Google's reference, read as a
+    # Display only: an int 0-100 in Google's reference, read as a
     # float so a decimal never rejects the reply.
     cloudCover: DisplayFloat = None
 
@@ -391,7 +391,7 @@ def _display_samples(
     hour: GoogleForecastHour,
     wrong_gust_units: list[str | None],
 ) -> list[NormalizedSample]:
-    """The hour's display samples (card 7); never raises.
+    """The hour's display samples; never raises.
 
     Cloud cover (%) and wind direction (degrees, from) are stored as given.
     A gust is stored, in m/s, only when its unit is the expected km/h; a gust

@@ -1,4 +1,4 @@
-"""The refused-access kinds' lanes run independently (plan §13.5 FM4).
+"""The refused-access kinds' lanes run independently (FM4).
 
 ``current_obs``, ``hourly`` and ``five_minute`` (today's wind ``all_1day``
 download) each hold only their own ``AccessKind``. ``hourly`` is the gap
@@ -161,7 +161,7 @@ def _freeze(monkeypatch: pytest.MonkeyPatch, when: datetime) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AH1-AH4 (P2 14.7): the five_minute hold checked per row, inside each
+# AH1-AH4: the five_minute hold checked per row, inside each
 # station's own reservation, for today's 5-minute download.
 # ---------------------------------------------------------------------------
 
@@ -171,7 +171,7 @@ _AH_DAY_START = local_day_slots(_AH_DAY, _AH_TZ)[0]
 
 
 def _start_ah_day(conn: sqlite3.Connection, site_id: int) -> None:
-    """Give the site a P1 record dated ``_AH_DAY`` (the lane needs one to
+    """Give the site a day record dated ``_AH_DAY`` (the lane needs one to
     run at all now that the daily close is always on)."""
     start_site_days(conn, site_id, _AH_DAY, now_utc=_AH_DAY_START)
 
@@ -256,7 +256,7 @@ def _set_hold(  # type: ignore[no-untyped-def]
 def test_ah1_a_held_try_sends_nothing_and_moves_to_its_next_slot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """P2 14.7 AH1: the ``five_minute`` hold in force until 23:40:12; two
+    """AH1: the ``five_minute`` hold in force until 23:40:12; two
     stations' today rows due at 23:06. No request is sent, the budget is
     unchanged, the hold's own row is unchanged (same ``until``), each row
     moves to its own next slot (23:11 -- not the hold's ``until``), and one
@@ -337,7 +337,7 @@ def test_ah1_a_held_try_sends_nothing_and_moves_to_its_next_slot(
 def test_ah2_collection_resumes_at_the_rows_own_next_slot_not_the_holds_end(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """P2 14.7 AH2: the same hold (until 23:40:12); the lane runs at 23:36
+    """AH2: the same hold (until 23:40:12); the lane runs at 23:36
     and at 23:40:13. At 23:36 the held rows move to 23:41 (their own next
     slot); at 23:40:13, just after the hold lifts, nothing is due yet (the
     rows are not due again until 23:41, not "as soon as the hold ends");
@@ -430,7 +430,7 @@ def test_ah2_collection_resumes_at_the_rows_own_next_slot_not_the_holds_end(
 def test_ah3_a_401_for_the_first_station_holds_the_others_in_the_same_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """P2 14.7 AH3: a 401 at 23:00 for the first of three stations in one
+    """AH3: a 401 at 23:00 for the first of three stations in one
     run: the hold is written to one hour after the refusal (local 00:00),
     the other stations' rows are held in the SAME run with no request,
     every row's next try is 23:06, and the first station's log row is
@@ -516,7 +516,7 @@ def test_ah3_a_401_for_the_first_station_holds_the_others_in_the_same_run(
 
 
 # ---------------------------------------------------------------------------
-# FT1 (health-release plan §6, Part F): the refusal's body carries the
+# FT1: the refusal's body carries the
 # provider's own reason -- stored on the hold AND appended to the day's
 # last_error, shown both on the Ops access-hold line (right after the kind
 # label) and in the Wind History table's Last error column.
@@ -526,14 +526,14 @@ def test_ah3_a_401_for_the_first_station_holds_the_others_in_the_same_run(
 def test_ft1_five_minute_refusal_stores_and_shows_providers_reason(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Part F, FT1 (plan §6): a 401 whose body carries weather.com's own
+    """FT1: a 401 whose body carries weather.com's own
     reason -- stored on the five_minute hold and appended to the day's
     ``last_error``, and shown both on the Ops access-hold line (right
     after the kind label) and in the Wind History table's Last error
     column.
 
     Catches: only `_http_status_error` changed so the reason never
-    reaches the five_minute hold or the station error list (TODO item 4)
+    reaches the five_minute hold or the station error list
     -- at the "hold row's reason" and "last_error ends with" assertions
     below: correct = the message text, mutant = None/absent.
     """
@@ -609,7 +609,7 @@ def test_ft1_five_minute_refusal_stores_and_shows_providers_reason(
 def test_ah4_a_2xx_clears_only_five_minute_not_current_obs_or_hourly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """P2 14.7 AH4: a 2xx on today's row while ``current_obs`` and
+    """AH4: a 2xx on today's row while ``current_obs`` and
     ``hourly`` are held: only ``five_minute`` is cleared (M45: a 2xx on
     today's row clearing every kind)."""
     db = _init_tmp_db(tmp_path)
@@ -685,8 +685,8 @@ def test_fm4_each_kinds_hold_leaves_the_other_two_lanes_running(
     constant (e.g. the wind lane checking ``"hourly"`` instead of
     ``"five_minute"``, or the current-obs lane never checking its own
     kind) shows up here as a held lane still making its call, or a
-    not-held lane unexpectedly making 0 calls -- a combination none of
-    CO1/FM1 (each exercising only its own lane) can catch.
+    not-held lane unexpectedly making 0 calls -- a combination a test
+    exercising only its own lane cannot catch.
     """
     now = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
     _freeze(monkeypatch, now)
@@ -694,7 +694,7 @@ def test_fm4_each_kinds_hold_leaves_the_other_two_lanes_running(
     conn = db._conn  # noqa: SLF001
 
     site_id = _seed_site(conn)
-    # The lane needs a P1 record holding `now` (the daily close is always
+    # The lane needs a day record holding `now` (the daily close is always
     # on): dated `now`'s own local date, not _AH_DAY/_AH_TZ.
     start_site_days(conn, site_id, now.date(), now_utc=now)
     station_id = _seed_station(conn, site_id, pws_id="KTEST001")
@@ -724,8 +724,8 @@ def test_fm4_each_kinds_hold_leaves_the_other_two_lanes_running(
     # due at once) is due regardless of which kind is held.
     assert wind_lane_due(conn, site_id, ZoneInfo("UTC"), now=now) is True, (
         "mutant -> at this assertion"
-        f" (held={held}): correct = True (all_1day is always open under"
-        " P2 4.4; a held kind no longer suppresses due-ness), mutant"
+        f" (held={held}): correct = True (all_1day is always open;"
+        " a held kind no longer suppresses due-ness), mutant"
         " (wind_lane_due still gates all_1day on the five_minute hold,"
         " 0.16.13's behaviour) = False when held='five_minute'"
     )

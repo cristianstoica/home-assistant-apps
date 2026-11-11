@@ -1,5 +1,5 @@
-"""Persistence's shared pure function (storage-release plan 2026-11-02,
-3.5). ``wxverify.scoring.history`` holds the core of ``_persistence_pairs``
+"""Persistence's shared pure function. ``wxverify.scoring.history`` holds
+the core of ``_persistence_pairs``
 (``wxverify/scoring/close_scores.py:676-712``) as a pure function, so
 stage 5 (``score_day``) and the later readers (the win rate, the history
 chart) share one definition. Behaviour is unchanged.
@@ -8,7 +8,7 @@ Test HP3 additionally imports it to cross-check ``score_day``'s stored rows
 against the shared function's own output.
 
 The API exposed by ``wxverify.scoring.history``, chosen from what
-``_persistence_pairs`` needs (``close_scores.py:676-712``) and from 3.5's
+``_persistence_pairs`` needs (``close_scores.py:676-712``) and from the
 "shortest/longest lead" readers:
 
     @dataclass(frozen=True, slots=True)
@@ -53,13 +53,13 @@ The API exposed by ``wxverify.scoring.history``, chosen from what
         cells: Iterable[PersistenceCell],
     ) -> dict[tuple[datetime, int], PersistenceCell]:
         '''Per (target instant, day ahead), the cell with the smallest
-        ``lead_hours`` -- the win rate's pick (3.5). Pure.'''
+        ``lead_hours`` -- the win rate's pick. Pure.'''
 
     def longest_lead_cells(
         cells: Iterable[PersistenceCell],
     ) -> dict[tuple[datetime, int], PersistenceCell]:
         '''Per (target instant, day ahead), the cell with the largest
-        ``lead_hours`` -- the history chart's pick (3.5). Pure.'''
+        ``lead_hours`` -- the history chart's pick. Pure.'''
 
 Real SQLite throughout for HP3 (``tests.helpers.asof_conn``, real
 migrations); nothing in the code under test is mocked. Synthetic data only:
@@ -340,7 +340,7 @@ def test_hp3_stage5_persistence_day_score_matches_hand_computed_definition() -> 
     day, value 15.0, which is D's only scored hour). The persistence
     feed's only possible pair is lead 4, day ahead 0 (HP1's own h1 case) --
     the resulting ``day_scores`` row is compared against values computed
-    here by hand from the definition (3.5), not against anything the code
+    here by hand from the definition, not against anything the code
     under test produced.
 
     Also cross-checks the shared pure function directly against the same
@@ -402,7 +402,7 @@ def test_hp3_stage5_persistence_day_score_matches_hand_computed_definition() -> 
         "fixture bug: expected a persistence/temperature/day_ahead=0 day_scores row"
     )
 
-    # Hand computed from 3.5's definition: the only pair is lead 4,
+    # Hand computed from the definition: the only pair is lead 4,
     # forecast=12.0 (the 22:00Z-the-day-before value), observed=15.0 (D's
     # 02:00Z value); persistence's own ref_sq_error equals its own
     # sq_error, so the skill sums equal the error sums here.
@@ -447,10 +447,9 @@ def test_hp3_stage5_persistence_day_score_matches_hand_computed_definition() -> 
 
 
 # ---------------------------------------------------------------------------
-# W11: persistence_picks_at (storage-release plan 2026-11-02-storage-release,
-# W11) -- held equal, cell for cell, to longest_lead_cells/shortest_lead_cells
-# applied to persistence_cells filtered to one day ahead (the rule, plan
-# line 351).
+# W11: persistence_picks_at -- held equal, cell for cell, to
+# longest_lead_cells/shortest_lead_cells applied to persistence_cells
+# filtered to one day ahead.
 # ---------------------------------------------------------------------------
 
 
@@ -458,7 +457,7 @@ def _w11_reference_picks(rows, target_valid_at, zone, day_ahead, *, longest):
     """The rule's own definition of the correct pick: ``persistence_cells``
     filtered to ``day_ahead``, then ``longest_lead_cells`` /
     ``shortest_lead_cells``, sorted by instant -- what
-    ``persistence_picks_at`` must equal for every input (plan line 351)."""
+    ``persistence_picks_at`` must equal for every input."""
     from wxverify.scoring.history import (
         longest_lead_cells,
         persistence_cells,
@@ -848,7 +847,7 @@ def test_w11_day_ahead_minus_one_and_eight_are_always_empty_paired_positive() ->
 
 # ---------------------------------------------------------------------------
 # W11 seeded sweep: ~100 made-up row sets around each 2026 DST change,
-# checked at every day ahead -1 to 8 with both picks (plan line 354).
+# checked at every day ahead -1 to 8 with both picks.
 # ---------------------------------------------------------------------------
 
 _SWEEP_ZONE = ZoneInfo("America/New_York")
@@ -868,8 +867,7 @@ def _sweep_case(
 ) -> tuple[list[tuple[str, float]], list[str]]:
     """One made-up row set anchored near a DST ``transition``: rows from at
     least 8 days before the first target, with gaps, ``:30`` rows,
-    duplicate ``Z``/``+00:00`` instants and text that does not parse (plan
-    line 354)."""
+    duplicate ``Z``/``+00:00`` instants and text that does not parse."""
     first_target = (transition + timedelta(hours=rng.randint(-24, 24))).replace(
         minute=0, second=0, microsecond=0
     )
@@ -912,8 +910,8 @@ def _sweep_case(
 def test_w11_sweep_matches_reference_across_dst_changes() -> None:
     """About 100 made-up row sets, half anchored near each 2026 DST change,
     compared against the rule's reference pick at every day ahead -1 to 8,
-    both the shortest and longest pick, cell for cell, in instant order
-    (plan line 354). Also checks that the sweep's own generator exercises
+    both the shortest and longest pick, cell for cell, in instant order.
+    Also checks that the sweep's own generator exercises
     a non-empty pick at every day ahead 0-7, for both picks -- otherwise
     the day-ahead comparisons above could pass vacuously on an all-empty
     sweep.

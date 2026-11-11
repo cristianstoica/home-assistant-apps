@@ -1,5 +1,4 @@
-"""Tests for the decoded-payload diagnostic boundary (§9 O1-O13 of the
-terminal-error-and-json-decode plan).
+"""Tests for the decoded-payload diagnostic boundary (O1-O13).
 
 O1-O13 exercise ``decode_observations_payload`` through the real adapter
 functions (``fetch_hourly_history``, ``validate_station``) under an

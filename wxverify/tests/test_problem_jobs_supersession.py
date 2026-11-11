@@ -1,4 +1,4 @@
-"""Failed-arm supersession oracles for problem_jobs (plan §6.3, §9).
+"""Failed-arm supersession oracles for problem_jobs.
 
 A later genuine success of a scope -- a completed row carrying the
 success marker ``result='ok'`` -- resolves an aged terminal failure of
@@ -7,7 +7,7 @@ types only. Every fixture here is synthetic: one site named ``'S'`` at
 the test suite's placeholder coordinates, job keys such as ``fetch:1``,
 ``obs`` and ``gapscan``, and a fixed clock of 2026-07-09T12:00:00Z.
 
-This module carries the §6.3 harness and O1-O10, O12, O13 and O17.
+This module carries the harness and O1-O10, O12, O13 and O17.
 """
 
 from __future__ import annotations

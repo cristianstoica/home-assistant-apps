@@ -1,4 +1,4 @@
-"""Tests for the 0.16.3 write-lock timing instrumentation (D1.1, connection.py).
+"""Tests for the 0.16.3 write-lock timing instrumentation (``connection.py``).
 
 Covers the `slow db write` INFO line `Database.write` emits via
 `_log_slow_write`: `hold` is measured across the whole locked section --
@@ -77,7 +77,7 @@ def test_slow_write_logs_hold_at_or_above_threshold(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A `write` whose `fn` sleeps 1.1s in the thread logs `slow db write`
-    with `hold=` >= 1000 (plan 14.3 bullet 1)."""
+    with `hold=` >= 1000."""
 
     async def _drive() -> None:
         db = Database(str(tmp_path / "db.sqlite"))
@@ -101,7 +101,7 @@ def test_waiter_behind_a_slow_write_logs_lock_wait_at_or_above_threshold(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A waiter queued behind a held write lock logs `lock_wait=` >= 1000
-    once it finally acquires (plan 14.3 bullet 2).
+    once it finally acquires.
 
     The holder blocks on a `threading.Event` rather than a fixed sleep, so
     the test can PROVE the waiter has genuinely queued behind the held lock
@@ -215,7 +215,7 @@ def test_log_slow_write_logs_at_exactly_the_threshold_on_either_side(
 def test_quick_write_under_threshold_logs_nothing(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A 10ms write logs nothing (plan 14.3 bullet 3) -- the paired positive
+    """A 10ms write logs nothing -- the paired positive
     to the two slow-write cases above: this is the same helper and the same
     threshold gate, just under it, so the gate is genuinely exercised on
     both sides rather than only ever seen firing."""
@@ -235,7 +235,7 @@ def test_quick_write_under_threshold_logs_nothing(
 def test_raising_write_still_logs_hold(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """An `fn` that raises still logs `hold` (plan 14.3 bullet 4): the stop
+    """An `fn` that raises still logs `hold`: the stop
     time is taken in a `try/finally` inside the lock, so the exception path
     is measured too."""
 

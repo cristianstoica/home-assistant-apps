@@ -1,10 +1,8 @@
-"""The rain model ranking per day ahead (rain release, Part C, C2).
+"""The rain model ranking per day ahead.
 
-``plans/2026-11-01-rain-release.md`` C2, built from §9.1 of
-``plans/2026-09-29-forecast-method.md``. Pure: no SQLite, no clock. The
-publication (``scoring/publication.py``) reads the window's rain truth and
-the models' daily rain totals, and calls :func:`rank_rain` once per day
-ahead.
+Pure: no SQLite, no clock. The publication (``scoring/publication.py``) reads
+the window's rain truth and the models' daily rain totals, and calls
+:func:`rank_rain` once per day ahead.
 
 - **Counted day:** a day whose truth is rain or dry, for which the model has
   a daily total at the day ahead. Unknown days are never counted, and never
@@ -41,7 +39,7 @@ RAIN_DAYS_AHEAD: Final = tuple(range(8))
 #: The minimum's counted days, and how many models must reach it.
 MIN_COUNTED_DAYS: Final = 20
 MIN_MODELS: Final = 2
-#: A miss weighs twice a false alarm (the owner's w_r, D3).
+#: A miss weighs twice a false alarm.
 MISS_WEIGHT: Final = 2
 #: The incumbent is replaced when it trails by this many points or more.
 SWITCH_MARGIN: Final = 3
@@ -114,7 +112,7 @@ def rank_rain(
     models: Sequence[ModelSeries],
     incumbent_feed_id: int | None,
 ) -> RainRanking:
-    """Rank the models at ``day_ahead`` and select one (C2).
+    """Rank the models at ``day_ahead`` and select one.
 
     ``truth`` maps each known day of the window to whether it was rain
     nearby; ``models`` give each model's forecasts on its counted days. A

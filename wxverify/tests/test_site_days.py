@@ -1,9 +1,8 @@
-"""Day-state tests for ``wxverify.db.site_days`` (daily-close plan §13.2).
+"""Day-state tests for ``wxverify.db.site_days``.
 
 Every test here is written before ``wxverify/db/site_days.py`` exists and
 fails first for that reason: the module-level import below raises
-``ModuleNotFoundError``. Section 14 of the plan names the mutant each test
-ID must kill; that mapping is not repeated in the docstrings here.
+``ModuleNotFoundError``.
 
 Real SQLite only (``tests.helpers.asof_conn``, real ``run_migrations``, real
 writers). Station ids are synthetic (``ISTATION01``, ``ISTATION02``, ...),
@@ -68,10 +67,10 @@ _ALL_KINDS: tuple[WriteKind, ...] = (
     WriteKind.RAW_PRUNE,
 )
 
-# Table 5.2, state-keyed. RAW_PRUNE's "yes" case (a done day whose next day
+# ``_STATE_KINDS``, state-keyed. RAW_PRUNE's "yes" case (a done day whose next day
 # is done too, 7 days after the later done_at) is pinned separately by DS22;
 # here every fixture state refuses it, which is also correct for every state
-# this table exercises (open/closing/retry_due never satisfy 5.4; the
+# this table exercises (open/closing/retry_due never satisfy ``_raw_prune_due``; the
 # "closed" fixture's next day, D-2, is missed -- done -- but RAW_PRUNE is
 # still refused because 7 days have not passed since the later done_at; the
 # "missed" fixture's next day, D-1, is still open).
@@ -1283,7 +1282,7 @@ def test_ds16_enter_zone_change_refusals_and_acceptance() -> None:
         "SELECT timezone FROM sites WHERE id = ?", (site_id,)
     ).fetchone()[0]
 
-    # Plan row :928 doesn't list UTC -> Etc/GMT+12 as a refusal: current is
+    # UTC -> Etc/GMT+12 is not a refusal: current is
     # D (day_end_utc = D+1 00:00Z); C = D+1; local_day_slots(D+1, GMT+12)[1]
     # (GMT+12 = UTC-12) is D+2 12:00Z, so the span is 36h -- accepted, not
     # refused -- so there is no refusal case to assert here.
@@ -1446,7 +1445,7 @@ def test_ds17_changeover_day_states() -> None:
     )  # c = D+1, changeover
 
     # D-1 and D (left open by day_close_site/enter_zone_change) must be
-    # done before c (D+1) can be marked missed -- 4.5/table 4.7's
+    # done before c (D+1) can be marked missed -- the
     # date-order rule -- so the refusals below test the changeover rule
     # itself, not an unrelated "earlier day not done".
     d_minus_1 = D - timedelta(days=1)

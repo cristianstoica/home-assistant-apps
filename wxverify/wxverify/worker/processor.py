@@ -112,7 +112,7 @@ async def run_worker(db: Database) -> None:
     Every cancellation path drains both lanes, then runs exactly one
     shutdown reclaim, then raises CancelledError; once a stop has been
     requested, the drain and the reclaim each wait only within the stop
-    budget (core.stop, storage-release plan 6.4).
+    budget (core.stop).
     """
     main = asyncio.create_task(_run_main_lane(db), name="worker-main-lane")
     poller = asyncio.create_task(
@@ -172,7 +172,7 @@ async def _shutdown_reclaim(db: Database) -> None:
     this returns. A failed write is logged. Any other outcome propagates,
     including a cancel of the task from outside (the event loop's final
     sweep). Once a stop has been requested the wait ends with the stop
-    budget (plan 6.4); a reclaim not done by then is left behind, and the
+    budget; a reclaim not done by then is left behind, and the
     next start's reclaim_all_stale does its work.
     """
     # Exempt: a shutdown-time bulk sweep over whatever jobs the
@@ -259,7 +259,7 @@ def _raise_lane_outcome(
 async def _run_main_lane(db: Database) -> None:
     """Tick the scheduler and run main-lane jobs one at a time, forever.
 
-    Once a stop has begun (``core.stop.STOP``, storage-release plan 6.3)
+    Once a stop has begun (``core.stop.STOP``)
     the lane claims nothing: it goes back to the poll sleep, where the
     cancel lands. It never returns -- a lane that ends on its own is a
     crash to ``api.app._stop_on_worker_done``.
@@ -361,7 +361,7 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
             outcome = "dropped"
     except stop.StopRequested:
         # A stop began before this job's work started (the close chain
-        # checks before each stage, plan 6.3). Nothing is recorded: the
+        # checks before each stage). Nothing is recorded: the
         # row stays running, and the shutdown reclaim or the next start's
         # reclaim_all_stale puts it back to pending, to run once.
         outcome = "stopped"
@@ -469,11 +469,10 @@ def _fail_job(conn: sqlite3.Connection, job: Job, error: str) -> FailDisposition
     transaction, but before ``fail()``: its stage-log row copies the job
     row's claim stamp, ``updated_at``, which ``fail()`` overwrites. Both
     kinds are enqueued with ``max_retries`` 0, so every failure of theirs is
-    terminal (daily-close P3 9.1, 9.4).
+    terminal.
 
     A ``fetch_feed`` job writes its try's ``failed`` download row there too,
-    before ``fail()`` overwrites the claim stamp it takes as the try's start
-    (daily-close P4 4.2).
+    before ``fail()`` overwrites the claim stamp it takes as the try's start.
     """
     if job.type == "day_close":
         fail_day_close_job(conn, job, error, now_utc=utc_now())
@@ -815,7 +814,7 @@ async def _fetch_feed(
     *,
     payload: dict[str, object],
 ) -> None:
-    """Run one ``fetch_feed`` try and record its download row (P4 plan 4.2).
+    """Run one ``fetch_feed`` try and record its download row.
 
     The slot comes from ``payload``; a payload with no ``slot`` runs
     ``unscheduled``. A persisted reply's row is written with its samples
@@ -825,7 +824,7 @@ async def _fetch_feed(
     deferred or cancelled, and ``failed`` by ``_fail_job`` for a raised
     error.
 
-    A round try (P4 plan 4.4) is cancelled before any call, with no row, at
+    A round try is cancelled before any call, with no row, at
     or after its round's bound or once the feed has a ``stored`` round row
     for the date. Its ``budget`` or ``backoff`` row is followed by
     ``JobCancelled``, not ``JobDeferred``: a deferred try would run again
@@ -898,12 +897,12 @@ async def _fetch_feed(
         raise JobCancelled()
 
 
-# A daytime slot in a fetch_feed payload: local "HH:MM" (P4 plan 5.1).
+# A daytime slot in a fetch_feed payload: local "HH:MM".
 _DAYTIME_SLOT_RE: Final = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 
 
 def _download_slot(payload: dict[str, object], *, started_at: datetime) -> DownloadSlot:
-    """The try's slot from a ``fetch_feed`` payload (P4 plan 4.2, 4.4, 5.1).
+    """The try's slot from a ``fetch_feed`` payload.
 
     No ``slot`` key gives ``unscheduled``: the enable-time and command-line
     fetches, and any job queued before the upgrade. ``"round"`` needs a
@@ -956,7 +955,7 @@ async def _record_fetch_try(
     slot: DownloadSlot,
     outcome: DownloadOutcome,
 ) -> None:
-    """Write the download row of a try that ended without a reply (4.2)."""
+    """Write the download row of a try that ended without a reply."""
     await writer.write(
         lambda conn: record_download_try(
             conn,
@@ -987,7 +986,7 @@ def _mark_feed_unavailable_and_record(
 
 def _record_failed_fetch(conn: sqlite3.Connection, job: Job, error: str) -> None:
     """``_fail_job``'s ``fetch_feed`` branch: the try's ``failed`` download
-    row, with ``error`` (already sanitized) as its reason (P4 plan 4.2).
+    row, with ``error`` (already sanitized) as its reason.
 
     The try started when the job was claimed: the row's ``updated_at`` holds
     the claim stamp until ``fail()`` overwrites it, so this runs first.

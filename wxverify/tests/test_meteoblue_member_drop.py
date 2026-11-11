@@ -1,4 +1,4 @@
-"""Meteoblue member drop oracles — plan Step 6 (§7 option B).
+"""Meteoblue member drop oracles.
 
 Covers ``wxverify.config.DROPPED_METEOBLUE_MEMBERS``/``DROPPED_METEOBLUE_REASON``
 and ``wxverify.db.migrations.pause_dropped_meteoblue_members``: the one-shot,

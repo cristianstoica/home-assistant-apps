@@ -1,17 +1,9 @@
-"""Tests for the scored round's schedule and daytime downloads (P4 plan
-§18.2, §18.3) --
-``plans/2026-10-22-daily-close-pairs-and-publication.md``.
+"""Tests for the scored round's schedule and daytime downloads.
 
 RS1-RS13 and DT1-DT4, one test per row (some rows have two or three
-parts, kept in one test). Every assertion that kills a mutant named in
-the row's last column (plan §19.2) carries a message of the form
+parts, kept in one test). Every assertion that kills a numbered mutant
+carries a message of the form
 ``"M<n> -> at this assertion: correct = <X>, mutant = <Y>"``.
-
-``wxverify.worker.round`` (``round_state``, ``schedule_day``,
-``enqueue_due_round_tries``, ``enqueue_due_daytime_downloads``) and the
-``scoring_round_local_time`` setter do not exist before piece 3 (plan
-§20 Step 4), so this whole file fails at collection with
-``ModuleNotFoundError`` until then -- the plan's Step 3 accepts that.
 """
 
 from __future__ import annotations
@@ -51,12 +43,12 @@ from wxverify.db.runtime_state import set_runtime_state
 from wxverify.db.switch import ensure_site_generation
 from wxverify.monitor import FAILED_JOB_AGE_HOURS, FAILED_SCOPES_SQL
 from wxverify.worker.processor import run_claimed_job
-from wxverify.worker.round import (  # P4 piece 3 (plan §4.4, §4.5, §5.1, §16.1)
+from wxverify.worker.round import (
     round_state,
     schedule_day,
 )
 
-R = STANDARD_NIGHT_R  # 2024-06-11 (plan §15.1's standard night: R = D + 1)
+R = STANDARD_NIGHT_R  # 2024-06-11 (the standard night: R = D + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -68,13 +60,12 @@ def _exclude_seeded_feeds_from_the_round(conn: sqlite3.Connection) -> None:
     """Take every seeded real feed besides X, Y, Z, G and the meteoblue
     package out of the round/daytime schedule. The open-meteo feeds
     ``config.FEED_SEEDS`` installs at boot are ``default_subscribed=1``
-    (plan §18.1's test feeds are X, Y, Z, G and P only), and
+    (the test feeds are X, Y, Z, G and P only), and
     ``_schedule_feeds`` (``worker/round.py``) treats a real feed as
     subscribed via ``COALESCE(sfs.enabled, f.default_subscribed) = 1``
     -- with no ``site_feed_state`` row, every seeded open-meteo feed
     would join every round and every daytime tick alongside the test's
-    own feeds. A plain UPDATE on the global ``feeds`` row (plan §18.1's
-    "seed helpers by plain INSERT [or UPDATE]"), not a per-site
+    own feeds. A plain UPDATE on the global ``feeds`` row, not a per-site
     ``site_feed_state`` row, since ``default_subscribed`` is the column
     ``_schedule_feeds`` falls back to. meteoblue is already
     ``default_subscribed=0`` (``subscribe_meteoblue_package`` opts it in
@@ -92,7 +83,7 @@ def _night(
     subscribe: tuple[str, ...] = ("X", "Y", "Z"),
     clock_start: datetime | None = None,
 ):
-    """P3's standard night (``standard_night``) plus P4's round-schedule
+    """The standard night (``standard_night``) plus the round-schedule
     feeds (``seed_round_schedule_feeds``), the provider stand-in
     installed, and a :class:`MovingClock` patched over every close-chain
     module. Also disables the daily close's other job-kind enqueuers
@@ -141,7 +132,7 @@ def _job_for_key(conn: sqlite3.Connection, job_key: str) -> list[sqlite3.Row]:
 
 
 def _downloads(conn: sqlite3.Connection, feed_id: int) -> list[sqlite3.Row]:
-    """Every ``forecast_downloads`` row of ``feed_id``, in id order (4.2)."""
+    """Every ``forecast_downloads`` row of ``feed_id``, in id order."""
     return list(
         conn.execute(
             "SELECT * FROM forecast_downloads WHERE feed_id=? ORDER BY id",
@@ -159,8 +150,8 @@ def _label(model: str, hour: int, *, day: date = R) -> str:
 
 
 def _reply(feed_id_name: str, model: str, hour: int, *, day: date = R) -> ProviderReply:
-    """One usable sample at lead 6h for ``model`` (plan §18.1's "a reply
-    with given run labels and values")."""
+    """One usable sample at lead 6h for ``model``: a reply with given run
+    labels and values."""
     issued_at = _label(model, hour, day=day)
     valid_at = isoformat_utc(parse_utc(issued_at.split("[")[0]) + timedelta(hours=6))
     return ProviderReply(
@@ -185,9 +176,9 @@ def _insert_pending_job(
     payload: dict[str, object],
     time_of_day: str,
 ) -> None:
-    """A ``pending`` job row by plain INSERT (plan §18.1's "seed helpers
-    by plain INSERT"), stamped on D's date at ``time_of_day`` so claim
-    order among several such rows follows their insertion order (RS9)."""
+    """A ``pending`` job row by plain INSERT, stamped on D's date at
+    ``time_of_day`` so claim order among several such rows follows their
+    insertion order (RS9)."""
     stamp = f"{D.isoformat()}T{time_of_day}.000Z"
     conn.execute(
         "INSERT INTO jobs"
@@ -198,7 +189,7 @@ def _insert_pending_job(
 
 
 # ---------------------------------------------------------------------------
-# §18.2 The round's schedule
+# The round's schedule
 # ---------------------------------------------------------------------------
 
 
@@ -306,7 +297,7 @@ def test_rs3_no_fifth_try_and_bound_cancels_the_last_one(
         asyncio.run(run_claimed_job(db, job, lane="main"))
         conn.commit()
     # RS3 (i): after try 4 has ended (whether it stored or failed), the
-    # round is settled (4.5) -- try 4 is this feed's last try regardless
+    # round is settled -- try 4 is this feed's last try regardless
     # of its outcome.
     state_after_try4 = round_state(conn, site_id=site_id, round_date=R)
     assert state_after_try4.settled is True, (
@@ -486,7 +477,7 @@ def test_rs6_round_time_setting_range(
 def test_rs7_round_start_from_the_records_zone_not_sites_timezone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RS7: zone Etc/GMT-14, close on, R's record from P1's helper; after
+    """RS7: zone Etc/GMT-14, close on, R's record from ``day_close_site``; after
     the records exist, UPDATE sites SET timezone='UTC'."""
     from tests.helpers import day_close_site
     from wxverify import config
@@ -526,7 +517,7 @@ def test_rs7_round_start_from_the_records_zone_not_sites_timezone(
 def test_rs8_meteoblue_slots_dropped_latest_first_and_budget_stops_a_try(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RS8 (amended) (a): round tries 1 to 3 for P (meteoblue-style) all
+    """RS8 (a): round tries 1 to 3 for P (meteoblue-style) all
     end without a stored row, so a fourth try is still due. Ticking for
     real through the day's slot times shows P's daytime slots that day
     are 09:10 only (12:10 and 21:10 dropped, latest first).
@@ -839,7 +830,7 @@ def test_rs10_backoff_then_success_while_the_package_is_capped(
     # X's try 2 is due at the start plus 5 minutes (00:15Z), still inside
     # the round's 00:40Z bound -- run it there, not after jumping straight
     # to 02:00Z, which would land past the bound and get it cancelled
-    # instead of stored (cause 5).
+    # instead of stored.
     asyncio.run(tick(db, clock, at=datetime(R.year, R.month, R.day, 0, 15, tzinfo=UTC)))
     job = claim_next_job(conn)
     assert job is not None, "X's try 2 was not enqueued at 00:15Z"
@@ -942,7 +933,7 @@ def test_rs11_a_reclaimed_round_try_is_cancelled(
     clock2.set(datetime(R.year, R.month, R.day, 0, 20, tzinfo=UTC))
     reclaim_all_stale(conn2)
     conn2.commit()
-    # Re-claim before re-running, as (i) does (cause 6): job2's claim is
+    # Re-claim before re-running, as (i) does: job2's claim is
     # stale once reclaim_all_stale re-pends the row.
     reclaimed_job2 = claim_next_job(conn2)
     assert reclaimed_job2 is not None
@@ -980,7 +971,7 @@ def test_rs12_round_without_a_record_uses_the_latest_records_zone(
 
     d_minus_1 = D - timedelta(days=1)
     # 00:00Z on D-1 is D-1 14:00 local in Etc/GMT-14 (UTC+14) -- still
-    # D-1's local date. 12:00Z would be D 02:00 local (cause 7): local
+    # D-1's local date. 12:00Z would be D 02:00 local: local
     # day D-1 runs from D-2 10:00Z to D-1 10:00Z, so anything at or past
     # D-1 10:00Z is already D's local day.
     seed_now = datetime(d_minus_1.year, d_minus_1.month, d_minus_1.day, 0, tzinfo=UTC)
@@ -1109,9 +1100,8 @@ def test_rs13_failed_scopes_resolve_across_round_and_fetch_keys(
             if job is None:
                 break
             # A round try's ConnectError is caught inside run_claimed_job
-            # and recorded as a failed job (4.4's "no_usable, failed and
-            # backoff count as failed tries") -- it does not propagate
-            # (cause 8).
+            # and recorded as a failed job (no_usable, failed and backoff
+            # all count as failed tries) -- it does not propagate.
             asyncio.run(run_claimed_job(db, job, lane="main"))
             conn.commit()
     asyncio.run(tick(db, clock, at=datetime(R.year, R.month, R.day, 6, 10, tzinfo=UTC)))
@@ -1181,7 +1171,7 @@ def test_rs13_failed_scopes_resolve_across_round_and_fetch_keys(
         for line in plan
     )
     assert has_k_search, (
-        "O11 (unchanged) -> at this assertion: correct = True (a 'SEARCH k"
+        "at this assertion: correct = True (a 'SEARCH k"
         f" ...' line too), mutant = {plan!r}"
     )
 
@@ -1190,7 +1180,7 @@ def test_rs14_a_changeover_day_with_no_round_slot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """RS14 (i): close on, zone UTC, only X subscribed; D the site's first
-    record, made by P1's helper during D-1; worker_started_at before D's
+    record, made by ``start_site_days`` during D-1; worker_started_at before D's
     end; at D 12:00Z ``enter_zone_change`` to Etc/GMT-14, so R is a
     changeover day with no round slot (D's local 00:10, lead to R's
     10:00Z bound, falls outside R's own short record)."""
@@ -1278,8 +1268,7 @@ def test_rs14_ii_d_attempt_starts_on_the_r_0000z_tick(
     with no round slot. With ``disable_other_enqueuers``, real ticks at D
     23:59Z and R 00:00Z: neither tick logs an ERROR line for the site,
     and at the R 00:00Z tick D's attempt 1 starts and D moves to
-    ``closing`` (``_close_due_days``, D's own round being R's, 4.4, 4.5;
-    ``worker/close_chain.py:1946-1983``)."""
+    ``closing`` (``_close_due_days``, D's own round being R's)."""
     from wxverify import config
     from wxverify.db.connection import close_db, init_db
     from wxverify.db.site_days import (
@@ -1343,7 +1332,7 @@ def test_rs14_ii_d_attempt_starts_on_the_r_0000z_tick(
     assert errors_at_r_tick == [], (
         "M145/M146 -> at this assertion: correct = no ERROR line at the R"
         " 00:00Z tick, mutant (round_state(R) raises, or answers the"
-        " wrong settled/bound_utc, so D's own round -- R's, 4.5's '_round'"
+        " wrong settled/bound_utc, so D's own round -- R's"
         f" -- fails the site's steps) = {[r.getMessage() for r in errors_at_r_tick]!r}"
     )
 
@@ -1372,7 +1361,7 @@ def test_rs14_ii_d_attempt_starts_on_the_r_0000z_tick(
 
 
 # ---------------------------------------------------------------------------
-# §18.3 Daytime downloads
+# Daytime downloads
 # ---------------------------------------------------------------------------
 
 
@@ -1536,8 +1525,8 @@ def test_dt3_a_feed_with_a_1440_minute_interval_has_the_round_only(
 def test_dt4_an_unreadable_interval_skips_the_feed_not_the_others(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """DT4: a feed whose fetch_interval_minutes is 0, then 'abc' (cause 9:
-    the second pass must not re-tick R 00:10 -- X's round already stored
+    """DT4: a feed whose fetch_interval_minutes is 0, then 'abc' (the
+    second pass must not re-tick R 00:10 -- X's round already stored
     there in the first pass, so no second round try is ever due; it
     needs X's own next slot, 06:10, instead)."""
     db, conn, _site_id, feed_ids, standin, clock = _night(

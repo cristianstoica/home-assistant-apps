@@ -117,10 +117,10 @@ def _make_confident(
     """Give `feed_id` a real, positive skill ranking at (variable,
     day_ahead) against a `virtual/_persistence` baseline of forecast=8.0
     (`feed_id` forecasts 10.5): both land in a `publication_rankings` row
-    via :func:`_seed_score_cache`, confident (n=3 matches this file's
+    via :func:`_seed_published_ranking`, confident (n=3 matches this file's
     seeded ``min_n``)."""
     persistence_id = _feed_id(conn, "virtual", "_persistence")
-    _seed_score_cache(
+    _seed_published_ranking(
         conn,
         variable=variable,
         day_ahead=day_ahead,
@@ -229,7 +229,7 @@ def _seed_far_horizon_collapse(conn: sqlite3.Connection) -> None:
         value=25.0,  # outside the covered range: a pre-fix collapse is obvious
     )
     # degenerate OUT-skills covered (forecast nearer observed 10.0).
-    _seed_score_cache(
+    _seed_published_ranking(
         conn,
         variable="temperature",
         day_ahead=7,
@@ -245,11 +245,11 @@ def _ensure_test_publication(conn: sqlite3.Connection, *, min_n: int) -> int:
     """This connection's one site-1 publication, created on first use.
 
     ``leaderboard_with_status``'s ``rolling`` window now always reads the
-    active publication (9.2), never a live recompute, so every ranking
+    active publication, never a live recompute, so every ranking
     this file seeds must land in ONE publication -- its ``min_n`` is baked
     in at creation, matching the runtime ``min_n`` setting at that point,
     so the read-time confidence check agrees with what
-    :func:`_seed_score_cache` computed.
+    :func:`_seed_published_ranking` computed.
     """
     row = conn.execute(
         "SELECT id FROM publications WHERE site_id = 1 ORDER BY id DESC LIMIT 1"
@@ -266,7 +266,7 @@ def _ensure_test_publication(conn: sqlite3.Connection, *, min_n: int) -> int:
     )
 
 
-def _seed_score_cache(
+def _seed_published_ranking(
     conn: sqlite3.Connection,
     *,
     variable: str,
@@ -276,7 +276,7 @@ def _seed_score_cache(
     """Seed one published-ranking row per feed in ``forecasts`` (site 1,
     ``variable``, ``day_ahead``), each hand-derived from an explicit
     ``MetricSums``: `leaderboard_with_status`'s ``rolling`` window always
-    reads the active publication (9.2), never a live recompute.
+    reads the active publication, never a live recompute.
 
     Every key of ``forecasts`` stands for 3 identical far-future pairs
     against a fixed observed=10.0 baseline (``n=3``, matching this file's
@@ -434,7 +434,7 @@ def test_stale_badge_orthogonal_to_normal_state() -> None:
 # ---------------------------------------------------------------------------
 # Minimum-coverage guard: a cell whose selected feeds don't reach
 # MIN_COVERAGE_HOURS still carries the "partial" badge. For temperature
-# (Item F) and precipitation (Item G), under-coverage means the feed is not
+# and precipitation, under-coverage means the feed is not
 # extrema-eligible (it does not cover the whole local day exactly), so the
 # daily high/low, and the daily total/wet-hours, are suppressed rather than
 # aggregated from a partial range.
@@ -588,7 +588,7 @@ def test_tile_precedence_low_confidence_beats_normal_not_available_excluded() ->
 # ---------------------------------------------------------------------------
 # Cache-status display: a per-feed "rebuilding" ranking status can suppress
 # the low_confidence label, but only over the feeds each surface actually
-# renders. See wxverify/docs/plans/2026-09-08-cache-status-display.md.
+# renders.
 # ---------------------------------------------------------------------------
 
 
@@ -601,10 +601,10 @@ def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
     tile 1: wind is `normal`, precip's extrema state is `rebuilding` and
     nothing else is degraded -- the rollup must read `rebuilding`.
 
-    This is purely about D4's precedence, not D2's per-surface width --
+    This is purely about precedence, not the per-surface width --
     that is O8's job.
 
-    Rain release, C4: the rain cell's `rebuilding` is now a provisional
+    The rain cell's `rebuilding` is now a provisional
     published rain ranking, read with the daily close on, and shows in its
     extrema state (the cell's hourly state is `normal`), so the rollup is
     the tile's `confidence_state`. The rain cell's state does not come from
@@ -679,7 +679,7 @@ def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
     assert today.precip.meta.extrema_state == "rebuilding"
     assert today.wind.meta.state == "not_available"
     # low_confidence (a caveat that does not resolve on its own) outranks
-    # rebuilding (a caveat that resolves itself) -- D4.
+    # rebuilding (a caveat that resolves itself).
     assert today.confidence_state == "low_confidence"
 
     tomorrow = view.tiles[1]
@@ -772,7 +772,7 @@ def test_mixed_representative_leads_stay_low_confidence_unconfident_winner() -> 
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
     valid_ats = _hours("2026-07-20", 4, 20)
 
-    # Raise min_n above the n=3 _seed_score_cache seeds, so feed A's
+    # Raise min_n above the n=3 _seed_published_ranking seeds, so feed A's
     # cached row is scored (n=3 > 0) but not confident (n < min_n).
     set_setting(conn, "min_n", "4")
 
@@ -785,7 +785,7 @@ def test_mixed_representative_leads_stay_low_confidence_unconfident_winner() -> 
     )
     # No persistence forecast given -> no skill, but a ranking row still
     # exists (n=3, not confident since n < the raised min_n=4).
-    _seed_score_cache(
+    _seed_published_ranking(
         conn, variable="temperature", day_ahead=1, forecasts={feed_a: 10.5}
     )
 
@@ -850,7 +850,7 @@ def test_build_forecast_empty_when_no_samples_at_all() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Rain icon and wet hours (rain release, C4): the icon follows the ranking's
+# Rain icon and wet hours: the icon follows the ranking's
 # 0.2 mm trigger on the winner's total, and the hours are the winner's own
 # count, not a blend. RAIN_GLYPH_MIN_WET_HOURS (the old six-wet-hour glyph
 # rule) is deleted. The fixture is a complete 24-hour local day so the
@@ -1014,7 +1014,7 @@ def _seed_wind_hours_outside_axis_fixture() -> tuple[
     """The base fixture of
     ``test_build_hourly_hour_axis_reflects_selected_feed_only`` plus
     ``winner_id`` wind samples at hours outside the temperature-only axis
-    (Part E). With no wind track record no feed has a wind weight
+    With no wind track record no feed has a wind weight
     (``:1015-1035``), so the wind selection is empty and the axis is the
     two temperature hours only.
     """
@@ -1063,7 +1063,7 @@ def test_e1_forecast_page_wind_grid_leaves_off_axis_hours_to_the_model_row_only(
     its own hour.
 
     Catches: a later page change that builds a per-feed series on the
-    axis (the card 7 plan's "Rain-only feed" catch, now for wind at an
+    axis (the rain-only feed's catch, now for wind at an
     off-axis hour; ``test_forecast_page.py:412`` covers only an on-axis
     hour).
     """
@@ -1365,7 +1365,7 @@ def test_paused_feed_does_not_narrow_the_pool(pause_kind: str) -> None:
 
 
 def test_drop_takes_a_member_off_the_served_wind() -> None:
-    """The dropped-member pause (plan Step 6) reaches the served wind blend,
+    """The dropped-member pause reaches the served wind blend,
     its weights, its per-feed listing and its training set -- not just the
     feed's own row.
 
@@ -1376,7 +1376,7 @@ def test_drop_takes_a_member_off_the_served_wind() -> None:
 
     Catches: a pause that misses the member row the fetcher creates (wrong
     ``source`` or case -- the member would keep its control-era payload
-    weight); Step 2 missing (the member's samples would stay in
+    weight); the candidate filter missing (the member's samples would stay in
     ``build_hourly``'s candidates and the payload would still include it).
     """
     conn = _make_db()
@@ -1439,7 +1439,7 @@ def test_drop_takes_a_member_off_the_served_wind() -> None:
 
 
 def test_far_horizon_multipoint_feed_rescues_collapsed_tile() -> None:
-    """Headline regression (FAILS pre-fix, PASSES post-fix), updated for Item F.
+    """Headline regression (FAILS pre-fix, PASSES post-fix), updated for extrema.
 
     Pre-fix reasoning: with blend_depth=1 the selection pool == candidates, so
     the confidence ladder ranks the two confident feeds by skill and takes the
@@ -1449,8 +1449,8 @@ def test_far_horizon_multipoint_feed_rescues_collapsed_tile() -> None:
     ecmwf_ifs feed (covered_hours 1 < 12 gates gfs out), so the blend never
     collapses -- pinned below via ``build_hourly``'s per-feed series, since
     ``meta.feeds`` now names the extrema set for temperature, not the blend
-    set (Item F).
-    Item F: neither feed covers the whole 24-hour local day (ecmwf_ifs
+    set.
+    Extrema rule: neither feed covers the whole 24-hour local day (ecmwf_ifs
     supplies 15, gfs_global 1), so neither is extrema-eligible; the daily
     high/low are suppressed rather than aggregated from ecmwf_ifs's partial
     9.1..17.0 range, and the tile's own coverage-guard "partial" badge (a
@@ -1514,7 +1514,7 @@ def test_near_tile_skill_still_decides_end_to_end() -> None:
     )
     # high_id's forecast is nearer persistence's observed baseline than
     # low_id's -> higher skill.
-    _seed_score_cache(
+    _seed_published_ranking(
         conn,
         variable="temperature",
         day_ahead=1,
@@ -1569,9 +1569,9 @@ def test_far_horizon_multipoint_tier_rescues_when_best_below_adequate() -> None:
     pool would fall straight to all candidates and re-collapse -- which is
     exactly what this test guards, pinned via ``build_hourly``'s per-feed
     series since ``meta.feeds`` now names the extrema set for temperature
-    (Item F), not the blend set.
+    and not the blend set.
 
-    Item F: neither feed covers the whole 24-hour local day (partial_id
+    Extrema rule: neither feed covers the whole 24-hour local day (partial_id
     supplies 8, degenerate_id 1), so neither is extrema-eligible and the
     daily high/low are suppressed rather than aggregated from partial_id's
     9.0..16.0 range."""
@@ -1602,7 +1602,7 @@ def test_far_horizon_multipoint_tier_rescues_when_best_below_adequate() -> None:
         value=25.0,
     )
     # degenerate OUT-skills partial (forecast nearer observed 10.0).
-    _seed_score_cache(
+    _seed_published_ranking(
         conn,
         variable="temperature",
         day_ahead=7,
@@ -1642,9 +1642,9 @@ def test_far_horizon_two_single_slot_feeds_collapse_at_default_depth() -> None:
     (1 member < depth 2, no top-up from outside the pool) restricts to the
     covered feed -> the blend never collapses. Pinned via ``build_hourly``'s
     per-feed series since ``meta.feeds`` now names the extrema set for
-    temperature (Item F), not the blend set.
+    temperature, not the blend set.
 
-    Item F: none of the three feeds covers the whole 24-hour local day (the
+    Extrema rule: none of the three feeds covers the whole 24-hour local day (the
     best, ``covered``, supplies 15), so no candidate is extrema-eligible and
     the daily high/low are suppressed rather than aggregated from
     ``covered``'s partial 9.0..16.0 range.
@@ -1687,7 +1687,7 @@ def test_far_horizon_two_single_slot_feeds_collapse_at_default_depth() -> None:
     # Both single-slot feeds out-skill the covered feed (forecast nearer the
     # seeded observed 10.0 => lower MSE => higher skill), so pre-fix the top-2
     # ladder selects BOTH of them and never the covered feed.
-    _seed_score_cache(
+    _seed_published_ranking(
         conn,
         variable="temperature",
         day_ahead=7,

@@ -71,7 +71,7 @@ def _subscribe(
 
 # ---------------------------------------------------------------------------
 # T17 -- effective_due_minutes: the 690-720 lead band, table-driven over all
-# eight plan values (both edges of the band and a point on either side).
+# eight values (both edges of the band and a point on either side).
 # ---------------------------------------------------------------------------
 
 
@@ -130,7 +130,7 @@ def _fetch_feed_jobs(conn: sqlite3.Connection, feed_id: int) -> list[sqlite3.Row
 
 def test_t20_scheduler_null_last_run_at_is_due(tmp_path: Path) -> None:
     """Scheduler-side half of T20's NULL last_run_at case, rewritten to the
-    slot rule (plan §5.1): a feed with no try at all is due once its first
+    slot rule: a feed with no try at all is due once its first
     daytime slot (the round's default local 00:10 plus one 360-minute
     interval, 06:10) has passed, same "never run is due" direction as the
     catchup side pinned by test_valid_interval_and_null_last_run_at_are_due.
@@ -151,8 +151,8 @@ def test_t20_scheduler_hostile_fetch_interval_skips_only_that_feed(
     tmp_path: Path,
 ) -> None:
     """Scheduler-side half of T20's unreadable-interval case, rewritten to
-    the slot rule (plan §5.1, "the same `parse_fetch_interval_minutes`
-    fail-closed rule"): the bad feed is skipped (via `continue`) before any
+    the slot rule (the same `parse_fetch_interval_minutes` fail-closed
+    rule): the bad feed is skipped (via `continue`) before any
     slot-due decision, same direction as the catchup side pinned by
     test_hostile_fetch_interval_minutes_skips_only_that_feed, while a
     healthy sibling feed at its own due slot is unaffected.

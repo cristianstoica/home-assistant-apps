@@ -1,8 +1,7 @@
-"""Part A of the switch-over migration (plan ``2026-10-22-daily-close-switch-
-over.md`` §16, §17.5, MG8): the 0.16.12 boundary step's current,
+"""The switch-over migration's 0.16.12 boundary step (MG8): its current,
 retired-rescore-free behaviour, exercised on every normal boot, not just a
-one-time upgrade. MG7 (the gate that kept ``migrate_v15_switch`` from
-rerunning on a file already at its target version) is retired:
+one-time upgrade. The gate that kept ``migrate_v15_switch`` from rerunning
+on a file already at its target version is retired:
 ``migrate_v15_switch`` and every migration below the current target are
 deleted, and a file at user_version 1-15 is now refused outright rather
 than silently left alone.
@@ -60,17 +59,17 @@ def _jobs(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 # ---------------------------------------------------------------------------
-# MG7 -- no test here: ``migrate_v15_switch`` and every migration below
+# No test here for the old rerun gate: ``migrate_v15_switch`` and every migration below
 # the current ``TARGET_USER_VERSION`` are deleted; a file at user_version
 # 1-15, including 15 itself, is now refused outright
 # ("too old for this release"), not silently left alone on a later open.
-# Nothing about Part A's old rerun gate survives to test.
+# Nothing about that gate survives to test.
 # ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
 # MG8 -- the 0.16.12 boundary step keeps only its boundary-key write; its
-# rain-pair delete, correction restart and rescore are retired (§16.3).
+# rain-pair delete, correction restart and rescore are retired.
 # M34. Calls run_migrations directly; no wxverify.db.switch import needed.
 # ---------------------------------------------------------------------------
 

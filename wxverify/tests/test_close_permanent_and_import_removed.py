@@ -1,26 +1,26 @@
-"""W5 tests (plan 2026-11-02-storage-release.md, table 1.B, 3.2, 5.5, W5).
+"""The daily close is permanent and the database import is removed.
 
 Names relied on: ``wxverify.scoring.consensus.materialize_consensus``
 (``conn, *, site_id, variable, valid_at, now_utc=None``), which deletes no
 pair, ``score_cache`` or ``forecast_history`` row on an ``observations``
-write or delete (B6); the routes ``PUT /api/feeds/{id}`` (``update_feed``,
-B12), ``PUT /api/sites/{id}/feeds/{id}`` (``update_subscription``, B13),
-and ``PUT /api/sites/{id}`` (``update_site``, B14, ``sites.py:133-148``),
-none of which touch ``forecast_history`` -- the storage-release table drop
-(3.1) removed the mean-rebuild/pair-invalidation call path these routes
+write or delete; the routes ``PUT /api/feeds/{id}`` (``update_feed``),
+``PUT /api/sites/{id}/feeds/{id}`` (``update_subscription``),
+and ``PUT /api/sites/{id}`` (``update_site``, ``sites.py:133-148``),
+none of which touch ``forecast_history`` -- dropping the pair tables
+removed the mean-rebuild/pair-invalidation call path these routes
 used to run through;
 ``wxverify.api.routes.db_transfer`` (``export_begin``/``export_status``/
 ``export_download``, ``import_db`` at ``:671``, ``run_rebuild_all``); the
 Ops panel marker ``id="import-panel"`` in
 ``web/templates/ops/_import.html``, included at ``ops/show.html:22``; and
 ``wxverify.api.app``'s startup read of the ``import_rebuild_state`` runtime
-key (``api/app.py:192-197``), removed by 5.5 step (d).
+key (``api/app.py:192-197``), since removed.
 
 Every test here that still exercises a dropped-pair-table trigger pins a
 behaviour that already holds with the pair tables gone -- a guard against
 a future regression, not a from-the-build-fails-first pin.
 ``test_export_round_trip_still_opens_and_passes_integrity_check`` is a
-separate guard against over-deletion in the W5 build; its docstring says
+separate guard against over-deletion; its docstring says
 so.
 
 Real SQLite only (``tests.helpers.asof_conn``/``init_db``, real migrations,
@@ -126,14 +126,14 @@ def _await_export_ready(
 
 
 # ---------------------------------------------------------------------------
-# 1. An ``observations`` write (B6) deletes no pair/cache/history row.
+# 1. An ``observations`` write deletes no pair/cache/history row.
 # ---------------------------------------------------------------------------
 
 
 def test_observations_write_deletes_no_pair_cache_or_history_row() -> None:
-    """B6: ``materialize_consensus`` must not delete any ``forecast_history``
+    """``materialize_consensus`` must not delete any ``forecast_history``
     row on an ``observations`` write (no pair tables are read or written
-    here at all any more, storage-release plan table 1.B row B6). Guards
+    here at all any more). Guards
     against a future regression reintroducing a dependents-invalidation
     delete keyed on this write.
     """
@@ -172,7 +172,7 @@ def test_observations_write_deletes_no_pair_cache_or_history_row() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. Feed PUT (B12), subscription toggle (B13) and rain-threshold PUT (B14)
+# 2. Feed PUT, subscription toggle and rain-threshold PUT
 #    each touch no pair table.
 # ---------------------------------------------------------------------------
 
@@ -180,10 +180,9 @@ def test_observations_write_deletes_no_pair_cache_or_history_row() -> None:
 def test_feed_put_leaves_pair_tables_as_seeded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """B12: ``PUT /api/feeds/{id}`` toggling ``enabled`` must not touch the
+    """``PUT /api/feeds/{id}`` toggling ``enabled`` must not touch the
     site's ``forecast_history`` rows, for the toggled feed or the
-    multimodel-mean feed, no pair table remaining to invalidate any more
-    (storage-release plan table 1.B rows B12/B13).
+    multimodel-mean feed, no pair table remaining to invalidate any more.
     """
     conn = _init_tmp_db(tmp_path)
     site_id = asof_make_site(conn, "feed-put-site")
@@ -254,10 +253,10 @@ def test_feed_put_leaves_pair_tables_as_seeded(
 def test_subscription_toggle_leaves_pair_tables_as_seeded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """B13: ``PUT /api/sites/{id}/feeds/{id}`` (``update_subscription``)
+    """``PUT /api/sites/{id}/feeds/{id}`` (``update_subscription``)
     must not touch the site's ``forecast_history`` rows, for the toggled
     feed or the multimodel-mean feed, no pair table remaining to
-    invalidate any more (storage-release plan table 1.B row B13).
+    invalidate any more.
     """
     conn = _init_tmp_db(tmp_path)
     site_id = asof_make_site(conn, "sub-toggle-site")
@@ -328,10 +327,9 @@ def test_subscription_toggle_leaves_pair_tables_as_seeded(
 def test_rain_threshold_put_leaves_pair_tables_as_seeded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """B14: ``PUT /api/sites/{id}`` with a new ``rain_threshold_mm``
+    """``PUT /api/sites/{id}`` with a new ``rain_threshold_mm``
     (``sites.py:133-148``) must not touch the site's precip
-    ``forecast_history`` rows, no pair table remaining to re-pair
-    (storage-release plan table 1.B row B14).
+    ``forecast_history`` rows, no pair table remaining to re-pair.
     """
     conn = _init_tmp_db(tmp_path)
     site_id = asof_make_site(conn, "rain-threshold-site")
@@ -384,7 +382,7 @@ def test_rain_threshold_put_leaves_pair_tables_as_seeded(
 def test_import_db_route_is_gone_and_ops_page_has_no_import_panel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """5.5: ``POST /api/import/db`` (``api/routes/db_transfer.py:671``) and
+    """``POST /api/import/db`` (``api/routes/db_transfer.py:671``) and
     the Ops import panel (``web/templates/ops/_import.html``, included at
     ``ops/show.html:22``, marker ``id="import-panel"``) are both removed
     whole. Fails now: the route still exists (the CSRF guard refuses an
@@ -410,11 +408,9 @@ def test_import_db_route_is_gone_and_ops_page_has_no_import_panel(
 def test_export_round_trip_still_opens_and_passes_integrity_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Guards against over-deletion from the 5.5 import removal: the
+    """Guards against over-deletion from the import removal: the
     export half (``begin`` -> ``status`` -> ``download``) must keep
-    working. This test MAY ALREADY PASS before the build -- it pins a
-    behavior the plan says stays, not a bug the plan fixes; that is
-    expected and documented here, per the brief.
+    working.
     """
     conn = _init_tmp_db(tmp_path)
     asof_make_site(conn, "Export Round Trip Site")
@@ -467,7 +463,7 @@ def test_startup_no_longer_resumes_import_rebuild(
         pass
 
     assert calls == [], (
-        "W5 removes the startup rebuild-resume read (api/app.py:192-197)"
+        "the startup rebuild-resume read must be gone (api/app.py:192-197)"
     )
     direct = sqlite3.connect(config.db_path)
     try:

@@ -60,7 +60,7 @@ class _AttrParser(HTMLParser):
 # --------------------------------------------------------------------------
 # set_site_subscription, update_subscription and update_feed do not call
 # rebuild_mean_for_site at all, so there is no mean-rebuild-skip behavior
-# for T1-T8 to pin. T9-T11 (app.js/HTML, unrelated to the rebuild) stay.
+# to pin. T9-T11 (app.js/HTML, unrelated to the rebuild) stay.
 # --------------------------------------------------------------------------
 
 

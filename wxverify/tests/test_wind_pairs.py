@@ -1,9 +1,9 @@
-"""Pairing of the raw station wind figure (plan §7, §15.1 T1-T7).
+"""Pairing of the raw station wind figure (T1-T7).
 
 ``pair_max_by_hour`` (``wxverify.obs.wind_pairs``) is pure: no database, no
 clock, no network. T8 (the stored window / record_count) is NOT in this
 file -- it needs the lane's ``_persist_day`` and a full
-``station_wind_days`` fixture (plan §8.5) and is tracked separately.
+``station_wind_days`` fixture, and lives in ``tests/test_wind_days_lane.py``.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ def _hour(hour: int) -> datetime:
 
 
 def test_pair_max_by_hour_worked_example() -> None:
-    """2:55=15, 3:00=10, 3:05=5 -> {15:00: 12.5} (§2 S1's own example).
+    """2:55=15, 3:00=10, 3:05=5 -> {15:00: 12.5}.
 
     pair(2:55,3:00) = 12.5 counted at 3:00 (the LATER record's hour).
     pair(3:00,3:05) = 7.5 counted at 3:00 too (the later record, 3:05, still
@@ -78,8 +78,8 @@ def test_pair_max_by_hour_takes_max_not_min_of_competing_pairs() -> None:
 
 
 def test_wp1_pair_gap_exactly_1200s_pairs_1201s_does_not() -> None:
-    """WP1 (plan 14.2): a 0 < gap <= 1200 s pair counts; a 1201 s gap does
-    not pair at all (the 20-minute widening, K28, 7.4).
+    """WP1: a 0 < gap <= 1200 s pair counts; a 1201 s gap does
+    not pair at all (the 20-minute widening).
 
     mutant_const_600 -> at the first assertion: correct = 1200, mutant
     (``MAX_PAIR_GAP_SECONDS`` left at 600) = 600; the two literals differ at
@@ -111,7 +111,7 @@ def test_wp1_pair_gap_exactly_1200s_pairs_1201s_does_not() -> None:
 
 
 def test_wp2_fifteen_minute_station_pairs_within_widened_gap() -> None:
-    """WP2 (plan 14.2): D's 15-minute cadence (900 s gaps) pairs under the
+    """WP2: D's 15-minute cadence (900 s gaps) pairs under the
     widened 1200 s rule, where it never paired under 600 s.
 
     mutant_still_600 -> at this assertion: correct = {_hour(3): 14.0,
@@ -204,8 +204,8 @@ def test_today_incomplete_hour_not_derived_until_next_hour_start_reached() -> No
     """An hour H is only "complete" once a record at >= H+1h exists.
 
     This test pins the CONTRACT `pair_max_by_hour` relies on: callers must
-    only pass `hours` that are complete (plan §8.5 step 2, "today: only the
-    hours H with H + 1h <= max(stored obs_at)"). `pair_max_by_hour` itself
+    only pass `hours` that are complete (today: only the hours H with
+    H + 1h <= max(stored obs_at)). `pair_max_by_hour` itself
     is pure and will happily compute a value for ANY hour in `hours` given a
     pair -- so this test demonstrates the boundary at the caller's own
     membership check: hour 3 has a pair fully inside it (3:00, 3:05) but

@@ -1,4 +1,4 @@
-"""Step 4 (card 7): close-retention cleanup of past display rows.
+"""Close-retention cleanup of past display rows.
 
 A synthetic zone with a non-zero offset (``Etc/GMT-14``, UTC+14) separates
 "yesterday" from "today" by a local midnight that differs from the UTC

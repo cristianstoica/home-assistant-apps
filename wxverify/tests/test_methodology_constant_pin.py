@@ -1,8 +1,8 @@
-"""§14/W11: the automated pin on `verification/methodology.py`.
+"""The automated pin on `verification/methodology.py`.
 
 Every public constant declared there is either referenced by a non-test
 module or named in ``DECLARATIVE_ONLY``. This is the test that stops the
-drift W11 repaired from recurring: a constant published as methodology but
+drift from recurring: a constant published as methodology but
 wired to nothing is either consumed or declared, never silently neither.
 
 The scan is AST-based rather than textual, so a constant's name appearing

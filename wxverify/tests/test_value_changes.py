@@ -1,22 +1,15 @@
-"""Tests for the value-change log (P4 plan §18.5) --
-``plans/2026-10-22-daily-close-pairs-and-publication.md``.
+"""Tests for the value-change log.
 
-VC1-VC6, one test per row. Every assertion that kills a mutant named in
-the row's last column (plan §19.2) carries a message of the form
+VC1-VC6, one test per row. Every assertion that kills a numbered mutant
+carries a message of the form
 ``"M<n> -> at this assertion: correct = <X>, mutant = <Y>"``.
-
-``forecast_value_changes`` does not exist before piece 1 (plan §20 Step
-4), and the writer that fills it (inside ``_persist_fetch_success``)
-does not exist before piece 2 -- this whole file fails at collection
-and at run time (``forecast_value_changes`` unresolved on the real
-SQLite file) until then, which the plan's Step 3 accepts.
 
 Every download in these tests is driven through the real job pipeline
 (``tick``/``claim_next_job``/``run_claimed_job``) for feed X, since the
 value-change log is written as a side effect of
-``_persist_fetch_success``'s own transaction (5.2) -- there is no pure
+``_persist_fetch_success``'s own transaction -- there is no pure
 function to seed its inputs against directly, unlike the download
-record's own ``scored_download``/``scored_version`` (§18.4).
+record's own ``scored_download``/``scored_version``.
 """
 
 from __future__ import annotations
@@ -45,7 +38,7 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.queue import claim_next_job, complete, enqueue_if_absent
 from wxverify.worker.processor import run_claimed_job
 
-R = STANDARD_NIGHT_R  # 2024-06-11 (plan §15.1's standard night: R = D + 1)
+R = STANDARD_NIGHT_R  # 2024-06-11 (the standard night: R = D + 1)
 S = R
 SOURCE = "synthetic-round-x"
 
@@ -56,7 +49,7 @@ SOURCE = "synthetic-round-x"
 
 
 def _setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """P3's standard night plus P4's round-schedule feeds, the provider
+    """The standard night plus the round-schedule feeds, the provider
     stand-in and the synthetic-source domain-backoff patch installed, and
     a :class:`MovingClock` patched over every close-chain module. Returns
     ``(db, conn, site_id, feed_id, standin, clock)`` with only X
@@ -80,9 +73,8 @@ def _stamp(dt: datetime) -> str:
 def _run_round(db, conn: sqlite3.Connection, site_id: int, feed_id: int) -> None:
     """One round try (round_try 1, round_date R) for ``feed_id``, claimed
     and run to completion -- the job is enqueued directly rather than
-    through the scheduler's round enqueuer (``worker/round.py``), which
-    does not exist before piece 3 (plan sec 20 Step 4); these rows test
-    the value-change log piece 2 writes, not the round's own schedule."""
+    through the scheduler's round enqueuer (``worker/round.py``): these
+    rows test the value-change log, not the round's own schedule."""
     enqueue_if_absent(
         conn,
         "fetch_feed",
@@ -106,8 +98,8 @@ def _run_unscheduled(db, conn: sqlite3.Connection, site_id: int, feed_id: int) -
     """One unscheduled fetch for ``feed_id``, claimed and run to
     completion -- the simplest way to drive a second (or third) download
     of X without depending on the round's retry/bound mechanics, which
-    the value-change log does not care about (5.2: "for every stored
-    download -- round, daytime or unscheduled").
+    the value-change log does not care about (it is written for every
+    stored download: round, daytime or unscheduled).
 
     A failed try (e.g. VC4's 404 between the two stored downloads)
     re-pends its job -- status back to 'pending', with a retry's future
@@ -420,7 +412,7 @@ def test_vc6_a_revised_value_under_a_stored_label_is_logged_and_stored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """VC6: a download with the provider's revised value under a label
-    already stored. Since the rain release (Part B) ``forecast_samples``
+    already stored. Since the rain release ``forecast_samples``
     holds the newest value of each hour, so the revised value replaces the
     first; the change is still logged."""
     db, conn, site_id, feed_id, standin, _clock = _setup(tmp_path, monkeypatch)
@@ -457,7 +449,7 @@ def test_vc6_a_revised_value_under_a_stored_label_is_logged_and_stored(
         "no forecast_samples row found for the stored label"
     )
     assert stored_value["value"] == 15.0, (
-        "Part B -> at this assertion: correct = 15.0 (the newest value"
+        "at this assertion: correct = 15.0 (the newest value"
         f" stored), mutant (the first value kept) = {stored_value['value']!r}"
     )
 
@@ -478,7 +470,7 @@ def test_vc5_the_swap_deletes_value_change_rows_older_than_90_days(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """VC5: a publication swap with value-change rows 89 and 91 days old."""
-    from wxverify.scoring.publication import publish  # P4 piece 6 (plan §8)
+    from wxverify.scoring.publication import publish
 
     db, writer, site_id, _stations = standard_night(tmp_path)
     conn = db._conn  # noqa: SLF001
@@ -581,7 +573,7 @@ def test_vc7_the_delete_list_follows_ended_at_not_insertion_order(
     insertion order as a stand-in for age, which would get the wrong answer
     here precisely because id order and age order disagree.
     """
-    from wxverify.scoring.publication import publish  # P4 piece 6 (plan sec 8)
+    from wxverify.scoring.publication import publish
 
     db, writer, site_id, _stations = standard_night(tmp_path)
     conn = db._conn  # noqa: SLF001

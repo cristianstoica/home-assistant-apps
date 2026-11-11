@@ -24,15 +24,15 @@ class MetricResult(BaseModel):
     hss: float | None = None
 
 
-#: One cell's sums, keyed by the ``day_scores`` sum columns (daily-close
-#: plan 6.4): ``n``, ``err_n``, ``err_sum``, ``abs_sum``, ``sq_sum``,
+#: One cell's sums, keyed by the ``day_scores`` sum columns:
+#: ``n``, ``err_n``, ``err_sum``, ``abs_sum``, ``sq_sum``,
 #: ``hits``, ``false_alarms``, ``misses``, ``correct_negs``, ``skill_n``,
 #: ``skill_sq_sum`` and ``skill_ref_sq_sum``. A missing key reads as NULL.
 MetricSums = Mapping[str, float | int | None]
 
 
 def metrics_from_sums(sums: MetricSums, *, variable: str, min_n: int) -> MetricResult:
-    """The metrics of one cell from its sums (daily-close plan 6.4).
+    """The metrics of one cell from its sums.
 
     The one place the metric arithmetic lives: the daily close's stored
     sums go through it. Bias is ``err_sum / err_n``, MAE ``abs_sum / err_n``,

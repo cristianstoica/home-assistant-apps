@@ -1,7 +1,7 @@
-"""Item G -- daily rain from a fixed set of feeds (plan G.11, G-T1-G-T28).
+"""Daily rain from a fixed set of feeds (G-T1-G-T28).
 
 Precipitation adopts the same coverage-before-ranking discipline temperature
-got under Item F, but with a STRICTER predicate: an extrema-eligible feed
+got for its extrema, but with a STRICTER predicate: an extrema-eligible feed
 must supply each hour of the local day EXACTLY once
 (:func:`wxverify.forecast.aggregate.covers_local_day_exactly`), because a
 daily total and a wet-hour count need one value per hour, not merely "at
@@ -15,10 +15,9 @@ G-T14/G-T15 (``wet_hours``'s own arithmetic) live in
 All fixtures are synthetic and offline (the autouse ``_deny_network`` fixture
 in ``conftest.py`` fails any test that opens a socket): site timezone UTC
 except the DST cases, which use ``Europe/Berlin`` (G-T4, G-T5, G-T11) and
-``Australia/Lord_Howe`` (G-T27, G-T28) per G.11; coordinates ``0.0/0.0``;
+``Australia/Lord_Howe`` (G-T27, G-T28); coordinates ``0.0/0.0``;
 ``rain_threshold_mm=0.2``. Every expected value is derived from reading the
-body of the named production function, never transcribed from the plan
-document.
+body of the named production function.
 """
 
 from __future__ import annotations
@@ -139,7 +138,7 @@ def _ensure_test_publication(
     so callers must read it back rather than assume it.
 
     ``forecast_ranking_with_status``'s ``rolling`` window now always reads
-    the active publication (9.2), never a live recompute. Mirrors
+    the active publication, never a live recompute. Mirrors
     ``tests/test_forecast_service.py``'s identically-named helper.
     """
     row = conn.execute(
@@ -201,7 +200,7 @@ def _precip_metric_result(
     return metrics_from_sums(sums, variable="precip", min_n=min_n)
 
 
-def _seed_score_cache(
+def _seed_published_ranking(
     conn: sqlite3.Connection,
     *,
     day_ahead: int,
@@ -318,13 +317,13 @@ def _day0_header_html(html: str) -> str:
 
 def _precip_day_text(html: str) -> str:
     """The Precipitation grid's top-row day-column text (``page.rain_text``)
-    -- card 7's replacement for the old tile row's "Rain" ``<strong>``.
+    -- the replacement for the old tile row's "Rain" ``<strong>``.
     Scoped to the Precipitation ``<table>`` (the selected day's only)."""
     section = html.split("Precipitation <span>mm/h</span>")[1]
     section = section.split("</table>")[0]
     start = section.index('<td class="day">') + len('<td class="day">')
     end = section.index("</td>", start)
-    # The cell's visible text only -- the rain winner's markup (C4) wraps it
+    # The cell's visible text only -- the rain winner's markup wraps it
     # in a <small> and, with an agreement percentage, a
     # <span title="Agreement">: strip every tag, keep what a reader sees.
     return re.sub(r"<[^>]+>", "", section[start:end]).strip()
@@ -427,7 +426,7 @@ def test_mixed_denominators_partial_feed_never_reaches_displayed_values() -> Non
         valid_ats=_hours("2026-07-20", 0, 12),
         values=partial_values,
     )
-    # Rain release, C4: the tile follows the published rain ranking's
+    # The tile follows the published rain ranking's
     # winner. The partial feed is even the SELECTED model here; with no full
     # day it hands over to the complete feed, so it still never reaches the
     # displayed values.
@@ -452,7 +451,7 @@ def test_mixed_denominators_partial_feed_never_reaches_displayed_values() -> Non
     assert old_style_share != precip.wet_hours
 
     # The pre-change path also aggregated over BOTH feeds' sums (the
-    # clearing-subset path Item G retired for precip); the partial feed's
+    # clearing-subset path since retired for precip); the partial feed's
     # denominator must never leak into the shipped total.
     pooled_total = blend_mean([sum(complete_values), sum(partial_values)])
     assert pooled_total == 4.5
@@ -529,7 +528,7 @@ def test_covers_local_day_vs_exactly_diverge_on_an_off_hour_extra() -> None:
         valid_ats=with_extra,
         value=1.0,
     )
-    # Rain release, C4: the feed is the ranking's only model; with no exact
+    # The feed is the ranking's only model; with no exact
     # day it is no winner, so the tile has no rain forecast.
     seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_id]})
     conn.commit()
@@ -567,7 +566,7 @@ def test_half_hourly_series_is_ineligible() -> None:
         valid_ats=half_hourly,
         value=1.0,
     )
-    # Rain release, C4: the ranking's only model has no exact day -> no
+    # The ranking's only model has no exact day -> no
     # winner.
     seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_id]})
     conn.commit()
@@ -601,7 +600,7 @@ def test_missing_hour_is_not_a_dry_hour() -> None:
         valid_ats=all_but_one,
         value=0.0,
     )
-    # Rain release, C4: ranked, so the None below comes from the missing
+    # Ranked, so the None below comes from the missing
     # hour, not from an absent ranking.
     seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_id]})
     conn.commit()
@@ -621,7 +620,7 @@ def test_missing_hour_is_not_a_dry_hour() -> None:
 
 
 def test_all_dry_complete_day_renders_differently_from_insufficient_coverage() -> None:
-    """Rain release, C4: a day with no winner (insufficient coverage, or no
+    """A day with no winner (insufficient coverage, or no
     rain candidate at all) reads "No rain forecast"; a winner's all-dry day
     reads "0.0 mm". The old "Daily rainfall unavailable" text and the plain
     dash are gone."""
@@ -753,7 +752,7 @@ def test_reconciliation_invariant_24h_two_feeds() -> None:
         valid_ats=ats,
         values=[0.05 * i for i in range(24)],
     )
-    # Rain release, C4: the tile and the drill-down's line are the selected
+    # The tile and the drill-down's line are the selected
     # model's (B here, ranked first), not a blend of both.
     seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_b, feed_a]})
     conn.commit()
@@ -843,7 +842,7 @@ def test_reconciliation_invariant_23h_and_25h_days() -> None:
         now = datetime(
             local_date.year, local_date.month, local_date.day, 12, tzinfo=UTC
         )
-        # Rain release, C4: the line and the total are the winner's (B).
+        # The line and the total are the winner's (B).
         seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_b, feed_a]})
         conn.commit()
         view = build_forecast(
@@ -906,7 +905,7 @@ def test_aggregate_null_axis_instant_and_total_agrees_with_tile() -> None:
         lead_hours=15,
         value=3.0,
     )
-    # Rain release, C4: the line is the winner's (A).
+    # The line is the winner's (A).
     seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_a, feed_b]})
     conn.commit()
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
@@ -925,14 +924,14 @@ def test_aggregate_null_axis_instant_and_total_agrees_with_tile() -> None:
 
 
 # ===========================================================================
-# G-T13 -- the axis reaches the rain winner outside the ladder's set (C4).
+# G-T13 -- the axis reaches the rain winner outside the ladder's set.
 # ===========================================================================
 
 
 def test_axis_widens_for_the_rain_winner_outside_the_ladder_set() -> None:
     import pytest
 
-    # Rain release, C4: the axis reaches the rain WINNER when it is outside
+    # The axis reaches the rain WINNER when it is outside
     # the ladder's precipitation set (the per-feed lines). With the daily
     # close on and no published precipitation ranking, the ladder ranks by
     # sample count, so the 20-hour feed gets more samples (five extra
@@ -1008,8 +1007,8 @@ def test_rain_glyph_never_shows_on_a_suppressed_cell() -> None:
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
     # 20 hours, every one well above the wet threshold -- would show the
     # rain icon IF the feed were the winner, but it has no full day (only 20
-    # of 24 hours), so the ranking's only model is no winner (rain release,
-    # C4) and the cell must show no icon regardless.
+    # of 24 hours), so the ranking's only model is no winner
+    # and the cell must show no icon regardless.
     _seed_uniform(
         conn,
         feed_id=feed_id,
@@ -1058,7 +1057,7 @@ def test_temperature_and_per_feed_series_survive_precip_suppression() -> None:
         valid_ats=partial_ats,
         values=[0.1 * i for i in range(20)],
     )
-    # Rain release, C4: ranked, but with no full day -> no winner.
+    # Ranked, but with no full day -> no winner.
     seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [partial_precip]})
     conn.commit()
     view = build_forecast(
@@ -1269,12 +1268,12 @@ def _seed_ab_precip_fixture(
     if seed_b_scoring:
         # Wet-always: mid-table skill, strictly below A's perfect skill.
         pairs[feed_b] = ((1.0, 1.0, 1.0), _PRECIP_MIXED_OBSERVED)
-    _seed_score_cache(conn, day_ahead=0, pairs=pairs)
+    _seed_published_ranking(conn, day_ahead=0, pairs=pairs)
     return feed_a, feed_b
 
 
 def test_stale_union_for_precipitation() -> None:
-    """Rain release, C4: the rain cell's stale flag covers the feeds the
+    """The rain cell's stale flag covers the feeds the
     tile's rain uses -- the winner and the agreement members -- and no
     other. Each case ranks A (20 h, the selected model, no full day) first
     and B (24 h, the winner) second.
@@ -1364,7 +1363,7 @@ def test_stale_union_for_precipitation() -> None:
 
 
 def test_confident_blend_set_with_unscored_precip_extrema_set() -> None:
-    """Tile half, rain release C4: the rain cell has one feed set, the
+    """Tile half: the rain cell has one feed set, the
     winner, and no leaderboard verdict. B (no precipitation pairs, the old
     unscored extrema set) is the winner of a settled rain ranking: both of
     the cell's states read normal, and no confidence badge shows.
@@ -1402,7 +1401,7 @@ def test_confident_blend_set_with_unscored_precip_extrema_set() -> None:
 
 
 def test_rebuilding_precedence_on_the_precip_extrema_set() -> None:
-    """Tile half, rain release C4: a PROVISIONAL rain ranking whose winner
+    """Tile half: a PROVISIONAL rain ranking whose winner
     is B shows as the rain cell's rebuilding extrema state: the tile stays
     state-normal and shows "ranking updating", never "low confidence"."""
     conn = _make_db()
@@ -1419,7 +1418,7 @@ def test_rebuilding_precedence_on_the_precip_extrema_set() -> None:
     # below comes from the rain ranking's own provisional flag, asserted
     # further down.
     #
-    # ``seed_rain_ranks`` runs BEFORE the ``_seed_score_cache``
+    # ``seed_rain_ranks`` runs BEFORE the ``_seed_published_ranking``
     # setup below: both create a publication if none exists yet, and
     # ``active_publication`` picks whichever has the LATEST cutoff, never
     # the most recently published -- seeding the score-cache publication
@@ -1442,7 +1441,7 @@ def test_rebuilding_precedence_on_the_precip_extrema_set() -> None:
         valid_ats=_hours("2026-07-20", 0, 20),
         values=[0.1 * i for i in range(20)],
     )
-    _seed_score_cache(
+    _seed_published_ranking(
         conn,
         day_ahead=0,
         pairs={
@@ -1484,7 +1483,7 @@ def test_rebuilding_precedence_on_the_precip_extrema_set() -> None:
 
 
 def test_suppressed_precip_extrema_contribute_to_neither_warning() -> None:
-    """Rain release, C4: a ranked model with no full day is no winner and
+    """A ranked model with no full day is no winner and
     feeds no warning. A is stale and its ranking provisional, yet the tile
     (kept available by a normal wind cell) shows neither the stale nor the
     "ranking updating" badge. Paired positive: the same A with a full day

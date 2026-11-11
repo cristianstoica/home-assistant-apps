@@ -1,5 +1,4 @@
-"""The nightly gap-fill pause (plan 2026-10-21-daily-close-close-job.md
-section 15.9): SP1 to SP6.
+"""The nightly gap-fill pause: SP1 to SP6.
 
 Written before ``close_chain.enqueue_due_close_work``, ``close_p4`` and
 stage 2's body exist, and fails first for that reason: every test here
@@ -10,8 +9,8 @@ pattern of ``tests/test_close_timeline.py``), so each reaches
 ``ModuleNotFoundError`` today, since ``wxverify.worker.close_p4`` does not
 exist.
 
-The pause itself (plan 5.6) reads the COUNTED day before D's own
-``close_station_days`` row (written at stage 2's completion, 11.3), not a
+The pause itself reads the COUNTED day before D's own
+``close_station_days`` row (written at stage 2's completion), not a
 live recomputation. Since nothing writes that table yet, each test seeds
 the counted day's ``close_station_days`` row for station C directly --
 the data stage 2 is specified to have produced, not a recomputation this
@@ -19,8 +18,8 @@ test could share a bug with -- then drives the chain for D itself through
 ``run_due_jobs`` to observe D's own written presence/pause and gap-fill
 try-log rows once stage 2 exists.
 
-Section 16.2 names the mutant each test ID kills; the mapping is given
-inline on the exact assertion it kills at.
+The mutant each test ID kills is named inline on the exact assertion it
+kills at.
 
 Real SQLite only (``tests.helpers.day_close_site``/``standard_night``'s
 own building blocks, real ``run_migrations`` via ``init_db`` on a
@@ -71,8 +70,8 @@ _SEED_CHANGED_AT = isoformat_utc_micro(
 @pytest.fixture(autouse=True)
 def _clear_close_chain_log_map() -> None:
     """This file's own autouse wiring of ``clear_close_chain_log_map``
-    (15.1's "The log map.") -- autouse HERE, inside this one P3 test
-    file, never across the whole suite."""
+    -- autouse HERE, inside this one close-chain test file, never across
+    the whole suite."""
     clear_close_chain_log_map()
 
 
@@ -110,7 +109,7 @@ def _seed_close_station_day(
     paused: bool = False,
 ) -> None:
     """Seed the one ``close_station_days`` row stage 2 would have written
-    for ``local_date`` (plan 11.3) -- nothing writes this table yet, so a
+    for ``local_date`` -- nothing writes this table yet, so a
     test that needs a COUNTED day's presence builds it directly."""
     conn.execute(
         "INSERT INTO close_station_days (site_id, local_date, station_id,"
@@ -266,7 +265,7 @@ async def _try_log_rows(db, site_id, local_date, station_id):  # type: ignore[no
 
 
 def _default_transport_handler(request):  # type: ignore[no-untyped-def]
-    """A full, well-formed hourly reply (P2 §14.1's handler shape) for any
+    """A full, well-formed hourly reply for any
     gap-fill call this file's non-pause SP cases let through."""
     import httpx
 
@@ -288,8 +287,7 @@ def test_sp1_a_station_with_nothing_for_two_days_is_paused(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """SP1: C had nothing on D − 1; C has nothing on D. C ``paused`` on D;
-    no gap-fill request for C; C's try-log row ``skipped``; D closes
-    (5.6).
+    no gap-fill request for C; C's try-log row ``skipped``; D closes.
 
     M58 -> at the transport-call assertion below: correct = zero gap-fill
     requests for C (the pause withholds the call), mutant M58 (a paused
@@ -373,7 +371,7 @@ def test_sp2_a_returning_station_is_not_paused(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """SP2: C had nothing on D − 1; C has a current-conditions reading on
-    D. C not paused; its gap hours filled (5.6).
+    D. C not paused; its gap hours filled.
 
     M56 -> at the paused assertion below: correct = ``paused`` 0 (D itself
     has a reading, so the pause never applies regardless of yesterday),
@@ -441,7 +439,7 @@ def test_sp3_a_day_lost_to_refused_access_does_not_pause(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """SP3: C's D − 1 lost to refused access (``answered`` 0, ``refused_at``
-    set); D − 2 had readings. C not paused on D (5.6, :137).
+    set); D − 2 had readings. C not paused on D.
 
     M53 -> at the paused assertion below: correct = ``paused`` 0 (D − 1 is
     skipped as lost to refused access, so D − 2 -- which had readings --
@@ -512,9 +510,9 @@ def test_sp4_a_missed_day_is_skipped_the_earlier_day_decides(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """SP4: D − 1 ``missed``; D − 2 had nothing for C. C paused (the
-    missed day skipped, D − 2 decides) (5.6).
+    missed day skipped, D − 2 decides).
 
-    The plan's own fixture (D-2 ALSO says nothing) cannot by itself
+    The base fixture (D-2 ALSO says nothing) cannot by itself
     discriminate M54 from the correct rule: both give ``paused`` 1 here,
     one by correctly skipping to D-2, the other by wrongly treating the
     missed D-1 itself as "nothing". A paired positive is added below,
@@ -568,8 +566,8 @@ def test_sp4_a_missed_day_is_skipped_the_earlier_day_decides(
         _run(d_minus_2_has_readings=False, suffix="plan_case")
     )
     assert paused_plan_case == 1, (
-        "the plan's own case (D-1 missed, D-2 also nothing): C must be"
-        " paused on D (5.6); see the paired case below for M54's kill"
+        "the base case (D-1 missed, D-2 also nothing): C must be"
+        " paused on D; see the paired case below for M54's kill"
     )
 
     paused_paired = asyncio.run(_run(d_minus_2_has_readings=True, suffix="paired_case"))
@@ -590,11 +588,10 @@ def test_sp5_current_conditions_readings_count_as_something(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """SP5: C had only current-conditions readings on D − 1. Not nothing:
-    C not paused (5.6).
+    C not paused.
 
     M55 -> at the paused assertion below: correct = ``paused`` 0 (Home
-    Assistant readings count, 5.6: "the current-conditions poll is the
-    Home Assistant readings ... it counts"), mutant M55 (the pause leaves
+    Assistant readings count), mutant M55 (the pause leaves
     out ``current_obs`` readings) = ``paused`` 1, treating a day with only
     current-conditions readings as a day with nothing.
     """
@@ -661,7 +658,7 @@ def test_sp6_the_counted_day_is_the_latest_one_listing_the_station(
 ) -> None:
     """SP6: C not on D − 1's list, on D's list; D − 2 had nothing for C
     and listed it. C paused (the counted day is the latest one listing
-    it) (5.6).
+    it).
 
     M57 -> at the paused assertion below: correct = ``paused`` 1 (D-2 is
     the latest day that actually listed C, and it said nothing), mutant
@@ -695,7 +692,7 @@ def test_sp6_the_counted_day_is_the_latest_one_listing_the_station(
             hourly=0,
             answered=False,
         )
-        # C was added effective D-10 (_add_station_c), so P1 wrote it onto
+        # C was added effective D-10 (_add_station_c), so it was written onto
         # D-1's saved station list when D-1 opened (site_days.py :355-409).
         # Strip it directly, as stage 2's own data would never do this
         # listing: D-1 must not list C.

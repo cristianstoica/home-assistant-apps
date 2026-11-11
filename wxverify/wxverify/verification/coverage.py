@@ -1,14 +1,14 @@
-"""Pure per-quantity coverage gates and daily-quantity evaluation (plan §4/§5).
+"""Pure per-quantity coverage gates and daily-quantity evaluation.
 
 One shared implementation serves BOTH sides of the comparison:
 
 * truth materialization (``wxverify.verification.truth``) evaluates hourly
   CONSENSUS observations for a local day;
-* forecast-side eligibility (§5) evaluates an entity's as-of-T hourly
+* forecast-side eligibility evaluates an entity's as-of-T hourly
   forecast samples for the target day with the very same gates — "renderable
   by the production page" is not sufficient forecast eligibility.
 
-Coverage counting follows §4's distinct-UTC-instant rule: expected slots come
+Coverage counting follows the distinct-UTC-instant rule: expected slots come
 from the site timezone's actual local-day boundaries (DST days contain 23, 24
 or 25 UTC hourly instants; both instants of the repeated autumn wall-clock
 hour count), and covered hours are distinct UTC hour instants (truncate the
@@ -34,7 +34,7 @@ from wxverify.verification.methodology import (
     TEMP_TRUTH_MIN_HOURS,
 )
 
-# The five daily quantities (§4). Scorability is recorded per quantity,
+# The five daily quantities. Scorability is recorded per quantity,
 # never per variable: one outcome of a day may score while another is
 # excluded.
 QUANTITY_TEMPERATURE_HIGH = "temperature_high"
@@ -59,7 +59,7 @@ VARIABLE_QUANTITIES: dict[str, tuple[str, ...]] = {
 }
 
 # Recorded per-quantity exclusion reasons. Classification is by FIRST
-# failing gate, in the order §4's table states them.
+# failing gate, in the order each evaluator checks them.
 EXCLUDE_INSUFFICIENT_COVERAGE = "insufficient_coverage"
 EXCLUDE_MISSING_PEAK_WINDOW = "missing_peak_window"
 EXCLUDE_BELOW_NEAR_COMPLETE = "below_near_complete"
@@ -100,8 +100,8 @@ class QuantityOutcome:
     """One daily quantity's value, eligibility, and coverage metadata.
 
     ``value`` is retained even when ineligible (an explicitly labeled
-    diagnostic — §4 keeps every excluded outcome visible with its coverage
-    count and reason; §5 retains partial-product results as diagnostics,
+    diagnostic — every excluded outcome stays visible with its coverage
+    count and reason; partial-product results stay as diagnostics,
     never headline inputs). The single exception: an ineligible "dry"
     occurrence verdict has ``value = None`` — partial coverage cannot prove
     a dry day, so there is no diagnostic value to label.
@@ -124,7 +124,7 @@ def _hourly_slots(
     """Deduplicate samples to one value per distinct UTC hour instant.
 
     Truncation to the hour happens in UTC, before any local conversion
-    (§4's fold-correct counting rule). Membership is judged on the
+    (the fold-correct counting rule). Membership is judged on the
     truncated instant against the day's UTC window. On duplicate instants
     the last sample wins — hourly consensus rows are unique per instant by
     schema, so this only matters for caller-assembled forecast samples.
@@ -189,7 +189,7 @@ def near_complete_threshold(expected_slots: int) -> int:
 def evaluate_temperature(
     samples: list[tuple[str, float]], *, timezone: str, local_date: date
 ) -> tuple[QuantityOutcome, QuantityOutcome]:
-    """Daily high and low with §4's temperature gates.
+    """Daily high and low with the temperature gates.
 
     Eligible iff ≥ 18 distinct covered hours AND ≥ 1 slot inside the
     applicable peak window (12–18 local for the high, 03–09 local for the
@@ -234,7 +234,7 @@ def evaluate_precip(
     local_date: date,
     rain_threshold_mm: float,
 ) -> tuple[QuantityOutcome, QuantityOutcome]:
-    """Daily precip total and occurrence with §4's precip gates.
+    """Daily precip total and occurrence with the precip gates.
 
     Total: near-complete gate — an incomplete sum is never exact truth (the
     partial sum is still stored as a labeled diagnostic). Occurrence is
@@ -297,7 +297,7 @@ def evaluate_variable(
     """Evaluate every quantity derived from ``variable`` for one local day.
 
     Shared entry point for truth materialization (consensus samples) and
-    §5 forecast-side eligibility (an entity's as-of hourly samples) —
+    forecast-side eligibility (an entity's as-of hourly samples) —
     identical gates by construction. Unknown variables yield no outcomes.
     """
     if variable == "temperature":

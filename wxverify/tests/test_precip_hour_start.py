@@ -1,4 +1,4 @@
-"""Part B -- rain labelled by the start of its hour, not its end.
+"""Rain labelled by the start of its hour, not its end.
 
 Open-Meteo and meteoblue document rain by the END of the hour; wxverify's
 other feeds already label by the start. ``precip_hour_start`` converts a
@@ -146,8 +146,8 @@ def test_open_meteo_forward_temperature_and_wind_columns_unchanged() -> None:
 
 
 # ---------------------------------------------------------------------------
-# B9 -- the four providers whose rain label is NOT part of this rework
-# (SC3), named where an owner deciding how to settle them would look.
+# The four providers whose rain label is NOT part of this rework, named where
+# a maintainer deciding how to settle them would look.
 # ---------------------------------------------------------------------------
 
 _FLAGGED_PROVIDERS = ("Google", "Visual Crossing", "OpenWeatherMap", "WeatherAPI")
@@ -171,8 +171,8 @@ def test_precip_hour_start_docstring_names_the_four_flagged_providers() -> None:
 def test_readme_names_the_four_flagged_providers_together() -> None:
     # The four names already appear scattered in README.md (one per
     # provider-key row in the settings table), so a bare substring check on
-    # the whole file would pass vacuously whether or not B9's addition ever
-    # lands. Require them on ONE line together, naming them as the group
+    # the whole file would pass vacuously whether or not the group is named.
+    # Require them on ONE line together, naming them as the group
     # left unconverted by this rework.
     readme = Path(__file__).resolve().parent.parent / "README.md"
     lines = readme.read_text(encoding="utf-8").splitlines()
@@ -185,7 +185,7 @@ def test_readme_names_the_four_flagged_providers_together() -> None:
 def test_flagged_adapter_does_not_reference_the_new_boundary_helpers(
     module_name: str,
 ) -> None:
-    # Structural guard for SC3: none of the four flagged adapters' rain
+    # Structural guard: none of the four flagged adapters' rain
     # labelling is touched by this rework, so none of them should come to
     # import the new start-of-hour conversion helpers.
     import importlib

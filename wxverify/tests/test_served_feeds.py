@@ -1,4 +1,4 @@
-"""``served_feed_ids`` and the ``served_only`` loader flag (plan Steps 1-2).
+"""``served_feed_ids`` and the ``served_only`` loader flag.
 
 All fixture names are synthetic.
 """

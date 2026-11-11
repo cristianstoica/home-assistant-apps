@@ -1,11 +1,9 @@
-"""Shared weather.com call lock (§6.3.10) and the add-station route's
-bounded wait (§17 item 11) -- commits 4 and 5 of the 2026-09-23
-station-health-and-retries plan. Covers K2-K5d of plan §14.2 (commit 4) plus
-K1 (commit 5, added once the current-obs lane exists).
+"""Shared weather.com call lock and the add-station route's bounded wait
+(K2-K5d).
 
-Out of scope here (plan §14.2):
+Out of scope here:
 
-- The supervisor's C4 stale-generation case (the shared-lock assertion
+- The supervisor's stale-generation case (the shared-lock assertion
   inside a full two-lane cancellation/reclaim scenario) lives in
   ``test_graceful_shutdown.py`` alongside the rest of the C-series
   supervisor-contract tests, not here.
@@ -15,19 +13,6 @@ Out of scope here (plan §14.2):
   ``test_graceful_shutdown.py`` respectively, alongside the harnesses that
   already drive those lanes -- not duplicated here.
 
-Adaptation from the plan's literal wording: every K2/K5 case that the plan
-describes via ``run_claimed_job`` (a commit-5 name) is instead driven
-through today's entry points -- ``processor._fetch_current_obs`` and the
-add-station route -- because ``run_claimed_job`` is not introduced until
-commit 5 (plan §16.1 row 5, and confirmed absent from
-``worker/processor.py`` at this commit). The plan's own §14.2 test-sm3
-precedent (``test_disabled_site_station_does_not_starve_main_claim``)
-documents the same substitution for D0. The plan's §6.3.10 line-number
-table (e.g. ``processor.py:526``, ``:545``) predates commits 1-3 renumbering
-the file; this file locates every call site by content (diffed against the
-worktree) rather than by those line numbers, and no anchor mismatch beyond
-the run_claimed_job substitution was found.
-
 Convention: every provider call is faked at its
 ``wxverify.worker.<module>.fetch_*`` (or ``wxverify.api.routes.stations.
 validate_station``) import site -- matching ``test_sm4_backoff.py`` and
@@ -35,8 +20,7 @@ validate_station``) import site -- matching ``test_sm4_backoff.py`` and
 ``httpx.MockTransport``, because the lock's scope is the point in question,
 not the HTTP layer. ``asyncio.run(run())`` drives every non-route case; no
 pytest-asyncio. Route cases use ``TestClient`` + ``client.portal``,
-following ``test_generation_fence.py:243-300``, with the plan's
-hang-guard/teardown discipline (§14.2, "Add-station route bounded wait")
+following ``test_generation_fence.py``, with a hang guard and teardown
 so a failed guard reports instead of hanging.
 
 Every ``db.write``/``FencedWriter.write`` call in this file runs its
@@ -147,7 +131,7 @@ def _rate_limited_response() -> httpx.Response:
 
 async def _release_lock(lock: asyncio.Lock) -> None:
     """Async wrapper: ``Lock.release`` is sync, and ``BlockingPortal.call``
-    only awaits a coroutine function (plan §14.2, add-station fixture note).
+    only awaits a coroutine function.
     """
     lock.release()
 
@@ -369,11 +353,6 @@ def test_k2_lock_held_at_add_station_route(
 
 
 # ---------------------------------------------------------------------------
-# K1 -- one shared lock serializes both lanes
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # K3 -- FIFO canary
 # ---------------------------------------------------------------------------
 
@@ -381,9 +360,9 @@ def test_k2_lock_held_at_add_station_route(
 def test_k3_fifo_canary_pins_stdlib_wakeup_order() -> None:
     """K3: hold the lock, queue three waiters in order, release, and create
     a fourth acquirer immediately after the release. Acquisition order is
-    ``[0, 1, 2, late]`` -- probed on Python 3.13.14 as ``[0, 1, 2, 99]``
-    (plan §14.2). Pins the stdlib property §6.3.10's fairness note relies
-    on: a Python upgrade that changes ``asyncio.Lock``'s FIFO wakeup order
+    ``[0, 1, 2, late]`` -- probed on Python 3.13.14 as ``[0, 1, 2, 99]``.
+    Pins the stdlib property the lock's fairness relies on: a Python
+    upgrade that changes ``asyncio.Lock``'s FIFO wakeup order
     fails here rather than only surfacing as a silent fairness regression.
     """
 
@@ -610,7 +589,7 @@ def test_k5b_cancel_at_hand_off_still_wakes_the_next_waiter() -> None:
     """K5b step 2 (hand-off): a holder releases and cancels waiter W with
     no ``await`` between, so the lock is handed to W and W is cancelled
     before it runs. W raises ``CancelledError``, and waiter B still returns
-    True -- the ``locks.py:113-121`` re-wake §6.3.10 relies on.
+    True -- the ``asyncio.Lock`` re-wake the lock's fairness relies on.
 
     Mutant: ``asyncio.wait_for(asyncio.shield(lock.acquire()), timeout_s)``.
     The shielded inner acquire keeps the hand-off alive under the

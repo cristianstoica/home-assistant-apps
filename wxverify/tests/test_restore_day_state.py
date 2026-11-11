@@ -1,16 +1,16 @@
-"""#71's day-state check (switch-over plan 2026-10-22-daily-close-switch-
-over.md section 13.4; test IDs RS1-RS5 of 17.14).
+"""The restore test's day-state check (test IDs RS1-RS5).
 
-These pin #71's read-only probe text, copied verbatim from 13.4, not P6's
-code (18.1: "RS1 to RS5 have no mutant"). They may legitimately pass before
-P6 lands (17's Step 3 note) since nothing here imports a P6 name: ``site_
-days``, ``close_try_log`` and ``runtime_state`` are all P1/P3 tables, and
-the probe itself is #71's SQL, not wxverify's.
+These pin the restore test's read-only probe text, copied verbatim, not
+the add-on's code, so no test here has a mutant and they can pass on any
+tree: nothing here imports new code, ``site_days``, ``close_try_log`` and
+``runtime_state`` are existing tables, and the probe itself is the restore
+test's SQL, not wxverify's.
 
-Each test opens its own tmp-file database as #71 opens its file (``mode=
-ro``, ``PRAGMA query_only=ON``), runs the exact lines of 13.4 with ``exec``,
-and reproduces 13.4's post-stop comparison (the two ``grep`` calls) in
-Python rather than a subprocess, since both inputs are already in memory.
+Each test opens its own tmp-file database as the restore test opens its
+file (``mode=ro``, ``PRAGMA query_only=ON``), runs the probe's exact lines
+with ``exec``, and reproduces its post-stop comparison (the two ``grep``
+calls) in Python rather than a subprocess, since both inputs are already
+in memory.
 Zone is ``UTC`` throughout; synthetic dates only.
 """
 
@@ -27,8 +27,8 @@ from wxverify import config
 from wxverify.db.connection import close_db, init_db
 from wxverify.db.site_days import begin_close, ensure_site_days, finish_close
 
-# The lines inserted into <scratch>/tools/probe.py just before con.close()
-# (plan 13.4), copied verbatim.
+# The lines inserted into <scratch>/tools/probe.py just before con.close(),
+# copied verbatim.
 _PROBE_TAIL: Final = """
 tables = {r[0] for r in con.execute(
     "SELECT name FROM sqlite_master WHERE type = 'table'"
@@ -92,7 +92,7 @@ if "site_days" in tables:
 
 
 def _run_probe(con: sqlite3.Connection) -> str:
-    """Runs 13.4's lines with ``exec``, #71's ``one`` bound to ``con``."""
+    """Runs the probe's lines with ``exec``, its ``one`` bound to ``con``."""
 
     def one(sql: str, *params: object) -> tuple[object, ...] | None:
         return con.execute(sql, params).fetchone()
@@ -104,7 +104,7 @@ def _run_probe(con: sqlite3.Connection) -> str:
 
 
 def _readonly(db_path: Path) -> sqlite3.Connection:
-    """#71's own open: ``mode=ro``, ``PRAGMA query_only=ON``."""
+    """The probe's own open: ``mode=ro``, ``PRAGMA query_only=ON``."""
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     con.execute("PRAGMA query_only=ON")
     return con
@@ -129,7 +129,7 @@ def _field(probe_output: str, name: str) -> str | None:
 def test_rs1_a_pre_switch_schema_prints_close_on_absent_and_nothing_else(
     tmp_path: Path,
 ) -> None:
-    """RS1 (plan 13.4, row 1 of the table, PASS): a pre-switch schema (no
+    """RS1 (PASS): a pre-switch schema (no
     ``site_days``, no ``close_try_log``) prints ``close_on absent`` and
     nothing else.
     """
@@ -170,7 +170,7 @@ def _build_post_switch_db(base: Path) -> tuple[sqlite3.Connection, Path, int]:
 def test_rs2_a_post_switch_backup_after_a_correct_first_tick_passes(
     tmp_path: Path,
 ) -> None:
-    """RS2 (plan 13.4, row 2, PASS): a post-switch backup and a run whose
+    """RS2 (PASS): a post-switch backup and a run whose
     first tick moved the old open days to ``missed``, holding also a day
     still ``retry_due`` whose ``retry_at`` is after S, a retry gap-fill
     row tried after S for a day whose ``retry_at`` is after S, and a day
@@ -273,7 +273,7 @@ def _seed_days(conn: sqlite3.Connection, site_id: int) -> None:
 
 
 def test_rs3_each_divergence_fails(tmp_path: Path) -> None:
-    """RS3 (plan 13.4, row 2, FAIL each time): an old day still ``open``
+    """RS3 (FAIL each time): an old day still ``open``
     (stale_open above 0); a day still ``retry_due`` whose ``retry_at`` is
     before S (stale_open above 0); a retry gap-fill row tried after S for
     a day whose ``retry_at`` is before S (old_fills above 0)."""
@@ -340,7 +340,7 @@ def test_rs3_each_divergence_fails(tmp_path: Path) -> None:
 def test_rs4_unparseable_instants_and_a_stale_tick_are_cant_tell(
     tmp_path: Path,
 ) -> None:
-    """RS4 (plan 13.4, row 2, CAN'T TELL): ``scheduler_last_tick_at``
+    """RS4 (CAN'T TELL): ``scheduler_last_tick_at``
     before S; ``worker_started_at`` unreadable; a ``retry_at`` that does
     not parse."""
     conn, db_path, site_id = _build_post_switch_db(tmp_path)
@@ -374,7 +374,7 @@ def test_rs4_unparseable_instants_and_a_stale_tick_are_cant_tell(
 
 
 def test_rs5_the_read_only_probe_changes_nothing(tmp_path: Path) -> None:
-    """RS5 (plan 13.4): every file's hash unchanged and its ``-wal`` 0
+    """RS5: every file's hash unchanged and its ``-wal`` 0
     bytes after the probe."""
     conn, db_path, _site_id = _build_post_switch_db(tmp_path)
     close_db()

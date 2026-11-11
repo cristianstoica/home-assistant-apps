@@ -84,7 +84,7 @@ def _insert_sample(
     lead_hours: int,
     value: float,
 ) -> None:
-    # Since the rain release (Part B) an hour holds one row
+    # An hour holds one row
     # (idx_samples_slot): a later label replaces the hour's stored row.
     conn.execute(
         "DELETE FROM forecast_samples WHERE site_id = ? AND feed_id = ?"
@@ -134,7 +134,7 @@ def _count_load_sites_calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
 
 
 #: Each day header's High/Low span sits right after its <b> label
-#: ("<b>Today</b><span>13° / 13°</span>"), card 7's rebuild of the markup
+#: ("<b>Today</b><span>13° / 13°</span>"), the rebuild of the markup
 #: the old "High / Low</span><strong>" pair used to carry.
 _HIGH_LOW_RE = re.compile(r"<b>.*?</b>\s*<span>([^<]*)</span>", re.DOTALL)
 
@@ -304,7 +304,7 @@ def test_tiles_204_when_only_non_sample_state_changed(
 
     min_n = get_number_setting(conn, "min_n", 30, minimum=0)
     # leaderboard_with_status's `rolling` window now always reads the
-    # active publication (9.2), never a live recompute, so the three feeds'
+    # active publication, never a live recompute, so the three feeds'
     # rankings land in one site publication instead of score_cache.
     pub_id = seed_active_publication(
         conn,
@@ -485,7 +485,7 @@ def test_explicit_site_id_resolves_disabled_site_via_page_and_poll(
 ) -> None:
     """An EXPLICIT site_id resolves through ``load_site``, which does not
     filter on ``enabled`` -- pinned on both the page and the poll, the two
-    call sites the fix touches. Card 7 dropped the per-site subtitle that
+    call sites the fix touches. The page dropped the per-site subtitle that
     used to carry the site's own name and "- paused" wording, so a disabled
     site resolving normally is now pinned by the "Paused" indicator firing
     instead of the page falling back to "No sites configured.", which is

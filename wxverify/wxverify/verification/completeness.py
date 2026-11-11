@@ -1,4 +1,4 @@
-"""Admission basis for one closed local day's ``daily_truth`` rows (plan 7.1).
+"""Admission basis for one closed local day's ``daily_truth`` rows.
 
 ``daily_truth.admission_basis`` records whether all of a day's hours were
 present when the daily close wrote the day: :data:`ADMISSION_COMPLETE` when
@@ -6,7 +6,7 @@ every evaluated quantity's covered_hours equals its expected_slots, else
 :data:`ADMISSION_DEADLINE`. The close decides WHEN a day is written, so the
 basis never decides whether it may be.
 
-The basis never touches ``eligible``, which is the §4 coverage verdict
+The basis never touches ``eligible``, which is the coverage verdict
 scoring consumes. It is per-day, never per-quantity: a day's five quantity
 rows are written together and carry one basis.
 
@@ -28,7 +28,7 @@ ADMISSION_DEADLINE: Final = "deadline"
 
 
 def close_admission_basis(evaluation: DayEvaluation) -> str:
-    """The ``admission_basis`` the daily close stores with a day's rows (7.1).
+    """The ``admission_basis`` the daily close stores with a day's rows.
 
     :data:`ADMISSION_COMPLETE` when every evaluated quantity's covered hours
     equal its expected slots, else :data:`ADMISSION_DEADLINE`. An empty set

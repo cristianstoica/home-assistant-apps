@@ -1,17 +1,4 @@
-"""The publication (daily-close plan 2026-10-22-daily-close-pairs-and-
-publication.md, sections 7 and 8; test IDs PB1-PB17, plan 18.7).
-
-PB14, PB15 and PB18 drove ``publish_first``, ``seed_starting_history`` and
-``_SEED_UNSETTLED_SQL`` directly. The starting history is read-only now
-(storage-release plan 2026-11-02, table 1.B) and those names are gone from
-``wxverify.scoring.publication``, so all three pinned removed behaviour and
-are deleted with it.
-
-Written before ``wxverify.scoring.publication`` exists: every test below
-collects, then fails at its own ``from wxverify.scoring.publication import
-...`` with ``ModuleNotFoundError`` -- the failure Step 3 accepts. Once
-piece 1's migration exists but piece 6 does not, the same import still
-fails first, before any table is touched.
+"""The publication (test IDs PB1-PB17).
 
 Real SQLite throughout, through ``init_db`` on a ``tmp_path`` file (the
 ``standard_night``/``day_close_site`` pattern); nothing in the code under
@@ -23,17 +10,9 @@ in an inner ``async def _run()`` and drives it with ``asyncio.run(_run())``
 there is no ``pytest-asyncio`` dependency here, so ``async def test_...``
 would never run).
 
-Piece rule (plan 20, Step 4's table): PB rows go green in piece 6, so every
-seed here is a plain INSERT into ``day_scores``/``starting_scores``/
+Every seed here is a plain INSERT into ``day_scores``/``starting_scores``/
 ``starting_wind_days``/``publications`` and its child tables -- never
 through ``score_day`` or ``publish`` itself.
-
-Column shapes assumed for the five new tables this file seeds directly
-(``day_scores``, ``starting_scores``, ``starting_wind_days``,
-``publications`` and its three child tables) are the plainest reading of
-plan sections 6.4, 7.1 and 7.3 -- the schema does not exist yet to check
-against. See the test-authoring report for the exact column lists and the
-two functions patched as deterministic injection points (PB5, PB6).
 """
 
 from __future__ import annotations
@@ -409,7 +388,7 @@ def _publication_table_counts(conn: sqlite3.Connection, site_id: int) -> dict[st
 def test_pb1_publish_builds_rankings_bounds_and_settings(tmp_path: Path) -> None:
     """PB1: one ``publish`` call for cutoff D-1 writes a ``publications``
     row with the right bounds and settings, and X's ``w:5``/``w:all``
-    rankings sum the right dates (7.1-7.3, 8.2).
+    rankings sum the right dates.
     """
 
     async def _run() -> None:
@@ -459,7 +438,7 @@ def test_pb1_publish_builds_rankings_bounds_and_settings(tmp_path: Path) -> None
 
 def test_pb2_a_deleted_date_shrinks_the_sum_not_the_bounds(tmp_path: Path) -> None:
     """PB2: D-2's ``day_scores`` rows deleted; the ``w:5`` window still
-    starts at D-5 (7.2) and sums only the 4 remaining dates (7.2)."""
+    starts at D-5 and sums only the 4 remaining dates."""
 
     async def _run() -> None:
         from wxverify.scoring.publication import publish
@@ -480,7 +459,7 @@ def test_pb2_a_deleted_date_shrinks_the_sum_not_the_bounds(tmp_path: Path) -> No
         assert pub is not None
         assert pub["window_start_date"] == (CUTOFF - timedelta(days=4)).isoformat(), (
             "M63 -> at this assertion: correct = D-5 (a window counts"
-            " calendar dates, never days with data, 7.2), mutant M63"
+            " calendar dates, never days with data), mutant M63"
             " (w:{N} counted in days with data) would need a 6th calendar"
             " date to reach 5 WITH data, moving window_start_date to D-6"
         )
@@ -489,7 +468,7 @@ def test_pb2_a_deleted_date_shrinks_the_sum_not_the_bounds(tmp_path: Path) -> No
         assert rank5["n"] == 8, (
             "M65 -> at this assertion: correct = 8 (the 4 remaining dates'"
             " sums only; a window never reaches back to replace a missing"
-            " date, 7.2), mutant M65 (a window reaches back past a missing"
+            " date), mutant M65 (a window reaches back past a missing"
             " date) = 10 (pulls in a 6th date, D-6, to replace D-2)"
         )
 
@@ -507,19 +486,18 @@ def test_pb3_repeat_publish_returns_same_id_and_rebuilds_nothing(
 ) -> None:
     """PB3: a second ``publish`` for the same cutoff returns the first
     id and writes nothing new -- proven by emptying the inputs before the
-    second call and showing the first ranking row survives untouched
-    (8.2).
+    second call and showing the first ranking row survives untouched.
 
     The row-unchanged check alone cannot discriminate M66 (the repeat
-    check at step 1 removed): even with it gone, ``_swap``'s OWN repeat
-    check (8.3 step 1, ``scoring/publication.py``'s ``_swap``) still
-    fires on the WRITE side and returns the existing id before any insert,
-    so the stored row survives either way. What step 1's check actually
-    buys is never reaching the BUILD (8.2 steps 2-5) at all on a repeat;
-    with it removed, the second call wastefully rebuilds from the
-    (emptied) inputs although the swap then discards the result. A spy on
-    ``compute_wind_weights`` -- the one pure step 8.2 always reaches,
-    patched the same way PB5/PB6/PB9 inject into it -- counts the builds.
+    check at the start of ``publish`` removed): even with it gone,
+    ``_swap``'s OWN repeat check still fires on the WRITE side and returns
+    the existing id before any insert, so the stored row survives either
+    way. What the first check actually buys is never reaching the BUILD at
+    all on a repeat; with it removed, the second call wastefully rebuilds
+    from the (emptied) inputs although the swap then discards the result. A
+    spy on ``compute_wind_weights`` -- the one pure step the build always
+    reaches, patched the same way PB5/PB6/PB9 inject into it -- counts the
+    builds.
     """
 
     async def _run() -> None:
@@ -560,7 +538,7 @@ def test_pb3_repeat_publish_returns_same_id_and_rebuilds_nothing(
         assert second_id == first_id
         assert build_calls["n"] == 1, (
             "M66 -> at this assertion: correct = 1 (the repeat check at"
-            " 8.2 step 1 returns the existing id before the build is ever"
+            " publish's start returns the existing id before the build is ever"
             " reached a second time; compute_wind_weights is the one pure"
             " step the build always calls, once per build, so this count"
             " is the build count), mutant M66 (the repeat check removed)"
@@ -577,8 +555,8 @@ def test_pb3_repeat_publish_returns_same_id_and_rebuilds_nothing(
             " nothing else), mutant M66 (the repeat check removed) = the"
             " row gone (its inputs were emptied before the second call) or"
             " an IntegrityError from a duplicate (site_id, cutoff) insert"
-            " -- in fact neither: _swap's own inner repeat check (8.3 step"
-            " 1) still catches it and this row stays unchanged either way;"
+            " -- in fact neither: _swap's own inner repeat check still"
+            " catches it and this row stays unchanged either way;"
             " the build-count assertion above is M66's actual kill"
         )
         counts = _publication_table_counts(conn, site_id)
@@ -594,7 +572,7 @@ def test_pb3_repeat_publish_returns_same_id_and_rebuilds_nothing(
 
 def test_pb4_an_open_or_recordless_cutoff_fails(tmp_path: Path) -> None:
     """PB4: an open cutoff (D) and one with no record (D-9) both fail with
-    ``PublicationFailed("cutoff_not_closed")``; no rows (8.2)."""
+    ``PublicationFailed("cutoff_not_closed")``; no rows."""
 
     async def _run() -> None:
         from wxverify.scoring.publication import PublicationFailed, publish
@@ -638,14 +616,13 @@ def test_pb5_a_setting_saved_mid_build_waits_for_the_next_publication(
 ) -> None:
     """PB5: ``rolling_window_days`` changed from 5 to 7 between the build's
     settings snapshot and its wind-weight step (injected at the one call to
-    ``compute_wind_weights``, the pure step 8.2 places after the ranking
+    ``compute_wind_weights``, the pure step that comes after the ranking
     sums and the settings read): the publication built from THIS call
-    still keeps window 5 (8.2, 13.1).
+    still keeps window 5.
 
     Assumes ``scoring.publication`` imports ``compute_wind_weights`` by
-    name from ``forecast.wind_blend`` (this file's own assumption, listed
-    in the test-authoring report) -- a deterministic injection point, not
-    a timing race: the real function still runs, after the side effect.
+    name from ``forecast.wind_blend`` -- a deterministic injection point,
+    not a timing race: the real function still runs, after the side effect.
     """
 
     async def _run() -> None:
@@ -707,7 +684,7 @@ def test_pb6_the_site_deleted_mid_build_fails_the_swap(
     """PB6: the site deleted between the build's read phase and the swap
     (injected at the same ``compute_wind_weights`` call as PB5) fails the
     swap with ``PublicationFailed("no_site")`` rather than writing a
-    publication for a gone site (8.3)."""
+    publication for a gone site."""
 
     async def _run() -> None:
         from wxverify.scoring.publication import PublicationFailed, publish
@@ -761,7 +738,7 @@ def test_pb7_a_poisoned_swap_insert_leaves_no_row_anywhere(tmp_path: Path) -> No
     """PB7: a trigger that raises on INSERT into ``publication_coverage``
     fails the whole swap; since it is one ``writer.write``, no row lands
     in ``publications``, ``publication_rankings`` or
-    ``publication_wind_weights`` either (8.3)."""
+    ``publication_wind_weights`` either."""
 
     async def _run() -> None:
         from wxverify.scoring.publication import publish
@@ -859,7 +836,7 @@ def test_pb8_an_older_publication_is_kept_until_192h_past_its_successor(
 ) -> None:
     """PB8: D-5's publication, whose successor (D-3's) was published
     ``delta`` before the clock of a new build. Kept at 192h-1s and at
-    exactly 192h; deleted with its children past 192h (7.5)."""
+    exactly 192h; deleted with its children past 192h."""
 
     async def _run() -> None:
         from wxverify.scoring.publication import publish
@@ -931,8 +908,8 @@ def test_pb9_a_second_connection_holding_begin_immediate_only_blocks_the_swap(
 ) -> None:
     """PB9: a second connection holds ``BEGIN IMMEDIATE`` through the
     build's read phase; the build completes and reaches its wind-weight
-    step promptly (its reads run outside the write lock, 8.2); only the
-    swap (8.3's one ``writer.write``) then waits for the lock (K18).
+    step promptly (its reads run outside the write lock); only the
+    swap (its one ``writer.write``) then waits for the lock.
 
     A rendezvous, not a timing race: the wind-weight step (the same
     deterministic injection point PB5/PB6 use) signals a ``threading.
@@ -986,7 +963,7 @@ def test_pb9_a_second_connection_holding_begin_immediate_only_blocks_the_swap(
             assert reached, (
                 "M72 -> at this assertion: correct = the wind-weight step"
                 " reached promptly (the build's reads run outside the"
-                " write lock, 8.2), mutant M72 (the build's sums read"
+                " write lock), mutant M72 (the build's sums read"
                 " inside writer.write) = this call never arrives while"
                 " the second connection holds BEGIN IMMEDIATE -- the"
                 " whole build blocks first"
@@ -1002,7 +979,7 @@ def test_pb9_a_second_connection_holding_begin_immediate_only_blocks_the_swap(
             assert publish_task in pending, (
                 "M72 -> at this assertion: correct = the publish task"
                 " still pending once its read phase completes (only the"
-                " swap, 8.3's one writer.write, waits for the lock, 8.2),"
+                " swap, the build's one writer.write, waits for the lock),"
                 " mutant M72 (the build itself holds or re-enters a write"
                 " lock during its reads) would already have finished (or"
                 " raised) here instead of still waiting on the external"
@@ -1032,7 +1009,7 @@ def test_pb10_coverage_counts_scored_expected_and_starting_days_apart(
 ) -> None:
     """PB10: of a 7-date window (2 starting, 5 closed), X is scored on 3
     closed dates, absent on 1, and the variable not_counted on the last ->
-    scored 3, expected 4 (not_counted excluded), starting_days 2 (7.4)."""
+    scored 3, expected 4 (not_counted excluded), starting_days 2."""
 
     async def _run() -> None:
         from wxverify.scoring.publication import publish
@@ -1119,7 +1096,7 @@ def test_pb10_coverage_counts_scored_expected_and_starting_days_apart(
 def test_pb11_wind_weight_needs_min_training_days(tmp_path: Path) -> None:
     """PB11: X has 20 qualifying wind days in the 30-date window, Y 19 ->
     X gets a weight (mae_ms the mean absolute difference of its highs), Y
-    none (MIN_TRAINING_DAYS, 8.2)."""
+    none (MIN_TRAINING_DAYS)."""
 
     async def _run() -> None:
         from wxverify.scoring.publication import publish
@@ -1217,8 +1194,7 @@ def test_pb16_build_started_at_published_at_whole_second_microseconds_dropped(
 ) -> None:
     """PB16: as PB1, with ``now_utc`` at an instant whose microsecond is
     250000: ``publications.build_started_at`` and ``published_at`` pass
-    ``is_canonical_utc_stamp``, the check import applies to them (15.2,
-    15.6)."""
+    ``is_canonical_utc_stamp``, the check import applies to them."""
 
     async def _run() -> None:
         from wxverify.scoring.publication import publish
@@ -1247,8 +1223,8 @@ def test_pb16_build_started_at_published_at_whole_second_microseconds_dropped(
         )
         assert pub["build_started_at"] == whole_second_stamp, (
             "M144 -> at this assertion: correct ="
-            f" {whole_second_stamp!r} (15.2's"
-            " isoformat_utc(t.replace(microsecond=0))), mutant ="
+            f" {whole_second_stamp!r} ("
+            "isoformat_utc(t.replace(microsecond=0))), mutant ="
             f" {pub['build_started_at']!r}"
         )
 
@@ -1260,8 +1236,8 @@ def test_pb16_build_started_at_published_at_whole_second_microseconds_dropped(
         )
         assert pub["published_at"] == whole_second_stamp, (
             "M144 -> at this assertion: correct ="
-            f" {whole_second_stamp!r} (15.2's"
-            " isoformat_utc(t.replace(microsecond=0))), mutant ="
+            f" {whole_second_stamp!r} ("
+            "isoformat_utc(t.replace(microsecond=0))), mutant ="
             f" {pub['published_at']!r}"
         )
 
@@ -1282,11 +1258,11 @@ def _close_through_with_missed(
     missed_date,
 ) -> None:
     """Like ``_close_through``, but ``missed_date`` (between ``first_date``
-    and ``last_closed_date`` inclusive) becomes ``missed`` via P1's own
+    and ``last_closed_date`` inclusive) becomes ``missed`` via the day record's own
     retry-exhaustion path (``begin_close`` then ``fail_close``, twice) in
     place of ``closed``; every other date in range still closes normally.
-    Dates are processed in order, as P1 requires (``_has_earlier_undone``,
-    ``db/site_days.py:757``): a ``missed`` date counts as done, so the date
+    Dates are processed in order, as ``_has_earlier_undone`` requires: a
+    ``missed`` date counts as done, so the date
     after it still closes.
     """
     from wxverify.db.site_days import fail_close, finish_close
@@ -1326,10 +1302,10 @@ def _close_through_with_missed(
 def test_pb17_a_missed_dates_leftover_day_scores_rows_are_excluded(
     tmp_path: Path,
 ) -> None:
-    """PB17: D-2's record is ``missed`` (P1's ``begin_close`` then
+    """PB17: D-2's record is ``missed`` (``begin_close`` then
     ``fail_close``, twice), its ``day_scores`` rows left in place, scored
     with sums as on D-3 and D-1. X's ``w:5``/``w:all`` sums and w:5
-    coverage leave D-2 out, as PB2 does by deleting its rows outright (7.2);
+    coverage leave D-2 out, as PB2 does by deleting its rows outright;
     here the rows stay and only the record's ``closed`` state excludes
     them, proving ``_DAY_SUMS_SQL`` joins on it (M150). Y's wind row on the
     missed D-2 would be its 20th qualifying day (``MIN_TRAINING_DAYS``) if
@@ -1403,7 +1379,7 @@ def test_pb17_a_missed_dates_leftover_day_scores_rows_are_excluded(
         assert rank5["n"] == 8, (
             "M150 -> at this assertion: correct = 8 (the starting D-5,D-4"
             " (2*2) plus the closed D-3,D-1 (2*2); D-2's record is missed,"
-            " so its leftover day_scores row is left out, 7.2), mutant M150"
+            " so its leftover day_scores row is left out), mutant M150"
             " (_DAY_SUMS_SQL reads day_scores without the record's closed"
             " state) = 10 (D-2's leftover row, n=2, counted in)"
         )

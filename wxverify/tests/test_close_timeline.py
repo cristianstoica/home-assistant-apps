@@ -1,22 +1,8 @@
-"""The night and the first attempt (plan 2026-10-21-daily-close-close-job.md
-section 15.4): TL1 to TL10.
+"""The night and the first attempt: TL1 to TL10.
 
-Written before ``close_chain.enqueue_due_close_work`` and ``close_p4``
-exist, and fails first for that reason: every test here reaches a call
-that needs one of them, either directly (an inline import inside a test
-body, below) or through ``tests.helpers.install_round_state_standin``,
-which patches an attribute of ``wxverify.worker.close_p4`` -- a module
-that does not exist yet, so the patch itself raises
-``ModuleNotFoundError``. Where the close branch is never reached at all
-(``scheduler_tick`` has no call to it at all until piece 4), the test
-instead fails on a plain assertion that needs P3's behaviour -- the
-moved-day or new-job-row check simply finds nothing moved and nothing
-enqueued.
-
-Section 16.2 of the plan names the mutant each test ID kills; that mapping
-is given inline on the exact assertion it kills at, in the file's own
-style. TL7 has no listed mutant (16.2 lists none for it), so its assertion
-carries a plain message.
+The mutant each test ID kills is named inline on the exact assertion it
+kills at, in the file's own style. TL7 has no assigned mutant, so its
+assertion carries a plain message.
 
 Real SQLite only (``tests.helpers.standard_night``, built on
 ``tests.helpers.day_close_site``, real ``run_migrations`` via ``init_db``
@@ -68,9 +54,9 @@ from wxverify.worker.day_values import write_hourly_values
 @pytest.fixture(autouse=True)
 def _clear_close_chain_log_map() -> None:
     """This file's own autouse wiring of ``clear_close_chain_log_map``
-    (15.1's "The log map.") -- autouse HERE, inside this one P3 test
-    file, never across the whole suite (constraint: the module-level
-    fixture lives in this file, not in ``tests/conftest.py``)."""
+    -- autouse HERE, inside this one close-chain test file, never across
+    the whole suite (the module-level fixture lives in this file, not in
+    ``tests/conftest.py``)."""
     clear_close_chain_log_map()
 
 
@@ -131,7 +117,7 @@ def test_tl1_attempt_starts_only_once_the_round_settles(
     """TL1: the round of R settles at R 00:20Z; ticks at R 00:00Z, 00:10Z,
     00:20Z. No attempt before 00:20Z; at 00:20Z ``begin_close`` (attempt
     1), stage 1's log row with ``started_at`` D's end and ``ended_at``
-    00:20Z, one ``day_close`` job keyed ``close:{S}:{D}:2`` (5.1, 8.1).
+    00:20Z, one ``day_close`` job keyed ``close:{S}:{D}:2``.
 
     M13 -> at the 00:20Z assertion below: correct = ('closing', 1) (the
     attempt starts once the round settles, 20 minutes before its bound),
@@ -171,10 +157,8 @@ def test_tl1_attempt_starts_only_once_the_round_settles(
         )
 
         stage1 = await _stage1_row(db, site_id)
-        assert stage1 is not None, "stage 1's own stage-log row (8.1) was never written"
-        assert stage1["job_id"] is None, (
-            "stage 1 has no job_id (8.1: stage 1 = job_id NULL)"
-        )
+        assert stage1 is not None, "stage 1's own stage-log row was never written"
+        assert stage1["job_id"] is None, "stage 1 has no job_id (stage 1 = job_id NULL)"
         d_end_row = await db.read(
             lambda c: c.execute(
                 "SELECT day_end_utc FROM site_days"
@@ -183,18 +167,18 @@ def test_tl1_attempt_starts_only_once_the_round_settles(
             ).fetchone()
         )
         assert stage1["started_at"] == d_end_row["day_end_utc"], (
-            "stage 1's started_at must be D's own day_end_utc (4.1: the round"
+            "stage 1's started_at must be D's own day_end_utc (the round"
             " starts just after D's end)"
         )
         assert stage1["ended_at"] == isoformat_utc_micro(_r_at(0, 20)), (
             "stage 1's ended_at must be the instant it actually settled, not"
-            " the bound or some other time (plan 12.3: every stamp P3 writes"
-            " uses isoformat_utc_micro)"
+            " the bound or some other time (close_chain.py writes every"
+            " ended_at with isoformat_utc_micro)"
         )
 
         keys = await _day_close_job_keys(db, site_id)
         assert keys == [f"close:{site_id}:{D.isoformat()}:2"], (
-            "exactly one day_close job, keyed close:{site}:{date}:2 (8.1)"
+            "exactly one day_close job, keyed close:{site}:{date}:2"
         )
 
     asyncio.run(_run())
@@ -209,7 +193,7 @@ def test_tl2_bound_starts_the_attempt_when_the_round_never_settles(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """TL2: the round never settles; ticks at R 00:39Z and 00:40Z. The
-    attempt starts at 00:40Z, not before (5.1, :154).
+    attempt starts at 00:40Z, not before.
 
     M14 -> at the 00:40Z assertion below: correct = ('closing', 1) (the
     bound alone starts the attempt once reached, even though 'settled'
@@ -252,7 +236,7 @@ def test_tl3_close_waits_behind_a_due_wind_lane_job(
 ) -> None:
     """TL3: a ``fetch_obs`` ``wind-days`` job of S is ``pending`` and due
     at R 00:40Z. No attempt at that tick; the wind job is claimed; the
-    attempt starts at the next tick (5.1).
+    attempt starts at the next tick.
 
     M15 -> at the first assertion below: correct = ('open', 0) (the
     attempt does not start while the due wind-lane job is still
@@ -283,7 +267,7 @@ def test_tl3_close_waits_behind_a_due_wind_lane_job(
             " wind-lane job check removed) = ('closing', 1)"
         )
 
-        # The row says only that the attempt STARTS at the next tick (5.1),
+        # This case pins only that the attempt STARTS at the next tick,
         # not that it runs to completion -- stop once stage 2's job is
         # pending, so this test never reaches stage 5's close_p4.score_day
         # (install_p4_standins above is the safety net if it ever did).
@@ -296,8 +280,7 @@ def test_tl3_close_waits_behind_a_due_wind_lane_job(
 
         record = await _state(db, site_id)
         assert (record.state, record.attempts) == ("closing", 1), (
-            "once the wind-lane job is out of the way, the next tick starts"
-            " the attempt (5.1)"
+            "once the wind-lane job is out of the way, the next tick starts the attempt"
         )
 
     asyncio.run(_run())
@@ -313,14 +296,14 @@ def test_tl4_days_are_attempted_oldest_first(
 ) -> None:
     """TL4: D - 1 still ``retry_due`` at R 00:40Z (``BOUND``), its retry
     now due within ``CLOSE_LATE_LIMIT`` (1h) of the tick, so the "running
-    when due" rule of 5.2 does not itself fire here. No attempt for D
-    until D - 1 is done (P1 §4.5).
+    when due" rule does not itself fire here. No attempt for D
+    until D - 1 is done.
 
     M16 -> at the assertion below: correct = D - 1 moves to ``closing``
     (attempt 2) at this tick, its retry now due and D - 1 being the
     site's oldest not-done day, while D stays ``open`` at 0 attempts
     (D has ended by ``BOUND`` and is blocked only because D - 1 is not
-    done, P1 §4.5), mutant M16 (the tick takes the site's newest
+    done), mutant M16 (the tick takes the site's newest
     not-done day instead of its oldest, so ``begin_close`` is tried on D
     instead and refused) = D - 1 stays ``retry_due`` at attempt 1, its
     retry never attempted, while D is unchanged too.
@@ -338,7 +321,7 @@ def test_tl4_days_are_attempted_oldest_first(
         # Undo standard_night's D-1 closure: put it back to closing/attempt 1,
         # then fail it 1h30m before BOUND, so its retry_at (failure +
         # RETRY_DELAY, 1h) lands 30 minutes before BOUND -- inside the hour
-        # the "running when due" rule (5.2) allows. standard_night's
+        # the "running when due" rule allows. standard_night's
         # worker_started_at is NOW (D 12:00Z), before retry_at, so the
         # add-on counts as running.
         failed_at = note_day_clock(BOUND - timedelta(minutes=90))
@@ -359,9 +342,9 @@ def test_tl4_days_are_attempted_oldest_first(
             "D-1 must start this test retry_due at attempt 1"
         )
 
-        # Tick at R's bound (plan 5.1): D-1's retry_at is BOUND - 30m, within
+        # Tick at R's bound: D-1's retry_at is BOUND - 30m, within
         # CLOSE_LATE_LIMIT (1h) of this tick, so the "running when due" rule
-        # (5.2) lets the retry be attempted -- it is this case's oldest
+        # lets the retry be attempted -- it is this case's oldest
         # not-done day.
         await tick(db, clock, BOUND)
 
@@ -374,7 +357,7 @@ def test_tl4_days_are_attempted_oldest_first(
             " and never reaches D-1"
         )
         assert (d_after.state, d_after.attempts) == ("open", 0), (
-            "D itself must stay blocked behind D-1 regardless (P1 §4.5)"
+            "D itself must stay blocked behind D-1 regardless"
         )
 
     asyncio.run(_run())
@@ -390,15 +373,14 @@ def test_tl5_sites_are_enqueued_in_due_instant_order(
 ) -> None:
     """TL5: two sites, S1 in ``Etc/GMT-14`` and S2 in ``UTC``, both due.
     S1's attempt at its own bound, S2's at its own; at a tick where both
-    are due, S1's job is created first when its due instant is earlier
-    (4.5, 8.5).
+    are due, S1's job is created first when its due instant is earlier.
 
     S1's own round bound is set a few minutes earlier than S2's (the
     round date's bound is whatever ``round_state``'s stand-in answers,
     independent of either site's real timezone math), the smallest gap
     that still orders S1 before S2 -- any larger gap risks ticking more
     than ``CLOSE_LATE_LIMIT`` (1h) after S1's own due instant, which
-    would itself trip the "running when due" rule of 5.2 and strand S1
+    would itself trip the "running when due" rule and strand S1
     unattempted instead of testing the ordering this case is about.
 
     Built so the GMT-14 site gets the HIGHER site id, deliberately
@@ -475,9 +457,9 @@ def test_tl5_sites_are_enqueued_in_due_instant_order(
 def test_tl6_a_changeover_day_is_missed_not_scored(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """TL6: D is a changeover day (P1 §6.4); ticks to R 01:00Z. At its
+    """TL6: D is a changeover day; ticks to R 01:00Z. At its
     due instant D is ``missed``, ``zone_changeover``; no ``day_close``
-    job; D + 1 is closed as usual the next night (4.4).
+    job; D + 1 is closed as usual the next night.
 
     M18 -> at the assertion below: correct = ('missed',
     'zone_changeover') with no day_close job, mutant M18 (a changeover
@@ -489,11 +471,11 @@ def test_tl6_a_changeover_day_is_missed_not_scored(
         disable_other_enqueuers(monkeypatch)
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
-        # The tick's due-instant read (_site_due_instant, plan 4.5/8.5) asks
+        # The tick's due-instant read (_site_due_instant) asks
         # close_p4.round_state for the round's bound even for a changeover
         # day -- without a stand-in the real, unimplemented round_state
         # raises, the per-site savepoint rolls the whole tick back, and D
-        # never moves (plan 173, 219).
+        # never moves.
         round_state = install_round_state_standin(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
 
@@ -519,7 +501,7 @@ def test_tl6_a_changeover_day_is_missed_not_scored(
         keys = await _day_close_job_keys(db, site_id)
         assert keys == [], (
             "no day_close job of any stage may exist for a changeover day"
-            " (4.4: 'with no attempt')"
+            " (with no attempt)"
         )
 
     asyncio.run(_run())
@@ -537,7 +519,7 @@ def test_tl8_close_kinds_claim_ahead_of_an_older_tier1_job(
     is older than every ``day_close`` and ``day_publish`` job;
     ``run_due_jobs``. Claims in order: ``day_close`` stages 2 to 6,
     ``day_publish`` stages 7 and 8, then the ``fetch_feed`` job, which
-    runs through the stub of 15.1 (tier 0, 4.3); after the run, no
+    runs through the stub (tier 0); after the run, no
     ``day_close`` or ``day_publish`` job is in tier 2.
 
     M19/M19b -> at the ordering assertion below: correct = every claim
@@ -611,7 +593,7 @@ def test_tl8_close_kinds_claim_ahead_of_an_older_tier1_job(
             "M20/M20b -> at this assertion: correct = no day_close/day_publish"
             " row has a next_attempt_at moved off its own updated_at by"
             " reclaim_all_stale's tier-2 handling (they are never chain"
-            " types, 4.3), mutant M20/M20b (either kind added to"
+            " types), mutant M20/M20b (either kind added to"
             " _CHAIN_TYPES_SQL) = such a row exists after a stale reclaim --"
             " not exercised in THIS run (nothing here goes stale), so this"
             " assertion does not kill M20/M20b; it only confirms the"
@@ -706,7 +688,7 @@ def test_tl8_reclaim_all_stale_leaves_close_kinds_next_attempt_at_alone(
 ) -> None:
     """TL8 extension: ``reclaim_all_stale`` must never touch a stuck
     ``day_close``/``day_publish`` job's ``next_attempt_at`` -- they are
-    not chain types (4.3), so a kill left behind by a restart simply
+    not chain types, so a kill left behind by a restart simply
     re-pends with its stamp untouched, never promoted into tier 2's
     stale-chain handling. TL8's own end-of-run "no stale tier-2 row"
     read is explicit that it cannot tell this apart from the real code,
@@ -790,11 +772,10 @@ def test_tl9_a_retention_failure_does_not_undo_the_ticks_moves(
     tmp_path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """TL9: AT4's start (``worker_started_at`` after the bound, so D is
-    never attempted), with P2's ``prune_raw_readings`` raising a
+    never attempted), with ``prune_raw_readings`` raising a
     ``RuntimeError`` where ``close_chain`` calls it. The first tick's
     write raises nothing; D ``missed``, ``never_attempted``, read back
-    on a second connection; one ERROR line naming ``RuntimeError`` (8.4,
-    8.5).
+    on a second connection; one ERROR line naming ``RuntimeError``.
 
     M75 -> at the assertion below: correct = D read back as 'missed'/
     'never_attempted' on a FRESH connection (the tick's write committed
@@ -809,8 +790,8 @@ def test_tl9_a_retention_failure_does_not_undo_the_ticks_moves(
         disable_other_enqueuers(monkeypatch)
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
-        # D's own due instant still needs P4's bound even on this AT4-style
-        # start (plan 173, 219): without a round_state stand-in the real,
+        # D's own due instant still needs round_state's bound even on this AT4-style
+        # start: without a round_state stand-in the real,
         # unimplemented round_state raises, the per-site savepoint rolls
         # the tick back, and D never moves.
         round_state = install_round_state_standin(monkeypatch)
@@ -819,7 +800,7 @@ def test_tl9_a_retention_failure_does_not_undo_the_ticks_moves(
         # AT4's start: worker_started_at AFTER the bound (standard_night's
         # own worker_started_at, NOW, is before the bound, so it must be
         # overridden here) -- the first attempt's due instant (the bound)
-        # falls while the add-on is not yet started (5.2): D is missed,
+        # falls while the add-on is not yet started: D is missed,
         # never_attempted, with no gap-fill call at all.
         late_start = BOUND + timedelta(minutes=61)
         await db.write(
@@ -834,9 +815,8 @@ def test_tl9_a_retention_failure_does_not_undo_the_ticks_moves(
         def _raising_prune(conn: object, *, now_utc: object) -> None:
             raise RuntimeError("synthetic prune failure for TL9")
 
-        # close_chain.py imports prune_raw_readings BY NAME (14.4: "P3 calls
-        # ... prune_raw_readings"), so the patch targets close_chain's own
-        # name.
+        # close_chain.py imports prune_raw_readings BY NAME, so the patch
+        # targets close_chain's own name.
         monkeypatch.setattr(
             "wxverify.worker.close_chain.prune_raw_readings",
             _raising_prune,
@@ -863,7 +843,7 @@ def test_tl9_a_retention_failure_does_not_undo_the_ticks_moves(
         assert any(
             "RuntimeError" in rec.message and rec.levelname == "ERROR"
             for rec in caplog.records
-        ), "one ERROR line naming RuntimeError must be written (8.4)"
+        ), "one ERROR line naming RuntimeError must be written"
 
     asyncio.run(_run())
 
@@ -882,7 +862,7 @@ def test_tl10_one_sites_fault_does_not_stop_the_others(
     later. S2's attempt begins at the first tick (``begin_close``, one
     ``day_close`` job); after both ticks S1's day records unchanged and
     no ``day_close`` job of S1; one ERROR line naming S1 and step 3
-    after the first tick, none added by the second (8.5).
+    after the first tick, none added by the second.
 
     M74 -> at the per-site-isolation assertion below: correct = S2's
     attempt still begins even though S1's round_state call raised,
@@ -950,7 +930,7 @@ def test_tl10_one_sites_fault_does_not_stop_the_others(
         )
         assert "3" in error_lines_after_first[0].message, (
             "the ERROR line must name the step (round_state is read in step"
-            " 3 of enqueue_due_close_work, 8.5)"
+            " 3 of enqueue_due_close_work)"
         )
 
         caplog.clear()
@@ -959,7 +939,7 @@ def test_tl10_one_sites_fault_does_not_stop_the_others(
             rec for rec in caplog.records if rec.levelname == "ERROR"
         ]
         assert error_lines_after_second == [], (
-            "the flood guard (8.5's log map) must suppress a second ERROR"
+            "the flood guard (the log map) must suppress a second ERROR"
             " line for the same site and step inside the same hour"
         )
 
@@ -971,7 +951,7 @@ def test_tl10_a_second_loop_fault_does_not_fail_the_whole_tick(
 ) -> None:
     """TL10 extension: TL10 above puts S1's fault in ``round_state``,
     which ``_site_due_instant`` reaches in ``enqueue_due_close_work``'s
-    FIRST per-site loop (8.5) -- a loop M74 never touches (M74 drops the
+    FIRST per-site loop -- a loop M74 never touches (M74 drops the
     savepoint only from the SECOND loop, ``close_chain.py:2126``, where
     ``_site_steps`` runs). S1 is excluded from the ``order`` list already
     in that first, still-protected loop, so its fault never reaches the
@@ -979,7 +959,7 @@ def test_tl10_a_second_loop_fault_does_not_fail_the_whole_tick(
 
     This test puts the fault in the second loop instead: S1 gets a
     ``closing`` ``site_days`` row with NO matching ``close_attempts``
-    row, so step 4's repair (``_repair``, plan 8.2) raises
+    row, so step 4's repair (``_repair``) raises
     ``RuntimeError("the closing attempt has no attempt record")`` from
     inside ``_site_steps``. ``_site_due_instant`` never touches
     ``close_attempts`` for a ``closing`` day (its only branches are
@@ -1059,7 +1039,7 @@ def test_l5_a_database_error_from_enqueue_due_close_work_raises(
 ) -> None:
     """L5: a ``sqlite3.DatabaseError`` raised from inside one site's step
     of ``enqueue_due_close_work`` (here, S1's ``round_state`` call, step 3
-    of the first loop, 8.5) is NOT a fault the per-site savepoint
+    of the first loop) is NOT a fault the per-site savepoint
     swallows -- ``_database_failing`` excludes every ``DatabaseError`` but
     ``IntegrityError`` from the per-site catch (``close_chain.py`` around
     :1694), so it must re-raise out of ``_in_site_savepoint`` and out of

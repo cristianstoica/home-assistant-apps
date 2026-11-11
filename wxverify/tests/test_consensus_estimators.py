@@ -1,4 +1,4 @@
-"""Part A per-variable estimator oracles.
+"""Per-variable estimator oracles.
 
 Covers the pure estimator functions (`_p90`, `_low_trim`, `_mean`), the
 allowlist dispatch inside `compute_consensus`, the wind anti-regression
@@ -182,7 +182,7 @@ def test_temperature_dispatch_unchanged_lapse_normalization_pin() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Precip gate pin (critical): median/MAD ships in R1, low_trim is NOT wired
+# Precip gate pin (critical): median/MAD ships, low_trim is NOT wired
 # ---------------------------------------------------------------------------
 
 
@@ -327,7 +327,7 @@ def test_materialize_consensus_wind_p90_through_real_write_path(
         ).lastrowid
     )
     valid_at = "2026-01-01T00:00:00Z"
-    # A P1 record holding `valid_at` (the close is always on; the closed-day
+    # A day record holding `valid_at` (the close is always on; the closed-day
     # guard behind write_station_observation/materialize_consensus refuses
     # the write with no record).
     start_site_days(
@@ -345,8 +345,8 @@ def test_materialize_consensus_wind_p90_through_real_write_path(
                 (site_id, f"STATION{index}"),
             ).lastrowid
         )
-        # Puts the station on the day's saved list (6.2) through the real
-        # record_station_change path, before the P1 record (local_date
+        # Puts the station on the day's saved list through the real
+        # record_station_change path, before the day record (local_date
         # 2026-01-01) was started -- 2025-12-31 holds no record, so its
         # "added" takes effect on the next local date, 2026-01-01.
         record_station_change(

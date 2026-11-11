@@ -1,7 +1,7 @@
-"""The provisional observed line of the Overlay (daily-close plan P5, §8, §9.1).
+"""The provisional observed line of the Overlay.
 
 While a day is not yet closed, the Overlay draws its observed values from
-P2's raw table with the close's own method, unchanged: ``hourly_values`` per
+the raw readings with the close's own method, unchanged: ``hourly_values`` per
 day, then each station value's jump check (``qc_flag``) and the site's
 consensus (``compute_consensus``), built in memory the way the close builds
 the site's hourly truth. Nothing here writes: no station value, consensus
@@ -11,9 +11,9 @@ never called.
 The pages read the line as ``provisional_site_hours(conn, site_id=...,
 variable=..., now_utc=...)`` and the days of a range as ``day_spans``. The
 close, pairing, scoring, the rankings, the publication and Station Trust
-never import this module (plan §8.5). Day states come only through
-``wxverify.db.site_days``'s functions; this module names none of P1's
-tables. ``now`` is passed in by the caller.
+never import this module. Day states come only through
+``wxverify.db.site_days``'s functions; this module names none of that
+module's tables. ``now`` is passed in by the caller.
 """
 
 from __future__ import annotations
@@ -46,18 +46,18 @@ _ONE_DAY: Final = timedelta(days=1)
 #: The smallest step of a ``datetime``: a range's last instant is its end less
 #: one tick.
 _TICK: Final = timedelta(microseconds=1)
-#: The variables the line draws, each P2's quantity of the same name.
+#: The variables the line draws, each the ``Quantity`` of the same name.
 _QUANTITY_BY_VARIABLE: Final[dict[str, Quantity]] = {q: q for q in QUANTITIES}
 
 
 @dataclass(frozen=True)
 class DaySpan:
-    """One P1 day record as the pages draw it (plan §9.1).
+    """One day record as the pages draw it.
 
     ``start_utc`` and ``end_utc`` are the record's stored bounds, the day
     being ``[start_utc, end_utc)``. ``state``, ``timezone``,
     ``zone_changeover`` and ``missed_reason`` are the record's own;
-    ``zone_flagged`` is P1's ``zone_flagged`` for the day: whether the day's
+    ``zone_flagged`` is ``site_days.zone_flagged`` for the day: whether the day's
     zone differs from the site's zone.
     """
 
@@ -73,13 +73,14 @@ class DaySpan:
 
 @dataclass(frozen=True)
 class ProvisionalLine:
-    """The provisional observed line of one site and variable (plan §8, §9.1).
+    """The provisional observed line of one site and variable.
 
     ``valid_at`` holds every hour drawn, oldest first: the ended hours of the
     days not yet done. ``values`` holds the site value of each of those hours
     that has one, in °C, mm or m/s; an hour without one is absent, never 0.
-    ``latest_reading_at`` is the latest of P2's ``latest_reading_at`` over the
-    stations and days drawn (plan §8.4), ``None`` when there is none.
+    ``latest_reading_at`` is the latest of ``hourly_values``'s
+    ``latest_reading_at`` over the stations and days drawn, ``None`` when there
+    is none.
     """
 
     valid_at: tuple[datetime, ...]
@@ -100,7 +101,7 @@ def _empty_line() -> ProvisionalLine:
 
 
 def _span(conn: sqlite3.Connection, record: DayRecord) -> DaySpan:
-    """The record as a ``DaySpan``, with P1's ``zone_flagged`` for its day."""
+    """The record as a ``DaySpan``, with ``zone_flagged`` for its day."""
     return DaySpan(
         local_date=record.local_date,
         start_utc=record.day_start_utc,
@@ -119,9 +120,9 @@ def _first_overlapping(
     """The oldest record whose bounds overlap ``[start, end)``, or ``None``.
 
     The record that holds ``start``, when one does. Otherwise the range
-    starts before the site's first record or after its last one, and P1 has
-    no public read of a site's first record, so this finds it among the
-    records P1 does return. P1's records follow one another without a gap,
+    starts before the site's first record or after its last one, and
+    ``site_days`` has no public read of a site's first record, so this finds
+    it among the records it does return. Records follow one another without a gap,
     one date apart, so a record that overlaps the range without holding
     ``start`` lies wholly after it. When a record holds the range's last
     instant, the walk goes down by date from it and reads only records in
@@ -154,8 +155,8 @@ def day_spans(
 ) -> list[DaySpan]:
     """The site's day records whose bounds overlap ``[start_utc, end_utc)``.
 
-    One ``DaySpan`` per record, oldest first (plan §9.1). The first is the
-    record that holds ``start_utc`` (P1's ``day_for_instant``) or, when the
+    One ``DaySpan`` per record, oldest first. The first is the
+    record that holds ``start_utc`` (``day_for_instant``) or, when the
     range starts before the site's first record, that first record; the
     walk then reads each next date with ``day_record`` until a day starts at
     or after ``end_utc``. Instants before the site's first record, the
@@ -177,7 +178,7 @@ def day_spans(
 def _undone_spans(
     conn: sqlite3.Connection, site_id: int, now: datetime
 ) -> list[DaySpan]:
-    """The site's days that have started by ``now`` and are not done (plan §8.1).
+    """The site's days that have started by ``now`` and are not done.
 
     Days become done in date order, so these follow ``closed_through``: from
     the end of that day to ``now``, read with ``day_spans``. While no day is
@@ -240,7 +241,7 @@ def _ok_readings(
     elevations: dict[int, float | None],
     counted: frozenset[int] | None,
 ) -> list[ConsensusReading]:
-    """The hour's station values that pass the close's jump check (plan §8.3).
+    """The hour's station values that pass the close's jump check.
 
     Each listed station's value of the hour is checked with ``qc_flag``
     against ``previous[station]``: the station's previous value on the line,
@@ -284,7 +285,7 @@ def _ok_readings(
 def provisional_site_hours(
     conn: sqlite3.Connection, *, site_id: int, variable: str, now_utc: datetime
 ) -> ProvisionalLine:
-    """Section 8's provisional line for one site and variable (plan §8, §9.1).
+    """The provisional line for one site and variable.
 
     Empty for a variable other than ``temperature``, ``precip`` or ``wind``,
     and for a site that does not exist. Otherwise it covers the site's days

@@ -1,4 +1,4 @@
-"""Tests for card 7's display-only variables (``cloud_cover``, ``wind_gust``,
+"""Tests for the display-only variables (``cloud_cover``, ``wind_gust``,
 ``wind_direction``) staying out of everything the scored pipeline counts.
 
 Covers ``persist_fetch_result`` (``wxverify/collection/forecast_fetcher.py``)
@@ -239,7 +239,7 @@ def _display_samples(
     wind_gust: float,
     wind_direction: float,
 ) -> tuple[NormalizedSample, ...]:
-    """The three display variables (card 7) at the same two hours, valid
+    """The three display variables at the same two hours, valid
     values of each's own range (``DISPLAY_VALUE_RANGES``)."""
     hours = (base_valid, base_valid + timedelta(hours=1))
     leads = (6, 7)
@@ -264,7 +264,7 @@ def _display_samples(
 
 
 # ---------------------------------------------------------------------------
-# Step 3, bullet 1: two fresh files, same scored reply, one with display
+# Two fresh files, same scored reply, one with display
 # samples added.
 # ---------------------------------------------------------------------------
 
@@ -337,7 +337,7 @@ def test_display_samples_added_do_not_move_scored_usable_labels_or_outcome(
 
 
 # ---------------------------------------------------------------------------
-# Step 3, bullet 1 (second half): a second round changing only display
+# A second round changing only display
 # values writes no forecast_value_changes row for a display variable, with
 # a paired positive that a changed scored value does.
 # ---------------------------------------------------------------------------
@@ -399,7 +399,7 @@ def test_second_round_changing_only_display_values_logs_no_display_variable(
 
 
 # ---------------------------------------------------------------------------
-# Step 3, bullet 2: a display-only reply is a no_usable download, blocking
+# A display-only reply is a no_usable download, blocking
 # nothing of the day's first scored write for a later scored reply.
 # ---------------------------------------------------------------------------
 
@@ -450,7 +450,7 @@ def test_display_only_reply_is_no_usable_and_does_not_block_a_later_scored_downl
 
 
 # ---------------------------------------------------------------------------
-# Step 3, bullet 2 (meteoblue package): one member fully scored, one member
+# The meteoblue package: one member fully scored, one member
 # display-only.
 # ---------------------------------------------------------------------------
 
@@ -531,11 +531,10 @@ def test_meteoblue_package_member_display_only_blocks_until_a_later_scored_reply
 
 
 # ---------------------------------------------------------------------------
-# §8 Part H (plan 2026-11-07-health-release.md): out-of-range display
-# values dropped before they reach forecast_samples. H1-H4 drive
-# persist_fetch_result directly on a bare conn (no job pipeline needed):
-# the drop lives entirely inside that function, and a fresh site/feed is
-# all it reads.
+# Out-of-range display values dropped before they reach forecast_samples.
+# H1-H4 drive persist_fetch_result directly on a bare conn (no job pipeline
+# needed): the drop lives entirely inside that function, and a fresh
+# site/feed is all it reads.
 # ---------------------------------------------------------------------------
 
 
@@ -589,7 +588,7 @@ def _dropped_records(
 def test_h1_out_of_range_cloud_cover_dropped_and_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """H1 (plan §8), the owner's case. Catches: no drop (every row would
+    """H1, out-of-range cloud_cover. Catches: no drop (every row would
     persist); ``<``/``<=`` swapped (the in-bound 0/100 rows dropped
     instead of the out-of-range ones); one log line written per sample
     instead of one per call; low and high swapped in the message; the
@@ -634,7 +633,7 @@ def test_h1_out_of_range_cloud_cover_dropped_and_logged(
 def test_h2_two_fields_out_of_range_in_one_reply_write_one_line_naming_both(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """H2 (plan §8), two fields, one line. Catches: a separate log line
+    """H2, two fields, one line. Catches: a separate log line
     written per dropped field instead of one line naming all of them; a
     drop record written even when every display value in a reply is in
     range (the paired positive below); the drop placed before the
@@ -690,7 +689,7 @@ def test_h2_two_fields_out_of_range_in_one_reply_write_one_line_naming_both(
 
 
 def test_h3_scored_out_of_range_values_still_stored_and_counted_as_bad() -> None:
-    """H3 (plan §8), scored values unchanged. Catches: the display drop
+    """H3, scored values unchanged. Catches: the display drop
     reaching scored-roster variables -- an out-of-range temperature or
     wind sample must still be stored (as today) and counted by
     ``bad_sample_count_sql``.
@@ -723,7 +722,7 @@ def test_h3_scored_out_of_range_values_still_stored_and_counted_as_bad() -> None
 def test_h4_out_of_range_display_values_move_nothing_else_nan_included(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """H4 (plan §8), nothing else moves, the NaN case included. Catches:
+    """H4, nothing else moves, the NaN case included. Catches:
     the range test run before the NaN skip -- a NaN sample counted into
     the tally, or an out-of-range sample's drop blocked by a NaN check
     running first (caught here by the drop log, which the range test

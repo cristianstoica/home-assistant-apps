@@ -1,4 +1,4 @@
-"""One process-wide stop (storage-release plan 6.2-6.4).
+"""One process-wide stop.
 
 A stop begins with ``request_stop()``. The SIGTERM/SIGINT wrapper that
 ``api.app.lifespan`` installs while ``init_db`` runs calls it, and so does
@@ -33,14 +33,15 @@ from typing import Any, Final
 
 STOP: Final = threading.Event()
 
-# From M13's longest measured step, L = 58.084 s (plan 6.5: STOP_BUDGET_S =
-# L + 5, rounded up to whole seconds). The s6 grace times in Dockerfile and
-# the Supervisor's `timeout:` in config.yaml are set from this value; change
-# all three together. Always read through this module at the point of use,
-# never bound to a local name at import time, so a changed value takes effect.
+# From the longest measured step (the slowest close stage or job write),
+# L = 58.084 s: STOP_BUDGET_S = L + 5, rounded up to whole seconds. The s6
+# grace times in Dockerfile and the Supervisor's `timeout:` in config.yaml
+# are set from this value; change all three together. Always read through
+# this module at the point of use, never bound to a local name at import
+# time, so a changed value takes effect.
 STOP_BUDGET_S: float = 64.0
 
-# Plan 6.4 step 3: once the budget has run out and the writer has been
+# Once the budget has run out and the writer has been
 # interrupted, the waits go on for up to this much longer. Measured from the
 # same start, so the whole stop ends by STOP_BUDGET_S + GRACE_S however many
 # waits are nested.
@@ -79,7 +80,7 @@ def unregister(conn: sqlite3.Connection) -> None:
     """Undo ``register(conn)``: drop it and its progress handler.
 
     The progress handler must not outlive startup: on the running writer it
-    would interrupt the job write a stop lets finish (plan 6.3). A closed
+    would interrupt the job write a stop lets finish. A closed
     ``conn`` has no handler left to remove.
     """
     global _registered
@@ -158,8 +159,8 @@ async def wait_within_budget(
     once the wait is over, for the caller to re-raise or absorb.
 
     With no stop requested, the wait has no limit. Once ``request_stop``
-    has run, the budget is ``STOP_BUDGET_S`` measured from that call (plan
-    6.4). When it runs out: one ERROR names what is still running
+    has run, the budget is ``STOP_BUDGET_S`` measured from that call. When
+    it runs out: one ERROR names what is still running
     (``still_running``, logged on the caller's ``log``); ``interrupt_writer``
     ends the writer's running statement, so its transaction rolls back
     rather than being killed mid-commit; and the wait goes on for up to

@@ -1,4 +1,4 @@
-"""Cross-check (plan step 7, "Other pages") that every static class token
+"""Cross-check that every static class token
 anywhere in the Dashboard, Sites, Ops and Overlay template trees -- each
 page's own top-level file, every partial it reaches (directly or through
 another partial) via ``{% include %}``, and the shared ``base.html`` they
@@ -33,7 +33,7 @@ _TEMPLATES_ROOT: Final = _WEB_ROOT / "templates"
 _APP_CSS: Final = (_WEB_ROOT / "static" / "app.css").read_text(encoding="utf-8")
 _APP_JS: Final = (_WEB_ROOT / "static" / "app.js").read_text(encoding="utf-8")
 
-#: The exact templates the plan names -- each page's own top-level file.
+#: The exact templates checked -- each page's own top-level file.
 _SHELLS: Final = (
     _TEMPLATES_ROOT / "dashboard" / "show.html",
     _TEMPLATES_ROOT / "sites" / "list.html",

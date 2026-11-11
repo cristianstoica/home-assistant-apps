@@ -240,9 +240,9 @@ def _has_interior_null(values: Sequence[object]) -> bool:
 
 
 def summarize(payload: object) -> Summary | None:
-    """Summarize a forward response body; ``None`` means bad shape (R1).
+    """Summarize a forward response body; ``None`` means bad shape.
 
-    R1's shape: ``hourly`` holds ``time`` and the three forward names as lists
+    Good shape: ``hourly`` holds ``time`` and the three forward names as lists
     of equal length. ``first_valid``/``last_valid`` are the first and last
     ``hourly.time`` values at which all three names are non-null (``None`` if
     there is none, or if that entry does not parse). ``consecutive`` holds when
@@ -312,7 +312,9 @@ def classify(error: Exception) -> tuple[Verdict, Reason]:
 def verdict(
     outcome: Exception | None, summary: Summary | None, fetch_hour: datetime
 ) -> tuple[Verdict, Reason]:
-    """The forward verdict: classification, then R1, R4, R2 and R3 in order.
+    """The forward verdict, checked in this order: classification, shape,
+    times, step count, then every forward name's value count before any
+    name's gaps.
 
     ``outcome`` is the exception the forward request raised, or ``None``.
     """

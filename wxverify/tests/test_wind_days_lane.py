@@ -1,4 +1,4 @@
-"""Tests: the wind-history lane, group 1 of plan section 15.1 (2026-09-30).
+"""Tests: the wind-history lane.
 
 Covers T8, T30 (today-only row creation), T34 (today's own persist/retry),
 T45, T47 against ``wxverify/worker/wind_days.py`` (selector, persist,
@@ -7,17 +7,16 @@ scheduler integration) using a real sqlite3 ``:memory:`` connection +
 ``Database``/``FencedWriter`` for the handful of cases that go through an
 async write path (T45, T47 via dispatch/scheduler).
 
-Also covers T35 (the ``_fetch_failed`` >=500/payload-fault/refundable-
-transport-error dispatch -- in ``tests/test_wind_auth_hold.py``, alongside
-its existing 401/403/429 coverage) and T46's chunk-level
+Also covers the ``_fetch_failed`` >=500/payload-fault/refundable-
+transport-error dispatch (in ``tests/test_wind_auth_hold.py``, alongside
+its existing 401/403/429 coverage) and the chunk-level
 headroom-exhaustion integration (``_run_fetch_chunk`` raising
 ``WindHeadroomExhausted`` through a live chunk loop -- in
 ``tests/test_wind_quota.py``, reusing its headroom-0 fixture).
 
-T33 (held/probing endpoint selection), T36 (``pair_max`` materialize and
-``pair_and_score`` enqueue), T44/T104-T107 (reconcile/refetch), T97 (a
-past-day row retried to final) and T99 (a probing-hold job) are retired by
-the daily-close switch-over plan (section 7.2, R4/R5/R7): the lane no
+The tests of held/probing endpoint selection, ``pair_max`` materialize and
+``pair_and_score`` enqueue, reconcile/refetch, a past-day row retried to
+final and a probing-hold job are retired: the lane no
 longer fetches or finishes a past day, derives hourly station rows, or
 holds ``history_all``/``all_1day`` behind an auth hold. The remaining
 429/budget-deferral coverage for today's own evening-window row stays
@@ -195,7 +194,7 @@ def test_persist_day_window_and_record_count_scope(
 ) -> None:
     """``_today_window``/``_persist_day`` for today's row: the stored window
     is yesterday's start to today's end, capped at now plus ``_FUTURE_SLACK``
-    (P2 4.1, the past-row margin gone with R4); ``record_count`` is today's
+    (the past-row margin is gone); ``record_count`` is today's
     exact [start, end). A reading in yesterday's bounds is stored but not
     counted; one before yesterday's start is dropped from both."""
     conn = _make_db()
@@ -206,7 +205,7 @@ def test_persist_day_window_and_record_count_scope(
 
     start = datetime(2020, 1, 15, 0, 0, 0, tzinfo=UTC)
     now = start + timedelta(hours=2)
-    # P1 records for the 13th, 14th and 15th (the close is always on; `now`
+    # Day records for the 13th, 14th and 15th (the close is always on; `now`
     # passed here falls on the 13th, so `start_site_days`'s own fill extends
     # forward through the 15th) -- `before_yesterday` needs its own real,
     # open record for the guard to admit it.
@@ -314,7 +313,7 @@ def test_persist_day_today_204_stays_partial_with_refresh_schedule(
     station_id = _make_station(conn, site_id, "WSTATION01")
     today = date(2026, 3, 10)
     _insert_day(conn, station_id, today, status="partial", attempts=0)
-    # A P1 record holding today (the close is always on; without one
+    # A day record holding today (the close is always on; without one
     # `_today_try` has no clock and the row just keeps its old stamp).
     start = local_day_slots(today, _TZ)[0]
     start_site_days(conn, site_id, today, now_utc=start)
@@ -334,7 +333,7 @@ def test_persist_day_today_204_stays_partial_with_refresh_schedule(
 
     row = _day_row(conn, station_id, today)
     assert row["status"] == "partial", (
-        "mutant -> at this assertion: correct = 'partial' (R4/R7: the lane"
+        "mutant -> at this assertion: correct = 'partial' (the lane"
         " selects only today's row, and _persist_day always sets it"
         " partial), mutant (status set to something else) = a different"
         " status"
@@ -343,7 +342,7 @@ def test_persist_day_today_204_stays_partial_with_refresh_schedule(
 
 
 def test_today_next_attempt_near_midnight_rolls_to_tomorrow_plus_an_hour() -> None:
-    """4.2: the daytime cadence is capped at end - 1h (23:00 local), not the
+    """The daytime cadence is capped at end - 1h (23:00 local), not the
     old end - 35 min; a try at or after the cap clamps there too (the
     evening window, not this function, owns the midnight rollover)."""
     conn = _make_db()
@@ -369,8 +368,8 @@ def test_today_next_attempt_near_midnight_rolls_to_tomorrow_plus_an_hour() -> No
 
 # =============================================================================
 # Shared async dispatch harness (tmp-path DB + httpx.MockTransport), used by
-# the plan section 9 item-10 test below. T97 itself (a past-day row retried
-# to final) is retired by R4.
+# the evening-window 429 test below. The test of a past-day row retried to
+# final is retired.
 # =============================================================================
 
 
@@ -488,8 +487,8 @@ def test_enqueue_due_wind_days_enqueues_for_a_site_with_an_enabled_station(
     _make_station(conn, site_id, "WSTATION01")
     now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
     _freeze_scheduler_now(monkeypatch, now)
-    # A P1 record holding `now` (the close is always on; without one
-    # `wind_lane_due` finds no current day at all, 4.2). Today's row is
+    # A day record holding `now` (the close is always on; without one
+    # `wind_lane_due` finds no current day at all). Today's row is
     # still missing, which is what makes the lane due.
     start_site_days(conn, site_id, now.date(), now_utc=now)
 
@@ -777,11 +776,11 @@ def test_wind_lane_due_ignores_any_stored_wind_basis_value(value: str) -> None:
 
 
 # =============================================================================
-# Wind pre-midnight fetch: the day-finish step (items 1, 2, 4-8 and 11)
+# Wind pre-midnight fetch: the day-finish step
 # has nothing left to pin now that the daily close is permanent -- nothing
 # fetches or finishes a past/waiting day, and there is no ``history_all``
-# auth hold. Item 3 (``_today_next_attempt``'s cap) and item 10 (a 429
-# during the evening window) are kept below, for
+# auth hold. ``_today_next_attempt``'s cap and a 429
+# during the evening window are kept below, for
 # today's own row. D = the local day under test; start, end =
 # local_day_slots(D, tz)[:2]. Every expected value is derived from `end`,
 # never written as a bare literal.
@@ -798,14 +797,9 @@ def _budget_calls(conn: sqlite3.Connection) -> int:
 
 
 def test_today_next_attempt_caps_at_final_and_retries_once() -> None:
-    """Plan item 3, rewritten for 4.2's evening window (14.12) and again for
-    0.16.14's signature change (``cap`` required, ``failed`` dropped -- it
-    never changed the result, so the old outer ``for failed in (False,
-    True)`` loop ran the identical call twice and is dropped here along
-    with the kwarg itself): the daytime cadence is ``min(now + interval,
-    cap)`` -- 4.2 drops the old one-retry-near-midnight window (the 15
-    evening slots, tested in ``test_evening_window.py``, own every retry at
-    or after the cap)."""
+    """The daytime cadence is ``min(now + interval, cap)``; the old
+    one-retry-near-midnight window is gone (the 15 evening slots, tested
+    in ``test_evening_window.py``, own every retry at or after the cap)."""
     conn = _make_db()
     end = datetime(2026, 3, 11, 0, 0, 0, tzinfo=UTC)
     cap = end - timedelta(hours=1)
@@ -826,7 +820,7 @@ def test_today_next_attempt_caps_at_final_and_retries_once() -> None:
         assert got == want, (
             f"at now={now.isoformat()}:"
             " mutant -> at this assertion: correct ="
-            f" {want} (the cap is 23:00, 4.2), mutant ="
+            f" {want} (the cap is 23:00), mutant ="
             f" {got}"
         )
 
@@ -834,20 +828,20 @@ def test_today_next_attempt_caps_at_final_and_retries_once() -> None:
 def test_final_call_429_leaves_row_due_until_the_backoff_ends(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Plan item 10, adapted for 4.2's window-deferral rule (14.12): a 429
+    """The evening window's deferral rule: a 429
     on the final call (now the always-run 23:56 slot) raises JobDeferred
     carrying the domain backoff's own F + 60s (the default initial delay,
     no Retry-After header), while the row's own next_attempt_at moves --
     unlike 0.16.13's unconditional 15-minute defer -- to the first evening
-    slot at or after that backoff end (4.2's "Deferrals inside the
-    window"), here 23:57 -- the two times must be asserted separately.
+    slot at or after that backoff end, here 23:57 -- the two times must
+    be asserted separately.
     Once the backoff clears, the next run makes the call and finishes the
     evening window normally."""
     conn = _t97_init_tmp_db(tmp_path)
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
     D = date(2026, 3, 10)
-    # The lane needs a P1 record holding D (the daily close is always on).
+    # The lane needs a day record holding D (the daily close is always on).
     start_site_days(
         conn, site_id, D, now_utc=datetime(D.year, D.month, D.day, tzinfo=UTC)
     )
@@ -890,7 +884,7 @@ def test_final_call_429_leaves_row_due_until_the_backoff_ends(
         " on a 429) = a different status"
     )
     assert row["next_attempt_at"] == isoformat_utc(final + timedelta(minutes=1)), (
-        "mutant -> at this assertion: correct = 23:57 (4.2: in the window,"
+        "mutant -> at this assertion: correct = 23:57 (in the window,"
         " a 429 back-off moves the row to the first evening slot at or"
         " after the deferral's end, F + 60s = 23:57:00), mutant (the row"
         " left unchanged at F, 0.16.13's behaviour, or jumped 15 minutes"

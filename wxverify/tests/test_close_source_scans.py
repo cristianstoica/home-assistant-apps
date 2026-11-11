@@ -1,15 +1,12 @@
-"""P5 plan §13.11: source scans (SS1-SS4).
+"""Source scans (SS1-SS4).
 
 These pin structural facts about the new modules' source text and import
 graph directly, the same way test_app_js_chart_a11y.py pins app.js's source
 (no JS runner) -- here because the fact under test IS "who calls/imports
 whom", which running the code cannot observe any more directly than reading
-it. Every row fails on today's code: ``close_monitor.py`` and
-``provisional_line.py`` do not exist yet, so reading them raises
-``FileNotFoundError``, and SS1/SS2 additionally import the new names
-(inside each test body, plan §13.1/§15 Step 3) and assert they exist, so a
-future world where the files exist but the names do not still fails for the
-right reason.
+it. SS1/SS2 additionally import the new names (inside each test body) and
+assert they exist, so a world where the files exist but the names do not
+still fails for the right reason.
 """
 
 from __future__ import annotations
@@ -33,12 +30,10 @@ def _strip_def_lines(text: str, name: str) -> str:
 
 
 def test_ss1_provisional_site_hours_called_only_from_its_two_homes() -> None:
-    """SS1 (plan §13.11, §8.5): ``provisional_site_hours`` is called only
+    """SS1: ``provisional_site_hours`` is called only
     from ``api/routes/timeseries.py`` and ``provisional_line.py`` (M109).
 
-    Also asserts the name exists (plan's instruction for SS1): on today's
-    code this import fails, since neither the module nor the name exists
-    yet.
+    Also asserts the name exists.
     """
     from wxverify.provisional_line import provisional_site_hours
 
@@ -58,7 +53,7 @@ def test_ss1_provisional_site_hours_called_only_from_its_two_homes() -> None:
 
     assert callers, (
         "expected at least one real call site (api/routes/timeseries.py"
-        " calls it per plan §9.2) -- an empty set here means the scan"
+        " calls it) -- an empty set here means the scan"
         " itself found nothing to check, not that the rule holds."
     )
     extra = callers - allowed
@@ -72,7 +67,7 @@ def test_ss1_provisional_site_hours_called_only_from_its_two_homes() -> None:
 
 
 def test_ss2_provisional_line_never_imported_by_scoring_or_the_close() -> None:
-    """SS2 (plan §13.11, §8.5): no module of the close, pairing, scoring,
+    """SS2: no module of the close, pairing, scoring,
     rankings, the publication or Station Trust imports ``provisional_line``
     (M110).
 
@@ -102,7 +97,7 @@ def test_ss2_provisional_line_never_imported_by_scoring_or_the_close() -> None:
     )
 
     # Explicit named check on the close/pairing/scoring/rankings/publication
-    # modules the plan calls out, so the kill is pinned to a concrete list
+    # modules named here, so the kill is pinned to a concrete list
     # rather than resting only on the broad scan above.
     named_modules = [
         PACKAGE_ROOT / "worker" / "close_chain.py",
@@ -154,7 +149,7 @@ def _monitor_import_site(node: ast.AST) -> str | None:
 
 
 def test_ss3_close_monitor_is_read_only_and_imports_nothing_from_monitor() -> None:
-    """SS3 (plan §13.11, §5.1): ``close_monitor.py`` imports nothing from
+    """SS3: ``close_monitor.py`` imports nothing from
     ``monitor`` and contains no ``INSERT``, ``UPDATE`` or ``DELETE`` (M111).
 
     A source regex for ``from wxverify.monitor import`` /
@@ -182,25 +177,27 @@ def test_ss3_close_monitor_is_read_only_and_imports_nothing_from_monitor() -> No
     assert not offenders, (
         "M111 -> at this assertion: correct = close_monitor.py imports"
         " nothing from `monitor`, at module scope or inside a function"
-        " body (it copies the stamp helper instead, §5.1), mutant ="
+        " body (it copies the stamp helper instead), mutant ="
         " close_monitor.py imports `monitor` (the mutant's own form is a"
         " function-body `from wxverify import monitor as ...`); found"
         f" {offenders!r}."
     )
-    # No mutant of §14.2 targets this half of SS1's row on its own (M111's
+    # No mutant targets this half of SS1's row on its own (M111's
     # one planted mutant is the `monitor` import, pinned above); this half
     # has no assigned mutant to claim a kill for, so it carries a plain
     # assertion message instead of an "M<n> ->" divergence claim.
     for keyword in ("INSERT", "UPDATE", "DELETE"):
         assert not re.search(rf"\b{keyword}\b", text), (
-            f"close_monitor.py must stay read-only (plan §5.1: 'it writes"
-            f" nothing'); found a bare SQL {keyword} keyword."
+            f"close_monitor.py must stay read-only (it writes"
+            f" nothing); found a bare SQL {keyword} keyword."
         )
 
 
-def test_ss4_close_monitor_and_provisional_line_name_no_p1_table() -> None:
-    """SS4 (plan §13.11, §2.3): ``close_monitor.py`` and
-    ``provisional_line.py`` name no P1 table directly, reading day states
+def test_ss4_close_monitor_and_provisional_line_read_day_states_through_site_days() -> (
+    None
+):
+    """SS4: ``close_monitor.py`` and
+    ``provisional_line.py`` name no day-state table directly, reading day states
     only through ``wxverify.db.site_days``'s functions (M112)."""
     close_monitor = (PACKAGE_ROOT / "close_monitor.py").read_text(encoding="utf-8")
     provisional_line = (PACKAGE_ROOT / "provisional_line.py").read_text(
@@ -225,8 +222,8 @@ def test_ss4_close_monitor_and_provisional_line_name_no_p1_table() -> None:
         )
         assert site_days_import.search(text), (
             f"M112 -> at this assertion: correct = {name} imports its day"
-            " states from `wxverify.db.site_days` (the only route the plan"
-            " allows), mutant = close_monitor.py reads `site_days` by SQL"
+            " states from `wxverify.db.site_days` (the only allowed route),"
+            " mutant = close_monitor.py reads `site_days` by SQL"
             f" instead of through that module's functions, so {name} would"
             " carry no such import."
         )

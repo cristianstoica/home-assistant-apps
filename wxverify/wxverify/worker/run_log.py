@@ -1,4 +1,4 @@
-"""One INFO line per model run a reply carried (card 27).
+"""One INFO line per model run a reply carried.
 
 Each line says when the reply came back, the model's run time, the
 provider's own update time for the run when the reply has one, the latest
