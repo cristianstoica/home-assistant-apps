@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.16.21
+
+meteoblue is now called at set site times: 00:10, 09:10, 12:10 and 21:10.
+`meteoblue run:` lines gain a `local=` field at the end, the call's site
+time. Install between 00:15 and 06:10 or between 12:15 and 18:10 site
+time. Installed at other times, that UTC day needs a fifth meteoblue
+call, which the credit limit refuses, and meteoblue misses the next
+midnight scoring round once.
+
+Code comments and test messages state their rules directly. No
+behaviour change.
+
 ## 0.16.20
 
 Meteosource is now asked for its times in UTC, so its values are filed at
