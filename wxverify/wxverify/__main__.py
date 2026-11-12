@@ -20,6 +20,7 @@ from wxverify import __version__, config
 from wxverify.api.app import create_app
 from wxverify.collection.budget import set_source_cap
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
+from wxverify.collection.om_archive import allowance_needed
 from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.log_redaction import RedactUrlSecretsFilter
 from wxverify.core.options import load_runtime_config
@@ -49,6 +50,7 @@ from wxverify.provider_ops import (
 )
 from wxverify.settings.keys import get_setting, set_setting
 from wxverify.settings.service import set_rolling_window_days_sync
+from wxverify.worker import om_archive_fill
 from wxverify.worker.feed_fetch import (
     BackoffActive,
     BudgetExhausted,
@@ -89,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
         return _jobs(args)
     if args.command == "timezone":
         return _timezone(args)
+    if args.command == "om-archive":
+        return _om_archive(args)
     _die("unknown command")
 
 
@@ -196,6 +200,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # message rather than a usage error.
     tz_change.add_argument("--effective-from")
     tz_change.add_argument("--json", action="store_true")
+
+    # The one-off fill of old Open-Meteo forecasts from Open-Meteo's archive.
+    om_archive = sub.add_parser("om-archive")
+    om_archive_sub = om_archive.add_subparsers(dest="om_archive_command", required=True)
+    om_check = om_archive_sub.add_parser("check")
+    om_check.add_argument("--site-id", type=int)
     return parser
 
 
@@ -441,6 +451,68 @@ def _timezone_change(args: argparse.Namespace) -> int:
         print(f"  changeover date: {changeover}")
     print(f"  first full day under the new zone: {first_full_day}")
     return 0
+
+
+def _om_archive(args: argparse.Namespace) -> int:
+    if args.om_archive_command == "check":
+        return asyncio.run(_om_archive_check(args))
+    _die("unknown om-archive command")
+
+
+async def _om_archive_check(args: argparse.Namespace) -> int:
+    """Check that Open-Meteo's archive rebuilds the add-on's own downloads.
+
+    One line per active Open-Meteo model of each site checked (the site
+    given, else every enabled site). Exit 0 only when every model is PASS
+    or STALE and RAIN OK. Prints fixed texts, counts and model names only.
+    """
+    db = get_db()
+    requested: int | None = None if args.site_id is None else int(args.site_id)
+    site_ids = await db.read(
+        lambda conn: om_archive_fill.check_site_ids(conn, requested)
+    )
+    if not site_ids:
+        print("om archive check: no enabled site")
+        return 1
+    passed = True
+    for site_id in site_ids:
+        result = await om_archive_fill.check_site(db, site_id)
+        for line in _om_archive_check_lines(result):
+            print(line)
+        passed = passed and result.passed
+    if passed:
+        print("om archive check: every model passes")
+        return 0
+    print("om archive check: not every model passes")
+    return 1
+
+
+def _om_archive_check_lines(result: om_archive_fill.SiteCheck) -> list[str]:
+    if result.problem is not None:
+        return [f"om archive check site={result.site_id}: {result.problem}"]
+    lines = [f"om archive check site={result.site_id}"]
+    if not result.models:
+        lines.append("  no active Open-Meteo feed")
+    for model in result.models:
+        counts = model.counts
+        share = (
+            "-" if model.round_share is None else f"{round(model.round_share * 100)}%"
+        )
+        verdict: str = model.verdict
+        if model.verdict == "TOO FRESH":
+            verdict += f" (allowance {allowance_needed(counts)} min)"
+        lines.append(
+            f"  model={model.model} downloads={counts.downloads}"
+            f" decided={counts.decided} r1_match={counts.r1_match}"
+            f" older_match={counts.older_match} newer_match={counts.newer_match}"
+            f" no_match={counts.no_match} extra_hours={counts.extra_hours}"
+            f" missing_hours={counts.missing_hours} wet_hours={counts.wet_hours}"
+            f" rain_unshifted={counts.rain_unshifted}"
+            f" rain_minus1={counts.rain_minus1} rain_plus1={counts.rain_plus1}"
+            f" round_share={share} fetch_errors={model.fetch_errors}"
+            f" | {verdict} | {model.rain_verdict}"
+        )
+    return lines
 
 
 def _providers_doctor(args: argparse.Namespace) -> int:

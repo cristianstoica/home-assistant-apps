@@ -119,6 +119,28 @@ def _snap_run(model: str, fetch_time: str | None = None) -> str:
     return isoformat_utc(snapped)
 
 
+def snap_run(model: str, fetch_time: str) -> str:
+    """The run a download fetched at ``fetch_time`` is stamped with.
+
+    The adapter's own estimate (``_snap_run``): the fetch time less the
+    model's availability lag, floored to its run cadence. A stored lead
+    counts from it. ``fetch_time`` is required, so this never reads the
+    clock.
+    """
+    return _snap_run(model, fetch_time)
+
+
+def run_samples(model: str, issued_at: str, data: object) -> list[NormalizedSample]:
+    """A reply's samples, converted as the adapter converts a download.
+
+    The adapter's own conversion (``_samples_from_hourly``): wind from km/h
+    to m/s, a trace negative rain value to 0, rain moved to the start of its
+    hour, and each lead counted from ``issued_at``; an hour with a lead
+    under 1 is dropped.
+    """
+    return _samples_from_hourly(model, issued_at, data)
+
+
 def _metered_calls(variables: int, days: int) -> int:
     """Integer form of max(1, ceil((V / 10) * max(1, days / 14)))."""
     if variables <= 0:
