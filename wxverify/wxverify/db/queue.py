@@ -259,9 +259,11 @@ _CURRENT_OBS_LANE_CLAUSE: Final = "AND +type = 'fetch_current_obs'"
 CHAIN_PROMOTION_AGE: Final = timedelta(minutes=5)
 
 #: The resumable chain types: the claim's tier-2 rule and the reclaim stamp.
-#: Empty since the nightly replay and the time-zone rebuild were retired, so
-#: both match no row. SQLite accepts an empty IN list.
-_CHAIN_TYPES_SQL: Final = "()"
+#: One since the nightly replay and the time-zone rebuild were retired: the
+#: Open-Meteo archive fill's ``backfill_site`` (key ``om-archive``), so its
+#: paced runs claim after the other due main-lane work. Written out because
+#: worker/om_archive_fill.py (its OM_ARCHIVE_JOB_TYPE) imports this module.
+_CHAIN_TYPES_SQL: Final = "('backfill_site')"
 
 # Tier 0 also holds the wind lane's job (``fetch_obs`` keyed ``wind-days``),
 # so an evening slot is claimed before any waiting tier-1 job. The key is
@@ -319,10 +321,10 @@ def _claim(conn: sqlite3.Connection, type_clause: str) -> Job | None:
     ``day_close`` / ``day_publish``, the wind lane's ``fetch_obs`` job keyed
     ``wind-days`` and the scored round's ``fetch_feed`` tries keyed
     ``round:{feed_id}`` (tier 0) still claim ahead of everything. A
-    resumable chain chunk (a kind listed in
-    ``_CHAIN_TYPES_SQL``, which is empty today) would claim after all other
-    work for its first ``CHAIN_PROMOTION_AGE`` (5 minutes), then in tier 1,
-    FIFO by ``created_at`` with the rest, its age running from
+    resumable chain chunk (a kind listed in ``_CHAIN_TYPES_SQL``: today
+    only the Open-Meteo archive fill's ``backfill_site``) claims after all
+    other work for its first ``CHAIN_PROMOTION_AGE`` (5 minutes), then in
+    tier 1, FIFO by ``created_at`` with the rest, its age running from
     ``COALESCE(next_attempt_at, updated_at)``.
     """
     claim_at = timeutil.utc_now()  # module attribute, the clock isoformat_utc() reads
@@ -485,7 +487,8 @@ def reclaim_all_stale(conn: sqlite3.Connection) -> int:
     """Re-pend every running row.
 
     A chain row's next_attempt_at becomes now, so it waits in tier 2 (see
-    _claim; no kind is a chain kind today). Besides status and updated_at,
+    _claim; the one chain kind is the archive fill's backfill_site, which so
+    waits behind the start's own work). Besides status and updated_at,
     nothing else changes: created_at, retry_count and every other type's
     next_attempt_at stay as they were.
     """

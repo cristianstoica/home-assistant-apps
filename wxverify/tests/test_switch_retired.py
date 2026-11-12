@@ -486,6 +486,10 @@ _RE6_KNOWN_FORWARDERS = sorted(
     ]
 )
 _WIND_DAYS_KEY_FORMS = {"'wind-days'", "WIND_DAYS_JOB_KEY"}
+# backfill_site is retired too, and reused the same way: the Open-Meteo
+# archive fill (worker/om_archive_fill.py, enqueue_om_archive) keys it
+# 'om-archive'; any other key is an offender, exactly as fetch_obs/wind-days.
+_OM_ARCHIVE_KEY_FORMS = {"'om-archive'", "OM_ARCHIVE_JOB_KEY"}
 _INTO_JOBS = re.compile(r"INTO\s+jobs\b")
 
 # keep _literal_str and _call_target_name as they are
@@ -535,6 +539,7 @@ def test_re6_every_enqueue_and_continuation_names_a_kept_kind() -> None:
     offenders: list[str] = []
     forwarders: list[tuple[str, str, str]] = []
     fetch_obs_sites: list[tuple[str, str]] = []
+    om_archive_sites: list[tuple[str, str]] = []
     into_jobs: list[str] = []
     for path in sorted(PACKAGE_ROOT.rglob("*.py")):
         if "__pycache__" in path.parts:
@@ -558,7 +563,10 @@ def test_re6_every_enqueue_and_continuation_names_a_kept_kind() -> None:
                 else:
                     offenders.append(f"{where}: non-literal type {shown!r}")
                 continue
-            if literal not in _RE6_ALLOWED_KINDS:
+            # backfill_site is retired, like fetch_obs's old routine download,
+            # but the Open-Meteo archive fill reuses it keyed 'om-archive' --
+            # so it is allowed ONLY under that key, never just by its kind.
+            if literal not in _RE6_ALLOWED_KINDS and literal != "backfill_site":
                 offenders.append(f"{where}: retired kind {literal!r}")
             if literal == "fetch_obs":
                 fetch_obs_sites.append((rel, func))
@@ -567,11 +575,19 @@ def test_re6_every_enqueue_and_continuation_names_a_kept_kind() -> None:
                     offenders.append(
                         f"{where}: fetch_obs keyed {key!r}, not the wind lane's"
                     )
+            if literal == "backfill_site":
+                om_archive_sites.append((rel, func))
+                key = None if key_arg is None else ast.unparse(key_arg)
+                if key not in _OM_ARCHIVE_KEY_FORMS:
+                    offenders.append(
+                        f"{where}: backfill_site keyed {key!r}, not om-archive's"
+                    )
     assert not offenders, (
         "M48 -> at this assertion: correct = every enqueue/continuation names a"
-        " kept kind or pair_and_score, and every fetch_obs enqueue the wind"
-        f" lane's key, mutant = {offenders!r} (e.g. `_enqueue_due_obs` kept"
-        " under another name still queues fetch_obs keyed 'obs')"
+        " kept kind, pair_and_score, or backfill_site keyed om-archive, and"
+        " every fetch_obs enqueue the wind lane's key, mutant ="
+        f" {offenders!r} (e.g. `_enqueue_due_obs` kept under another name"
+        " still queues fetch_obs keyed 'obs')"
     )
     assert sorted(forwarders) == _RE6_KNOWN_FORWARDERS, (
         "the non-literal job types must be exactly RE6's two forwarders --"
@@ -580,6 +596,10 @@ def test_re6_every_enqueue_and_continuation_names_a_kept_kind() -> None:
     assert fetch_obs_sites, (
         "the scan must reach the wind lane's fetch_obs enqueue"
         " (worker/scheduler.py, _enqueue_due_wind_days); none found"
+    )
+    assert om_archive_sites, (
+        "the scan must reach the Open-Meteo archive fill's enqueue"
+        " (worker/om_archive_fill.py, enqueue_om_archive); none found"
     )
     assert into_jobs == ["db/queue.py"], (
         f"INTO jobs must appear only in db/queue.py; found {into_jobs!r}"

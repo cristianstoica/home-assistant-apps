@@ -19,11 +19,18 @@ row per (variable, day ahead) of a day before the site's first record, in
 one transaction; ``fill_site`` runs units in a loop, as the ``om-archive
 fill`` command does. ``remove_fill`` is the undo; no production path calls
 it.
+
+``run_om_archive_job`` is the add-on's own job for the fill (type
+``backfill_site``, key ``om-archive``, one per site): one unit per run,
+``UNIT_PACE_SECONDS`` apart, never in the quiet window over the night's
+round and close. ``enqueue_om_archive`` queues it at start-up for each
+enabled site with a unit left.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import sqlite3
@@ -50,6 +57,7 @@ from wxverify.collection.om_archive import (
     FILL_VARIABLES,
     MAX_DAY_AHEAD,
     OLDER_RUNS_REACH,
+    QUIET_END_MARGIN,
     REFUSED_UNITS_LIMIT,
     UNIT_PACE_SECONDS,
     CandidateName,
@@ -67,6 +75,7 @@ from wxverify.collection.om_archive import (
     needs_older_run,
     newer_run,
     older_run,
+    quiet_until,
     rain_label_counts,
     rain_label_verdict,
     request_hours,
@@ -76,7 +85,8 @@ from wxverify.collection.om_archive import (
 from wxverify.core.error_sanitize import provider_reason
 from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc, utc_now
 from wxverify.db.connection import Database, FencedWriter
-from wxverify.db.site_days import DONE_STATES
+from wxverify.db.queue import Job, enqueue_if_absent
+from wxverify.db.site_days import DONE_STATES, RETRY_DELAY
 from wxverify.db.switch import first_record_date, site_generation_id
 from wxverify.feeds.open_meteo import (
     RUN_CADENCE_HOURS,
@@ -92,9 +102,9 @@ from wxverify.scoring.close_scores import (
     scored_variables,
 )
 from wxverify.scoring.downloads import scored_values, scored_values_download
-from wxverify.worker.control import JobDeferred
+from wxverify.worker.control import JobCancelled, JobDeferred
 from wxverify.worker.domain_backoff import check_domain_backoff, source_domain
-from wxverify.worker.round import scoring_round_local_time
+from wxverify.worker.round import ROUND_BOUND, scoring_round_local_time
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +208,12 @@ class Retry:
     after: datetime
     refundable: bool = False
     status: int | None = None
+
+    @property
+    def unreadable(self) -> bool:
+        """A reply came with a success status but did not read: the one
+        case the fill's job bounds (``UNREADABLE_UNITS_LIMIT``)."""
+        return self.status is not None and 200 <= self.status < 300
 
 
 @dataclass(frozen=True, slots=True)
@@ -1187,7 +1203,9 @@ class UnitDone:
 @dataclass(frozen=True, slots=True)
 class UnitDeferred:
     """A unit that wrote nothing and waits until ``until`` (UTC);
-    ``calls`` were counted before it stopped."""
+    ``calls`` were counted before it stopped. ``unreadable`` is True when
+    the wait is a ``Retry`` for a reply that did not read
+    (``Retry.unreadable``)."""
 
     feed_id: int
     model: str
@@ -1195,6 +1213,7 @@ class UnitDeferred:
     until: datetime
     reason: DeferReason
     calls: int
+    unreadable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1220,6 +1239,9 @@ class UnitSkipped:
 
 
 UnitResult = UnitDone | UnitDeferred | ModelExcluded | UnitSkipped
+#: A unit's result recorded in the unit's own write transaction, after its
+#: rows: the job keeps its state there (``fill_unit``'s ``record``).
+UnitRecorder = Callable[[sqlite3.Connection, UnitDone | ModelExcluded], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1739,23 +1761,31 @@ async def _exclude_model(
     *,
     reason: str,
     calls: int,
+    record: UnitRecorder | None = None,
 ) -> ModelExcluded:
     """Take the unit's model out of the fill: ``refused`` ledger rows for
-    its remaining cells in one transaction, then one ERROR line."""
+    its remaining cells in one transaction, ``record`` in the same one,
+    then one ERROR line."""
     feed = plan.feed
     first_download = plan.site.first_download
 
-    def _refuse(conn: sqlite3.Connection) -> int:
-        return _write_refused(conn, site_id, feed.feed_id, first_download)
+    def _refuse(conn: sqlite3.Connection) -> ModelExcluded:
+        excluded = ModelExcluded(
+            feed_id=feed.feed_id,
+            model=feed.model,
+            reason=reason,
+            counts=FillCounts(
+                refused=_write_refused(conn, site_id, feed.feed_id, first_download),
+                calls=calls,
+            ),
+        )
+        if record is not None:
+            record(conn, excluded)
+        return excluded
 
-    refused = await _write(db, writer, _refuse)
+    excluded = await _write(db, writer, _refuse)
     logger.error("om archive fill stopped: model=%s reason=%s", feed.model, reason)
-    return ModelExcluded(
-        feed_id=feed.feed_id,
-        model=feed.model,
-        reason=reason,
-        counts=FillCounts(refused=refused, calls=calls),
-    )
+    return excluded
 
 
 async def fill_unit(
@@ -1767,6 +1797,7 @@ async def fill_unit(
     client: httpx.AsyncClient,
     writer: FencedWriter | None = None,
     refused_units: int = 0,
+    record: UnitRecorder | None = None,
 ) -> UnitResult:
     """Fill one unit: the feed's cells of download day ``download_date``.
 
@@ -1790,9 +1821,12 @@ async def fill_unit(
       empty cells as ``no_run``.
 
     ``refused_units`` is the caller's count of this model's refused units
-    in a row (``refused_streak_after``). Writes go through ``writer`` when
-    given. Never calls ``record_http_backoff`` or ``clear_domain_backoff``
-    and never touches feed error state.
+    in a row (``refused_streak_after``). ``record``, when given, runs with
+    the ``UnitDone`` or ``ModelExcluded`` inside the transaction that
+    writes it, so what the caller keeps of it lands with the unit's rows or
+    not at all; a unit that writes nothing does not call it. Writes go
+    through ``writer`` when given. Never calls ``record_http_backoff`` or
+    ``clear_domain_backoff`` and never touches feed error state.
     """
 
     def _read(conn: sqlite3.Connection) -> _UnitPlan | str:
@@ -1813,19 +1847,22 @@ async def fill_unit(
         )
     if not plan.empty:
 
-        def _present(conn: sqlite3.Connection) -> FillCounts:
-            return _write_unit(
-                conn, site_id, plan, {}, found_run=False, newest_run=None
+        def _present(conn: sqlite3.Connection) -> UnitDone:
+            done = UnitDone(
+                feed_id=feed_id,
+                model=feed.model,
+                download_date=download_date,
+                counts=_write_unit(
+                    conn, site_id, plan, {}, found_run=False, newest_run=None
+                ),
+                found_run=False,
+                refused_unit=False,
             )
+            if record is not None:
+                record(conn, done)
+            return done
 
-        return UnitDone(
-            feed_id=feed_id,
-            model=feed.model,
-            download_date=download_date,
-            counts=await _write(db, writer, _present),
-            found_run=False,
-            refused_unit=False,
-        )
+        return await _write(db, writer, _present)
     runs = _FillRuns(
         db,
         writer,
@@ -1862,7 +1899,9 @@ async def fill_unit(
         )
         return _deferred(plan, utc_now() + RETRY_WAIT, "deadline", runs.calls)
     if isinstance(rebuilt, Retry):
-        return _deferred(plan, rebuilt.after, "retry", runs.calls)
+        return _deferred(
+            plan, rebuilt.after, "retry", runs.calls, unreadable=rebuilt.unreadable
+        )
     if isinstance(rebuilt, Refused):
         return await _exclude_model(
             db,
@@ -1871,6 +1910,7 @@ async def fill_unit(
             plan,
             reason=f"status {rebuilt.status}",
             calls=runs.calls,
+            record=record,
         )
     outcomes = list(runs.outcomes.values())
     found = [outcome.run_at for outcome in outcomes if isinstance(outcome, Run)]
@@ -1885,12 +1925,13 @@ async def fill_unit(
             plan,
             reason=f"{REFUSED_UNITS_LIMIT} refused units in a row",
             calls=runs.calls,
+            record=record,
         )
     cells = day_cells(rebuilt.kept, download_date, plan.site.zone)
     newest_run = max(found, default=None)
 
-    def _fill(conn: sqlite3.Connection) -> FillCounts:
-        return _write_unit(
+    def _fill(conn: sqlite3.Connection) -> UnitDone:
+        counts = _write_unit(
             conn,
             site_id,
             plan,
@@ -1898,21 +1939,29 @@ async def fill_unit(
             found_run=bool(found),
             newest_run=newest_run,
         )
+        counts.calls = runs.calls
+        done = UnitDone(
+            feed_id=feed_id,
+            model=feed.model,
+            download_date=download_date,
+            counts=counts,
+            found_run=bool(found),
+            refused_unit=refused_unit,
+        )
+        if record is not None:
+            record(conn, done)
+        return done
 
-    counts = await _write(db, writer, _fill)
-    counts.calls = runs.calls
-    return UnitDone(
-        feed_id=feed_id,
-        model=feed.model,
-        download_date=download_date,
-        counts=counts,
-        found_run=bool(found),
-        refused_unit=refused_unit,
-    )
+    return await _write(db, writer, _fill)
 
 
 def _deferred(
-    plan: _UnitPlan, until: datetime, reason: DeferReason, calls: int
+    plan: _UnitPlan,
+    until: datetime,
+    reason: DeferReason,
+    calls: int,
+    *,
+    unreadable: bool = False,
 ) -> UnitDeferred:
     return UnitDeferred(
         feed_id=plan.feed.feed_id,
@@ -1921,6 +1970,7 @@ def _deferred(
         until=until,
         reason=reason,
         calls=calls,
+        unreadable=unreadable,
     )
 
 
@@ -2037,6 +2087,375 @@ async def fill_site(
         left_out=tuple(feed.model for feed in site.left_out),
         paused=paused,
     )
+
+
+# ---------------------------------------------------------------------------
+# The job
+# ---------------------------------------------------------------------------
+
+#: The fill's job: the retired ``backfill_site`` type, which the ``jobs``
+#: CHECK still allows, keyed ``om-archive``, one per site.
+OM_ARCHIVE_JOB_TYPE: Final = "backfill_site"
+OM_ARCHIVE_JOB_KEY: Final = "om-archive"
+#: Retries of a run that raised an error (``fail``); a deferral is not one.
+OM_ARCHIVE_MAX_RETRIES: Final = 5
+#: The job ends after this many units in a row deferred by a reply that did
+#: not read, with no unit done between them, so such replies cannot keep it
+#: retrying; the next start queues it again while a unit is left.
+UNREADABLE_UNITS_LIMIT: Final = 5
+#: From the round's local start to the end of the fill's quiet window: the
+#: round's bound, the close's first retry, then a margin.
+QUIET_END_AFTER_ROUND: Final = ROUND_BOUND + RETRY_DELAY + QUIET_END_MARGIN
+
+_ONE_MINUTE: Final = timedelta(minutes=1)
+#: The most digits of a feed id read back from the job's payload, so the
+#: number stays inside SQLite's INTEGER.
+_FEED_ID_DIGITS_MAX: Final = 18
+_ENABLED_SITE_SQL: Final = "SELECT 1 FROM sites WHERE id = ? AND enabled = 1"
+_JOB_PAYLOAD_SQL: Final = "SELECT payload FROM jobs WHERE id = ?"
+# The job's state goes only into its own claimed row. Binds: the payload,
+# the job id, type and key.
+_SAVE_JOB_STATE_SQL: Final = """
+    UPDATE jobs SET payload = ?
+    WHERE id = ? AND type = ? AND job_key = ? AND status = 'running'
+"""
+# One feed's ledger rows by outcome: the cells, and the rows written.
+_LEDGER_TOTALS_SQL: Final = """
+    SELECT outcome, COUNT(*) AS cells, COALESCE(SUM(hours), 0) AS hours
+    FROM om_archive_cells
+    WHERE site_id = ? AND feed_id = ?
+    GROUP BY outcome
+"""
+
+
+def quiet_end_local(round_start: time) -> time:
+    """The site-local end of the fill's quiet window: the round's local
+    start plus ``QUIET_END_AFTER_ROUND``, as a wall time. 02:10 for the
+    default 00:10 round, 05:00 for a 03:00 round, 07:00 for the latest
+    round, 05:00."""
+    minutes = (
+        round_start.hour * 60
+        + round_start.minute
+        + QUIET_END_AFTER_ROUND // _ONE_MINUTE
+    )
+    return time(minutes // 60, minutes % 60)
+
+
+def _count_value(value: object) -> int:
+    """A count kept in the job's payload: a non-negative int, else 0."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _feed_counts(value: object) -> dict[int, int]:
+    """Per-feed counts kept in the job's payload, keyed by the feed id's
+    digits; an entry that does not read, or is 0, is left out."""
+    if not isinstance(value, dict):
+        return {}
+    counts: dict[int, int] = {}
+    for key, count in cast(dict[str, object], value).items():
+        if not (key.isascii() and key.isdigit()) or len(key) > _FEED_ID_DIGITS_MAX:
+            continue
+        number = _count_value(count)
+        if number:
+            counts[int(key)] = number
+    return counts
+
+
+@dataclass(frozen=True, slots=True)
+class FillJobState:
+    """What the fill's job carries from one run to the next, as JSON in its
+    row's ``payload``: per feed id, the model's refused units in a row
+    (``streaks``, the next unit's ``refused_units``) and this job's counted
+    calls (``calls``); and the units in a row deferred by a reply that did
+    not read (``unreadable``).
+
+    These are what the ledger cannot tell: a unit whose every request got
+    an HTTP 400 and a unit whose replies held no value both write
+    ``no_run``, and the ledger counts no calls. The summary lines read
+    every other count from the ledger.
+    """
+
+    streaks: Mapping[int, int] = field(default_factory=dict[int, int])
+    calls: Mapping[int, int] = field(default_factory=dict[int, int])
+    unreadable: int = 0
+
+    @staticmethod
+    def from_payload(text: object) -> FillJobState:
+        """The state in a job row's ``payload`` text. What does not read
+        counts as 0, so an empty or hand-edited payload never stops the
+        job."""
+        if not isinstance(text, str):
+            return FillJobState()
+        try:
+            data: object = json.loads(text)
+        except (ValueError, RecursionError):
+            return FillJobState()
+        if not isinstance(data, dict):
+            return FillJobState()
+        fields = cast(dict[str, object], data)
+        return FillJobState(
+            streaks=_feed_counts(fields.get("streaks")),
+            calls=_feed_counts(fields.get("calls")),
+            unreadable=_count_value(fields.get("unreadable")),
+        )
+
+    def to_payload(self) -> str:
+        """The state as the ``payload`` text ``from_payload`` reads."""
+        return json.dumps(
+            {
+                "streaks": {
+                    str(feed_id): n for feed_id, n in sorted(self.streaks.items()) if n
+                },
+                "calls": {
+                    str(feed_id): n for feed_id, n in sorted(self.calls.items()) if n
+                },
+                "unreadable": self.unreadable,
+            },
+            separators=(",", ":"),
+        )
+
+    def after(self, result: UnitDone | UnitDeferred | ModelExcluded) -> FillJobState:
+        """The state after one unit's ``result``.
+
+        A unit done sets its model's streak (``refused_streak_after``) and
+        ends the run of unreadable units; an excluded model's streak goes
+        and that run ends too; a deferred unit adds one to that run when a
+        reply did not read, and leaves it as it is otherwise. Each adds its
+        counted calls to its feed's.
+        """
+        feed_id = result.feed_id
+        streaks = dict(self.streaks)
+        calls = dict(self.calls)
+        unreadable = 0
+        if isinstance(result, UnitDeferred):
+            spent = result.calls
+            unreadable = self.unreadable + (1 if result.unreadable else 0)
+        elif isinstance(result, UnitDone):
+            spent = result.counts.calls
+            streak = refused_streak_after(streaks.pop(feed_id, 0), result)
+            if streak:
+                streaks[feed_id] = streak
+        else:
+            spent = result.counts.calls
+            streaks.pop(feed_id, None)
+        if spent:
+            calls[feed_id] = calls.get(feed_id, 0) + spent
+        return FillJobState(streaks=streaks, calls=calls, unreadable=unreadable)
+
+
+@dataclass(frozen=True, slots=True)
+class _JobRead:
+    """What one run of the job reads, in one read: the site, its next unit
+    (None when no unit is left), the job's state, and, with no unit left,
+    each feed's summary counts (the ledger's, with this job's calls)."""
+
+    site: _FillSite
+    unit: FillUnit | None
+    state: FillJobState
+    totals: Mapping[int, FillCounts]
+
+
+def _ledger_counts(conn: sqlite3.Connection, site_id: int, feed_id: int) -> FillCounts:
+    """One feed's ledger rows by outcome, and the rows its ``written`` cells
+    hold. Read-only."""
+    counts = FillCounts()
+    for row in conn.execute(_LEDGER_TOTALS_SQL, (site_id, feed_id)):
+        outcome = str(row["outcome"])
+        cells = int(row["cells"])
+        if outcome == "written":
+            counts.written = cells
+            counts.rows = int(row["hours"])
+        elif outcome == "present":
+            counts.present = cells
+        elif outcome == "no_hours":
+            counts.no_hours = cells
+        elif outcome == "no_run":
+            counts.no_run = cells
+        elif outcome == "refused":
+            counts.refused = cells
+    return counts
+
+
+def _job_read(conn: sqlite3.Connection, site_id: int, job_id: int) -> _JobRead | str:
+    """One run's read, or the fixed text of why the site's fill cannot go
+    on. Read-only."""
+    if conn.execute(_ENABLED_SITE_SQL, (site_id,)).fetchone() is None:
+        return "the site is gone or disabled"
+    site = _fill_site(conn, site_id)
+    if isinstance(site, str):
+        return site
+    row = conn.execute(_JOB_PAYLOAD_SQL, (job_id,)).fetchone()
+    state = FillJobState() if row is None else FillJobState.from_payload(row["payload"])
+    unit = next_unit(conn, site_id)
+    totals: dict[int, FillCounts] = {}
+    if unit is None:
+        for feed in site.feeds:
+            counts = _ledger_counts(conn, site_id, feed.feed_id)
+            counts.calls = state.calls.get(feed.feed_id, 0)
+            totals[feed.feed_id] = counts
+    return _JobRead(site=site, unit=unit, state=state, totals=totals)
+
+
+def _save_job_state(conn: sqlite3.Connection, job_id: int, state: FillJobState) -> None:
+    """Save ``state`` in the job's row, in the caller's transaction; only
+    while the row is this claimed job's."""
+    conn.execute(
+        _SAVE_JOB_STATE_SQL,
+        (state.to_payload(), job_id, OM_ARCHIVE_JOB_TYPE, OM_ARCHIVE_JOB_KEY),
+    )
+
+
+async def run_om_archive_job(
+    db: Database,
+    writer: FencedWriter,
+    job: Job,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> None:
+    """One run of the fill's job for the site ``job.site_id``: at most one
+    unit.
+
+    One read gives the site, its next unit (``next_unit``) and the job's
+    state (``FillJobState``, from the row's ``payload``). Then:
+
+    - in the quiet window, from ``QUIET_START_LOCAL`` to
+      ``quiet_end_local`` of the round's start, site time (``quiet_until``),
+      it raises ``JobDeferred`` to the window's end and asks nothing;
+    - with no unit left, it logs one INFO line per feed
+      (``fill_summary_line``: the ledger's counts and this job's calls)
+      and returns, so the job completes ``ok``;
+    - otherwise it fills the unit (``fill_unit``, with the model's streak,
+      the state saved in the unit's own transaction) and raises
+      ``JobDeferred``: ``UNIT_PACE_SECONDS`` from then after a unit done or
+      a model excluded; after a deferred unit, at its ``until`` (the domain
+      hold's end, the next billing window, ``RETRY_WAIT`` or a longer
+      ``Retry-After``), its calls and unreadable count saved first.
+
+    It raises ``JobCancelled``, so the job completes without ``ok`` and a
+    later start queues it again while a unit is left, with one log line of
+    fixed text, when the site is gone, disabled or no longer filled, when a
+    unit cannot be filled, and at ``UNREADABLE_UNITS_LIMIT`` unreadable
+    units in a row (ERROR). Nothing it logs or raises carries the site's
+    coordinates or a request address.
+
+    The clock is this module's ``utc_now``. The state is saved only while
+    the job's row is ``running``. ``client`` is for tests; a run that asks
+    the archive opens its own ``httpx.AsyncClient`` otherwise.
+    """
+    site_id = job.site_id
+    if site_id is None:
+        raise JobCancelled()
+    job_id = job.id
+
+    def _read(conn: sqlite3.Connection) -> _JobRead | str:
+        return _job_read(conn, site_id, job_id)
+
+    read = await db.read(_read)
+    if isinstance(read, str):
+        logger.warning("om archive fill ended early: site=%d reason=%s", site_id, read)
+        raise JobCancelled()
+    site = read.site
+    quiet_end = quiet_until(
+        utc_now().astimezone(site.zone), quiet_end_local(site.round_start)
+    )
+    if quiet_end is not None:
+        raise JobDeferred(isoformat_utc(quiet_end))
+    unit = read.unit
+    if unit is None:
+        for feed in site.feeds:
+            counts = read.totals.get(feed.feed_id, FillCounts())
+            logger.info("%s", fill_summary_line(feed.model, counts))
+        return
+    state = read.state
+    feed_id = unit.feed_id
+    download_date = unit.download_date
+
+    def _record(conn: sqlite3.Connection, result: UnitDone | ModelExcluded) -> None:
+        after = state.after(result)
+        if after != state:
+            _save_job_state(conn, job_id, after)
+
+    async def _fill(http: httpx.AsyncClient) -> UnitResult:
+        return await fill_unit(
+            db,
+            site_id,
+            feed_id,
+            download_date,
+            client=http,
+            writer=writer,
+            refused_units=state.streaks.get(feed_id, 0),
+            record=_record,
+        )
+
+    if client is None:
+        async with httpx.AsyncClient() as owned:
+            result = await _fill(owned)
+    else:
+        result = await _fill(client)
+    if isinstance(result, UnitSkipped):
+        logger.warning(
+            "om archive fill ended early: site=%d reason=%s", site_id, result.reason
+        )
+        raise JobCancelled()
+    if isinstance(result, UnitDeferred):
+        after = state.after(result)
+        if after != state:
+
+            def _save(conn: sqlite3.Connection) -> None:
+                _save_job_state(conn, job_id, after)
+
+            await writer.write(_save)
+        if after.unreadable >= UNREADABLE_UNITS_LIMIT:
+            logger.error(
+                "om archive fill paused: model=%s reason=%d unreadable replies"
+                " in a row; the next start carries on",
+                result.model,
+                after.unreadable,
+            )
+            raise JobCancelled()
+        raise JobDeferred(isoformat_utc(result.until))
+    raise JobDeferred(isoformat_utc(utc_now() + timedelta(seconds=UNIT_PACE_SECONDS)))
+
+
+def enqueue_om_archive(conn: sqlite3.Connection) -> int:
+    """Queue the fill's job for each enabled site with a unit left, in the
+    caller's transaction; the number queued.
+
+    Run at start-up. ``enqueue_if_absent`` keeps one ``OM_ARCHIVE_JOB_TYPE``
+    job keyed ``OM_ARCHIVE_JOB_KEY`` per site (``OM_ARCHIVE_MAX_RETRIES``);
+    a site with no unit left (``next_unit``), as every site once each of
+    its (feed, variable) has its last row, gets none. A site whose read
+    raises gets none either, and one ERROR line naming only the exception's
+    class: the fill must never stop the add-on from starting.
+    """
+    queued = 0
+    for site_id in check_site_ids(conn, None):
+        try:
+            unit = next_unit(conn, site_id)
+        except Exception as exc:
+            logger.error(
+                "om archive fill not queued: site=%d error=%s",
+                site_id,
+                type(exc).__name__,
+            )
+            continue
+        if unit is None:
+            continue
+        # The type is a literal (OM_ARCHIVE_JOB_TYPE's value) so the
+        # retired-kinds scan (test_switch_retired RE6) can check it with its key.
+        result = enqueue_if_absent(
+            conn,
+            "backfill_site",
+            site_id,
+            OM_ARCHIVE_JOB_KEY,
+            max_retries=OM_ARCHIVE_MAX_RETRIES,
+        )
+        if result.created:
+            queued += 1
+            logger.info("om archive fill queued: site=%d", site_id)
+    return queued
 
 
 def remove_fill(conn: sqlite3.Connection) -> int:

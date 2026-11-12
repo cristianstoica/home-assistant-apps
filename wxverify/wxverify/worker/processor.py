@@ -87,6 +87,7 @@ from wxverify.worker.feed_fetch import (
     mark_feed_unavailable,
     record_download_try,
 )
+from wxverify.worker.om_archive_fill import OM_ARCHIVE_JOB_KEY, run_om_archive_job
 from wxverify.worker.round import round_try_stale
 from wxverify.worker.scheduler import scheduler_tick
 from wxverify.worker.station_pacing import weathercom_call_lock
@@ -514,6 +515,11 @@ async def dispatch(db: Database, writer: FencedWriter, job: Job) -> None:
         if site_id is None:
             raise JobCancelled()
         await run_wind_days(db, writer, site_id)
+        return None
+    if job.type == "backfill_site" and job.job_key == OM_ARCHIVE_JOB_KEY:
+        # The Open-Meteo archive fill reuses the retired type; any other key
+        # is the retired backfill and ends at the raise below.
+        await run_om_archive_job(db, writer, job)
         return None
     if job.type == "fetch_current_obs":
         site_id = job.site_id

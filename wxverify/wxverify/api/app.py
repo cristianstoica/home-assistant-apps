@@ -50,6 +50,7 @@ from wxverify.settings.service import apply_plain_settings, set_rolling_window_d
 from wxverify.web.render import static_dir
 from wxverify.web.routes import router as web_router
 from wxverify.worker.close_chain import settle_interrupted_closes
+from wxverify.worker.om_archive_fill import enqueue_om_archive
 from wxverify.worker.processor import run_worker
 
 StopProcess = Callable[[], None]
@@ -154,6 +155,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     # Close work a stop cut short is settled before the workers start and
     # before this start's `worker_started_at`.
     await db.write(lambda conn: settle_interrupted_closes(conn, now_utc=utc_now()))
+    # The one-off Open-Meteo archive fill: a job for each enabled site with a
+    # unit left, so once the fill is done a start queues nothing.
+    await db.write(enqueue_om_archive)
     await db.write(lambda conn: set_runtime_state_now(conn, "worker_started_at"))
     if options.rolling_window_days is not None:
         await set_rolling_window_days(options.rolling_window_days)
