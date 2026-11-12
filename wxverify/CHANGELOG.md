@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.16.22
+
+Open-Meteo's older forecasts are filled in from Open-Meteo's archive of
+past model runs, for the days before a site's first day record, from a
+week before its first rain reading. For each model and day, the fill
+rebuilds the download the add-on would have made at that day's scoring
+round, from the run Open-Meteo served then or an older one. Where the
+archive lacks a run, an older run is used or the day stays empty. Rain
+is filled, and temperature and wind wherever a day is still empty.
+Nothing already stored is changed.
+
+The fill runs by itself after the update, as a background job that lets
+every other job go first. It pauses from 22:30 until the night's scoring
+round and close are over (02:10 at the default round time). It needs
+about 3 hours and about 2,400 Open-Meteo calls, never more than 3,000 in
+a day and always at least 300 below the Open-Meteo call limit, so the
+add-on's own downloads keep their budget.
+
+What the add-on serves is unchanged. The dashboard's win rate and
+history chart and the Overlay page now show Open-Meteo rain for those
+older days, and temperature and wind where they were missing. Each
+filled day is listed in a new table, `om_archive_cells`. The
+`om-archive fill` and `om-archive check` commands run the fill and a
+comparison with the add-on's own downloads from the command line.
+
 ## 0.16.21
 
 meteoblue is now called at set site times: 00:10, 09:10, 12:10 and 21:10.

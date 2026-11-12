@@ -683,6 +683,8 @@ python -m wxverify --db /path/to/wxverify.db providers enable --site-id <site_id
 python -m wxverify --db /path/to/wxverify.db providers fetch --site-id <site_id> --source visualcrossing
 python -m wxverify --db /path/to/wxverify.db providers smoke --site-id <site_id> --all-new
 python -m wxverify --db /path/to/wxverify.db timezone change --site-id <site_id> --timezone <IANA zone> [--json]
+python -m wxverify --db /path/to/wxverify.db om-archive check [--site-id <site_id>]
+python -m wxverify --db /path/to/wxverify.db om-archive fill [--site-id <site_id>]
 ```
 
 For `weathercom`, the cap in force is the lower of the value stored with
@@ -696,6 +698,9 @@ Provider operations are local admin commands. `doctor`, `reconcile`,
 `enable`, `disable`, and enqueue-only `providers fetch` do not call external
 forecast APIs. `providers fetch --run-now` and `providers smoke` perform live
 provider calls and consume provider budget.
+
+`om-archive check` and `om-archive fill` call Open-Meteo's archive of past
+model runs; see [Open-Meteo archive fill](#open-meteo-archive-fill).
 
 `providers reconcile` is safe to run against a live database when seed catalog
 rows are missing; it inserts missing `sources` and `feeds` rows without
@@ -750,6 +755,34 @@ The command exits non-zero with a one-line message, for example when the site is
   reply (`none` or `unread` when unknown); `new` is `yes`, `no` or `unknown`.
   `local` is the call's site time, `unread` when the site's zone does not load.
   The lines hold no key, address or location.
+- The [Open-Meteo archive fill](#open-meteo-archive-fill) lists what it
+  handled in the `om_archive_cells` table: one row per site, Open-Meteo feed,
+  variable (`precip`, `temperature` or `wind`), day ahead and day
+  (`local_date`), with the download day it stands for (`download_date`), the
+  newest archive run used (`run_at`, empty when none was), `filled_at`, and an
+  `outcome`:
+  - `written`: there was no stored forecast for it, and it got `hours` hourly
+    values in `forecast_history`;
+  - `present`: stored values were already there, and were left as they were;
+  - `no_hours`: the archive had a run, but no hour of the day with a reading
+    had a value to keep;
+  - `no_run`: the archive had no run for that download day;
+  - `refused`: the model was taken out of the fill before its values were
+    asked for.
+
+  A `forecast_history` row was filled when its site, feed, variable, day ahead
+  and `local_date` match a `written` row; nothing else marks it. The `written`
+  rows per model, read-only (for example on a database export):
+
+  ```sql
+  SELECT f.model, COUNT(*) AS written_rows, SUM(c.hours) AS hourly_values,
+         MIN(c.local_date) AS first_day, MAX(c.local_date) AS last_day
+  FROM om_archive_cells c
+  JOIN feeds f ON f.id = c.feed_id
+  WHERE c.outcome = 'written'
+  GROUP BY f.model
+  ORDER BY f.model;
+  ```
 
 ## Database version 18: the first start after the upgrade
 
@@ -1087,6 +1120,81 @@ constraint.
 
 One-time setup work can add a few calls: adding a station uses one Weather.com
 validation call and one Open-Meteo elevation call.
+
+### Open-Meteo archive fill
+
+Most days before a site's first day record have no stored Open-Meteo rain, and
+some have no temperature or wind. 0.16.22 fills them once from Open-Meteo's
+archive of past model runs. For each Open-Meteo model the site uses and each
+download day, from a week before the site's first rain reading (never before 2
+April 2026) to the day before its first day record, the fill rebuilds the
+download the add-on would have made at that day's scoring round time, from the
+run Open-Meteo served then or an older one. It writes rain, temperature and
+wind for days ahead `0` to `7`, one value per hour that has a reading, and only
+where nothing is stored yet for that model, variable, day ahead and day;
+nothing already stored is changed. What it handled is listed in
+`om_archive_cells` (see [Operational Notes](#operational-notes)).
+
+It starts by itself after the update and needs no setting. Each start queues
+one background job for each enabled site with days left to fill (INFO
+`om archive fill queued: site=<id>`); once the fill is done, a start queues
+nothing. The job fills one model and download day at a time, `6` seconds
+apart, and lets other due jobs go first; after `5` minutes of waiting it moves
+up the queue. It does not run from `22:30` site time until two hours after the
+scoring round starts (`02:10` with the round at its default `00:10`), so the
+evening readings, the round and the close keep the worker. While it runs, the
+worker's `cycle:` lines show `type=backfill_site` with outcome `deferred` every
+few seconds.
+
+Each request to the archive counts as one Open-Meteo call on the Budget Gauges
+panel. Before each request the fill compares the billing day's Open-Meteo calls,
+the add-on's own included, with its ceiling: `3000` calls a day, or `300` below
+the Open-Meteo cap in force when that is lower, so the add-on's own downloads
+keep their budget. With a cap of `3300` or more (the default is `10000/day`)
+the ceiling is `3000`; with `1000` it is `700`; at `300` or less the fill makes
+no call. At the ceiling it waits for the next billing day and logs one INFO
+line, `om archive fill paused: daily ceiling <n> reached`. It also waits while
+the add-on's own Open-Meteo downloads are held back after Open-Meteo asked them
+to slow down; it never sets or ends that hold itself.
+
+The fill's log lines carry model names, run times, site ids, status codes and
+error class names, never a location or a request address:
+
+- INFO `om archive fill done: model=<m> written=<n> rows=<n> present=<n>
+  no_hours=<n> no_run=<n> refused=<n> calls=<n>`, one per model once nothing
+  is left; the job then ends. The counts are `om_archive_cells` rows by
+  outcome, and `rows` the hourly values written, for the whole fill; `calls`
+  counts the calls since the job was last queued.
+- WARNING `om archive no run model=<m> run=<run> status=400 reason=<masked>`:
+  the archive has no such run, and an older run is tried.
+- WARNING `om archive retry later …`, `om archive request failed …`,
+  `om archive unreadable reply …` or `om archive fill unit too slow …` (its
+  requests took over `60` seconds): nothing is written, and that download day
+  is tried again after `15` minutes, or later if Open-Meteo asks, up to a day.
+- WARNING `om archive refused model=<m> run=<run> status=<code>` for any other
+  error status, followed by ERROR `om archive fill stopped: model=<m>
+  reason=status <code>`; the same ERROR with `reason=3 refused units in a row`
+  after three download days in a row on which every request got a 400. That
+  model is out of the fill; the others carry on.
+- ERROR `om archive fill paused: model=<m> reason=5 unreadable replies in a row;
+  the next start carries on`: the job ends, and the next start queues it again.
+- WARNING `om archive fill ended early: site=<id> reason=<text>`: the site is
+  gone, disabled or can no longer be filled; the job ends.
+- ERROR `om archive fill not queued: site=<id> error=<class>`: the start could
+  not read that site's fill; the add-on starts anyway.
+
+`om-archive fill` (see [CLI](#cli)) runs the same fill from the command line,
+at once, with the same pace, ceiling and error rules, at any hour. It waits out
+a pause of up to an hour, and stops at the ceiling, at a longer pause, or after
+`5` pauses in a row with no download day done; run it again to carry on. It
+prints one line per model with this run's counts
+(`om archive fill done: …`, or `om archive fill so far: …` followed by
+`om archive fill paused: <reason>` when it stopped early), then
+`om archive fill: no unit left` (exit `0`) or
+`om archive fill: not finished; run it again to carry on` (exit `1`).
+`om-archive check` compares the archive with the add-on's own recorded
+Open-Meteo downloads, one line per model, and exits `0` only when every model
+passes; it writes nothing, and its requests are not counted.
 
 ## Local Checks
 
