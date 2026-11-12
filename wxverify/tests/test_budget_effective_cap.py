@@ -3,12 +3,14 @@
 `collection/budget.py`'s ``effective_daily_call_limit`` clamps the stored
 ``sources.daily_call_limit`` at ``PROVIDER_DAILY_CALL_ALLOWANCE`` (weathercom:
 1500) on EVERY read, so the stored/configured value is never raised past it
-by any writer. Five call sites must apply the clamp:
+by any writer. Six call sites must apply the clamp:
 ``reserve_budget`` (T111), ``monitor._budget_conditions``,
-``web/context.load_budgets``, ``provider_ops._provider_group`` and
-``api/routes/health.health_budget`` (T113), plus an AST pin (T114) proving no
-sixth reader exists, and the boot write (T115) that stores the configured
-value unclamped and logs a WARNING only when it bites.
+``web/context.load_budgets``, ``provider_ops._provider_group``,
+``api/routes/health.health_budget`` (T113) and
+``worker/om_archive_fill._reserve_fill_call`` (the Open-Meteo archive fill's
+own ceiling, plan §3 step 3), plus an AST pin (T114) proving no seventh
+reader exists, and the boot write (T115) that stores the configured value
+unclamped and logs a WARNING only when it bites.
 
 Isolation: T111/T113 (non-HTTP readers) use an in-memory sqlite3 connection
 + ``run_migrations`` + ``seed_default_sources``; T113's ops-page/health-route
@@ -365,6 +367,7 @@ _EXPECTED_READERS = {
     ("web/context.py", "load_budgets"),
     ("provider_ops.py", "_provider_group"),
     ("api/routes/health.py", "health_budget"),
+    ("worker/om_archive_fill.py", "_reserve_fill_call"),
 }
 
 
@@ -395,7 +398,7 @@ def _calls_effective_helper(node: ast.AST) -> bool:
     return False
 
 
-def test_daily_call_limit_readers_are_exactly_the_named_five() -> None:
+def test_daily_call_limit_readers_are_exactly_the_named_six() -> None:
     found: set[tuple[str, str]] = set()
     missing_helper: list[str] = []
     for path in sorted(_WXVERIFY_SRC.rglob("*.py")):

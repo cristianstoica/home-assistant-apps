@@ -632,6 +632,28 @@ def _hourly_values(
     return hourly
 
 
+def hourly_values(
+    conn: sqlite3.Connection,
+    site_id: int,
+    variables: frozenset[str],
+    *,
+    start_utc: datetime,
+    end_utc: datetime,
+) -> _Hourly:
+    """The close's own reader of the site's hourly values (``_hourly_values``).
+
+    Each variable's ``observations`` rows with ``valid_at`` in
+    ``[start_utc, end_utc)``, by text, keyed by instant; per instant the
+    stored stamp and value of the row the scan returns last. A stamp that
+    does not parse is left out. Read-only. The Open-Meteo archive fill takes
+    its observed hours and their stamps from here, so its rows carry the
+    stamp the close would pair.
+    """
+    return _hourly_values(
+        conn, site_id, variables, start_utc=start_utc, end_utc=end_utc
+    )
+
+
 def _reference_sq_error(
     values: Mapping[datetime, _Hour], instant: datetime, lead: int, observed: float
 ) -> float | None:

@@ -604,6 +604,26 @@ def create_tables(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (site_id, feed_id, variable, day_ahead, valid_at)
         ) WITHOUT ROWID;
 
+        -- The ledger of the one-off Open-Meteo archive fill: one row per
+        -- cell (site, feed, variable, day ahead, local date) of a day before
+        -- the site's first record that the fill handled. The 'written' rows
+        -- are exactly the forecast_history rows it added.
+        CREATE TABLE IF NOT EXISTS om_archive_cells (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            variable TEXT NOT NULL,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            local_date TEXT NOT NULL,          -- D
+            download_date TEXT NOT NULL,       -- S = D - day_ahead
+            outcome TEXT NOT NULL CHECK(outcome IN
+                ('written','present','no_hours','no_run','refused')),
+            hours INTEGER NOT NULL,            -- rows written; 0 unless written
+            run_at TEXT,                       -- the newest run used; NULL for
+                                               -- no_run, present and refused
+            filled_at TEXT NOT NULL,
+            PRIMARY KEY (site_id, feed_id, variable, day_ahead, local_date)
+        ) WITHOUT ROWID;
+
         CREATE TABLE IF NOT EXISTS day_scores (
             site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
             local_date TEXT NOT NULL,
@@ -1306,6 +1326,7 @@ METEOSOURCE_PRUNE_TABLES: Final[tuple[str, ...]] = (
     "forecast_downloads",
     "forecast_samples",
     "forecast_scored",
+    "om_archive_cells",
     "forecast_history",
     "day_scores",
     "close_record_downloads",

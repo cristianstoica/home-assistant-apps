@@ -243,6 +243,22 @@ def _seed_one_row_per_table(
         """,
         (site_id, cutoff, feed_id),
     )
+    conn.execute(
+        """
+        INSERT INTO om_archive_cells
+            (site_id, feed_id, variable, day_ahead, local_date, download_date,
+             outcome, hours, run_at, filled_at)
+        VALUES (?, ?, 'temperature', 0, ?, ?, 'written', 1, ?, ?)
+        """,
+        (
+            site_id,
+            feed_id,
+            local_date,
+            local_date,
+            f"{local_date}T00:00:00Z",
+            f"{local_date}T00:00:01Z",
+        ),
+    )
 
 
 def _row_count(conn: sqlite3.Connection, table: str, feed_id: int) -> int:

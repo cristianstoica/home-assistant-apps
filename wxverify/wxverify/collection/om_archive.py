@@ -38,8 +38,21 @@ ALLOWANCE_MINUTES: Final[Mapping[str, int]] = {
     "icon_global": 300,
     "icon_eu": 240,
 }
+#: Models left out of the fill: those check C2 found the archive cannot
+#: rebuild (NO MATCH). None is left out today: jma_gsm was CAN'T TELL,
+#: because the archive lacks some JMA runs, and the owner chose to include
+#: it (an older run is used, or the day is left empty, where a run is
+#: missing). A model listed here is never enumerated and gets no ledger
+#: row, so taking it off this list in a later release fills it with no
+#: ledger clean-up. A frozenset, not a tuple: pyright reads an empty
+#: ``Final`` tuple as ``tuple[()]`` and flags every membership test.
+FILL_EXCLUDED_MODELS: Final[frozenset[str]] = frozenset()
 #: The variables the fill writes, by the names the add-on stores.
 FILL_VARIABLES: Final[tuple[str, ...]] = ("precip", "temperature", "wind")
+#: The first day the archive holds runs of most models ("Most models are
+#: archived from 2 April 2026"); the fill asks for no download day before
+#: it.
+ARCHIVE_FIRST_DATE: Final = date(2026, 4, 2)
 #: The most counted Open-Meteo calls the fill makes in one billing day.
 FILL_DAILY_CALL_CEILING: Final = 3000
 #: Counted calls always left below the limit in force for the add-on's own
@@ -373,6 +386,23 @@ def day_cells(
     for cell_values in cells.values():
         cell_values.sort(key=lambda sample: parse_utc(sample.valid_at))
     return cells
+
+
+def fillable_model(model: str) -> bool:
+    """Whether the fill may fill ``model``: it has an allowance and a run
+    cadence, and it is not in ``FILL_EXCLUDED_MODELS``."""
+    return (
+        model in ALLOWANCE_MINUTES
+        and model in RUN_CADENCE_HOURS
+        and model not in FILL_EXCLUDED_MODELS
+    )
+
+
+def first_download_date(first_observed: date) -> date:
+    """The fill's first download day S: ``MAX_DAY_AHEAD`` days before the
+    site's first observed day, so its farthest day ahead reaches that day,
+    but never before ``ARCHIVE_FIRST_DATE``."""
+    return max(first_observed - timedelta(days=MAX_DAY_AHEAD), ARCHIVE_FIRST_DATE)
 
 
 def fill_call_ceiling(limit_in_force: int) -> int:

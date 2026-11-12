@@ -206,6 +206,8 @@ def _build_parser() -> argparse.ArgumentParser:
     om_archive_sub = om_archive.add_subparsers(dest="om_archive_command", required=True)
     om_check = om_archive_sub.add_parser("check")
     om_check.add_argument("--site-id", type=int)
+    om_fill = om_archive_sub.add_parser("fill")
+    om_fill.add_argument("--site-id", type=int)
     return parser
 
 
@@ -456,6 +458,8 @@ def _timezone_change(args: argparse.Namespace) -> int:
 def _om_archive(args: argparse.Namespace) -> int:
     if args.om_archive_command == "check":
         return asyncio.run(_om_archive_check(args))
+    if args.om_archive_command == "fill":
+        return asyncio.run(_om_archive_fill(args))
     _die("unknown om-archive command")
 
 
@@ -511,6 +515,65 @@ def _om_archive_check_lines(result: om_archive_fill.SiteCheck) -> list[str]:
             f" rain_minus1={counts.rain_minus1} rain_plus1={counts.rain_plus1}"
             f" round_share={share} fetch_errors={model.fetch_errors}"
             f" | {verdict} | {model.rain_verdict}"
+        )
+    return lines
+
+
+async def _om_archive_fill(args: argparse.Namespace) -> int:
+    """Fill old Open-Meteo forecasts from Open-Meteo's archive, now.
+
+    The same units as the job, with the same pace, ceiling, error and
+    refusal rules and no quiet window (``om_archive_fill.fill_site``), for
+    the site given, else every enabled site; then one summary line per
+    model. Exit 0 only when no unit is left. Prints fixed texts, counts and
+    model names only, never an exception's message.
+    """
+    db = get_db()
+    requested: int | None = None if args.site_id is None else int(args.site_id)
+    site_ids = await db.read(
+        lambda conn: om_archive_fill.check_site_ids(conn, requested)
+    )
+    if not site_ids:
+        print("om archive fill: no enabled site")
+        return 1
+    finished = True
+    for site_id in site_ids:
+        try:
+            result = await om_archive_fill.fill_site(db, site_id)
+        except Exception as exc:
+            print(
+                f"om archive fill site={site_id}: stopped by an error"
+                f" ({type(exc).__name__}); run it again to carry on"
+            )
+            return 1
+        for line in _om_archive_fill_lines(result):
+            print(line)
+        finished = finished and result.finished
+    if finished:
+        print("om archive fill: no unit left")
+        return 0
+    print("om archive fill: not finished; run it again to carry on")
+    return 1
+
+
+def _om_archive_fill_lines(result: om_archive_fill.SiteFill) -> list[str]:
+    if result.problem is not None:
+        return [f"om archive fill site={result.site_id}: {result.problem}"]
+    lines = [f"om archive fill site={result.site_id}"]
+    if not result.feeds and not result.left_out:
+        lines.append("  no active Open-Meteo feed")
+    for feed in result.feeds:
+        lines.append(
+            "  "
+            + om_archive_fill.fill_summary_line(
+                feed.model, feed.counts, done=result.finished
+            )
+        )
+    for model in result.left_out:
+        lines.append(f"  om archive fill left out: model={model}")
+    if result.paused is not None:
+        lines.append(
+            f"  om archive fill paused: {om_archive_fill.PAUSE_TEXT[result.paused]}"
         )
     return lines
 

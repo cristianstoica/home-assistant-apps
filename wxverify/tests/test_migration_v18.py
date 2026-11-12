@@ -91,17 +91,18 @@ def _all_table_rows(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ..
 def _with_empty_station_wind_constant(
     rows: dict[str, list[tuple[object, ...]]],
 ) -> dict[str, list[tuple[object, ...]]]:
-    """``rows`` plus an empty ``station_wind_constant`` table.
+    """``rows`` plus the two empty tables ``create_tables`` makes on every
+    open: ``station_wind_constant`` and ``om_archive_cells`` (the Open-Meteo
+    archive fill's ledger, added in 0.16.22).
 
-    ``create_tables`` makes ``station_wind_constant`` on
-    every open, unconditionally and ahead of the version-17 savepoint, so
-    even a run that stops or is denied before `migrate_v18` does anything
-    still leaves this one empty table behind on a v17 file that never had
-    it. A before/after row comparison taken around such a run must expect
-    exactly this one addition, nothing else -- any other difference still
-    fails.
+    ``create_tables`` makes both, unconditionally and ahead of the
+    version-17 savepoint, so even a run that stops or is denied before
+    `migrate_v18` does anything still leaves these two empty tables behind
+    on a v17 file that never had them. A before/after row comparison taken
+    around such a run must expect exactly this addition, nothing else --
+    any other difference still fails.
     """
-    return {**rows, "station_wind_constant": []}
+    return {**rows, "station_wind_constant": [], "om_archive_cells": []}
 
 
 # ---------------------------------------------------------------------------
@@ -454,10 +455,12 @@ def test_ut2_the_score_cache_table_and_only_its_key_go(
     after_sets = {table: set(rows) for table, rows in after.items()}
 
     assert set(after_sets) == (
-        set(before_sets) - {"score_cache"} | {"station_wind_constant"}
+        set(before_sets) - {"score_cache"}
+        | {"station_wind_constant", "om_archive_cells"}
     ), (
         "exactly score_cache must disappear from the schema, and the empty"
-        " station_wind_constant table create_tables always makes must appear"
+        " station_wind_constant and om_archive_cells tables create_tables"
+        " always makes must appear"
     )
     after_runtime_state = after_sets["runtime_state"]
     fix_rows = {
@@ -476,8 +479,11 @@ def test_ut2_the_score_cache_table_and_only_its_key_go(
     assert after_sets["station_wind_constant"] == set(), (
         "station_wind_constant must be empty -- this sub-step seeds no episode"
     )
+    assert after_sets["om_archive_cells"] == set(), (
+        "om_archive_cells must be empty -- this sub-step seeds no fill row"
+    )
     for table, rows in after_sets.items():
-        if table in ("runtime_state", "station_wind_constant"):
+        if table in ("runtime_state", "station_wind_constant", "om_archive_cells"):
             continue
         assert rows == before_sets[table], (
             f"table {table!r} changed, but this sub-step touches only"

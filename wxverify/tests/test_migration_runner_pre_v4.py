@@ -69,5 +69,7 @@ def test_o10_run_migrations_on_empty_matches_create_schema_plus_triggers() -> No
     # and publication_rain_ranks; 69 after +1 forecast_history, -15 for
     # forecast_pairs, close_pairs and the seven verification_* tables and
     # their own indexes, all dropped; 68 with the daily forecast record
-    # dropped; 67 with `score_cache` dropped; 68 with `station_wind_constant`.
-    assert len(fresh_names) == 68
+    # dropped; 67 with `score_cache` dropped; 68 with `station_wind_constant`;
+    # 69 with `om_archive_cells` (the Open-Meteo archive fill's ledger: it
+    # adds no index, and a `WITHOUT ROWID` key makes none).
+    assert len(fresh_names) == 69
