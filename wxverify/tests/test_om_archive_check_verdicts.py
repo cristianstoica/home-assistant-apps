@@ -112,6 +112,88 @@ def test_download_verdict_undecided_past_a_short_runs_end() -> None:
 
 
 # ---------------------------------------------------------------------------
+# download_verdict -- the temperature match boundary (TEMPERATURE_MATCH_C).
+# ---------------------------------------------------------------------------
+
+
+def test_download_verdict_matches_r1_one_tenth_degree_step_up() -> None:
+    """A rebuilt temperature one 0.1C step above stored, with the float
+    noise that step carries (``abs(20.1 - 20.0)`` is not exactly 0.1),
+    still matches r1. Fails if the tolerance were back at 0.05C."""
+    hour = datetime(2026, 6, 2, 7, tzinfo=UTC)
+    stored = {hour: 20.0}
+    candidates = _candidates(r1={hour: 20.1}, older={hour: 25.0}, newer={hour: 30.0})
+    assert download_verdict(stored, candidates) == "r1"
+
+
+def test_download_verdict_matches_r1_one_tenth_degree_step_down() -> None:
+    """The same one-step boundary the other way. Fails if the tolerance
+    were back at 0.05C."""
+    hour = datetime(2026, 6, 2, 7, tzinfo=UTC)
+    stored = {hour: 20.0}
+    candidates = _candidates(r1={hour: 19.9}, older={hour: 25.0}, newer={hour: 30.0})
+    assert download_verdict(stored, candidates) == "r1"
+
+
+def test_download_verdict_matches_r1_just_under_one_tenth_degree() -> None:
+    """A stored/rebuilt pair whose float difference (``abs(0.3 - 0.2)``)
+    lands just under 0.1C: still a match. Fails if the tolerance were
+    back at 0.05C, since this difference is itself just under 0.1 and
+    well above 0.05."""
+    hour = datetime(2026, 6, 2, 7, tzinfo=UTC)
+    stored = {hour: 0.3}
+    candidates = _candidates(r1={hour: 0.2}, older={hour: 25.0}, newer={hour: 30.0})
+    assert download_verdict(stored, candidates) == "r1"
+
+
+def test_download_verdict_two_tenths_degree_off_is_no_match() -> None:
+    """Two 0.1C steps off is still a miss. Fails if the tolerance were
+    widened to 0.2C or more."""
+    hour = datetime(2026, 6, 2, 7, tzinfo=UTC)
+    stored = {hour: 20.0}
+    candidates = _candidates(r1={hour: 20.2}, older={hour: 25.0}, newer={hour: 30.0})
+    assert download_verdict(stored, candidates) == "no_match"
+
+
+def test_download_verdict_matches_r1_with_one_hour_a_tenth_off() -> None:
+    """Across several hours, r1 equals stored on every hour but one,
+    which is a single 0.1C step off; the older run is 1.0C off on every
+    hour, the shape seen on real data. Fails if the tolerance were back
+    at 0.05C."""
+    base = datetime(2026, 6, 2, 0, tzinfo=UTC)
+    hours = [base + timedelta(hours=i) for i in range(4)]
+    stored = {hour: 10.0 for hour in hours}
+    r1 = dict(stored)
+    r1[hours[2]] = 10.1
+    older = {hour: value + 1.0 for hour, value in stored.items()}
+    candidates = _candidates(r1=r1, older=older)
+    assert download_verdict(stored, candidates) == "r1"
+
+
+def test_download_verdict_no_match_with_one_hour_two_tenths_off() -> None:
+    """The same shape, but that one hour is 0.2C off instead: no longer a
+    match. Fails if the tolerance were widened to 0.2C or more."""
+    base = datetime(2026, 6, 2, 0, tzinfo=UTC)
+    hours = [base + timedelta(hours=i) for i in range(4)]
+    stored = {hour: 10.0 for hour in hours}
+    r1 = dict(stored)
+    r1[hours[2]] = 10.2
+    older = {hour: value + 1.0 for hour, value in stored.items()}
+    candidates = _candidates(r1=r1, older=older)
+    assert download_verdict(stored, candidates) == "no_match"
+
+
+def test_download_verdict_two_matches_within_a_tenth_is_undecided() -> None:
+    """r1 and the newer run both land within the 0.1C tolerance: two
+    matches, still undecided -- the rule that separates runs still
+    applies at the wider tolerance."""
+    hour = datetime(2026, 6, 2, 7, tzinfo=UTC)
+    stored = {hour: 20.0}
+    candidates = _candidates(r1={hour: 20.1}, older={hour: 25.0}, newer={hour: 19.9})
+    assert download_verdict(stored, candidates) == "undecided"
+
+
+# ---------------------------------------------------------------------------
 # model_verdict -- CAN'T TELL / TOO FRESH / PASS / STALE / NO MATCH, in the
 # exact counts T12 names.
 # ---------------------------------------------------------------------------

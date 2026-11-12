@@ -69,8 +69,9 @@ logger = logging.getLogger(__name__)
 
 #: Open-Meteo's archive of individual model runs.
 SINGLE_RUNS_URL: Final = "https://single-runs-api.open-meteo.com/v1/forecast"
-#: Per-operation timeouts of one archive request.
-REQUEST_TIMEOUT: Final = httpx.Timeout(20.0, connect=5.0)
+#: Per-operation timeouts of one archive request. The read timeout is long
+#: because the archive's replies may be slower than the live API's.
+REQUEST_TIMEOUT: Final = httpx.Timeout(60.0, connect=5.0)
 #: How long a request that may work later waits, unless the reply's
 #: ``Retry-After`` asks for longer.
 RETRY_WAIT: Final = timedelta(minutes=15)

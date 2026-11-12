@@ -67,8 +67,11 @@ CHECK_PASS_PERCENT: Final = 90
 #: STALE: the served run and the next newer run together match at least
 #: this share.
 CHECK_STALE_PERCENT: Final = 50
-#: A stored temperature equals a rebuilt one within this many degrees C.
-TEMPERATURE_MATCH_C: Final = 0.05
+#: A stored temperature equals a rebuilt one within this many degrees C:
+#: one 0.1 degrees C step, the step Open-Meteo reports temperature in. On
+#: some hours the archive rounds the same run to the step next to the live
+#: reply's, so the served run can differ from its download by one step.
+TEMPERATURE_MATCH_C: Final = 0.1
 #: A stored rain value equals a rebuilt one within this many mm.
 RAIN_MATCH_MM: Final = 0.005
 #: An hour is wet at this much rain or more, in mm.
@@ -82,6 +85,11 @@ TOO_FRESH_MARGIN_MINUTES: Final = 30
 #: model's downloads.
 ALLOWANCE_LIMIT_MINUTES: Final = 24 * 60
 
+#: Added to ``TEMPERATURE_MATCH_C`` so a difference of exactly one step
+#: matches despite float error (``abs(20.1 - 20.0)`` is
+#: ``0.10000000000000142``). Far smaller than a step, so 0.2 degrees C never
+#: matches.
+_TEMPERATURE_FLOAT_SLACK_C: Final = 1e-6
 _HOUR: Final = timedelta(hours=1)
 _NO_SHIFT: Final = timedelta(0)
 #: How far the adapter files each variable's value before the provider's
@@ -401,12 +409,19 @@ def _temperatures_match(
     stored: Mapping[datetime, float], rebuilt: Mapping[datetime, float] | None
 ) -> bool:
     """Whether every stored temperature hour has a rebuilt value within
-    ``TEMPERATURE_MATCH_C``."""
+    ``TEMPERATURE_MATCH_C``, one 0.1 degrees C step.
+
+    The archive rounds some hours of a run to the step next to the live
+    reply's, so a difference of one step matches; ``_TEMPERATURE_FLOAT_SLACK_C``
+    keeps exactly one step matching despite float error. A difference of
+    0.2 degrees C does not match.
+    """
     if rebuilt is None:
         return False
+    bound = TEMPERATURE_MATCH_C + _TEMPERATURE_FLOAT_SLACK_C
     for instant, value in stored.items():
         candidate = rebuilt.get(instant)
-        if candidate is None or abs(candidate - value) > TEMPERATURE_MATCH_C:
+        if candidate is None or abs(candidate - value) > bound:
             return False
     return True
 
@@ -422,8 +437,10 @@ def download_verdict(
     each rebuilt as the fill rebuilds it) is its rebuilt temperature by
     hour, or None when the archive has no run at that time. A candidate
     matches when every stored hour equals its rebuilt hour within
-    ``TEMPERATURE_MATCH_C``. Exactly one match decides the download; none
-    decides it as ``no_match``. Undecided: no stored hour, no archive run
+    ``TEMPERATURE_MATCH_C``, one 0.1 degrees C step: on some hours the
+    archive rounds the same run to the step next to the live reply's.
+    Exactly one match decides the download; none decides it as
+    ``no_match``. Undecided: no stored hour, no archive run
     for ``r1``, or two or more matches (past a short run's end the
     candidates can be equal).
     """
