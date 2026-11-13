@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.16.23
+
+meteoblue's morning and evening calls move one hour earlier. The set
+site times are now 00:10, 08:10, 12:10 and 20:10. This continues the
+trial of 0.16.21: the `meteoblue run:` lines show whether the models'
+new runs are ready by then. Install between 00:15 and 09:10 or between
+12:15 and 21:10 site time. Installed between 09:10 and 12:10 or between
+21:10 and midnight, that UTC day needs a fifth meteoblue call, which
+the credit limit refuses, and meteoblue misses the next midnight
+scoring round once.
+
 ## 0.16.22
 
 Open-Meteo's older forecasts are filled in from Open-Meteo's archive of
