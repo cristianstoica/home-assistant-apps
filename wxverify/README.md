@@ -1066,7 +1066,7 @@ With the default cadences, each enabled site makes:
   add-on's defaults are set for Europe; for a site outside Europe, switch it off
   for that site on the Sites page, under Feed Subscriptions.
 - Meteoblue: one multimodel package call at each of four set site times: the
-  scoring round (`00:10` by default), then `09:10`, `12:10` and `21:10`, or `4`
+  scoring round (`00:10` by default), then `08:10`, `12:10` and `20:10`, or `4`
   calls per enabled site per day. The times are set in the code. The feed's
   interval no longer moves these calls; it still decides when the feed reads as
   stale and how long a failed call waits before retrying. The current package

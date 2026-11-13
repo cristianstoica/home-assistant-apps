@@ -72,7 +72,7 @@ DAYTIME_FAILURE_COOLDOWN: Final = timedelta(hours=1)
 #: clock order: the round is the day's first call, and the latest round
 #: time (05:00) is before the first of these. Retries give up the last one
 #: first. A trial; each change ships with a release.
-METEOBLUE_DAYTIME_LOCAL_TIMES: Final = ((9, 10), (12, 10), (21, 10))
+METEOBLUE_DAYTIME_LOCAL_TIMES: Final = ((8, 10), (12, 10), (20, 10))
 
 _LOCAL_TIME_RE: Final = re.compile(r"([01]\d|2[0-3]):([0-5]\d)")
 _MINUTES_PER_DAY: Final = 24 * 60
