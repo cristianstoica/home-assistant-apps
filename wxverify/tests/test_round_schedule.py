@@ -1580,14 +1580,14 @@ def test_dt5_the_package_uses_the_four_set_times(
 ) -> None:
     """DT5: the meteoblue package, subscribed alone (no other feed). Over
     two days, ticks at 06:10, 08:10, 18:10 and 20:10 create no package
-    job (08:10 and 20:10 are the old, now-superseded call times -- a
-    tick there must find the current slot already fetched and create
-    nothing); ticks at 00:10 (the round), 08:40, 12:10 and 20:40 each
-    create exactly one. After the 08:40 call, the package member's
-    ``forecast_scored.download_id`` is still the round's download id --
-    the day's first download, unaffected by the new call times
-    (``_setup_meteoblue`` in ``test_display_persistence.py`` shows a
-    package reply built the same way, with a scored member feed)."""
+    job (08:10 and 20:10 are the old, now-superseded call times: a tick
+    at 08:10 finds no slot due yet; a tick at 20:10 finds 12:10 already
+    fetched; neither creates a job); ticks at 00:10 (the round), 08:40,
+    12:10 and 20:40 each create exactly one. After the 08:40 call, the
+    package member's ``forecast_scored.download_id`` is still the round's
+    download id -- the day's first download, unaffected by the new call
+    times (``_setup_meteoblue`` in ``test_display_persistence.py`` shows
+    a package reply built the same way, with a scored member feed)."""
     db, conn, site_id, _feed_ids, standin, clock = _night(
         tmp_path, monkeypatch, subscribe=()
     )
