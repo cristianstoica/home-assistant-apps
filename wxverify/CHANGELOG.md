@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.16.24
+
+meteoblue's morning and evening calls move 30 minutes later. The set
+site times are now 00:10, 08:40, 12:10 and 20:40. At 08:10 and 20:10
+two of the six models in the trial did not yet have their new run;
+the `meteoblue run:` lines show whether they do by 08:40 and 20:40.
+Install between 00:15 and 08:10 or between 12:15 and 20:10 site time.
+Installed between 08:10 and 12:10 or between 20:10 and midnight, that
+UTC day needs a fifth meteoblue call, which the credit limit refuses,
+and meteoblue misses the next midnight scoring round once.
+
 ## 0.16.23
 
 meteoblue's morning and evening calls move one hour earlier. The set
