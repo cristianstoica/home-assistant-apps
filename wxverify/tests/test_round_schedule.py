@@ -520,16 +520,16 @@ def test_rs8_meteoblue_slots_dropped_latest_first_and_budget_stops_a_try(
     """RS8 (a): round tries 1 to 3 for P (meteoblue-style) all
     end without a stored row, so a fourth try is still due. Ticking for
     real through the day's slot times shows P's daytime slots that day
-    are 08:40 only (12:10 and 20:40 dropped, latest first).
+    are 07:10 only (10:10 and 11:10 dropped, latest first).
     (b): the same tries 1 to 3 on a fresh night, then, with the cap's
-    calls used up, try 4 ends ``budget`` with no call, and 08:40 is
+    calls used up, try 4 ends ``budget`` with no call, and 07:10 is
     dropped too (every recorded retry counts).
-    (c): one retry only -- try 1 fails, try 2 stores -- drops 20:40
-    alone, leaving 08:40 and 12:10.
+    (c): one retry only -- try 1 fails, try 2 stores -- drops 11:10
+    alone, leaving 07:10 and 10:10.
     (d): the round stores at try 1 (no retry, nothing dropped), then the
-    08:40 call itself fails and stays pending for its own retries; the
-    12:10 tick's enqueue, keyed on the same job, creates no second job --
-    the pending 08:40 try still occupies the key."""
+    07:10 call itself fails and stays pending for its own retries; the
+    10:10 tick's enqueue, keyed on the same job, creates no second job --
+    the pending 07:10 try still occupies the key."""
     from wxverify.collection.budget import set_source_cap
 
     # (a)
@@ -561,7 +561,7 @@ def test_rs8_meteoblue_slots_dropped_latest_first_and_budget_stops_a_try(
 
     # Tick for real through the day's three slot times, claiming and
     # running any job each tick creates.
-    for hour, minute in ((8, 40), (12, 10), (20, 40)):
+    for hour, minute in ((7, 10), (10, 10), (11, 10)):
         asyncio.run(
             tick(
                 db, clock, at=datetime(R.year, R.month, R.day, hour, minute, tzinfo=UTC)
@@ -575,8 +575,8 @@ def test_rs8_meteoblue_slots_dropped_latest_first_and_budget_stops_a_try(
         json.loads(r["payload"])["slot"]
         for r in _job_for_key(conn, f"fetch:{package_id}")
     )
-    assert slots == ["08:40"], (
-        f"at this assertion: correct = ['08:40'] (12:10/20:40 dropped), got = {slots!r}"
+    assert slots == ["07:10"], (
+        f"at this assertion: correct = ['07:10'] (10:10/11:10 dropped), got = {slots!r}"
     )
 
     # (b): the same tries 1-3, on a fresh night, then the cap's calls
@@ -635,8 +635,8 @@ def test_rs8_meteoblue_slots_dropped_latest_first_and_budget_stops_a_try(
     )
 
     # With every try (1 to 4) now recorded, the day's real slot ticks must
-    # drop 08:40 too -- no job is ever created for it.
-    for hour, minute in ((8, 40), (12, 10), (20, 40)):
+    # drop 07:10 too -- no job is ever created for it.
+    for hour, minute in ((7, 10), (10, 10), (11, 10)):
         asyncio.run(
             tick(
                 db2,
@@ -654,17 +654,17 @@ def test_rs8_meteoblue_slots_dropped_latest_first_and_budget_stops_a_try(
         for r in _job_for_key(conn2, f"fetch:{package2_id}")
     )
     assert slots_after_try4 == [], (
-        "at this assertion: correct = [] (08:40 dropped too),"
+        "at this assertion: correct = [] (07:10 dropped too),"
         f" got = {slots_after_try4!r}"
     )
     calls_after_daytime = standin2.calls.get("meteoblue", 0)
     assert calls_after_daytime == calls_after_try4, (
         "at this assertion: correct = no further adapter call"
-        f" (08:40 dropped), got ="
+        f" (07:10 dropped), got ="
         f" {calls_after_daytime - calls_after_try4} more call(s)"
     )
 
-    # (c): one retry only -- try 1 fails, try 2 stores -- drops 20:40
+    # (c): one retry only -- try 1 fails, try 2 stores -- drops 11:10
     # alone.
     db3, conn3, site3_id, _feed3_ids, standin3, clock3 = _night(
         tmp_path / "rs8c", monkeypatch, subscribe=()
@@ -675,8 +675,8 @@ def test_rs8_meteoblue_slots_dropped_latest_first_and_budget_stops_a_try(
         "meteoblue",
         ProviderHttpError(404),  # try 1: failed
         _reply("P", "multimodel", 0),  # try 2: stored (a retry; 1 slot dropped)
-        _reply("P", "multimodel", 8),  # the 08:40 daytime call
-        _reply("P", "multimodel", 12),  # the 12:10 daytime call
+        _reply("P", "multimodel", 7),  # the 07:10 daytime call
+        _reply("P", "multimodel", 10),  # the 10:10 daytime call
     )
 
     for minute in (10, 15):
@@ -693,7 +693,7 @@ def test_rs8_meteoblue_slots_dropped_latest_first_and_budget_stops_a_try(
     round_rows3 = _downloads(conn3, package3_id)
     assert round_rows3[-1]["outcome"] == "stored", "fixture sanity: try 2 must store"
 
-    for hour, minute in ((8, 40), (12, 10), (20, 40)):
+    for hour, minute in ((7, 10), (10, 10), (11, 10)):
         asyncio.run(
             tick(
                 db3,
@@ -709,15 +709,15 @@ def test_rs8_meteoblue_slots_dropped_latest_first_and_budget_stops_a_try(
         json.loads(r["payload"])["slot"]
         for r in _job_for_key(conn3, f"fetch:{package3_id}")
     )
-    assert slots3 == ["08:40", "12:10"], (
-        f"at this assertion: correct = ['08:40', '12:10'] (20:40 dropped,"
+    assert slots3 == ["07:10", "10:10"], (
+        f"at this assertion: correct = ['07:10', '10:10'] (11:10 dropped,"
         f" one retry), got = {slots3!r}"
     )
 
     # (d): the round stores at try 1 -- no retry, nothing dropped -- then
-    # the 08:40 call itself fails and stays pending for its own retries.
-    # The 12:10 tick's enqueue, keyed on the same job, creates no second
-    # job: the pending 08:40 try still occupies the key.
+    # the 07:10 call itself fails and stays pending for its own retries.
+    # The 10:10 tick's enqueue, keyed on the same job, creates no second
+    # job: the pending 07:10 try still occupies the key.
     db4, conn4, site4_id, _feed4_ids, standin4, clock4 = _night(
         tmp_path / "rs8d", monkeypatch, subscribe=()
     )
@@ -737,29 +737,29 @@ def test_rs8_meteoblue_slots_dropped_latest_first_and_budget_stops_a_try(
 
     standin4.program("meteoblue", ProviderConnectError())
     asyncio.run(
-        tick(db4, clock4, at=datetime(R.year, R.month, R.day, 8, 40, tzinfo=UTC))
+        tick(db4, clock4, at=datetime(R.year, R.month, R.day, 7, 10, tzinfo=UTC))
     )
-    job_0840 = claim_next_job(conn4)
-    assert job_0840 is not None, "08:40 slot was not enqueued"
-    asyncio.run(run_claimed_job(db4, job_0840, lane="main"))
+    job_0710 = claim_next_job(conn4)
+    assert job_0710 is not None, "07:10 slot was not enqueued"
+    asyncio.run(run_claimed_job(db4, job_0710, lane="main"))
     conn4.commit()
-    row_0840 = conn4.execute("SELECT * FROM jobs WHERE id=?", (job_0840.id,)).fetchone()
-    assert row_0840["status"] == "pending", (
+    row_0710 = conn4.execute("SELECT * FROM jobs WHERE id=?", (job_0710.id,)).fetchone()
+    assert row_0710["status"] == "pending", (
         "fixture sanity: a failed daytime try with retries left stays"
-        f" pending, got status={row_0840['status']!r}"
+        f" pending, got status={row_0710['status']!r}"
     )
 
     asyncio.run(
-        tick(db4, clock4, at=datetime(R.year, R.month, R.day, 12, 10, tzinfo=UTC))
+        tick(db4, clock4, at=datetime(R.year, R.month, R.day, 10, 10, tzinfo=UTC))
     )
     jobs_at_key = _job_for_key(conn4, f"fetch:{package4_id}")
     assert len(jobs_at_key) == 1, (
-        "at this assertion: correct = 1 (the 12:10 tick enqueues no second"
+        "at this assertion: correct = 1 (the 10:10 tick enqueues no second"
         f" job on the same key), got = {len(jobs_at_key)}"
     )
     slot_still = json.loads(jobs_at_key[0]["payload"])["slot"]
-    assert slot_still == "08:40", (
-        "at this assertion: correct = '08:40' (the pending retry keeps"
+    assert slot_still == "07:10", (
+        "at this assertion: correct = '07:10' (the pending retry keeps"
         f" its own slot label), got = {slot_still!r}"
     )
 
@@ -1579,15 +1579,17 @@ def test_dt5_the_package_uses_the_four_set_times(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """DT5: the meteoblue package, subscribed alone (no other feed). Over
-    two days, ticks at 06:10, 08:10, 18:10 and 20:10 create no package
-    job (08:10 and 20:10 are the old, now-superseded call times: a tick
-    at 08:10 finds no slot due yet; a tick at 20:10 finds 12:10 already
-    fetched; neither creates a job); ticks at 00:10 (the round), 08:40,
-    12:10 and 20:40 each create exactly one. After the 08:40 call, the
-    package member's ``forecast_scored.download_id`` is still the round's
-    download id -- the day's first download, unaffected by the new call
-    times (``_setup_meteoblue`` in ``test_display_persistence.py`` shows
-    a package reply built the same way, with a scored member feed)."""
+    two days, ticks at 06:10, 08:40, 12:10 and 20:40 create no package
+    job (08:40, 12:10 and 20:40 are the previous release's call times:
+    06:10 is before any slot, so none is due yet; a tick at 08:40 finds
+    only 07:10 already fetched, nothing new; ticks at 12:10 and 20:40
+    find 11:10 already fetched, nothing new); ticks at 00:10 (the
+    round), 07:10, 10:10 and 11:10 each create exactly one. After the
+    07:10 call, the package member's ``forecast_scored.download_id`` is
+    still the round's download id -- the day's first download,
+    unaffected by the new call times (``_setup_meteoblue`` in
+    ``test_display_persistence.py`` shows a package reply built the
+    same way, with a scored member feed)."""
     db, conn, site_id, _feed_ids, standin, clock = _night(
         tmp_path, monkeypatch, subscribe=()
     )
@@ -1608,17 +1610,17 @@ def test_dt5_the_package_uses_the_four_set_times(
         )
 
     def _run_day(day: date) -> None:
-        for hour, minute in ((0, 10), (8, 40), (12, 10), (20, 40)):
+        for hour, minute in ((0, 10), (7, 10), (10, 10), (11, 10)):
             at = datetime(day.year, day.month, day.day, hour, minute, tzinfo=UTC)
             standin.program("meteoblue", _member_reply(at))
         for hour, minute in (
             (0, 10),
             (6, 10),
-            (8, 10),
+            (7, 10),
             (8, 40),
+            (10, 10),
+            (11, 10),
             (12, 10),
-            (18, 10),
-            (20, 10),
             (20, 40),
         ):
             at = datetime(day.year, day.month, day.day, hour, minute, tzinfo=UTC)
@@ -1630,14 +1632,14 @@ def test_dt5_the_package_uses_the_four_set_times(
     _run_day(R)
     rows_day1 = _downloads(conn, package_id)
     slots_day1 = [row["slot"] for row in rows_day1]
-    assert slots_day1 == ["round", "08:40", "12:10", "20:40"], (
-        "at this assertion: correct = ['round', '08:40', '12:10', '20:40']"
-        " (no job at 06:10/08:10/18:10/20:10), got ="
+    assert slots_day1 == ["round", "07:10", "10:10", "11:10"], (
+        "at this assertion: correct = ['round', '07:10', '10:10', '11:10']"
+        " (no job at 06:10/08:40/12:10/20:40), got ="
         f" {slots_day1!r}"
     )
     expected_started_day1 = [
         isoformat_utc(datetime(R.year, R.month, R.day, hour, minute, tzinfo=UTC))
-        for hour, minute in ((0, 10), (8, 40), (12, 10), (20, 40))
+        for hour, minute in ((0, 10), (7, 10), (10, 10), (11, 10))
     ]
     actual_started_day1 = [row["started_at"] for row in rows_day1]
     assert actual_started_day1 == expected_started_day1, (
@@ -1659,7 +1661,7 @@ def test_dt5_the_package_uses_the_four_set_times(
     }
     assert scored_download_ids == {round_download_id}, (
         "at this assertion: correct = a single download id, the round's"
-        f" ({round_download_id}) -- the 08:40 call's own scored rows"
+        f" ({round_download_id}) -- the 07:10 call's own scored rows"
         " still point at the day's first download, not at themselves,"
         f" got = {scored_download_ids!r}"
     )
@@ -1671,9 +1673,9 @@ def test_dt5_the_package_uses_the_four_set_times(
         row for row in _downloads(conn, package_id) if int(row["id"]) not in before_day2
     ]
     slots_day2 = [row["slot"] for row in rows_day2]
-    assert slots_day2 == ["round", "08:40", "12:10", "20:40"], (
-        "at this assertion: correct = ['round', '08:40', '12:10', '20:40']"
-        " (no job at 06:10/08:10/18:10/20:10, the next day too), got ="
+    assert slots_day2 == ["round", "07:10", "10:10", "11:10"], (
+        "at this assertion: correct = ['round', '07:10', '10:10', '11:10']"
+        " (no job at 06:10/08:40/12:10/20:40, the next day too), got ="
         f" {slots_day2!r}"
     )
 
@@ -1689,9 +1691,9 @@ def test_dt6_the_package_slots_on_clock_change_days(
     ``_round_start_utc`` and ``_package_daytime_slots`` are checked
     against UTC instants written by hand from Berlin's CET (+1, winter)
     and CEST (+2, summer) offsets, and a direct call to
-    ``enqueue_due_daytime_downloads`` one second before 08:40 local
-    enqueues nothing while at 08:40 local it enqueues one job labelled
-    ``'08:40'``."""
+    ``enqueue_due_daytime_downloads`` one second before 07:10 local
+    enqueues nothing while at 07:10 local it enqueues one job labelled
+    ``'07:10'``."""
     from tests.helpers import day_close_site
     from wxverify import config
     from wxverify.db.connection import close_db, init_db
@@ -1716,19 +1718,19 @@ def test_dt6_the_package_slots_on_clock_change_days(
         (
             date(2026, 3, 29),  # spring forward, local 02:00 -> 03:00
             datetime(2026, 3, 28, 23, 10, tzinfo=UTC),  # 00:10 local, CET +1
-            datetime(2026, 3, 29, 6, 40, tzinfo=UTC),  # 08:40 local, CEST +2
-            datetime(2026, 3, 29, 10, 10, tzinfo=UTC),  # 12:10 local, CEST +2
-            datetime(2026, 3, 29, 18, 40, tzinfo=UTC),  # 20:40 local, CEST +2
+            datetime(2026, 3, 29, 5, 10, tzinfo=UTC),  # 07:10 local, CEST +2
+            datetime(2026, 3, 29, 8, 10, tzinfo=UTC),  # 10:10 local, CEST +2
+            datetime(2026, 3, 29, 9, 10, tzinfo=UTC),  # 11:10 local, CEST +2
         ),
         (
             date(2026, 10, 25),  # autumn fall-back, local 03:00 -> 02:00
             datetime(2026, 10, 24, 22, 10, tzinfo=UTC),  # 00:10 local, CEST +2
-            datetime(2026, 10, 25, 7, 40, tzinfo=UTC),  # 08:40 local, CET +1
-            datetime(2026, 10, 25, 11, 10, tzinfo=UTC),  # 12:10 local, CET +1
-            datetime(2026, 10, 25, 19, 40, tzinfo=UTC),  # 20:40 local, CET +1
+            datetime(2026, 10, 25, 6, 10, tzinfo=UTC),  # 07:10 local, CET +1
+            datetime(2026, 10, 25, 9, 10, tzinfo=UTC),  # 10:10 local, CET +1
+            datetime(2026, 10, 25, 10, 10, tzinfo=UTC),  # 11:10 local, CET +1
         ),
     )
-    for local_date, round_utc, slot_0840, slot_1210, slot_2040 in cases:
+    for local_date, round_utc, slot_0710, slot_1010, slot_1110 in cases:
         day = schedule_day(conn, site_id=site_id, local_date=local_date)
         start = _round_start_utc(conn, day)
         assert start == round_utc, (
@@ -1737,32 +1739,32 @@ def test_dt6_the_package_slots_on_clock_change_days(
         )
         slots = _package_daytime_slots(day)
         expected_slots = [
-            ("08:40", slot_0840),
-            ("12:10", slot_1210),
-            ("20:40", slot_2040),
+            ("07:10", slot_0710),
+            ("10:10", slot_1010),
+            ("11:10", slot_1110),
         ]
         assert slots == expected_slots, (
             f"at this assertion ({local_date}): correct ="
             f" {expected_slots!r}, got = {slots!r}"
         )
 
-        enqueue_due_daytime_downloads(conn, now_utc=slot_0840 - timedelta(seconds=1))
+        enqueue_due_daytime_downloads(conn, now_utc=slot_0710 - timedelta(seconds=1))
         conn.commit()
         none_yet = _job_for_key(conn, f"fetch:{package_id}")
         assert none_yet == [], (
             f"at this assertion ({local_date}): correct = 0 (one second"
-            f" before 08:40 local, no slot is due yet), got = {len(none_yet)}"
+            f" before 07:10 local, no slot is due yet), got = {len(none_yet)}"
         )
 
-        enqueue_due_daytime_downloads(conn, now_utc=slot_0840)
+        enqueue_due_daytime_downloads(conn, now_utc=slot_0710)
         conn.commit()
         due = _job_for_key(conn, f"fetch:{package_id}")
         assert len(due) == 1, (
             f"at this assertion ({local_date}): correct = 1, got = {len(due)}"
         )
         label = json.loads(due[0]["payload"])["slot"]
-        assert label == "08:40", (
-            f"at this assertion ({local_date}): correct = '08:40', got = {label!r}"
+        assert label == "07:10", (
+            f"at this assertion ({local_date}): correct = '07:10', got = {label!r}"
         )
         conn.execute("DELETE FROM jobs WHERE id=?", (due[0]["id"],))
         conn.commit()
@@ -1775,10 +1777,18 @@ def test_dt7_the_package_never_exceeds_the_daily_call_limit(
     clock-change zone (``America/New_York``, spanning its 2026
     spring-forward on 2026-03-08 and fall-back on 2026-11-01), the round
     plus the three set slots give at most 4 instants on any one UTC
-    calendar date, and no gap between consecutive instants exceeds 10
-    hours. Then, on the seeded ``sources`` row, ``reserve_budget`` for
-    16,000 credits a call passes four times and raises ``JobDeferred``
-    the fifth, with ``api_budget`` left at 4 calls and 64,000 credits."""
+    calendar date, and no gap between consecutive instants exceeds 13
+    hours -- this morning-only trial's longest link, 11:10 local to the
+    next day's 00:10 round, with no evening call to shorten it. A clock
+    change never widens it past 13 hours: spring-forward's lost hour
+    falls between 00:10 and 11:10, before this gap starts, and
+    fall-back's extra hour falls inside the 00:10-07:10 gap (giving 8
+    hours there, still under 13), never inside the 11:10-to-round gap
+    itself, since both its ends sit on the same side of 02:00 local on
+    any one changeover night. Then, on the seeded ``sources`` row,
+    ``reserve_budget`` for 16,000 credits a call passes four times and
+    raises ``JobDeferred`` the fifth, with ``api_budget`` left at 4
+    calls and 64,000 credits."""
     from collections import defaultdict
 
     from wxverify import config
@@ -1823,9 +1833,13 @@ def test_dt7_the_package_never_exceeds_the_daily_call_limit(
     all_instants = sorted(i for v in per_utc_date.values() for i in v)
     gaps = [b - a for a, b in zip(all_instants, all_instants[1:], strict=False)]
     max_gap = max(gaps)
-    assert max_gap <= timedelta(hours=10), (
-        "at this assertion: correct = at most 10 hours between consecutive"
-        f" calls, got = {max_gap}"
+    # Every non-changeover day carries this same gap (11:10 to the next
+    # day's round, with no evening call to shorten it), and no changeover
+    # day's gap exceeds it (the docstring above), so the 400-date maximum
+    # is this exact value, not merely bounded by it.
+    assert max_gap == timedelta(hours=13), (
+        "at this assertion: correct = exactly 13 hours (11:10 to the next"
+        f" round, the trial's longest link), got = {max_gap}"
     )
 
     for _ in range(4):
@@ -1860,10 +1874,10 @@ def test_dt8_the_packages_interval_no_longer_moves_its_calls(
         "UPDATE feeds SET fetch_interval_minutes=720 WHERE id=?", (package_id,)
     )
     conn.commit()
-    for hour in (0, 8, 12, 20):
+    for hour in (0, 7, 10, 11):
         standin.program("meteoblue", _reply("P", "multimodel", hour))
 
-    for hour, minute in ((0, 10), (8, 40), (12, 10), (20, 40)):
+    for hour, minute in ((0, 10), (7, 10), (10, 10), (11, 10)):
         asyncio.run(
             tick(
                 db,
@@ -1877,8 +1891,8 @@ def test_dt8_the_packages_interval_no_longer_moves_its_calls(
 
     rows = _downloads(conn, package_id)
     slots = [row["slot"] for row in rows]
-    assert slots == ["round", "08:40", "12:10", "20:40"], (
-        "at this assertion: correct = ['round', '08:40', '12:10', '20:40']"
+    assert slots == ["round", "07:10", "10:10", "11:10"], (
+        "at this assertion: correct = ['round', '07:10', '10:10', '11:10']"
         " (the package's own 720-minute interval no longer moves its"
         f" calls), got = {slots!r}"
     )

@@ -1066,11 +1066,16 @@ With the default cadences, each enabled site makes:
   add-on's defaults are set for Europe; for a site outside Europe, switch it off
   for that site on the Sites page, under Feed Subscriptions.
 - Meteoblue: one multimodel package call at each of four set site times: the
-  scoring round (`00:10` by default), then `08:40`, `12:10` and `20:40`, or `4`
+  scoring round (`00:10` by default), then `07:10`, `10:10` and `11:10`, or `4`
   calls per enabled site per day. The times are set in the code. The feed's
   interval no longer moves these calls; it still decides when the feed reads as
   stale and how long a failed call waits before retrying. The current package
-  costs `16000` credits per call.
+  costs `16000` credits per call. These times are a short trial with all three
+  daytime calls in the morning. With no evening call, the gap from `11:10` to
+  the next round at the default `00:10` is 13 hours, over the `12`-hour
+  staleness limit, so the package reads as stale (the `feed_stale` monitor
+  reason and the Forecast page's Stale badge) for about the last hour before
+  the round each night, and clears at the round.
 
 The run a forward Open-Meteo forecast is labelled with, and the time it is
 recorded as issued, are estimated from the time of the fetch: the add-on
