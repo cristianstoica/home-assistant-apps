@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.16.25
+
+A short trial: meteoblue's three daytime calls all move to the morning.
+The set site times are now 00:10, 07:10, 10:10 and 11:10, with no
+evening call. The `meteoblue run:` lines show which models have their
+00:00Z run by each of the three calls. With 13 hours from 11:10 to the
+next round at the default 00:10, meteoblue reads as stale (the
+`feed_stale` monitor reason and the Forecast page's Stale badge) for
+about the last hour before the round each night, and clears at the
+round. Scoring is unchanged.
+Install between 00:40 and 08:40 or between 10:10 and 20:40 site time.
+Installed between 08:40 and 10:10 or between 20:40 and midnight, that
+UTC day needs a fifth meteoblue call, which the credit limit refuses,
+and meteoblue misses the next midnight scoring round once. The release
+that brings an evening call back must be installed between 00:40 and
+07:10 site time.
+
 ## 0.16.24
 
 meteoblue's morning and evening calls move 30 minutes later. The set
